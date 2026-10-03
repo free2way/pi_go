@@ -59,6 +59,74 @@ const credentialSchema = z.object({
   reviewerApiKey: z.string().trim().min(12).max(512).optional(),
 }).refine((value) => value.developerApiKey || value.reviewerApiKey, "At least one credential is required");
 
+const runStateSchema = z.enum(["queued", "preparing", "developing", "checking", "reviewing", "completed", "needs_human", "failed", "cancelled"]);
+const findingSchema = z.object({
+  id: z.string().min(1).max(120),
+  severity: z.enum(["critical", "high", "medium", "low"]),
+  file: z.string().max(400).nullable(),
+  line: z.number().int().min(0).nullable(),
+  title: z.string().min(1).max(300),
+  evidence: z.string().max(8_000),
+  requiredChange: z.string().max(8_000),
+  resolved: z.boolean(),
+});
+const checkResultSchema = z.object({
+  id: z.string().min(1).max(80),
+  name: z.string().min(1).max(160),
+  command: z.string().min(1).max(1_000),
+  status: z.enum(["pending", "running", "passed", "failed"]),
+  durationMs: z.number().min(0).optional(),
+  output: z.string().max(64_000).optional(),
+});
+const subAgentTaskSchema = z.object({
+  id: z.string().min(1).max(64),
+  title: z.string().min(1).max(200),
+  description: z.string().max(8_000),
+  files: z.array(z.string().max(400)).max(40),
+  dependsOn: z.array(z.string().max(64)).max(20),
+  status: z.enum(["planned", "running", "completed", "merged", "failed"]),
+  branch: z.string().max(300).optional(),
+  summary: z.string().max(4_000).optional(),
+  durationMs: z.number().min(0).optional(),
+});
+const developmentPlanSchema = z.object({
+  complexity: z.enum(["small", "medium", "large"]),
+  rationale: z.string().max(4_000),
+  strategy: z.enum(["single", "parallel"]),
+  tasks: z.array(subAgentTaskSchema).max(8),
+});
+const runUsageSchema = z.object({
+  inputTokens: z.number().min(0),
+  outputTokens: z.number().min(0),
+  estimatedCost: z.number().min(0),
+  cacheReadTokens: z.number().min(0).optional(),
+  cacheWriteTokens: z.number().min(0).optional(),
+  totalTokens: z.number().min(0).optional(),
+});
+const runPatchSchema = z.object({
+  state: runStateSchema,
+  round: z.number().int().min(1).max(99),
+  summary: z.string().max(8_000),
+  diff: z.string().max(200_000),
+  findings: z.array(findingSchema).max(100),
+  checks: z.array(checkResultSchema).max(16),
+  plan: developmentPlanSchema,
+  usage: runUsageSchema,
+  durationMs: z.number().min(0).max(86_400_000),
+  worktree: z.string().max(600),
+}).partial().strict();
+const internalEventSchema = z.object({
+  round: z.number().int().min(1).max(99),
+  source: z.enum(["system", "developer", "checks", "reviewer"]),
+  type: z.string().min(1).max(120),
+  message: z.string().min(1).max(8_000),
+  meta: z.record(z.string(), z.unknown()).optional(),
+});
+const internalUpdateSchema = z.object({
+  patch: runPatchSchema.optional(),
+  event: internalEventSchema.optional(),
+}).strict();
+
 const credentialWrites = new Map<string, number[]>();
 function credentialWriteAllowed(userId: string) {
   const cutoff = Date.now() - 60_000;
@@ -103,7 +171,7 @@ app.addHook("preHandler", async (request, reply) => {
   return auth.authenticate(request, reply);
 });
 
-app.get("/api/health", async () => ({ status: "ok", service: "pigo-web", version: "0.2.0" }));
+app.get("/api/health", async () => ({ status: "ok", service: "pigo-web", version: "0.3.0" }));
 app.get("/api/me", async (request) => auth.user(request));
 app.get("/api/credentials/status", async (request) => vault.status(auth.user(request).id));
 
@@ -207,16 +275,15 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/cancel", async (request, rep
   return store.getRun(run.id, auth.user(request).id);
 });
 
-app.post<{ Params: { id: string } }>("/api/internal/runs/:id/update", async (request, reply) => {
+app.post<{ Params: { id: string } }>("/api/internal/runs/:id/update", { bodyLimit: 1024 * 1024 }, async (request, reply) => {
   if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
-  const body = request.body as { patch?: Record<string, unknown>; event?: { round: number; source: "system" | "developer" | "checks" | "reviewer"; type: string; message: string } };
+  const parsed = internalUpdateSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid internal update", details: parsed.error.issues });
   const run = store.getRun(request.params.id);
   if (!run) return reply.code(404).send({ error: "Run not found" });
-  if (body.patch) {
-    const { ownerId: _ignoredOwner, id: _ignoredId, ...allowedPatch } = body.patch;
-    await store.updateRun(run.id, allowedPatch as Partial<Run>);
-  }
-  if (body.event) await store.appendEvent({ ...body.event, runId: run.id, at: new Date().toISOString() });
+  const { patch, event } = parsed.data;
+  if (patch) await store.updateRun(run.id, patch as Partial<Run>);
+  if (event) await store.appendEvent({ ...event, runId: run.id, at: new Date().toISOString() });
   return { ok: true };
 });
 

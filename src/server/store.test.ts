@@ -1,4 +1,4 @@
-import { mkdtemp, readFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -35,5 +35,47 @@ describe("RunStore", () => {
     expect(store.listRuns("owner-b")).toHaveLength(0);
     expect(store.getRun(run.id, "owner-b")).toBeUndefined();
     expect(JSON.parse(await readFile(file, "utf8")).runs).toHaveLength(1);
+  });
+
+  it("keeps persisting after a transient write failure", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "pigo-store-"));
+    const file = path.join(directory, "runs.json");
+    const store = new RunStore(file);
+    await store.init();
+    const run = baseDemoRun({ title: "Recovery run", task: "A sufficiently long test task", repository: "test/repo" }, "owner-a");
+    await store.createRun(run, {
+      runId: run.id,
+      round: 1,
+      source: "system",
+      type: "run.created",
+      message: "created",
+      at: new Date().toISOString(),
+    });
+
+    await chmod(directory, 0o555);
+    try {
+      await expect(store.appendEvent({
+        runId: run.id,
+        round: 1,
+        source: "developer",
+        type: "agent.started",
+        message: "failing write",
+        at: new Date().toISOString(),
+      })).rejects.toThrow();
+    } finally {
+      await chmod(directory, 0o755);
+    }
+
+    await store.appendEvent({
+      runId: run.id,
+      round: 1,
+      source: "developer",
+      type: "agent.completed",
+      message: "recovered write",
+      at: new Date().toISOString(),
+    });
+    const persisted = JSON.parse(await readFile(file, "utf8")) as { events: Record<string, unknown[]> };
+    expect(persisted.events[run.id]).toHaveLength(3);
+    expect(store.getEvents(run.id).map((event) => event.seq)).toEqual([1, 2, 3]);
   });
 });

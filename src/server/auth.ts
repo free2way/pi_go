@@ -18,6 +18,9 @@ export class Authenticator {
   private readonly jwks?: ReturnType<typeof createRemoteJWKSet>;
 
   constructor() {
+    if (this.mode === "development" && process.env.NODE_ENV === "production") {
+      throw new Error("PI_AUTH_MODE=development is not allowed when NODE_ENV=production");
+    }
     if (this.mode === "cloudflare") {
       const teamDomain = process.env.PI_CF_ACCESS_TEAM_DOMAIN;
       this.audience = process.env.PI_CF_ACCESS_AUDIENCE;

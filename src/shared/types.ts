@@ -82,7 +82,14 @@ export interface Run {
   findings: Finding[];
   diff: string;
   summary: string;
-  usage: { inputTokens: number; outputTokens: number; estimatedCost: number };
+  usage: {
+    inputTokens: number;
+    outputTokens: number;
+    estimatedCost: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+    totalTokens?: number;
+  };
   durationMs: number;
   lastSeq: number;
   worktree?: string;

@@ -1,10 +1,13 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
+import { timingSafeEqual } from "node:crypto";
 import { mkdir, readdir, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
 import type { CheckResult, DevelopmentPlan, Finding, ProjectInfo, Run, RunEvent, RunState, SubAgentTask } from "../shared/types.js";
 import { executionWaves, fallbackPlan, parseDevelopmentPlan } from "./orchestrator.js";
+import { UsageTracker, addUsage, assistantTextFromEvent, emptyUsage, toRunUsage, toolNameFromEvent, type UsageTotals } from "./pi-events.js";
+import { parseReview, type ReviewResult } from "./review-protocol.js";
 
 const port = Number(process.env.PORT || 3200);
 const host = process.env.HOST || "localhost";
@@ -36,12 +39,6 @@ type JobInput = {
   };
 };
 
-type ReviewResult = {
-  verdict: "approved" | "changes_requested";
-  summary: string;
-  findings: Array<Omit<Finding, "resolved">>;
-};
-
 function redactJobSecrets(message: string, credentials: JobInput["credentials"]) {
   return [credentials.developer, credentials.reviewer].reduce(
     (safe, secret) => secret ? safe.replaceAll(secret, "[redacted]") : safe,
@@ -64,7 +61,10 @@ async function readJson(request: IncomingMessage) {
 }
 
 function authorized(request: IncomingMessage) {
-  return Boolean(internalToken) && request.headers.authorization === `Bearer ${internalToken}`;
+  if (!internalToken) return false;
+  const header = Buffer.from(request.headers.authorization || "");
+  const expected = Buffer.from(`Bearer ${internalToken}`);
+  return header.length === expected.length && timingSafeEqual(header, expected);
 }
 
 async function postUpdate(runId: string, input: {
@@ -171,13 +171,6 @@ function parsePiLine(line: string) {
   try { return JSON.parse(line) as Record<string, unknown>; } catch { return undefined; }
 }
 
-function extractAssistantText(event: Record<string, unknown>): string | undefined {
-  if (event.type !== "message_end") return undefined;
-  const message = event.message as { role?: string; content?: Array<{ type?: string; text?: string }> } | undefined;
-  if (message?.role !== "assistant") return undefined;
-  return message.content?.filter((item) => item.type === "text").map((item) => item.text || "").join("\n");
-}
-
 async function runPi(input: {
   cwd: string;
   provider: string;
@@ -205,6 +198,7 @@ async function runPi(input: {
   else args.push("--no-session");
   args.push("--", input.prompt);
   let finalText = "";
+  const tracker = new UsageTracker();
   let activityQueue = Promise.resolve();
   const childEnvironment = { ...process.env };
   delete childEnvironment.DEEPSEEK_API_KEY;
@@ -218,25 +212,17 @@ async function runPi(input: {
     onStdoutLine: (line) => {
       const event = parsePiLine(line);
       if (!event) return;
-      finalText = extractAssistantText(event) || finalText;
-      if (event.type === "tool_execution_start") {
-        const name = String((event.toolCall as { name?: string } | undefined)?.name || "tool");
-        activityQueue = activityQueue.then(() => input.onActivity(`Pi 正在调用 ${name}`)).catch(() => undefined);
+      tracker.track(event);
+      finalText = assistantTextFromEvent(event) || finalText;
+      const toolName = toolNameFromEvent(event);
+      if (toolName) {
+        activityQueue = activityQueue.then(() => input.onActivity(`Pi 正在调用 ${toolName}`)).catch(() => undefined);
       }
     },
   });
   await activityQueue;
   if (result.code !== 0) throw new Error(result.stderr.trim() || `Pi exited with ${result.code}`);
-  return finalText.trim();
-}
-
-function parseReview(text: string): ReviewResult {
-  const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
-  const parsed = JSON.parse(cleaned) as ReviewResult;
-  if (!parsed || !["approved", "changes_requested"].includes(parsed.verdict) || !Array.isArray(parsed.findings)) {
-    throw new Error("Reviewer returned an invalid protocol");
-  }
-  return parsed;
+  return { text: finalText.trim(), usage: tracker.totals };
 }
 
 async function collectDiff(worktree: string, signal: AbortSignal, baseRef?: string) {
@@ -245,7 +231,7 @@ async function collectDiff(worktree: string, signal: AbortSignal, baseRef?: stri
   return (await git(worktree, args, signal)).slice(0, 120_000);
 }
 
-async function planDevelopment(run: Run, worktree: string, credentials: JobInput["credentials"], signal: AbortSignal) {
+async function planDevelopment(run: Run, worktree: string, credentials: JobInput["credentials"], signal: AbortSignal, usage: UsageTotals) {
   const prompt = [
     "You are the lead engineering planner. Inspect the current repository read-only and size the requested implementation.",
     `Task: ${run.task}`,
@@ -267,7 +253,8 @@ async function planDevelopment(run: Run, worktree: string, credentials: JobInput
       signal,
       onActivity: (message) => postUpdate(run.id, { event: { round: run.round, source: "developer", type: "planner.activity", message: `主 Agent：${message}` } }),
     });
-    return parseDevelopmentPlan(redactJobSecrets(result, credentials), maxSubagents);
+    addUsage(usage, result.usage);
+    return parseDevelopmentPlan(redactJobSecrets(result.text, credentials), maxSubagents);
   } catch (error) {
     const safeMessage = redactJobSecrets((error as Error).message, credentials);
     await postUpdate(run.id, { event: { round: run.round, source: "system", type: "planner.fallback", message: `任务拆分失败，安全回退到单 Agent：${safeMessage}` } });
@@ -283,8 +270,9 @@ async function runDeveloperAgent(input: {
   prompt: string;
   sessionSuffix: string;
   activityPrefix?: string;
+  usage: UsageTotals;
 }) {
-  return runPi({
+  const result = await runPi({
     cwd: input.worktree,
     provider: input.run.developer.provider,
     model: input.run.developer.model,
@@ -302,6 +290,8 @@ async function runDeveloperAgent(input: {
       },
     }),
   });
+  addUsage(input.usage, result.usage);
+  return result.text;
 }
 
 type SubAgentResult = {
@@ -319,6 +309,7 @@ async function runSubAgent(input: {
   task: SubAgentTask;
   credentials: JobInput["credentials"];
   signal: AbortSignal;
+  usage: UsageTotals;
 }): Promise<SubAgentResult> {
   const startedAt = Date.now();
   const branch = `${input.mainBranch}/sub-${input.task.id}`;
@@ -345,6 +336,7 @@ async function runSubAgent(input: {
       prompt,
       sessionSuffix: `sub-${input.task.id}`,
       activityPrefix: `Sub Agent「${input.task.title}」`,
+      usage: input.usage,
     });
     const changed = await git(worktree, ["status", "--porcelain"], input.signal);
     let commit: string | undefined;
@@ -379,6 +371,7 @@ async function orchestrateSubAgents(input: {
   plan: DevelopmentPlan;
   credentials: JobInput["credentials"];
   signal: AbortSignal;
+  usage: UsageTotals;
 }) {
   const integrationNotes: string[] = [];
   for (const wave of executionWaves(input.plan.tasks)) {
@@ -398,6 +391,7 @@ async function orchestrateSubAgents(input: {
       task,
       credentials: input.credentials,
       signal: input.signal,
+      usage: input.usage,
     })));
     for (const result of results) {
       try {
@@ -449,6 +443,7 @@ async function runChecks(run: Run, worktree: string, commands: string[], signal:
 async function executeJob(input: JobInput, controller: AbortController) {
   const run = input.run;
   const started = Date.now();
+  const usage: UsageTotals = emptyUsage();
   try {
     const project = await resolveProject(run.repository);
     const dirty = await git(project, ["status", "--porcelain"], controller.signal);
@@ -468,10 +463,10 @@ async function executeJob(input: JobInput, controller: AbortController) {
       run.round = round;
       await postUpdate(run.id, { patch: { round }, event: { round, source: "system", type: "round.started", message: `开始第 ${round} 轮开发` } });
       if (round === 1) {
-        plan = await planDevelopment(run, worktree, input.credentials, controller.signal);
+        plan = await planDevelopment(run, worktree, input.credentials, controller.signal, usage);
         run.plan = plan;
         await postUpdate(run.id, {
-          patch: { plan },
+          patch: { plan, usage: toRunUsage(usage) },
           event: {
             round,
             source: "developer",
@@ -482,7 +477,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
           },
         });
         if (plan.tasks.length > 1) {
-          const integrationNotes = await orchestrateSubAgents({ run, project, worktree, plan, credentials: input.credentials, signal: controller.signal });
+          const integrationNotes = await orchestrateSubAgents({ run, project, worktree, plan, credentials: input.credentials, signal: controller.signal, usage });
           const integrationPrompt = [
             "You are the lead integration agent. Work only in the current Git worktree.",
             `Original task: ${run.task}`,
@@ -491,7 +486,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
             "Inspect the combined code, resolve integration gaps, complete any skipped work, and add or update end-to-end tests.",
             "Do not push, deploy, delete the repository, or read credentials. Do not undo correct sub-agent work.",
           ].join("\n\n");
-          await runDeveloperAgent({ run, worktree, credentials: input.credentials, signal: controller.signal, prompt: integrationPrompt, sessionSuffix: "integrator", activityPrefix: "集成 Agent" });
+          await runDeveloperAgent({ run, worktree, credentials: input.credentials, signal: controller.signal, prompt: integrationPrompt, sessionSuffix: "integrator", activityPrefix: "集成 Agent", usage });
         } else {
           const task = plan.tasks[0];
           task.status = "running";
@@ -502,7 +497,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
             "Inspect the repository, implement the task completely, and add or update tests.",
             "Do not push, deploy, delete the repository, or read credentials. Do not claim checks passed unless you ran them.",
           ].join("\n\n");
-          const summary = await runDeveloperAgent({ run, worktree, credentials: input.credentials, signal: controller.signal, prompt: developerPrompt, sessionSuffix: "developer" });
+          const summary = await runDeveloperAgent({ run, worktree, credentials: input.credentials, signal: controller.signal, prompt: developerPrompt, sessionSuffix: "developer", usage });
           task.status = "merged";
           task.summary = redactJobSecrets(summary, input.credentials).slice(0, 1_000);
           await postUpdate(run.id, { patch: { plan }, event: { round, source: "developer", type: "developer.completed", message: "单 Agent 实现完成" } });
@@ -515,10 +510,10 @@ async function executeJob(input: JobInput, controller: AbortController) {
           "Inspect the existing combined implementation, make the required fixes, and update tests.",
           "Do not push, deploy, delete the repository, or read credentials.",
         ].join("\n\n");
-        await runDeveloperAgent({ run, worktree, credentials: input.credentials, signal: controller.signal, prompt: repairPrompt, sessionSuffix: `repair-${round}`, activityPrefix: "修复 Agent" });
+        await runDeveloperAgent({ run, worktree, credentials: input.credentials, signal: controller.signal, prompt: repairPrompt, sessionSuffix: `repair-${round}`, activityPrefix: "修复 Agent", usage });
       }
       const diff = await collectDiff(worktree, controller.signal, baseCommit);
-      await update(run, "checking", "checks", "checks.started", "Developer 完成，开始确定性检查", { diff, summary: "正在运行项目检查" });
+      await update(run, "checking", "checks", "checks.started", "Developer 完成，开始确定性检查", { diff, summary: "正在运行项目检查", usage: toRunUsage(usage) });
       const checked = await runChecks(run, worktree, input.checks, controller.signal);
       if (!checked.passed) {
         feedback = `The deterministic checks failed. Fix these failures:\n${checked.results.filter((item) => item.status === "failed").map((item) => `${item.command}\n${item.output}`).join("\n\n")}`;
@@ -537,7 +532,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
         "Use changes_requested only for actionable defects. approved must not contain critical/high/medium findings.",
         `Diff:\n${latestDiff.slice(0, 90_000)}`,
       ].join("\n\n");
-      const reviewText = await runPi({
+      const firstReview = await runPi({
         cwd: worktree,
         provider: run.reviewer.provider,
         model: run.reviewer.model,
@@ -548,7 +543,36 @@ async function executeJob(input: JobInput, controller: AbortController) {
         signal: controller.signal,
         onActivity: (message) => postUpdate(run.id, { event: { round, source: "reviewer", type: "agent.activity", message } }),
       });
-      const review = parseReview(redactJobSecrets(reviewText, input.credentials));
+      addUsage(usage, firstReview.usage);
+      let review: ReviewResult;
+      try {
+        review = parseReview(redactJobSecrets(firstReview.text, input.credentials), round);
+      } catch (protocolError) {
+        const reason = redactJobSecrets((protocolError as Error).message, input.credentials).slice(0, 200);
+        await postUpdate(run.id, { event: { round, source: "reviewer", type: "review.retry", message: `审核输出无法解析（${reason}），已要求 Reviewer 重新输出` } });
+        const retryReview = await runPi({
+          cwd: worktree,
+          provider: run.reviewer.provider,
+          model: run.reviewer.model,
+          prompt: `${reviewPrompt}\n\n上一次回复被拒绝：不是合法的协议 JSON。只输出 JSON 对象本身，不要 markdown 代码块，不要任何解释。`,
+          readOnly: true,
+          apiKey: input.credentials.reviewer,
+          apiKeyEnvironmentName: "OPENAI_API_KEY",
+          signal: controller.signal,
+          onActivity: (message) => postUpdate(run.id, { event: { round, source: "reviewer", type: "agent.activity", message } }),
+        });
+        addUsage(usage, retryReview.usage);
+        try {
+          review = parseReview(redactJobSecrets(retryReview.text, input.credentials), round);
+        } catch (retryError) {
+          await update(run, "needs_human", "reviewer", "review.invalid_protocol", "Reviewer 两次输出均无法解析为审核协议，转人工处理", {
+            usage: toRunUsage(usage),
+            durationMs: Date.now() - started,
+            summary: `审核输出无法解析：${redactJobSecrets((retryError as Error).message, input.credentials).slice(0, 500)}`,
+          });
+          return;
+        }
+      }
       const currentFindings = review.findings.map((item) => ({ ...item, resolved: false }));
       findings = [...findings.map((item) => ({ ...item, resolved: true })), ...currentFindings];
       if (review.verdict === "approved") {
@@ -556,19 +580,21 @@ async function executeJob(input: JobInput, controller: AbortController) {
           findings,
           diff: latestDiff,
           summary: review.summary,
+          usage: toRunUsage(usage),
           durationMs: Date.now() - started,
         });
         return;
       }
       feedback = JSON.stringify(review.findings, null, 2);
-      await update(run, "developing", "reviewer", "review.changes_requested", `审核发现 ${review.findings.length} 个问题，退回 Developer`, { findings, summary: review.summary });
+      await update(run, "developing", "reviewer", "review.changes_requested", `审核发现 ${review.findings.length} 个问题，退回 Developer`, { findings, summary: review.summary, usage: toRunUsage(usage) });
     }
-    await update(run, "needs_human", "system", "run.needs_human", "达到最大审核轮次，需要人工处理", { findings, durationMs: Date.now() - started });
+    await update(run, "needs_human", "system", "run.needs_human", "达到最大审核轮次，需要人工处理", { findings, usage: toRunUsage(usage), durationMs: Date.now() - started });
   } catch (error) {
     const cancelled = controller.signal.aborted;
-    const safeMessage = redactJobSecrets((error as Error).message, input.credentials);
+    const safeMessage = redactJobSecrets((error as Error).message, input.credentials).slice(0, 2_000);
     await update(run, cancelled ? "cancelled" : "failed", "system", cancelled ? "run.cancelled" : "run.failed", cancelled ? "任务已取消" : `真实运行失败：${safeMessage}`, {
       summary: cancelled ? "已取消" : safeMessage,
+      usage: toRunUsage(usage),
       durationMs: Date.now() - started,
     }).catch(() => undefined);
   } finally {

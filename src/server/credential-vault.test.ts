@@ -1,4 +1,4 @@
-import { mkdtemp, readFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -32,6 +32,26 @@ describe("CredentialVault", () => {
     const reloaded = new CredentialVault(file, secret);
     await reloaded.init();
     expect(() => reloaded.get("owner-b")).toThrow();
+  });
+
+  it("keeps persisting after a transient write failure", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "pigo-vault-"));
+    const file = path.join(directory, "credentials.json");
+    const vault = new CredentialVault(file, Buffer.alloc(32, 3).toString("base64"));
+    await vault.init();
+    await vault.set("owner-a", { developer: "first-dev-secret", reviewer: "first-review-secret" });
+
+    await chmod(directory, 0o555);
+    try {
+      await expect(vault.set("owner-a", { developer: "second-dev-secret" })).rejects.toThrow();
+    } finally {
+      await chmod(directory, 0o755);
+    }
+
+    await vault.set("owner-a", { reviewer: "second-review-secret" });
+    expect(vault.get("owner-a")).toEqual({ developer: "second-dev-secret", reviewer: "second-review-secret" });
+    const persisted = JSON.parse(await readFile(file, "utf8")) as { users: Record<string, unknown> };
+    expect(persisted.users["owner-a"]).toBeDefined();
   });
 });
 

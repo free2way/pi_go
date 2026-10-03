@@ -79,11 +79,16 @@ export class RunStore {
   }
 
   private persist() {
-    this.writeQueue = this.writeQueue.then(async () => {
-      const temporary = `${this.filePath}.tmp`;
-      await writeFile(temporary, JSON.stringify(this.data, null, 2), "utf8");
-      await rename(temporary, this.filePath);
-    });
-    return this.writeQueue;
+    const attempt = this.writeQueue
+      .catch((error) => {
+        console.error("[store] previous persist failed; continuing with the next write", error);
+      })
+      .then(async () => {
+        const temporary = `${this.filePath}.tmp`;
+        await writeFile(temporary, JSON.stringify(this.data, null, 2), "utf8");
+        await rename(temporary, this.filePath);
+      });
+    this.writeQueue = attempt;
+    return attempt;
   }
 }

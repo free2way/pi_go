@@ -109,12 +109,17 @@ export class CredentialVault {
   }
 
   private persist() {
-    this.writeQueue = this.writeQueue.then(async () => {
-      const temporary = `${this.filePath}.tmp`;
-      await writeFile(temporary, JSON.stringify(this.data), { encoding: "utf8", mode: 0o600 });
-      await rename(temporary, this.filePath);
-      await chmod(this.filePath, 0o600);
-    });
-    return this.writeQueue;
+    const attempt = this.writeQueue
+      .catch((error) => {
+        console.error("[vault] previous persist failed; continuing with the next write", error);
+      })
+      .then(async () => {
+        const temporary = `${this.filePath}.tmp`;
+        await writeFile(temporary, JSON.stringify(this.data), { encoding: "utf8", mode: 0o600 });
+        await rename(temporary, this.filePath);
+        await chmod(this.filePath, 0o600);
+      });
+    this.writeQueue = attempt;
+    return attempt;
   }
 }
