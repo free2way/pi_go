@@ -51,6 +51,21 @@ export class IdentityService {
   constructor(private readonly db: Db) {}
 
   async resolve(input: IdentityInput): Promise<UserRecord> {
+    const maxAttempts = 5;
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await this.resolveOnce(input);
+      } catch (error) {
+        // Concurrent first-login requests race between "read miss" and INSERT:
+        // the loser hits a unique violation on users.legacy_owner_id or
+        // user_identities(issuer, subject). Retrying sees the committed rows.
+        const code = (error as { code?: string }).code;
+        if (code !== "23505" || attempt >= maxAttempts) throw error;
+      }
+    }
+  }
+
+  private async resolveOnce(input: IdentityInput): Promise<UserRecord> {
     const now = new Date().toISOString();
     const email = input.email.trim().toLowerCase();
 

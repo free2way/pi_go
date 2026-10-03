@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { Db } from "./db.js";
 import { IdentityService, ownerKeys } from "./identity.js";
 import { createTestDb } from "./test-db.js";
 
@@ -54,5 +55,50 @@ describe("identity service", () => {
     const b = await identities.resolve(cloudflare("sub-b", "b@example.com"));
     expect(a.id).not.toBe(b.id);
     expect(ownerKeys(a)).not.toContain(b.id);
+  });
+
+  it("retries when a concurrent first login already created the user (23505)", async () => {
+    const db = await createTestDb();
+    const identities = new IdentityService(db);
+    const racedId = "r".repeat(64);
+    const legacy = "abc123legacy";
+    const now = new Date().toISOString();
+
+    let fired = false;
+    const shimmed: Db = {
+      query: (text, params) => db.query(text, params),
+      withTransaction: (fn) =>
+        db.withTransaction((tx) =>
+          fn({
+            query: async (text, params) => {
+              if (!fired && text.startsWith("INSERT INTO users")) {
+                fired = true;
+                // simulate the competing request committing its user row first
+                await db.query(
+                  "INSERT INTO users (id, email, role, status, legacy_owner_id, created_at, updated_at) VALUES ($1, $2, 'user', 'active', $3, $4, $5)",
+                  [racedId, "other@example.com", legacy, now, now],
+                );
+                const error = new Error('duplicate key value violates unique constraint "users_legacy_owner_id_key"') as Error & { code?: string };
+                error.code = "23505";
+                throw error;
+              }
+              return tx.query(text, params);
+            },
+            withTransaction: (nested) => nested(tx),
+          }),
+        ),
+    };
+
+    const user = await new IdentityService(shimmed).resolve({
+      issuer: "https://team.cloudflareaccess.com",
+      subject: "sub-race",
+      email: "racer@example.com",
+      identityProvider: "cloudflare-access",
+      legacyOwnerId: legacy,
+    });
+
+    expect(user.id).toBe(racedId);
+    expect(user.email).toBe("racer@example.com");
+    expect(await identities.userCount()).toBe(1);
   });
 });
