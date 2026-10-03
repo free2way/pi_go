@@ -1,0 +1,12 @@
+.env
+.env*
+*.md
+docs/
+config/
+node_modules/
+dist/
+data/
+.codex-tmp-ssh-key/
+deploy/docker/.env
+deploy/docker/workspace/*
+!deploy/docker/workspace/.gitkeep

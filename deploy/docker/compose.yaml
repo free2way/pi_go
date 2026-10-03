@@ -1,0 +1,138 @@
+name: pi-agent
+
+services:
+  runtime:
+    build:
+      context: .
+      args:
+        PI_VERSION: "1.0.0"
+    image: local/pi-coding-agent:1.0.0
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    working_dir: /workspace
+    environment:
+      PI_DEVELOPER_MODEL: ${PI_DEVELOPER_MODEL:-deepseek-flash}
+      PI_REVIEWER_PROVIDER: ${PI_REVIEWER_PROVIDER:-openai-proxy}
+      PI_REVIEWER_MODEL: ${PI_REVIEWER_MODEL:-gpt-5.6-sol}
+    volumes:
+      - ./workspace:/workspace
+      - pi-config:/home/node/.pi
+    networks:
+      - pi-network
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    mem_limit: 4g
+    cpus: 2.0
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    healthcheck:
+      test: ["CMD", "pi", "--version"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  web:
+    build:
+      context: ${WEB_BUILD_CONTEXT:-../..}
+      dockerfile: deploy/docker/Dockerfile.web
+    image: local/pigo-web:0.1.0
+    restart: unless-stopped
+    init: true
+    environment:
+      HOST: web
+      PORT: 3100
+      PI_DATA_FILE: /app/data/runs.json
+      PI_DEMO_MODE: "true"
+      PI_VERSION: "1.0.0"
+      PI_DEVELOPER_MODEL: ${PI_DEVELOPER_MODEL:-deepseek-flash}
+      PI_REVIEWER_PROVIDER: ${PI_REVIEWER_PROVIDER:-openai-proxy}
+      PI_REVIEWER_MODEL: ${PI_REVIEWER_MODEL:-gpt-5.6-sol}
+      PI_DEVELOPER_CREDENTIAL_CONFIGURED: ${PI_DEVELOPER_CREDENTIAL_CONFIGURED:-false}
+      PI_REVIEWER_CREDENTIAL_CONFIGURED: ${PI_REVIEWER_CREDENTIAL_CONFIGURED:-false}
+      PI_REAL_RUNS_ENABLED: ${PI_REAL_RUNS_ENABLED:-false}
+      PI_WORKER_URL: http://worker:3200
+      PI_INTERNAL_TOKEN: ${PI_INTERNAL_TOKEN:-}
+    ports:
+      - target: 3100
+        published: "3100"
+        host_ip: ${PI_WEB_BIND_ADDRESS:?Set PI_WEB_BIND_ADDRESS in the deployment environment}
+    volumes:
+      - pigo-web-data:/app/data
+    networks:
+      - pi-network
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 0.5
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://web:3100/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  worker:
+    build:
+      context: ${WEB_BUILD_CONTEXT:-../..}
+      dockerfile: deploy/docker/Dockerfile.worker
+    image: local/pigo-worker:0.1.0
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    working_dir: /workspace
+    environment:
+      HOST: worker
+      PORT: 3200
+      PI_DEVELOPER_PROVIDER: ${PI_DEVELOPER_PROVIDER:-deepseek}
+      PI_DEVELOPER_MODEL: ${PI_DEVELOPER_MODEL:-deepseek-flash}
+      PI_REVIEWER_PROVIDER: ${PI_REVIEWER_PROVIDER:-openai-proxy}
+      PI_REVIEWER_MODEL: ${PI_REVIEWER_MODEL:-gpt-5.6-sol}
+      PI_WORKSPACE_ROOT: /workspace
+      PI_WEB_CALLBACK_URL: http://web:3100
+      PI_INTERNAL_TOKEN: ${PI_INTERNAL_TOKEN:-}
+      PI_MAX_REVIEW_ROUNDS: ${PI_MAX_REVIEW_ROUNDS:-3}
+      PI_RUN_TIMEOUT_SECONDS: ${PI_RUN_TIMEOUT_SECONDS:-1800}
+    volumes:
+      - ./workspace:/workspace
+      - pi-config:/home/node/.pi
+    networks:
+      - pi-network
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    pids_limit: 512
+    mem_limit: 4g
+    cpus: 2.0
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://worker:3200/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  pi-network:
+    name: pi-agent-network
+
+volumes:
+  pi-config:
+    name: pi-agent-config
+  pigo-web-data:
+    name: pigo-web-data
