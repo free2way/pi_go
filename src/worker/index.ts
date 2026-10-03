@@ -6,7 +6,7 @@ import path from "node:path";
 import readline from "node:readline";
 import type { CheckResult, DevelopmentPlan, Finding, ProjectInfo, Run, RunEvent, RunState, SubAgentTask } from "../shared/types.js";
 import { executionWaves, fallbackPlan, parseDevelopmentPlan } from "./orchestrator.js";
-import { UsageTracker, addUsage, assistantTextFromEvent, emptyUsage, toRunUsage, toolNameFromEvent, type UsageTotals } from "./pi-events.js";
+import { UsageTracker, addUsage, assistantErrorFromEvent, assistantTextFromEvent, emptyUsage, toRunUsage, toolNameFromEvent, type UsageTotals } from "./pi-events.js";
 import { parseReview, type ReviewResult } from "./review-protocol.js";
 
 const port = Number(process.env.PORT || 3200);
@@ -219,6 +219,7 @@ async function runPi(input: {
   else args.push("--no-session");
   args.push("--", input.prompt);
   let finalText = "";
+  let lastAssistantError: string | undefined;
   const tracker = new UsageTracker();
   let activityQueue = Promise.resolve();
   const childEnvironment = { ...process.env };
@@ -234,6 +235,10 @@ async function runPi(input: {
       const event = parsePiLine(line);
       if (!event) return;
       tracker.track(event);
+      if (event.type === "message_end") {
+        const message = event.message as { role?: string } | undefined;
+        if (message?.role === "assistant") lastAssistantError = assistantErrorFromEvent(event);
+      }
       finalText = assistantTextFromEvent(event) || finalText;
       const toolName = toolNameFromEvent(event);
       if (toolName) {
@@ -243,6 +248,7 @@ async function runPi(input: {
   });
   await activityQueue;
   if (result.code !== 0) throw new Error(result.stderr.trim() || `Pi exited with ${result.code}`);
+  if (lastAssistantError) throw new Error(lastAssistantError);
   return { text: finalText.trim(), usage: tracker.totals };
 }
 
@@ -553,17 +559,28 @@ async function executeJob(input: JobInput, controller: AbortController) {
         "Use changes_requested only for actionable defects. approved must not contain critical/high/medium findings.",
         `Diff:\n${latestDiff.slice(0, 90_000)}`,
       ].join("\n\n");
-      const firstReview = await runPi({
-        cwd: worktree,
-        provider: run.reviewer.provider,
-        model: run.reviewer.model,
-        prompt: reviewPrompt,
-        readOnly: true,
-        apiKey: input.credentials.reviewer,
-        apiKeyEnvironmentName: "OPENAI_API_KEY",
-        signal: controller.signal,
-        onActivity: (message) => postUpdate(run.id, { event: { round, source: "reviewer", type: "agent.activity", message } }),
-      });
+      let firstReview: { text: string; usage: UsageTotals };
+      try {
+        firstReview = await runPi({
+          cwd: worktree,
+          provider: run.reviewer.provider,
+          model: run.reviewer.model,
+          prompt: reviewPrompt,
+          readOnly: true,
+          apiKey: input.credentials.reviewer,
+          apiKeyEnvironmentName: "OPENAI_API_KEY",
+          signal: controller.signal,
+          onActivity: (message) => postUpdate(run.id, { event: { round, source: "reviewer", type: "agent.activity", message } }),
+        });
+      } catch (providerError) {
+        const reason = redactJobSecrets((providerError as Error).message, input.credentials).slice(0, 500);
+        await update(run, "needs_human", "reviewer", "review.provider_error", `审核模型调用失败：${reason}`, {
+          usage: toRunUsage(usage),
+          durationMs: Date.now() - started,
+          summary: `审核模型暂时不可用：${reason}`,
+        });
+        return;
+      }
       addUsage(usage, firstReview.usage);
       let review: ReviewResult;
       try {
@@ -571,17 +588,28 @@ async function executeJob(input: JobInput, controller: AbortController) {
       } catch (protocolError) {
         const reason = redactJobSecrets((protocolError as Error).message, input.credentials).slice(0, 200);
         await postUpdate(run.id, { event: { round, source: "reviewer", type: "review.retry", message: `审核输出无法解析（${reason}），已要求 Reviewer 重新输出` } });
-        const retryReview = await runPi({
-          cwd: worktree,
-          provider: run.reviewer.provider,
-          model: run.reviewer.model,
-          prompt: `${reviewPrompt}\n\n上一次回复被拒绝：不是合法的协议 JSON。只输出 JSON 对象本身，不要 markdown 代码块，不要任何解释。`,
-          readOnly: true,
-          apiKey: input.credentials.reviewer,
-          apiKeyEnvironmentName: "OPENAI_API_KEY",
-          signal: controller.signal,
-          onActivity: (message) => postUpdate(run.id, { event: { round, source: "reviewer", type: "agent.activity", message } }),
-        });
+        let retryReview: { text: string; usage: UsageTotals };
+        try {
+          retryReview = await runPi({
+            cwd: worktree,
+            provider: run.reviewer.provider,
+            model: run.reviewer.model,
+            prompt: `${reviewPrompt}\n\n上一次回复被拒绝：不是合法的协议 JSON。只输出 JSON 对象本身，不要 markdown 代码块，不要任何解释。`,
+            readOnly: true,
+            apiKey: input.credentials.reviewer,
+            apiKeyEnvironmentName: "OPENAI_API_KEY",
+            signal: controller.signal,
+            onActivity: (message) => postUpdate(run.id, { event: { round, source: "reviewer", type: "agent.activity", message } }),
+          });
+        } catch (providerError) {
+          const providerReason = redactJobSecrets((providerError as Error).message, input.credentials).slice(0, 500);
+          await update(run, "needs_human", "reviewer", "review.provider_error", `审核模型调用失败：${providerReason}`, {
+            usage: toRunUsage(usage),
+            durationMs: Date.now() - started,
+            summary: `审核模型暂时不可用：${providerReason}`,
+          });
+          return;
+        }
         addUsage(usage, retryReview.usage);
         try {
           review = parseReview(redactJobSecrets(retryReview.text, input.credentials), round);

@@ -62,6 +62,18 @@ export function assistantTextFromEvent(event: Record<string, unknown>): string |
   return message.content?.filter((item) => item.type === "text").map((item) => item.text || "").join("\n");
 }
 
+/**
+ * Returns the provider error reported on an assistant `message_end`, or undefined
+ * when the message completed normally. Pi already retried internally (see the
+ * `auto_retry_*` events) before surfacing the error here.
+ */
+export function assistantErrorFromEvent(event: Record<string, unknown>): string | undefined {
+  if (event.type !== "message_end") return undefined;
+  const message = event.message as { role?: string; stopReason?: string; errorMessage?: string } | undefined;
+  if (message?.role !== "assistant" || message.stopReason !== "error") return undefined;
+  return message.errorMessage || "Pi assistant message ended with an error";
+}
+
 export function toolNameFromEvent(event: Record<string, unknown>): string | undefined {
   if (event.type !== "tool_execution_start") return undefined;
   return typeof event.toolName === "string" && event.toolName ? event.toolName : "tool";

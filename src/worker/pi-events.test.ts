@@ -1,11 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { UsageTracker, assistantTextFromEvent, emptyUsage, toRunUsage, toolNameFromEvent } from "./pi-events.js";
+import { UsageTracker, assistantErrorFromEvent, assistantTextFromEvent, emptyUsage, toRunUsage, toolNameFromEvent } from "./pi-events.js";
 
 describe("pi events", () => {
   it("extracts tool names from tool_execution_start events", () => {
     expect(toolNameFromEvent({ type: "tool_execution_start", toolCallId: "call_abc", toolName: "bash", args: {} })).toBe("bash");
     expect(toolNameFromEvent({ type: "tool_execution_start", toolCallId: "call_abc" })).toBe("tool");
     expect(toolNameFromEvent({ type: "message_end" })).toBeUndefined();
+  });
+
+  it("extracts provider errors from failed assistant messages", () => {
+    const event = {
+      type: "message_end",
+      message: { role: "assistant", stopReason: "error", errorMessage: "429: rate limited", content: [] },
+    };
+    expect(assistantErrorFromEvent(event)).toBe("429: rate limited");
+    expect(assistantErrorFromEvent({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [] } })).toBeUndefined();
+    expect(assistantErrorFromEvent({ type: "message_end" })).toBeUndefined();
   });
 
   it("extracts assistant text from message_end events only", () => {
