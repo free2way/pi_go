@@ -1,25 +1,20 @@
-import { mkdtemp } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { databaseMigrations, newId, openDatabase } from "./db.js";
+import { databaseMigrations, newId, runMigrations } from "./db.js";
+import { createTestDb } from "./test-db.js";
 
 describe("database", () => {
   it("applies migrations exactly once", async () => {
-    const directory = await mkdtemp(path.join(tmpdir(), "pigo-db-"));
-    const file = path.join(directory, "pigo.db");
+    const db = await createTestDb();
+    const applied = (await db.query("SELECT id FROM schema_migrations ORDER BY id")).rows.map((row) => Number(row.id));
+    expect(applied).toEqual(databaseMigrations.map((migration) => migration.id));
 
-    const first = openDatabase(file);
-    const appliedRows = first.prepare("SELECT id FROM schema_migrations ORDER BY id").all() as Array<{ id: number }>;
-    expect(appliedRows.map((row) => Number(row.id))).toEqual(databaseMigrations.map((migration) => migration.id));
-    const tables = (first.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((row) => row.name);
-    expect(tables).toEqual(expect.arrayContaining(["users", "user_identities", "workspaces", "schema_migrations"]));
-    first.close();
+    await db.query("SELECT COUNT(*) FROM users");
+    await db.query("SELECT COUNT(*) FROM user_identities");
+    await db.query("SELECT COUNT(*) FROM workspaces");
 
-    const second = openDatabase(file);
-    const count = second.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get() as { count: number };
+    await runMigrations(db);
+    const count = (await db.query("SELECT COUNT(*)::int AS count FROM schema_migrations")).rows[0] as { count: number };
     expect(Number(count.count)).toBe(databaseMigrations.length);
-    second.close();
   });
 
   it("generates prefixed ids", () => {

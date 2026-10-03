@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { openDatabase } from "./db.js";
 import { IdentityService, ownerKeys } from "./identity.js";
+import { createTestDb } from "./test-db.js";
 
-function service() {
-  return new IdentityService(openDatabase(":memory:"));
+async function service() {
+  return new IdentityService(await createTestDb());
 }
 
 const cloudflare = (subject: string, email: string, legacyOwnerId = `legacy-${subject}`) => ({
@@ -15,21 +15,21 @@ const cloudflare = (subject: string, email: string, legacyOwnerId = `legacy-${su
 });
 
 describe("identity service", () => {
-  it("creates a stable internal user and reuses it for the same identity", () => {
-    const identities = service();
-    const first = identities.resolve(cloudflare("sub-1", "A@Example.com"));
-    const second = identities.resolve(cloudflare("sub-1", "a@example.com"));
+  it("creates a stable internal user and reuses it for the same identity", async () => {
+    const identities = await service();
+    const first = await identities.resolve(cloudflare("sub-1", "A@Example.com"));
+    const second = await identities.resolve(cloudflare("sub-1", "a@example.com"));
 
     expect(first.id).toMatch(/^[a-f0-9]{64}$/);
     expect(second.id).toBe(first.id);
     expect(first.email).toBe("a@example.com");
-    expect(identities.userCount()).toBe(1);
+    expect(await identities.userCount()).toBe(1);
   });
 
-  it("links a new subject to the existing user by email (IdP switch)", () => {
-    const identities = service();
-    const original = identities.resolve(cloudflare("sub-1", "user@example.com"));
-    const afterSwitch = identities.resolve({
+  it("links a new subject to the existing user by email (IdP switch)", async () => {
+    const identities = await service();
+    const original = await identities.resolve(cloudflare("sub-1", "user@example.com"));
+    const afterSwitch = await identities.resolve({
       issuer: "https://team.cloudflareaccess.com",
       subject: "sub-2-otp",
       email: "user@example.com",
@@ -38,20 +38,20 @@ describe("identity service", () => {
     });
 
     expect(afterSwitch.id).toBe(original.id);
-    expect(identities.userCount()).toBe(1);
+    expect(await identities.userCount()).toBe(1);
   });
 
-  it("adopts the legacy owner key so pre-migration runs stay visible", () => {
-    const identities = service();
-    const user = identities.resolve(cloudflare("sub-9", "late@example.com", "abc123legacy"));
+  it("adopts the legacy owner key so pre-migration runs stay visible", async () => {
+    const identities = await service();
+    const user = await identities.resolve(cloudflare("sub-9", "late@example.com", "abc123legacy"));
     expect(user.legacyOwnerId).toBe("abc123legacy");
     expect(ownerKeys(user)).toEqual([user.id, "abc123legacy"]);
   });
 
-  it("keeps owners isolated when emails differ", () => {
-    const identities = service();
-    const a = identities.resolve(cloudflare("sub-a", "a@example.com"));
-    const b = identities.resolve(cloudflare("sub-b", "b@example.com"));
+  it("keeps owners isolated when emails differ", async () => {
+    const identities = await service();
+    const a = await identities.resolve(cloudflare("sub-a", "a@example.com"));
+    const b = await identities.resolve(cloudflare("sub-b", "b@example.com"));
     expect(a.id).not.toBe(b.id);
     expect(ownerKeys(a)).not.toContain(b.id);
   });

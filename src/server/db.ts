@@ -1,15 +1,49 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import { createRequire } from "node:module";
-import path from "node:path";
-import type { DatabaseSync } from "node:sqlite";
+import { Pool } from "pg";
 
-// esbuild (tsup) strips the `node:` prefix from unknown builtins such as
-// `node:sqlite`, which breaks the bundle. Resolve it at runtime instead.
-const nodeRequire = createRequire(import.meta.url);
-const { DatabaseSync: SqliteDatabase } = nodeRequire("node:sqlite") as typeof import("node:sqlite");
+export type QueryResult = { rows: Record<string, unknown>[] };
 
-export type Database = DatabaseSync;
+export type Queryable = {
+  query: (text: string, params?: unknown[]) => Promise<QueryResult>;
+};
+
+export type PoolLike = Queryable & {
+  connect: () => Promise<{ query: Queryable["query"]; release: () => void }>;
+};
+
+export type Db = Queryable & {
+  withTransaction: <T>(fn: (tx: Db) => Promise<T>) => Promise<T>;
+};
+
+export function createPool(databaseUrl: string) {
+  return new Pool({ connectionString: databaseUrl, max: 10, connectionTimeoutMillis: 10_000 });
+}
+
+/** Wraps a pg-compatible pool (or pg-mem in tests) with a transaction helper. */
+export function createDb(pool: PoolLike): Db {
+  const withTransaction = async <T>(fn: (tx: Db) => Promise<T>): Promise<T> => {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const tx: Db = {
+        query: (text, params) => client.query(text, params),
+        withTransaction: (nested) => nested(tx),
+      };
+      const result = await fn(tx);
+      await client.query("COMMIT");
+      return result;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  };
+  return {
+    query: (text, params) => pool.query(text, params),
+    withTransaction,
+  };
+}
 
 type Migration = {
   id: number;
@@ -17,7 +51,7 @@ type Migration = {
   sql: string;
 };
 
-const migrations: Migration[] = [
+export const databaseMigrations: Migration[] = [
   {
     id: 1,
     name: "initial-users-workspaces",
@@ -70,50 +104,37 @@ const migrations: Migration[] = [
   },
 ];
 
-export function openDatabase(filePath: string): Database {
-  if (filePath !== ":memory:") mkdirSync(path.dirname(filePath), { recursive: true });
-  const db = new SqliteDatabase(filePath);
-  db.exec("PRAGMA journal_mode = WAL;");
-  db.exec("PRAGMA foreign_keys = ON;");
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS schema_migrations (
-      id INTEGER PRIMARY KEY,
-      name TEXT NOT NULL,
-      applied_at TEXT NOT NULL
-    );
-  `);
+export async function runMigrations(db: Db) {
+  // EXISTS-check via information_schema first: pg-mem cannot re-run
+  // CREATE TABLE IF NOT EXISTS when the table already exists.
+  const hasMigrationsTable = (await db.query(
+    "SELECT table_name FROM information_schema.tables WHERE table_name = 'schema_migrations'",
+  )).rows.length > 0;
+  if (!hasMigrationsTable) {
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+    `);
+  }
   const applied = new Set(
-    (db.prepare("SELECT id FROM schema_migrations").all() as Array<{ id: number }>).map((row) => Number(row.id)),
+    (await db.query("SELECT id FROM schema_migrations")).rows.map((row) => Number(row.id)),
   );
-  for (const migration of migrations) {
+  for (const migration of databaseMigrations) {
     if (applied.has(migration.id)) continue;
-    db.exec("BEGIN");
-    try {
-      db.exec(migration.sql);
-      db.prepare("INSERT INTO schema_migrations (id, name, applied_at) VALUES (?, ?, ?)").run(
+    await db.withTransaction(async (tx) => {
+      await tx.query(migration.sql);
+      await tx.query("INSERT INTO schema_migrations (id, name, applied_at) VALUES ($1, $2, $3)", [
         migration.id,
         migration.name,
         new Date().toISOString(),
-      );
-      db.exec("COMMIT");
-    } catch (error) {
-      db.exec("ROLLBACK");
-      throw error;
-    }
+      ]);
+    });
   }
-  return db;
 }
 
 export function newId(prefix: string) {
   return `${prefix}_${randomUUID().replaceAll("-", "").slice(0, 20)}`;
 }
-
-export function closeDatabase(db: Database) {
-  try {
-    db.close();
-  } catch {
-    // already closed
-  }
-}
-
-export const databaseMigrations = migrations;

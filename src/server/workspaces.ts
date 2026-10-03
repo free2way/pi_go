@@ -1,5 +1,5 @@
 import type { Workspace, WorkspaceStatus, WorkspaceVerifyResult } from "../shared/types.js";
-import { newId, type Database } from "./db.js";
+import { newId, type Db } from "./db.js";
 
 export type WorkerCall = <T>(pathName: string, init?: RequestInit) => Promise<T>;
 
@@ -74,21 +74,22 @@ export function isValidWorkspaceName(value: string) {
 
 export class WorkspaceService {
   constructor(
-    private readonly db: Database,
+    private readonly db: Db,
     private readonly callWorker: WorkerCall,
   ) {}
 
-  list(ownerKeys: string[]): Workspace[] {
+  async list(ownerKeys: string[]): Promise<Workspace[]> {
     if (ownerKeys.length === 0) return [];
-    const placeholders = ownerKeys.map(() => "?").join(", ");
-    const rows = this.db
-      .prepare(`SELECT * FROM workspaces WHERE owner_id IN (${placeholders}) AND status != 'unregistered' ORDER BY updated_at DESC`)
-      .all(...ownerKeys) as WorkspaceRow[];
+    const placeholders = ownerKeys.map((_, index) => `$${index + 1}`).join(", ");
+    const rows = (await this.db.query(
+      `SELECT * FROM workspaces WHERE owner_id IN (${placeholders}) AND status != 'unregistered' ORDER BY updated_at DESC`,
+      ownerKeys,
+    )).rows as WorkspaceRow[];
     return rows.map(toWorkspace);
   }
 
-  get(ownerKeys: string[], id: string): Workspace {
-    const row = this.findRow(ownerKeys, id);
+  async get(ownerKeys: string[], id: string): Promise<Workspace> {
+    const row = await this.findRow(ownerKeys, id);
     if (!row) throw new WorkspaceError("WORKSPACE_NOT_FOUND", "Workspace not found", 404);
     return toWorkspace(row);
   }
@@ -110,7 +111,7 @@ export class WorkspaceService {
   }
 
   async refresh(ownerKeys: string[], id: string): Promise<Workspace> {
-    const row = this.findRow(ownerKeys, id);
+    const row = await this.findRow(ownerKeys, id);
     if (!row) throw new WorkspaceError("WORKSPACE_NOT_FOUND", "Workspace not found", 404);
     const result = await this.callWorker<WorkspaceVerifyResult>("/workspaces/verify", {
       method: "POST",
@@ -118,37 +119,35 @@ export class WorkspaceService {
     });
     const now = new Date().toISOString();
     if (!result.ok) {
-      this.db.prepare("UPDATE workspaces SET status = 'invalid', last_checked_at = ?, updated_at = ? WHERE id = ?")
-        .run(now, now, row.id);
+      await this.db.query("UPDATE workspaces SET status = 'invalid', last_checked_at = $1, updated_at = $2 WHERE id = $3", [now, now, row.id]);
       throw this.verifyError(result);
     }
-    this.db.prepare(`
+    await this.db.query(`
       UPDATE workspaces
-      SET status = 'active', canonical_path = ?, git_branch = ?, git_head = ?, git_dirty = ?, last_checked_at = ?, updated_at = ?
-      WHERE id = ?
-    `).run(result.canonicalPath ?? row.canonical_path, result.branch ?? null, result.head ?? null, result.dirty ? 1 : 0, now, now, row.id);
-    return toWorkspace(this.db.prepare("SELECT * FROM workspaces WHERE id = ?").get(row.id) as WorkspaceRow);
+      SET status = 'active', canonical_path = $1, git_branch = $2, git_head = $3, git_dirty = $4, last_checked_at = $5, updated_at = $6
+      WHERE id = $7
+    `, [result.canonicalPath ?? row.canonical_path, result.branch ?? null, result.head ?? null, result.dirty ? 1 : 0, now, now, row.id]);
+    return toWorkspace((await this.db.query("SELECT * FROM workspaces WHERE id = $1", [row.id])).rows[0] as WorkspaceRow);
   }
 
-  patch(ownerKeys: string[], id: string, patch: { defaultChecks?: string[]; defaultBranch?: string }): Workspace {
-    const row = this.findRow(ownerKeys, id);
+  async patch(ownerKeys: string[], id: string, patch: { defaultChecks?: string[]; defaultBranch?: string }): Promise<Workspace> {
+    const row = await this.findRow(ownerKeys, id);
     if (!row) throw new WorkspaceError("WORKSPACE_NOT_FOUND", "Workspace not found", 404);
     const now = new Date().toISOString();
     if (patch.defaultChecks !== undefined) {
-      this.db.prepare("UPDATE workspaces SET default_checks_json = ? WHERE id = ?").run(JSON.stringify(patch.defaultChecks), row.id);
+      await this.db.query("UPDATE workspaces SET default_checks_json = $1 WHERE id = $2", [JSON.stringify(patch.defaultChecks), row.id]);
     }
     if (patch.defaultBranch !== undefined) {
-      this.db.prepare("UPDATE workspaces SET default_branch = ? WHERE id = ?").run(patch.defaultBranch, row.id);
+      await this.db.query("UPDATE workspaces SET default_branch = $1 WHERE id = $2", [patch.defaultBranch, row.id]);
     }
-    this.db.prepare("UPDATE workspaces SET updated_at = ? WHERE id = ?").run(now, row.id);
-    return toWorkspace(this.db.prepare("SELECT * FROM workspaces WHERE id = ?").get(row.id) as WorkspaceRow);
+    await this.db.query("UPDATE workspaces SET updated_at = $1 WHERE id = $2", [now, row.id]);
+    return toWorkspace((await this.db.query("SELECT * FROM workspaces WHERE id = $1", [row.id])).rows[0] as WorkspaceRow);
   }
 
-  unregister(ownerKeys: string[], id: string) {
-    const row = this.findRow(ownerKeys, id);
+  async unregister(ownerKeys: string[], id: string): Promise<void> {
+    const row = await this.findRow(ownerKeys, id);
     if (!row) throw new WorkspaceError("WORKSPACE_NOT_FOUND", "Workspace not found", 404);
-    const now = new Date().toISOString();
-    this.db.prepare("UPDATE workspaces SET status = 'unregistered', updated_at = ? WHERE id = ?").run(now, row.id);
+    await this.db.query("UPDATE workspaces SET status = 'unregistered', updated_at = $1 WHERE id = $2", [new Date().toISOString(), row.id]);
   }
 
   private async verifyOnWorker(relativePath: string): Promise<WorkspaceVerifyResult> {
@@ -160,44 +159,47 @@ export class WorkspaceService {
     return result;
   }
 
-  private persist(ownerId: string, result: WorkspaceVerifyResult, repositoryUrl: string | null): Workspace {
+  private async persist(ownerId: string, result: WorkspaceVerifyResult, repositoryUrl: string | null): Promise<Workspace> {
     const now = new Date().toISOString();
     const name = result.name!;
-    const existing = this.db.prepare("SELECT * FROM workspaces WHERE owner_id = ? AND name = ?").get(ownerId, name) as WorkspaceRow | undefined;
-    if (existing) {
-      this.db.prepare(`
-        UPDATE workspaces
-        SET root_path = ?, canonical_path = ?, repository_url = COALESCE(?, repository_url), status = 'active',
-            default_branch = COALESCE(default_branch, ?), git_branch = ?, git_head = ?, git_dirty = ?, last_checked_at = ?, updated_at = ?
-        WHERE id = ?
-      `).run(
-        result.relativePath ?? existing.root_path, result.canonicalPath ?? existing.canonical_path, repositoryUrl,
-        result.branch ?? null, result.branch ?? null, result.head ?? null, result.dirty ? 1 : 0, now, now, existing.id,
-      );
-      return toWorkspace(this.db.prepare("SELECT * FROM workspaces WHERE id = ?").get(existing.id) as WorkspaceRow);
-    }
-    const id = newId("ws");
-    this.db.prepare(`
-      INSERT INTO workspaces (id, owner_id, node_id, name, type, root_path, canonical_path, repository_url, default_branch, default_checks_json, status, git_branch, git_head, git_dirty, last_checked_at, created_at, updated_at)
-      VALUES (?, ?, 'server', ?, 'server', ?, ?, ?, ?, '[]', 'active', ?, ?, ?, ?, ?, ?)
-    `).run(
-      id, ownerId, name, result.relativePath ?? name, result.canonicalPath ?? "", repositoryUrl,
-      result.branch ?? null, result.branch ?? null, result.head ?? null, result.dirty ? 1 : 0, now, now, now,
-    );
-    return toWorkspace(this.db.prepare("SELECT * FROM workspaces WHERE id = ?").get(id) as WorkspaceRow);
+    return this.db.withTransaction(async (tx) => {
+      const existing = (await tx.query("SELECT * FROM workspaces WHERE owner_id = $1 AND name = $2", [ownerId, name])).rows[0] as WorkspaceRow | undefined;
+      if (existing) {
+        await tx.query(`
+          UPDATE workspaces
+          SET root_path = $1, canonical_path = $2, repository_url = COALESCE($3, repository_url), status = 'active',
+              default_branch = COALESCE(default_branch, $4), git_branch = $5, git_head = $6, git_dirty = $7, last_checked_at = $8, updated_at = $9
+          WHERE id = $10
+        `, [
+          result.relativePath ?? existing.root_path, result.canonicalPath ?? existing.canonical_path, repositoryUrl,
+          result.branch ?? null, result.branch ?? null, result.head ?? null, result.dirty ? 1 : 0, now, now, existing.id,
+        ]);
+        return toWorkspace((await tx.query("SELECT * FROM workspaces WHERE id = $1", [existing.id])).rows[0] as WorkspaceRow);
+      }
+      const id = newId("ws");
+      await tx.query(`
+        INSERT INTO workspaces (id, owner_id, node_id, name, type, root_path, canonical_path, repository_url, default_branch, default_checks_json, status, git_branch, git_head, git_dirty, last_checked_at, created_at, updated_at)
+        VALUES ($1, $2, 'server', $3, 'server', $4, $5, $6, $7, '[]', 'active', $8, $9, $10, $11, $12, $13)
+      `, [
+        id, ownerId, name, result.relativePath ?? name, result.canonicalPath ?? "", repositoryUrl,
+        result.branch ?? null, result.branch ?? null, result.head ?? null, result.dirty ? 1 : 0, now, now, now,
+      ]);
+      return toWorkspace((await tx.query("SELECT * FROM workspaces WHERE id = $1", [id])).rows[0] as WorkspaceRow);
+    });
   }
 
   private verifyError(result: WorkspaceVerifyResult) {
     const code = result.code || "WORKSPACE_INVALID";
-    const status = code === "WORKSPACE_EXISTS" ? 409 : code === "WORKSPACE_OUTSIDE_ROOT" ? 422 : 422;
+    const status = code === "WORKSPACE_EXISTS" ? 409 : code === "WORKSPACE_NOT_FOUND" ? 404 : 422;
     return new WorkspaceError(code, result.error || "Workspace validation failed", status);
   }
 
-  private findRow(ownerKeys: string[], id: string): WorkspaceRow | undefined {
+  private async findRow(ownerKeys: string[], id: string): Promise<WorkspaceRow | undefined> {
     if (ownerKeys.length === 0) return undefined;
-    const placeholders = ownerKeys.map(() => "?").join(", ");
-    return this.db
-      .prepare(`SELECT * FROM workspaces WHERE id = ? AND owner_id IN (${placeholders})`)
-      .get(id, ...ownerKeys) as WorkspaceRow | undefined;
+    const placeholders = ownerKeys.map((_, index) => `$${index + 2}`).join(", ");
+    return (await this.db.query(
+      `SELECT * FROM workspaces WHERE id = $1 AND owner_id IN (${placeholders})`,
+      [id, ...ownerKeys],
+    )).rows[0] as WorkspaceRow | undefined;
   }
 }

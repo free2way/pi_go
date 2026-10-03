@@ -1,6 +1,26 @@
 name: pi-agent
 
 services:
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pigo
+      POSTGRES_PASSWORD: ${PIGO_POSTGRES_PASSWORD:?Set PIGO_POSTGRES_PASSWORD in the deployment environment}
+      POSTGRES_DB: pigo
+    volumes:
+      - pigo-postgres-data:/var/lib/postgresql/data
+    networks:
+      - pi-network
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pigo -d pigo"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
   runtime:
     build:
       context: .
@@ -48,6 +68,7 @@ services:
       PI_DATA_FILE: /app/data/runs.json
       PI_VAULT_FILE: /app/data/credentials.v1.json
       PI_VAULT_SECRET: ${PI_VAULT_SECRET:?Set PI_VAULT_SECRET in the deployment environment}
+      PI_DATABASE_URL: postgresql://pigo:${PIGO_POSTGRES_PASSWORD:?Set PIGO_POSTGRES_PASSWORD in the deployment environment}@postgres:5432/pigo
       PI_AUTH_MODE: ${PI_AUTH_MODE:?Set PI_AUTH_MODE in the deployment environment}
       PI_CF_ACCESS_TEAM_DOMAIN: ${PI_CF_ACCESS_TEAM_DOMAIN:-}
       PI_CF_ACCESS_AUDIENCE: ${PI_CF_ACCESS_AUDIENCE:-}
@@ -68,6 +89,9 @@ services:
       - pigo-web-data:/app/data
     networks:
       - pi-network
+    depends_on:
+      postgres:
+        condition: service_healthy
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -139,3 +163,5 @@ volumes:
     name: pi-agent-config
   pigo-web-data:
     name: pigo-web-data
+  pigo-postgres-data:
+    name: pigo-postgres-data

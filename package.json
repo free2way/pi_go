@@ -1,6 +1,6 @@
 {
   "name": "pigo-web",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -10,7 +10,7 @@
     "dev": "concurrently -k -n api,web -c blue,magenta \"npm:dev:server\" \"npm:dev:client\"",
     "dev:server": "tsx watch src/server/index.ts",
     "dev:client": "vite",
-    "build": "vite build && tsup src/server/index.ts --format esm --platform node --out-dir dist/server --clean --external node:sqlite",
+    "build": "vite build && tsup src/server/index.ts --format esm --platform node --out-dir dist/server --clean",
     "start": "node dist/server/index.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
@@ -21,16 +21,19 @@
     "fastify": "^5.12.5",
     "jose": "^6.1.0",
     "lucide-react": "0.545.0",
+    "pg": "^8.23.1",
     "react": "19.2.0",
     "react-dom": "19.2.0",
     "zod": "4.1.12"
   },
   "devDependencies": {
     "@types/node": "24.9.1",
+    "@types/pg": "^8.23.1",
     "@types/react": "19.2.2",
     "@types/react-dom": "19.2.2",
     "@vitejs/plugin-react": "5.1.0",
     "concurrently": "^9.2.4",
+    "pg-mem": "^3.0.14",
     "tsup": "8.5.0",
     "tsx": "4.20.6",
     "typescript": "5.9.3",

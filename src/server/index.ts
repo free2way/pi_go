@@ -8,7 +8,7 @@ import { z } from "zod";
 import type { ConfigStatus, CurrentUser, Run } from "../shared/types.js";
 import { Authenticator } from "./auth.js";
 import { CredentialVault } from "./credential-vault.js";
-import { closeDatabase, openDatabase } from "./db.js";
+import { createDb, createPool, runMigrations } from "./db.js";
 import { baseDemoRun, runDemo } from "./demo-runner.js";
 import { IdentityService } from "./identity.js";
 import { baseRealRun } from "./real-run.js";
@@ -42,8 +42,11 @@ const vault = new CredentialVault(vaultFile, vaultSecret);
 const auth = new Authenticator();
 await Promise.all([store.init(), vault.init()]);
 
-const dbFile = process.env.PI_DB_FILE || path.join(path.dirname(dataFile), "pigo.db");
-const db = openDatabase(dbFile);
+const databaseUrl = process.env.PI_DATABASE_URL;
+if (!databaseUrl) throw new Error("PI_DATABASE_URL is required (postgresql://user:password@host:5432/database)");
+const pool = createPool(databaseUrl);
+const db = createDb(pool);
+await runMigrations(db);
 const identities = new IdentityService(db);
 const workspacesEnabled = process.env.PI_WORKSPACES_ENABLED !== "false";
 const workspaces = new WorkspaceService(db, workerRequest);
@@ -184,7 +187,7 @@ app.addHook("preHandler", async (request, reply) => {
   const cacheKey = `${identity.issuer}|${identity.subject}`;
   const cached = userCache.get(cacheKey);
   if (cached) return auth.setUser(request, cached);
-  const record = identities.resolve({
+  const record = await identities.resolve({
     issuer: identity.issuer,
     subject: identity.subject,
     email: identity.email,
@@ -207,7 +210,14 @@ function vaultKeyFor(request: FastifyRequest) {
   return user.legacyOwnerId ?? user.id;
 }
 
-app.get("/api/health", async () => ({ status: "ok", service: "pigo-web", version: "0.4.0" }));
+app.get("/api/health", async (_request, reply) => {
+  try {
+    await db.query("SELECT 1");
+    return { status: "ok", service: "pigo-web", version: "0.5.0", db: "ok" };
+  } catch {
+    return reply.code(503).send({ status: "error", service: "pigo-web", version: "0.5.0", db: "unavailable" });
+  }
+});
 app.get("/api/me", async (request) => auth.user(request));
 app.get("/api/credentials/status", async (request) => vault.status(vaultKeyFor(request)));
 
@@ -264,7 +274,7 @@ function workspaceErrorReply(reply: FastifyReply, error: unknown) {
 
 app.get("/api/workspaces", async (request, reply) => {
   if (!workspacesEnabled) return workspacesDisabled(reply);
-  return { workspaces: workspaces.list(ownerKeysFor(request)) };
+  return { workspaces: await workspaces.list(ownerKeysFor(request)) };
 });
 
 app.post("/api/workspaces/register", async (request, reply) => {
@@ -292,7 +302,7 @@ app.post("/api/workspaces/clone", async (request, reply) => {
 app.get<{ Params: { id: string } }>("/api/workspaces/:id", async (request, reply) => {
   if (!workspacesEnabled) return workspacesDisabled(reply);
   try {
-    return workspaces.get(ownerKeysFor(request), request.params.id);
+    return await workspaces.get(ownerKeysFor(request), request.params.id);
   } catch (error) {
     return workspaceErrorReply(reply, error);
   }
@@ -312,7 +322,7 @@ app.patch<{ Params: { id: string } }>("/api/workspaces/:id", async (request, rep
   const parsed = workspacePatchSchema.safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
   try {
-    return workspaces.patch(ownerKeysFor(request), request.params.id, parsed.data);
+    return await workspaces.patch(ownerKeysFor(request), request.params.id, parsed.data);
   } catch (error) {
     return workspaceErrorReply(reply, error);
   }
@@ -321,7 +331,7 @@ app.patch<{ Params: { id: string } }>("/api/workspaces/:id", async (request, rep
 app.delete<{ Params: { id: string } }>("/api/workspaces/:id", async (request, reply) => {
   if (!workspacesEnabled) return workspacesDisabled(reply);
   try {
-    workspaces.unregister(ownerKeysFor(request), request.params.id);
+    await workspaces.unregister(ownerKeysFor(request), request.params.id);
     return reply.code(204).send();
   } catch (error) {
     return workspaceErrorReply(reply, error);
@@ -427,8 +437,7 @@ if (existsSync(staticRoot)) {
 
 for (const signal of ["SIGTERM", "SIGINT"] as const) {
   process.once(signal, () => {
-    closeDatabase(db);
-    process.exit(0);
+    void pool.end().finally(() => process.exit(0));
   });
 }
 

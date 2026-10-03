@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { newId, type Database } from "./db.js";
+import { newId, type Db } from "./db.js";
 
 export type IdentityInput = {
   issuer: string;
@@ -48,67 +48,65 @@ function toUser(row: UserRow): UserRecord {
  * used when reading user-scoped resources during the transition (see ownerKeys).
  */
 export class IdentityService {
-  constructor(private readonly db: Database) {}
+  constructor(private readonly db: Db) {}
 
-  resolve(input: IdentityInput): UserRecord {
+  async resolve(input: IdentityInput): Promise<UserRecord> {
     const now = new Date().toISOString();
     const email = input.email.trim().toLowerCase();
 
-    const known = this.db
-      .prepare("SELECT user_id FROM user_identities WHERE issuer = ? AND subject = ?")
-      .get(input.issuer, input.subject) as { user_id: string } | undefined;
+    const known = (await this.db.query(
+      "SELECT user_id FROM user_identities WHERE issuer = $1 AND subject = $2",
+      [input.issuer, input.subject],
+    )).rows[0] as { user_id: string } | undefined;
     if (known) {
-      this.db
-        .prepare("UPDATE user_identities SET last_login_at = ? WHERE issuer = ? AND subject = ?")
-        .run(now, input.issuer, input.subject);
-      this.db.prepare("UPDATE users SET email = ?, updated_at = ? WHERE id = ?").run(email, now, known.user_id);
-      return this.getUser(known.user_id)!;
+      await this.db.query("UPDATE user_identities SET last_login_at = $1 WHERE issuer = $2 AND subject = $3", [now, input.issuer, input.subject]);
+      await this.db.query("UPDATE users SET email = $1, updated_at = $2 WHERE id = $3", [email, now, known.user_id]);
+      return (await this.getUser(known.user_id))!;
     }
 
-    this.db.exec("BEGIN");
-    try {
+    const userId = await this.db.withTransaction(async (tx) => {
       const byEmail = email
-        ? this.db.prepare("SELECT * FROM users WHERE email = ? AND status = 'active'").get(email) as UserRow | undefined
+        ? (await tx.query("SELECT * FROM users WHERE email = $1 AND status = 'active'", [email])).rows[0] as UserRow | undefined
         : undefined;
       const byLegacy = !byEmail && input.legacyOwnerId
-        ? this.db.prepare("SELECT * FROM users WHERE legacy_owner_id = ?").get(input.legacyOwnerId) as UserRow | undefined
+        ? (await tx.query("SELECT * FROM users WHERE legacy_owner_id = $1", [input.legacyOwnerId])).rows[0] as UserRow | undefined
         : undefined;
       const existing = byEmail ?? byLegacy;
 
-      let userId: string;
+      let id: string;
       if (existing) {
-        userId = existing.id;
-        const adoptLegacy = input.legacyOwnerId
-          && !existing.legacy_owner_id
-          && !this.db.prepare("SELECT id FROM users WHERE legacy_owner_id = ?").get(input.legacyOwnerId);
-        this.db
-          .prepare("UPDATE users SET email = ?, legacy_owner_id = ?, updated_at = ? WHERE id = ?")
-          .run(email || existing.email, adoptLegacy ? input.legacyOwnerId : existing.legacy_owner_id, now, userId);
+        id = existing.id;
+        let legacy = existing.legacy_owner_id;
+        if (input.legacyOwnerId && !legacy) {
+          const taken = (await tx.query("SELECT id FROM users WHERE legacy_owner_id = $1", [input.legacyOwnerId])).rows.length > 0;
+          if (!taken) legacy = input.legacyOwnerId;
+        }
+        await tx.query("UPDATE users SET email = $1, legacy_owner_id = $2, updated_at = $3 WHERE id = $4", [email || existing.email, legacy, now, id]);
       } else {
-        userId = randomBytes(32).toString("hex");
-        this.db
-          .prepare("INSERT INTO users (id, email, role, status, legacy_owner_id, created_at, updated_at) VALUES (?, ?, 'user', 'active', ?, ?, ?)")
-          .run(userId, email, input.legacyOwnerId || null, now, now);
+        id = randomBytes(32).toString("hex");
+        await tx.query(
+          "INSERT INTO users (id, email, role, status, legacy_owner_id, created_at, updated_at) VALUES ($1, $2, 'user', 'active', $3, $4, $5)",
+          [id, email, input.legacyOwnerId || null, now, now],
+        );
       }
 
-      this.db
-        .prepare("INSERT INTO user_identities (id, user_id, issuer, subject, identity_provider, last_login_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-        .run(newId("ident"), userId, input.issuer, input.subject, input.identityProvider, now, now);
-      this.db.exec("COMMIT");
-      return this.getUser(userId)!;
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
+      await tx.query(
+        "INSERT INTO user_identities (id, user_id, issuer, subject, identity_provider, last_login_at, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        [newId("ident"), id, input.issuer, input.subject, input.identityProvider, now, now],
+      );
+      return id;
+    });
+
+    return (await this.getUser(userId))!;
   }
 
-  getUser(id: string): UserRecord | undefined {
-    const row = this.db.prepare("SELECT * FROM users WHERE id = ?").get(id) as UserRow | undefined;
+  async getUser(id: string): Promise<UserRecord | undefined> {
+    const row = (await this.db.query("SELECT * FROM users WHERE id = $1", [id])).rows[0] as UserRow | undefined;
     return row ? toUser(row) : undefined;
   }
 
-  userCount() {
-    const row = this.db.prepare("SELECT COUNT(*) AS count FROM users").get() as { count: number };
+  async userCount(): Promise<number> {
+    const row = (await this.db.query("SELECT COUNT(*)::int AS count FROM users")).rows[0] as { count: number };
     return Number(row.count);
   }
 }
