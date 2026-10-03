@@ -1,6 +1,6 @@
 {
   "name": "pigo-web",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -10,7 +10,7 @@
     "dev": "concurrently -k -n api,web -c blue,magenta \"npm:dev:server\" \"npm:dev:client\"",
     "dev:server": "tsx watch src/server/index.ts",
     "dev:client": "vite",
-    "build": "vite build && tsup src/server/index.ts --format esm --platform node --out-dir dist/server --clean",
+    "build": "vite build && tsup src/server/index.ts --format esm --platform node --out-dir dist/server --clean --external node:sqlite",
     "start": "node dist/server/index.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"

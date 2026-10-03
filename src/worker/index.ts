@@ -1,13 +1,14 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
 import { timingSafeEqual } from "node:crypto";
-import { mkdir, readdir, realpath, stat } from "node:fs/promises";
+import { mkdir, readdir, realpath, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
-import type { CheckResult, DevelopmentPlan, Finding, ProjectInfo, Run, RunEvent, RunState, SubAgentTask } from "../shared/types.js";
+import type { CheckResult, DevelopmentPlan, Finding, ProjectInfo, Run, RunEvent, RunState, SubAgentTask, WorkspaceVerifyResult } from "../shared/types.js";
 import { executionWaves, fallbackPlan, parseDevelopmentPlan } from "./orchestrator.js";
 import { UsageTracker, addUsage, assistantErrorFromEvent, assistantTextFromEvent, emptyUsage, toRunUsage, toolNameFromEvent, type UsageTotals } from "./pi-events.js";
 import { parseReview, type ReviewResult } from "./review-protocol.js";
+import { WorkspacePathError, resolveInsideRoot, sanitizeRelativePath, sanitizeWorkspaceName, validateCloneUrl } from "./workspace-paths.js";
 
 const port = Number(process.env.PORT || 3200);
 const host = process.env.HOST || "localhost";
@@ -186,6 +187,49 @@ async function listProjects(): Promise<ProjectInfo[]> {
     }
   }
   return projects;
+}
+
+function redactCredentials(value: string) {
+  return value.replace(/\/\/[^@/\s]*@/g, "//***@");
+}
+
+async function verifyWorkspace(relativePath: string): Promise<WorkspaceVerifyResult> {
+  const candidate = await resolveInsideRoot(projectsRoot, relativePath);
+  const isGit = await git(candidate, ["rev-parse", "--is-inside-work-tree"]).then((value) => value === "true").catch(() => false);
+  if (!isGit) return { ok: false, code: "WORKSPACE_INVALID", error: "Not a Git repository" };
+  const branch = await git(candidate, ["branch", "--show-current"]).catch(() => "");
+  const head = await git(candidate, ["rev-parse", "HEAD"]).catch(() => "");
+  const dirty = Boolean(await git(candidate, ["status", "--porcelain"]).catch(() => ""));
+  return {
+    ok: true,
+    relativePath,
+    canonicalPath: candidate,
+    name: path.basename(candidate),
+    branch: branch || undefined,
+    head: head || undefined,
+    dirty,
+  };
+}
+
+async function cloneWorkspace(url: string, name: string): Promise<WorkspaceVerifyResult> {
+  const urlError = validateCloneUrl(url);
+  if (urlError) return { ok: false, code: "WORKSPACE_INVALID", error: urlError };
+  const cleanName = sanitizeWorkspaceName(name);
+  if (!cleanName) return { ok: false, code: "WORKSPACE_INVALID", error: "Invalid workspace name" };
+  const root = await realpath(projectsRoot).catch(() => projectsRoot);
+  const target = path.join(root, cleanName);
+  if (target !== root && !target.startsWith(`${root}${path.sep}`)) {
+    return { ok: false, code: "WORKSPACE_INVALID", error: "Invalid workspace target" };
+  }
+  const exists = await stat(target).then(() => true).catch(() => false);
+  if (exists) return { ok: false, code: "WORKSPACE_EXISTS", error: `Directory already exists: ${cleanName}` };
+  const result = await command("git", ["clone", "--quiet", url, target], { cwd: root, timeoutMs: 600_000 });
+  if (result.code !== 0) {
+    await rm(target, { recursive: true, force: true }).catch(() => undefined);
+    const reason = redactCredentials(`${result.stderr}\n${result.stdout}`.trim()).slice(0, 500);
+    return { ok: false, code: "CLONE_FAILED", error: reason || "git clone failed" };
+  }
+  return verifyWorkspace(cleanName);
 }
 
 function parsePiLine(line: string) {
@@ -658,7 +702,22 @@ const server = createServer(async (request, response) => {
     const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
     if (request.method === "GET" && url.pathname === "/health") return json(response, 200, { status: "ok", service: "pigo-worker", activeJobs: active.size });
     if (!authorized(request)) return json(response, 401, { error: "Unauthorized" });
-    if (request.method === "GET" && url.pathname === "/projects") return json(response, 200, await listProjects());
+    if (request.method === "GET" && (url.pathname === "/projects" || url.pathname === "/workspaces")) return json(response, 200, await listProjects());
+    if (request.method === "POST" && url.pathname === "/workspaces/verify") {
+      const body = await readJson(request) as { relativePath?: unknown };
+      const relative = sanitizeRelativePath(String(body.relativePath ?? ""));
+      if (!relative) return json(response, 200, { ok: false, code: "WORKSPACE_INVALID", error: "Invalid workspace path" });
+      try {
+        return json(response, 200, await verifyWorkspace(relative));
+      } catch (error) {
+        if (error instanceof WorkspacePathError) return json(response, 200, { ok: false, code: error.code, error: error.message });
+        throw error;
+      }
+    }
+    if (request.method === "POST" && url.pathname === "/workspaces/clone") {
+      const body = await readJson(request) as { url?: unknown; name?: unknown };
+      return json(response, 200, await cloneWorkspace(String(body.url ?? ""), String(body.name ?? "")));
+    }
     if (request.method === "POST" && url.pathname === "/jobs") {
       const body = await readJson(request) as unknown as JobInput;
       if (!body.run?.id || body.run.mode !== "real" || !Array.isArray(body.checks) || !body.credentials?.developer || !body.credentials?.reviewer) return json(response, 400, { error: "Invalid job" });

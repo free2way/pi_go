@@ -1,16 +1,19 @@
 import fastifyStatic from "@fastify/static";
-import Fastify from "fastify";
+import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import { timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import type { ConfigStatus, Run } from "../shared/types.js";
+import type { ConfigStatus, CurrentUser, Run } from "../shared/types.js";
 import { Authenticator } from "./auth.js";
 import { CredentialVault } from "./credential-vault.js";
+import { closeDatabase, openDatabase } from "./db.js";
 import { baseDemoRun, runDemo } from "./demo-runner.js";
+import { IdentityService } from "./identity.js";
 import { baseRealRun } from "./real-run.js";
 import { RunStore } from "./store.js";
+import { WorkspaceError, WorkspaceService } from "./workspaces.js";
 
 const app = Fastify({
   logger: {
@@ -38,6 +41,13 @@ const store = new RunStore(dataFile);
 const vault = new CredentialVault(vaultFile, vaultSecret);
 const auth = new Authenticator();
 await Promise.all([store.init(), vault.init()]);
+
+const dbFile = process.env.PI_DB_FILE || path.join(path.dirname(dataFile), "pigo.db");
+const db = openDatabase(dbFile);
+const identities = new IdentityService(db);
+const workspacesEnabled = process.env.PI_WORKSPACES_ENABLED !== "false";
+const workspaces = new WorkspaceService(db, workerRequest);
+const userCache = new Map<string, CurrentUser>();
 
 const createRunSchema = z.object({
   title: z.string().trim().min(2).max(80),
@@ -168,30 +178,56 @@ app.addHook("preHandler", async (request, reply) => {
     const origin = request.headers.origin;
     if (origin && origin !== publicOrigin) return reply.code(403).send({ error: "Origin not allowed" });
   }
-  return auth.authenticate(request, reply);
+  const unauthorized = await auth.authenticate(request, reply);
+  if (unauthorized) return unauthorized;
+  const identity = auth.identity(request);
+  const cacheKey = `${identity.issuer}|${identity.subject}`;
+  const cached = userCache.get(cacheKey);
+  if (cached) return auth.setUser(request, cached);
+  const record = identities.resolve({
+    issuer: identity.issuer,
+    subject: identity.subject,
+    email: identity.email,
+    identityProvider: identity.identityProvider,
+    legacyOwnerId: identity.legacyOwnerId,
+  });
+  const user: CurrentUser = { id: record.id, email: record.email, legacyOwnerId: record.legacyOwnerId ?? undefined };
+  userCache.set(cacheKey, user);
+  auth.setUser(request, user);
 });
 
-app.get("/api/health", async () => ({ status: "ok", service: "pigo-web", version: "0.3.0" }));
+function ownerKeysFor(request: FastifyRequest) {
+  const user = auth.user(request);
+  return user.legacyOwnerId ? [user.id, user.legacyOwnerId] : [user.id];
+}
+
+/** Credentials written before the internal-user migration live under the legacy owner key. */
+function vaultKeyFor(request: FastifyRequest) {
+  const user = auth.user(request);
+  return user.legacyOwnerId ?? user.id;
+}
+
+app.get("/api/health", async () => ({ status: "ok", service: "pigo-web", version: "0.4.0" }));
 app.get("/api/me", async (request) => auth.user(request));
-app.get("/api/credentials/status", async (request) => vault.status(auth.user(request).id));
+app.get("/api/credentials/status", async (request) => vault.status(vaultKeyFor(request)));
 
 app.put("/api/credentials", async (request, reply) => {
   const user = auth.user(request);
   if (!credentialWriteAllowed(user.id)) return reply.code(429).send({ error: "Too many credential updates" });
   const parsed = credentialSchema.safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: "Invalid credential request" });
-  return vault.set(user.id, { developer: parsed.data.developerApiKey, reviewer: parsed.data.reviewerApiKey });
+  return vault.set(vaultKeyFor(request), { developer: parsed.data.developerApiKey, reviewer: parsed.data.reviewerApiKey });
 });
 
 app.delete("/api/credentials", async (request, reply) => {
   const user = auth.user(request);
   if (!credentialWriteAllowed(user.id)) return reply.code(429).send({ error: "Too many credential updates" });
-  await vault.delete(user.id);
+  await vault.delete(vaultKeyFor(request));
   return reply.code(204).send();
 });
 
 app.get("/api/config/status", async (request): Promise<ConfigStatus> => {
-  const credentials = vault.status(auth.user(request).id);
+  const credentials = vault.status(vaultKeyFor(request));
   return {
     demoMode,
     piVersion: process.env.PI_VERSION || "1.0.0",
@@ -210,21 +246,103 @@ app.get("/api/projects", async (_request, reply) => {
   }
 });
 
-app.get("/api/runs", async (request) => store.listRuns(auth.user(request).id));
+const workspaceRegisterSchema = z.object({ relativePath: z.string().trim().min(1).max(240) });
+const workspaceCloneSchema = z.object({ url: z.string().trim().min(1).max(500), name: z.string().trim().min(1).max(80) });
+const workspacePatchSchema = z.object({
+  defaultChecks: z.array(z.string().trim().min(1).max(500)).max(8).optional(),
+  defaultBranch: z.string().trim().min(1).max(200).optional(),
+}).strict();
+
+function workspacesDisabled(reply: FastifyReply) {
+  return reply.code(503).send({ error: "Workspaces are disabled", code: "WORKSPACES_DISABLED" });
+}
+
+function workspaceErrorReply(reply: FastifyReply, error: unknown) {
+  if (error instanceof WorkspaceError) return reply.code(error.status).send({ error: error.message, code: error.code });
+  return reply.code(503).send({ error: `Workspace operation failed: ${(error as Error).message}` });
+}
+
+app.get("/api/workspaces", async (request, reply) => {
+  if (!workspacesEnabled) return workspacesDisabled(reply);
+  return { workspaces: workspaces.list(ownerKeysFor(request)) };
+});
+
+app.post("/api/workspaces/register", async (request, reply) => {
+  if (!workspacesEnabled) return workspacesDisabled(reply);
+  const parsed = workspaceRegisterSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
+  try {
+    return reply.code(201).send(await workspaces.register(auth.user(request).id, parsed.data.relativePath));
+  } catch (error) {
+    return workspaceErrorReply(reply, error);
+  }
+});
+
+app.post("/api/workspaces/clone", async (request, reply) => {
+  if (!workspacesEnabled) return workspacesDisabled(reply);
+  const parsed = workspaceCloneSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
+  try {
+    return reply.code(201).send(await workspaces.clone(auth.user(request).id, parsed.data.url, parsed.data.name));
+  } catch (error) {
+    return workspaceErrorReply(reply, error);
+  }
+});
+
+app.get<{ Params: { id: string } }>("/api/workspaces/:id", async (request, reply) => {
+  if (!workspacesEnabled) return workspacesDisabled(reply);
+  try {
+    return workspaces.get(ownerKeysFor(request), request.params.id);
+  } catch (error) {
+    return workspaceErrorReply(reply, error);
+  }
+});
+
+app.post<{ Params: { id: string } }>("/api/workspaces/:id/refresh", async (request, reply) => {
+  if (!workspacesEnabled) return workspacesDisabled(reply);
+  try {
+    return await workspaces.refresh(ownerKeysFor(request), request.params.id);
+  } catch (error) {
+    return workspaceErrorReply(reply, error);
+  }
+});
+
+app.patch<{ Params: { id: string } }>("/api/workspaces/:id", async (request, reply) => {
+  if (!workspacesEnabled) return workspacesDisabled(reply);
+  const parsed = workspacePatchSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
+  try {
+    return workspaces.patch(ownerKeysFor(request), request.params.id, parsed.data);
+  } catch (error) {
+    return workspaceErrorReply(reply, error);
+  }
+});
+
+app.delete<{ Params: { id: string } }>("/api/workspaces/:id", async (request, reply) => {
+  if (!workspacesEnabled) return workspacesDisabled(reply);
+  try {
+    workspaces.unregister(ownerKeysFor(request), request.params.id);
+    return reply.code(204).send();
+  } catch (error) {
+    return workspaceErrorReply(reply, error);
+  }
+});
+
+app.get("/api/runs", async (request) => store.listRuns(ownerKeysFor(request)));
 
 app.get<{ Params: { id: string } }>("/api/runs/:id", async (request, reply) => {
-  const run = store.getRun(request.params.id, auth.user(request).id);
+  const run = store.getRun(request.params.id, ownerKeysFor(request));
   if (!run) return reply.code(404).send({ error: "Run not found" });
   return run;
 });
 
 app.get<{ Params: { id: string }; Querystring: { after?: string } }>("/api/runs/:id/events", async (request, reply) => {
-  if (!store.getRun(request.params.id, auth.user(request).id)) return reply.code(404).send({ error: "Run not found" });
+  if (!store.getRun(request.params.id, ownerKeysFor(request))) return reply.code(404).send({ error: "Run not found" });
   return store.getEvents(request.params.id, Number(request.query.after || 0));
 });
 
 app.get<{ Params: { id: string }; Querystring: { after?: string } }>("/api/runs/:id/stream", async (request, reply) => {
-  if (!store.getRun(request.params.id, auth.user(request).id)) return reply.code(404).send({ error: "Run not found" });
+  if (!store.getRun(request.params.id, ownerKeysFor(request))) return reply.code(404).send({ error: "Run not found" });
   const after = Number(request.headers["last-event-id"] || request.query.after || 0);
   reply.hijack();
   reply.raw.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive", "X-Accel-Buffering": "no" });
@@ -241,7 +359,7 @@ app.post("/api/runs", async (request, reply) => {
   const user = auth.user(request);
   if (parsed.data.mode === "real") {
     if (!realRunsEnabled || !internalToken) return reply.code(503).send({ error: "Real agent execution is disabled", code: "REAL_RUNNER_NOT_AVAILABLE" });
-    const credentials = vault.get(user.id);
+    const credentials = vault.get(vaultKeyFor(request));
     if (!credentials) return reply.code(403).send({ error: "Configure both personal model keys before starting a real run", code: "PERSONAL_CREDENTIALS_REQUIRED" });
     const run = baseRealRun(parsed.data, user.id);
     await store.createRun(run, { runId: run.id, round: 1, source: "system", type: "run.created", message: "真实任务已创建，正在交给隔离 Pi Worker", at: new Date().toISOString() });
@@ -266,17 +384,17 @@ app.post("/api/runs", async (request, reply) => {
 });
 
 app.post<{ Params: { id: string } }>("/api/runs/:id/cancel", async (request, reply) => {
-  const run = store.getRun(request.params.id, auth.user(request).id);
+  const run = store.getRun(request.params.id, ownerKeysFor(request));
   if (!run) return reply.code(404).send({ error: "Run not found" });
   if (["completed", "failed", "cancelled"].includes(run.state)) return reply.code(409).send({ error: `Cannot cancel run in ${run.state}` });
   if (run.mode === "real") await workerRequest(`/jobs/${encodeURIComponent(run.id)}/cancel`, { method: "POST" }).catch(() => undefined);
   await store.updateRun(run.id, { state: "cancelled", summary: "已由用户取消" });
   await store.appendEvent({ runId: run.id, round: run.round, source: "system", type: "run.cancelled", message: "任务已取消", at: new Date().toISOString() });
-  return store.getRun(run.id, auth.user(request).id);
+  return store.getRun(run.id, ownerKeysFor(request));
 });
 
 app.delete<{ Params: { id: string } }>("/api/runs/:id", async (request, reply) => {
-  const run = store.getRun(request.params.id, auth.user(request).id);
+  const run = store.getRun(request.params.id, ownerKeysFor(request));
   if (!run) return reply.code(404).send({ error: "Run not found" });
   if (!["completed", "failed", "cancelled", "needs_human"].includes(run.state)) {
     return reply.code(409).send({ error: `Cannot delete a run in ${run.state}; cancel it first` });
@@ -304,6 +422,13 @@ if (existsSync(staticRoot)) {
   app.setNotFoundHandler((request, reply) => {
     if (request.url.startsWith("/api/")) return reply.code(404).send({ error: "Not found" });
     return reply.sendFile("index.html");
+  });
+}
+
+for (const signal of ["SIGTERM", "SIGINT"] as const) {
+  process.once(signal, () => {
+    closeDatabase(db);
+    process.exit(0);
   });
 }
 

@@ -3,7 +3,20 @@ import { createRemoteJWKSet, jwtVerify } from "jose";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import type { CurrentUser } from "../shared/types.js";
 
-type AuthenticatedRequest = FastifyRequest & { user?: CurrentUser };
+type AuthenticatedRequest = FastifyRequest & { user?: CurrentUser; identity?: RequestIdentity };
+
+export type RequestIdentity = {
+  email: string;
+  issuer: string;
+  subject: string;
+  identityProvider: string;
+  /** sha256(`${issuer}|${subject}`) — the owner key used before internal user ids existed. */
+  legacyOwnerId: string;
+};
+
+function legacyOwnerIdFor(issuer: string, subject: string) {
+  return createHash("sha256").update(`${issuer}|${subject}`).digest("hex");
+}
 
 function normalizeTeamDomain(value: string) {
   const url = new URL(value.startsWith("https://") ? value : `https://${value}`);
@@ -36,13 +49,19 @@ export class Authenticator {
 
   async authenticate(request: FastifyRequest, reply: FastifyReply) {
     try {
-      const user = this.mode === "cloudflare"
+      const identity = this.mode === "cloudflare"
         ? await this.fromCloudflare(request)
         : this.fromDevelopment(request);
-      (request as AuthenticatedRequest).user = user;
+      (request as AuthenticatedRequest).identity = identity;
     } catch {
       return reply.code(401).send({ error: "Authentication required" });
     }
+  }
+
+  identity(request: FastifyRequest) {
+    const identity = (request as AuthenticatedRequest).identity;
+    if (!identity) throw new Error("Authenticated identity context is missing");
+    return identity;
   }
 
   user(request: FastifyRequest) {
@@ -51,7 +70,11 @@ export class Authenticator {
     return user;
   }
 
-  private async fromCloudflare(request: FastifyRequest): Promise<CurrentUser> {
+  setUser(request: FastifyRequest, user: CurrentUser) {
+    (request as AuthenticatedRequest).user = user;
+  }
+
+  private async fromCloudflare(request: FastifyRequest): Promise<RequestIdentity> {
     const token = request.headers["cf-access-jwt-assertion"];
     if (typeof token !== "string" || !this.jwks || !this.issuer || !this.audience) {
       throw new Error("Missing Cloudflare Access token");
@@ -65,17 +88,23 @@ export class Authenticator {
       throw new Error("Invalid Cloudflare Access identity");
     }
     return {
-      id: createHash("sha256").update(`${this.issuer}|${payload.sub}`).digest("hex"),
       email: payload.email.toLowerCase(),
+      issuer: this.issuer,
+      subject: payload.sub,
+      identityProvider: "cloudflare-access",
+      legacyOwnerId: legacyOwnerIdFor(this.issuer, payload.sub),
     };
   }
 
-  private fromDevelopment(request: FastifyRequest): CurrentUser {
+  private fromDevelopment(request: FastifyRequest): RequestIdentity {
     const emailHeader = request.headers["x-pigo-dev-email"];
-    const email = typeof emailHeader === "string" ? emailHeader : "developer@localhost";
+    const email = (typeof emailHeader === "string" ? emailHeader : "developer@localhost").toLowerCase();
     return {
-      id: createHash("sha256").update(`development|${email.toLowerCase()}`).digest("hex"),
-      email: email.toLowerCase(),
+      email,
+      issuer: "development",
+      subject: email,
+      identityProvider: "development",
+      legacyOwnerId: legacyOwnerIdFor("development", email),
     };
   }
 }

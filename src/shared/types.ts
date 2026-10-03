@@ -123,10 +123,49 @@ export interface ConfigStatus {
 export interface CurrentUser {
   id: string;
   email: string;
+  legacyOwnerId?: string;
 }
 
 export interface CredentialStatus {
   developerConfigured: boolean;
   reviewerConfigured: boolean;
   updatedAt: string | null;
+}
+
+export type WorkspaceStatus = "active" | "unregistered" | "invalid";
+
+export interface WorkspaceGitInfo {
+  branch: string | null;
+  head: string | null;
+  dirty: boolean;
+}
+
+export interface Workspace {
+  id: string;
+  ownerId: string;
+  nodeId: string;
+  name: string;
+  type: "server";
+  rootPath: string;
+  canonicalPath: string;
+  repositoryUrl: string | null;
+  defaultBranch: string | null;
+  defaultChecks: string[];
+  status: WorkspaceStatus;
+  git: WorkspaceGitInfo | null;
+  lastCheckedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface WorkspaceVerifyResult {
+  ok: boolean;
+  code?: string;
+  error?: string;
+  relativePath?: string;
+  canonicalPath?: string;
+  name?: string;
+  branch?: string;
+  head?: string;
+  dirty?: boolean;
 }

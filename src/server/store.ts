@@ -26,12 +26,14 @@ export class RunStore {
     }
   }
 
-  listRuns(ownerId: string) {
-    return this.data.runs.filter((run) => run.ownerId === ownerId).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  listRuns(owner: string | string[]) {
+    const keys = new Set(Array.isArray(owner) ? owner : [owner]);
+    return this.data.runs.filter((run) => keys.has(run.ownerId)).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
-  getRun(id: string, ownerId?: string) {
-    return this.data.runs.find((run) => run.id === id && (!ownerId || run.ownerId === ownerId));
+  getRun(id: string, owner?: string | string[]) {
+    const keys = owner === undefined ? undefined : new Set(Array.isArray(owner) ? owner : [owner]);
+    return this.data.runs.find((run) => run.id === id && (!keys || keys.has(run.ownerId)));
   }
 
   async createRun(run: Run, event: Omit<RunEvent, "seq">) {
