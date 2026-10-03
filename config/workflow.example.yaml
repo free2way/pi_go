@@ -7,7 +7,21 @@ workspace:
   branchPrefix: ai-run/
   keepFailedWorkspace: true
 
+modelCatalog:
+  # Resolve selectable models from Pi, then restrict them with an administrator
+  # allowlist. The UI may independently choose one model for each run role.
+  source: pi-runtime
+  userSelectableRoles:
+    - developer
+    - reviewer
+  allowedProviders:
+    - deepseek
+    - openai-proxy
+  requireConfiguredCredential: true
+  preflightBeforeQueue: true
+
 developer:
+  # Deployment default only; a validated per-run selection overrides it.
   provider: ${PI_DEVELOPER_PROVIDER}
   model: ${PI_DEVELOPER_MODEL}
   thinkingLevel: high
@@ -19,6 +33,7 @@ developer:
   instructionsFile: prompts/developer.md
 
 reviewer:
+  # Deployment default only; a validated per-run selection overrides it.
   provider: ${PI_REVIEWER_PROVIDER}
   model: ${PI_REVIEWER_MODEL}
   thinkingLevel: high
@@ -53,4 +68,3 @@ limits:
 ui:
   eventTransport: sse
   retainEventDays: 30
-

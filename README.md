@@ -1,10 +1,10 @@
-# Pi 双模型开发审核平台
+# Pi 多模型开发审核平台
 
-本仓库包含可运行的 Pi 双模型开发审核平台，以及部署和二次开发文档。当前实现基于开源 [Pi](https://github.com/earendil-works/pi)：
+本仓库包含可运行的 Pi 开发审核平台，以及面向多模型路由的部署和二次开发文档。当前实现基于开源 [Pi](https://github.com/earendil-works/pi)：
 
 - 安装和部署 Pi；
-- 接入 DeepSeek、OpenAI 以及其他兼容模型；
-- 指定 DeepSeek 为开发 Agent、OpenAI 模型为审核 Agent；
+- 接入 DeepSeek、OpenAI 以及其他 Pi 兼容模型；
+- 用户可从管理员允许且已配置凭据的模型目录中，分别指定开发 Agent 和审核 Agent 使用的 provider/model；
 - 审核不通过时自动把结构化问题返给开发 Agent，修复后再次审核；
 - 用流程图、日志、Diff、测试结果和审核结果展示完整闭环；
 - 从服务器受控项目目录选择 Git 仓库，每个任务创建独立 worktree 保存代码。
@@ -14,9 +14,9 @@
 ```mermaid
 flowchart LR
     U[用户任务] --> P[准备独立 Git 工作区]
-    P --> D[DeepSeek 开发 Agent]
+    P --> D[开发 Agent\n用户指定 provider/model]
     D --> T[确定性测试/静态检查]
-    T --> R[OpenAI 审核 Agent]
+    T --> R[审核 Agent\n用户指定 provider/model]
     R -->|approved| S[完成/等待人工合并]
     R -->|changes_requested| D
     T -->|失败| D
@@ -35,6 +35,19 @@ flowchart LR
 - 结果保存在 `/app/pi-agent/workspace/runs/<run-id>` 对应的 Git worktree；
 - Web 服务不持有模型密钥，密钥仅注入隔离 Worker。
 
+## 新增产品需求：按角色选择模型
+
+目标版本不再把 DeepSeek/OpenAI 固定写死为开发与审核角色。新建真实任务时，用户必须能够独立选择：
+
+- 开发 Agent 的 provider 和 model；
+- 审核 Agent 的 provider 和 model；
+- 两个角色可选择不同模型，也允许在策略许可时选择同一模型；
+- 页面只展示管理员允许、Pi 运行时可解析、且当前用户已配置凭据的模型；
+- 服务端在任务入队前执行模型与凭据预检，并把本次选择固化到任务记录；
+- 指定模型不可用时明确失败，不允许静默切换到其他模型。
+
+当前 `v0.3.0` 仍由环境变量固定开发与审核模型，上述能力属于下一阶段待实现范围。
+
 真实模式不会自动提交、推送、合并或部署代码。人工确认结果后，再从任务 worktree 进行后续 Git 操作。
 
 ## 文档
@@ -42,6 +55,8 @@ flowchart LR
 - [安装部署与环境配置](docs/01-deployment-and-configuration.md)
 - [应用开发设计](docs/02-development-design.md)
 - [192.168.2.235 部署记录](docs/03-deployment-record-192.168.2.235.md)
+- [完整开发规格说明书](docs/04-product-development-specification.md)
+- [验收测试规格与交付清单](docs/05-acceptance-test-specification.md)
 - [工作流配置样例](config/workflow.example.yaml)
 - [环境变量样例](.env.example)
 

@@ -1,13 +1,14 @@
-# 双模型开发审核应用设计文档
+# 多模型开发审核应用设计文档
 
 ## 1. 目标与非目标
 
 ### 目标
 
 - 用户为一个 Git 仓库提交开发任务和验收条件；
-- DeepSeek 驱动的 Pi Agent 实际读写代码并执行命令；
-- 确定性检查通过后，OpenAI 驱动的独立 Pi Agent 审核需求、Diff、实现和测试；
-- 审核意见以结构化数据回传给原 DeepSeek 会话；
+- 用户从受控模型目录中分别指定开发 Agent 与审核 Agent 的 provider/model；
+- 开发模型驱动 Pi Agent 实际读写代码并执行命令；
+- 确定性检查通过后，由用户指定的独立审核模型检查需求、Diff、实现和测试；
+- 审核意见以结构化数据回传给原开发会话；
 - 自动重复“修复—测试—复审”，直到通过或触发停止条件；
 - UI 实时显示节点状态、模型、工具调用、Diff、日志、token/cost、审核问题和每轮耗时；
 - 全流程可恢复、可审计、可限额。
@@ -33,7 +34,7 @@
 | Git | 每任务 branch + worktree | 隔离修改并提供稳定 Diff |
 | 日志 | Pino + OpenTelemetry | 结构化日志与跨阶段 trace ID |
 
-不建议用 OpenAI Agents SDK 作为主编排器：本项目的执行核心已经是 Pi，且开发模型来自 DeepSeek。OpenAI Agents SDK 可以完成多 Agent handoff，但会增加第二套 Agent 生命周期与事件模型。这里由应用状态机编排两个 Pi Session，更简单、供应商中立且便于把同一事件流展示到 UI。
+不建议用某一家模型供应商的 Agents SDK 作为主编排器：本项目的执行核心已经是 Pi，开发与审核模型都应保持可替换。额外引入另一套 Agent SDK 会增加第二套生命周期与事件模型。这里由应用状态机编排开发与审核两个 Pi Session，更简单、供应商中立且便于把同一事件流展示到 UI。
 
 ## 3. 总体架构
 
@@ -43,9 +44,9 @@ flowchart LR
     API --> SM[Workflow State Machine]
     SM --> STORE[(Run/Event Store)]
     SM --> GIT[Workspace Manager]
-    SM --> D[Developer Session\nDeepSeek]
+    SM --> D[Developer Session\nselected provider/model]
     SM --> C[Check Runner]
-    SM --> R[Reviewer Session\nOpenAI]
+    SM --> R[Reviewer Session\nselected provider/model]
     D -->|Pi events| BUS[Event Bus]
     C -->|process events| BUS
     R -->|Pi events| BUS
@@ -118,6 +119,16 @@ if (!developerModel || !reviewerModel) {
 ```
 
 禁止“找不到指定模型就选第一个可用模型”，否则可能把开发或审核发给错误供应商。
+
+模型选择是每个 run 的一等配置，而不是只在部署环境中设置一次：
+
+- API 提供受控模型目录，模型来自 Pi `ModelRuntime`，再与管理员 allowlist、角色能力和当前用户凭据状态取交集；
+- 新建任务分别提交 `developer: { provider, model }` 与 `reviewer: { provider, model }`；
+- 开发与审核可以来自不同 provider，也可以在策略允许时使用同一模型；
+- 服务端必须在入队前精确解析两个模型，并执行最小可用性预检；
+- 凭据按用户与 provider 保存，角色只引用凭据，不再使用“开发 Key/审核 Key”作为固定存储结构；
+- run 创建后固化 provider/model 快照；重试、恢复和审核返修不得因全局默认值变化而换模型；
+- UI 不展示缺少凭据、被管理员禁用或不满足角色能力要求的模型；指定模型失效时返回明确错误，不静默降级。
 
 ### 5.2 Developer Session
 
@@ -282,7 +293,8 @@ Reviewer snapshot 可写以允许测试生成临时文件，但整个目录在�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/api/runs` | 创建任务，传 repo、base SHA、需求、验收条件和 workflow 配置引用 |
+| `GET` | `/api/models` | 返回当前用户可选的 provider/model、适用角色、能力和凭据状态 |
+| `POST` | `/api/runs` | 创建任务，传 repo、base SHA、需求、验收条件、开发/审核模型和 workflow 配置引用 |
 | `GET` | `/api/runs/:id` | 当前状态、轮次、模型、预算和摘要 |
 | `GET` | `/api/runs/:id/events?after=` | 事件补拉 |
 | `GET` | `/api/runs/:id/diff` | 当前或最终 Diff |
@@ -331,7 +343,9 @@ Reviewer snapshot 可写以允许测试生成临时文件，但整个目录在�
 
 ## 11. 图形化界面
 
-主画布固定显示六个节点：任务、准备、DeepSeek 开发、检查、OpenAI 审核、完成/人工介入。当前节点发光，已完成节点显示耗时和 token，失败边显示原因，`changes_requested` 用回边连回开发节点。
+主画布固定显示六个节点：任务、准备、开发 Agent、检查、审核 Agent、完成/人工介入。节点显示本次 run 固化的 provider/model；当前节点发光，已完成节点显示耗时和 token，失败边显示原因，`changes_requested` 用回边连回开发节点。
+
+新建任务表单分别提供“开发模型”和“审核模型”选择器。选项按 provider 分组，展示凭据状态、上下文窗口、工具支持和可用性；选中组合在提交前进行服务端预检。全局设置只提供默认值，不能覆盖用户对单次任务的明确选择。
 
 右侧详情面板：
 
@@ -441,6 +455,7 @@ Prompt 变更必须版本化，并在 run 中记录 `prompt_version`。Reviewer 
 ### M2：可用 MVP（5–8 天）
 
 - Fastify API、SQLite、SSE；
+- 模型目录、按用户/provider 管理凭据、开发/审核模型独立选择与入队前预检；
 - React Flow 状态图；
 - 日志/Diff/审核面板；
 - 取消、超时、最大轮次与恢复。
@@ -455,7 +470,8 @@ Prompt 变更必须版本化，并在 run 中记录 `prompt_version`。Reviewer 
 
 ## 16. Definition of Done
 
-- provider/model 可配置且启动时严格校验；
+- provider/model 有受控目录，用户可为开发与审核角色独立选择，并在入队前严格校验；
+- 每个 run 固化开发与审核模型，恢复或重试时不受全局默认配置变化影响；
 - Developer 只能在专用 worktree 修改；
 - Reviewer 在一次性快照运行，不能影响 Developer 文件；
 - 确定性检查与模型审核都通过才能完成；
@@ -471,4 +487,3 @@ Prompt 变更必须版本化，并在 run 中记录 `prompt_version`。Reviewer 
 - Pi SDK 允许为 session 指定 `modelRuntime`、`model`、`thinkingLevel`、tools，并订阅消息/工具/生命周期事件。
 - Pi RPC 也能服务自定义 UI，但 Node/TypeScript 同进程集成时官方建议优先 SDK；RPC 更适合非 Node 或强进程隔离客户端。
 - OpenAI 官方把 Agents SDK 定位为由应用控制部署、工具、状态和审批的代码优先编排方案；本项目采用相同的显式编排原则，但具体 Agent 运行统一由 Pi 承担。
-
