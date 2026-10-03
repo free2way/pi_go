@@ -9,7 +9,9 @@ services:
       POSTGRES_PASSWORD: ${PIGO_POSTGRES_PASSWORD:?Set PIGO_POSTGRES_PASSWORD in the deployment environment}
       POSTGRES_DB: pigo
     volumes:
-      - pigo-postgres-data:/var/lib/postgresql/data
+      # postgres:18+ stores data under /var/lib/postgresql/<major>/docker;
+      # mounting the old .../data path makes the entrypoint exit with an error.
+      - pigo-postgres-data:/var/lib/postgresql
     networks:
       - pi-network
     security_opt:
