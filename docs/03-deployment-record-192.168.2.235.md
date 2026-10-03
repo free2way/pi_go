@@ -89,3 +89,31 @@ docker compose --env-file .env down
 ```
 
 不要使用 `docker compose down --volumes`，除非明确要删除 Pi 的登录信息和配置。不要执行宿主机级别的 `docker system prune`，以免影响同机其他应用。
+
+## v0.3.0 升级记录
+
+升级日期：2026-10-03（Asia/Shanghai）
+
+| 项 | 值 |
+| --- | --- |
+| 新镜像 | `local/pigo-web:0.1.0`（v0.3.0，健康检查返回 `{"version":"0.3.0"}`）、`local/pigo-worker:0.1.0` |
+| 回滚标签 | `local/pigo-web:prev` / `local/pigo-worker:prev`（v0.2.0 时代）；`local/pigo-worker:prev2`（本次升级前版本） |
+| 备份 | `/app/pi-agent/backups/20261003-052048/`（`pigo-web-data` 卷 tar、`.env`、compose 文件） |
+| 源码留档 | `/app/pi-agent/source.prev-20261003`、`/app/pi-agent/source.prev2-20261003` |
+| 无变更 | runtime 容器、其他 10 个既有容器全程未重建、未受影响 |
+
+### 本次变更（代码）
+
+- **回调体积**：Worker→Web 内网回调路由 bodyLimit 由 64KiB 提升到 4MiB；Worker 侧增加 3MiB 兜底截断（先截 diff、再截检查输出），大改动任务不再被 413 误判失败。
+- **写队列恢复**：`RunStore` 与 `CredentialVault` 的持久化队列在单次写失败后自动复位，不再永久静默失败（含回归测试）。
+- **工具活动**：按 Pi JSON 协议读取 `tool_execution_start.toolName`，活动流展示真实工具名（原先只显示 "tool"）。
+- **usage 统计**：按 `message_update.usage` / `message_end.message.usage` 采集输入/输出/cache token 与 cost；真实运行不再显示全 0。
+- **审核降级**：解析失败自动重试一次；**提供方错误（429 等）与协议错误分开上报**；仍失败转 `needs_human`，不再整单 failed。
+- **安全**：internal 回调 patch 使用 zod 白名单（拒绝未知字段）；Worker 使用常量时间 token 比较；`NODE_ENV=production` 时禁止 development 认证模式启动。
+
+### 首次完整真实 E2E（2026-10-03 晚，run_8242185824054336）
+
+- 任务：`pi_go` 仓库 README/docs 文档任务，第二条检查故意首轮失败以验证修复回路。
+- 通过项：planner 单任务规划 ✅；第 1 轮检查失败 → 第 2 轮修复后检查全部通过 ✅；工具名展示 ✅；usage 采集（input 44,649 / output 15,974 / cacheRead 733,952）✅；错误降级路径 ✅。
+- 阻断项：审核阶段被上游代理限流（`pr.ai2note.com` → sub2api 返回 429：`no available OpenAI accounts supporting model: gpt-5.6-sol (pool=1, filtered: model_rate_limited=1)`）。属于代理账号额度问题，待账号恢复或补充后重跑即可完成全闭环。
+- 复核命令：`docker logs --tail 200 sub2api | grep -i rate` 可确认限流状态。
