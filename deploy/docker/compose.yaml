@@ -9,8 +9,6 @@ services:
     image: local/pi-coding-agent:1.0.0
     restart: unless-stopped
     init: true
-    env_file:
-      - .env
     working_dir: /workspace
     environment:
       PI_DEVELOPER_MODEL: ${PI_DEVELOPER_MODEL:-deepseek-flash}
@@ -48,13 +46,17 @@ services:
       HOST: web
       PORT: 3100
       PI_DATA_FILE: /app/data/runs.json
+      PI_VAULT_FILE: /app/data/credentials.v1.json
+      PI_VAULT_SECRET: ${PI_VAULT_SECRET:?Set PI_VAULT_SECRET in the deployment environment}
+      PI_AUTH_MODE: ${PI_AUTH_MODE:?Set PI_AUTH_MODE in the deployment environment}
+      PI_CF_ACCESS_TEAM_DOMAIN: ${PI_CF_ACCESS_TEAM_DOMAIN:-}
+      PI_CF_ACCESS_AUDIENCE: ${PI_CF_ACCESS_AUDIENCE:-}
+      PI_PUBLIC_ORIGIN: ${PI_PUBLIC_ORIGIN:-}
       PI_DEMO_MODE: "true"
       PI_VERSION: "1.0.0"
       PI_DEVELOPER_MODEL: ${PI_DEVELOPER_MODEL:-deepseek-flash}
       PI_REVIEWER_PROVIDER: ${PI_REVIEWER_PROVIDER:-openai-proxy}
       PI_REVIEWER_MODEL: ${PI_REVIEWER_MODEL:-gpt-5.6-sol}
-      PI_DEVELOPER_CREDENTIAL_CONFIGURED: ${PI_DEVELOPER_CREDENTIAL_CONFIGURED:-false}
-      PI_REVIEWER_CREDENTIAL_CONFIGURED: ${PI_REVIEWER_CREDENTIAL_CONFIGURED:-false}
       PI_REAL_RUNS_ENABLED: ${PI_REAL_RUNS_ENABLED:-false}
       PI_WORKER_URL: http://worker:3200
       PI_INTERNAL_TOKEN: ${PI_INTERNAL_TOKEN:-}
@@ -90,8 +92,6 @@ services:
     image: local/pigo-worker:0.1.0
     restart: unless-stopped
     init: true
-    env_file:
-      - .env
     working_dir: /workspace
     environment:
       HOST: worker
@@ -100,6 +100,7 @@ services:
       PI_DEVELOPER_MODEL: ${PI_DEVELOPER_MODEL:-deepseek-flash}
       PI_REVIEWER_PROVIDER: ${PI_REVIEWER_PROVIDER:-openai-proxy}
       PI_REVIEWER_MODEL: ${PI_REVIEWER_MODEL:-gpt-5.6-sol}
+      OPENAI_BASE_URL: ${PI_REVIEWER_BASE_URL:-}
       PI_WORKSPACE_ROOT: /workspace
       PI_WEB_CALLBACK_URL: http://web:3100
       PI_INTERNAL_TOKEN: ${PI_INTERNAL_TOKEN:-}

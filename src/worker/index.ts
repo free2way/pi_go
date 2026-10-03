@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
-import { readdir, realpath, stat } from "node:fs/promises";
+import { mkdir, readdir, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
 import type { CheckResult, Finding, ProjectInfo, Run, RunEvent, RunState } from "../shared/types.js";
@@ -18,6 +18,10 @@ const active = new Map<string, AbortController>();
 type JobInput = {
   run: Run;
   checks: string[];
+  credentials: {
+    developer: string;
+    reviewer: string;
+  };
 };
 
 type ReviewResult = {
@@ -72,6 +76,7 @@ type CommandResult = { code: number; stdout: string; stderr: string };
 
 function command(commandName: string, args: string[], options: {
   cwd: string;
+  env?: NodeJS.ProcessEnv;
   signal?: AbortSignal;
   timeoutMs?: number;
   onStdoutLine?: (line: string) => void;
@@ -79,7 +84,7 @@ function command(commandName: string, args: string[], options: {
   return new Promise((resolve, reject) => {
     const child = spawn(commandName, args, {
       cwd: options.cwd,
-      env: process.env,
+      env: options.env ?? process.env,
       stdio: ["ignore", "pipe", "pipe"],
       signal: options.signal,
     });
@@ -161,6 +166,8 @@ async function runPi(input: {
   prompt: string;
   sessionId?: string;
   readOnly?: boolean;
+  apiKey: string;
+  apiKeyEnvironmentName: "DEEPSEEK_API_KEY" | "OPENAI_API_KEY";
   signal: AbortSignal;
   onActivity: (message: string) => Promise<void>;
 }) {
@@ -180,8 +187,13 @@ async function runPi(input: {
   args.push("--", input.prompt);
   let finalText = "";
   let activityQueue = Promise.resolve();
+  const childEnvironment = { ...process.env };
+  delete childEnvironment.DEEPSEEK_API_KEY;
+  delete childEnvironment.OPENAI_API_KEY;
+  childEnvironment[input.apiKeyEnvironmentName] = input.apiKey;
   const result = await command("pi", args, {
     cwd: input.cwd,
+    env: childEnvironment,
     signal: input.signal,
     timeoutMs: Number(process.env.PI_RUN_TIMEOUT_SECONDS || 1800) * 1000,
     onStdoutLine: (line) => {
@@ -240,7 +252,9 @@ async function executeJob(input: JobInput, controller: AbortController) {
     const project = await resolveProject(run.repository);
     const dirty = await git(project, ["status", "--porcelain"], controller.signal);
     if (dirty) throw new Error("Source repository has uncommitted changes; clean it before starting a real run");
-    const worktree = path.join(runsRoot, run.id);
+    if (!/^[a-f0-9]{64}$/.test(run.ownerId)) throw new Error("Invalid run owner");
+    const worktree = path.join(runsRoot, run.ownerId, run.id);
+    await mkdir(path.dirname(worktree), { recursive: true });
     await update(run, "preparing", "system", "workspace.preparing", "正在创建隔离 Git worktree", { worktree: path.relative(workspaceRoot, worktree) });
     await git(project, ["worktree", "add", "-b", run.branch, worktree, "HEAD"], controller.signal);
     await update(run, "developing", "developer", "agent.started", `${run.developer.model} 开始真实开发`, { summary: "Developer Agent 正在修改代码" });
@@ -263,6 +277,8 @@ async function executeJob(input: JobInput, controller: AbortController) {
         model: run.developer.model,
         prompt: developerPrompt,
         sessionId: `${run.id.replaceAll("_", "-")}-developer`,
+        apiKey: input.credentials.developer,
+        apiKeyEnvironmentName: "DEEPSEEK_API_KEY",
         signal: controller.signal,
         onActivity: (message) => postUpdate(run.id, { event: { round, source: "developer", type: "agent.activity", message } }),
       });
@@ -292,6 +308,8 @@ async function executeJob(input: JobInput, controller: AbortController) {
         model: run.reviewer.model,
         prompt: reviewPrompt,
         readOnly: true,
+        apiKey: input.credentials.reviewer,
+        apiKeyEnvironmentName: "OPENAI_API_KEY",
         signal: controller.signal,
         onActivity: (message) => postUpdate(run.id, { event: { round, source: "reviewer", type: "agent.activity", message } }),
       });
@@ -313,11 +331,17 @@ async function executeJob(input: JobInput, controller: AbortController) {
     await update(run, "needs_human", "system", "run.needs_human", "达到最大审核轮次，需要人工处理", { findings, durationMs: Date.now() - started });
   } catch (error) {
     const cancelled = controller.signal.aborted;
-    await update(run, cancelled ? "cancelled" : "failed", "system", cancelled ? "run.cancelled" : "run.failed", cancelled ? "任务已取消" : `真实运行失败：${(error as Error).message}`, {
-      summary: cancelled ? "已取消" : (error as Error).message,
+    const safeMessage = [input.credentials.developer, input.credentials.reviewer].reduce(
+      (message, secret) => secret ? message.replaceAll(secret, "[redacted]") : message,
+      (error as Error).message,
+    );
+    await update(run, cancelled ? "cancelled" : "failed", "system", cancelled ? "run.cancelled" : "run.failed", cancelled ? "任务已取消" : `真实运行失败：${safeMessage}`, {
+      summary: cancelled ? "已取消" : safeMessage,
       durationMs: Date.now() - started,
     }).catch(() => undefined);
   } finally {
+    input.credentials.developer = "";
+    input.credentials.reviewer = "";
     active.delete(run.id);
   }
 }
@@ -330,7 +354,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/projects") return json(response, 200, await listProjects());
     if (request.method === "POST" && url.pathname === "/jobs") {
       const body = await readJson(request) as unknown as JobInput;
-      if (!body.run?.id || body.run.mode !== "real" || !Array.isArray(body.checks)) return json(response, 400, { error: "Invalid job" });
+      if (!body.run?.id || body.run.mode !== "real" || !Array.isArray(body.checks) || !body.credentials?.developer || !body.credentials?.reviewer) return json(response, 400, { error: "Invalid job" });
       if (active.has(body.run.id)) return json(response, 409, { error: "Job already active" });
       const controller = new AbortController();
       active.set(body.run.id, controller);

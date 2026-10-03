@@ -11,7 +11,7 @@ describe("RunStore", () => {
     const file = path.join(directory, "runs.json");
     const store = new RunStore(file);
     await store.init();
-    const run = baseDemoRun({ title: "Test run", task: "A sufficiently long test task", repository: "test/repo" });
+    const run = baseDemoRun({ title: "Test run", task: "A sufficiently long test task", repository: "test/repo" }, "owner-a");
 
     await store.createRun(run, {
       runId: run.id,
@@ -31,7 +31,9 @@ describe("RunStore", () => {
     });
 
     expect(store.getEvents(run.id).map((event) => event.seq)).toEqual([1, 2]);
+    expect(store.listRuns("owner-a")).toHaveLength(1);
+    expect(store.listRuns("owner-b")).toHaveLength(0);
+    expect(store.getRun(run.id, "owner-b")).toBeUndefined();
     expect(JSON.parse(await readFile(file, "utf8")).runs).toHaveLength(1);
   });
 });
-

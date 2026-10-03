@@ -27,8 +27,10 @@ import {
   FileCode2,
   GitBranch,
   GitPullRequestArrow,
+  KeyRound,
   ListChecks,
   LoaderCircle,
+  LogOut,
   Menu,
   PanelRightClose,
   Play,
@@ -44,7 +46,7 @@ import {
   Zap,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { ConfigStatus, Finding, ProjectInfo, Run, RunEvent, RunMode, RunState } from "../shared/types";
+import type { ConfigStatus, CurrentUser, Finding, ProjectInfo, Run, RunEvent, RunMode, RunState } from "../shared/types";
 import { api } from "./api";
 
 type Tab = "activity" | "review" | "diff" | "checks";
@@ -301,6 +303,78 @@ function CreateRunDialog({ open, onClose, onCreated, config }: {
   );
 }
 
+function CredentialsDialog({ open, onClose, config, onChanged }: {
+  open: boolean;
+  onClose: () => void;
+  config?: ConfigStatus;
+  onChanged: (config: ConfigStatus) => void;
+}) {
+  const [developerApiKey, setDeveloperApiKey] = useState("");
+  const [reviewerApiKey, setReviewerApiKey] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
+
+  if (!open) return null;
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setSubmitting(true);
+    setError("");
+    try {
+      await api.saveCredentials({
+        developerApiKey: developerApiKey || undefined,
+        reviewerApiKey: reviewerApiKey || undefined,
+      });
+      setDeveloperApiKey("");
+      setReviewerApiKey("");
+      onChanged(await api.config());
+      onClose();
+    } catch (cause) {
+      setError((cause as Error).message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+  const remove = async () => {
+    if (!window.confirm("删除当前账户保存的全部模型 Key？删除后真实开发将不可用。")) return;
+    setSubmitting(true);
+    setError("");
+    try {
+      await api.deleteCredentials();
+      onChanged(await api.config());
+      onClose();
+    } catch (cause) {
+      setError((cause as Error).message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose}>
+      <form className="modal credential-modal" onSubmit={submit} onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-head">
+          <div><span className="eyebrow">PERSONAL MODEL VAULT</span><h2>个人模型 Key</h2></div>
+          <button className="icon-button" type="button" onClick={onClose}><X size={18} /></button>
+        </div>
+        <div className="security-notice"><ShieldCheck size={18} /><div><strong>仅当前账户可用</strong><span>Key 经 AES-256-GCM 加密后保存，界面和 API 永不回显明文。留空可保留原 Key。</span></div></div>
+        <label>DeepSeek 开发模型 Key
+          <input type="password" autoComplete="new-password" value={developerApiKey} onChange={(event) => setDeveloperApiKey(event.target.value)} placeholder={config?.developer.credentialConfigured ? "已配置 · 输入新值可轮换" : "输入个人 Key"} />
+        </label>
+        <label>OpenAI 审核模型 Key
+          <input type="password" autoComplete="new-password" value={reviewerApiKey} onChange={(event) => setReviewerApiKey(event.target.value)} placeholder={config?.reviewer.credentialConfigured ? "已配置 · 输入新值可轮换" : "输入个人 Key"} />
+        </label>
+        <p className="credential-help">真实任务只在对应 Agent 进程运行期间把 Key 注入内存；不会写入任务、日志、Diff 或 Git 仓库。</p>
+        {error && <div className="form-error">{error}</div>}
+        <div className="modal-actions split-actions">
+          <button type="button" className="button danger-text" disabled={submitting || (!config?.developer.credentialConfigured && !config?.reviewer.credentialConfigured)} onClick={() => void remove()}>删除全部 Key</button>
+          <span />
+          <button type="button" className="button secondary" onClick={onClose}>取消</button>
+          <button type="submit" className="button primary" disabled={submitting || (!developerApiKey && !reviewerApiKey)}>{submitting ? <LoaderCircle className="spin" size={16} /> : <KeyRound size={16} />}安全保存</button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
 function ActivityPanel({ events }: { events: RunEvent[] }) {
   if (!events.length) return <EmptyPanel icon={Activity} text="等待事件" />;
   return (
@@ -377,8 +451,10 @@ export function App() {
   const [run, setRun] = useState<Run>();
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [config, setConfig] = useState<ConfigStatus>();
+  const [user, setUser] = useState<CurrentUser>();
   const [tab, setTab] = useState<Tab>("activity");
   const [createOpen, setCreateOpen] = useState(false);
+  const [credentialsOpen, setCredentialsOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [loading, setLoading] = useState(true);
 
@@ -389,7 +465,7 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    void Promise.all([api.config().then(setConfig), refreshRuns()]).finally(() => setLoading(false));
+    void Promise.all([api.config().then(setConfig), api.me().then(setUser), refreshRuns()]).finally(() => setLoading(false));
   }, [refreshRuns]);
 
   useEffect(() => {
@@ -429,7 +505,7 @@ export function App() {
         <button className="new-run" onClick={() => setCreateOpen(true)}><Plus size={17} />新建任务<span>⌘ K</span></button>
         <nav className="primary-nav">
           <a className="active" href="#workflow"><GitBranch size={16} />工作流</a>
-          <a href="#models"><Cpu size={16} />模型连接<span className="nav-badge">2</span></a>
+          <button type="button" onClick={() => setCredentialsOpen(true)}><KeyRound size={16} />个人模型 Key<span className="nav-badge">BYOK</span></button>
           <a href="#system"><Activity size={16} />运行状态</a>
         </nav>
         <div className="sidebar-section-head"><span>最近任务</span><Search size={14} /></div>
@@ -447,9 +523,10 @@ export function App() {
           <div className="providers-title"><span>AGENT ROUTING</span><Zap size={13} /></div>
           <ProviderStatus label="开发" provider={config.developer.provider} model={config.developer.model} ready={config.developer.credentialConfigured} icon={Code2} />
           <ProviderStatus label="审核" provider={config.reviewer.provider} model={config.reviewer.model} ready={config.reviewer.credentialConfigured} icon={ShieldCheck} />
+          <button className="manage-credentials" type="button" onClick={() => setCredentialsOpen(true)}><KeyRound size={13} />配置或轮换个人 Key</button>
           <div className={`credential-warning ${config.realRunsAvailable ? "runner-ready" : ""}`}><AlertTriangle size={13} />{config.realRunsAvailable ? "真实执行已启用" : "真实执行尚未启用"}</div>
         </div>}
-        <div className="sidebar-footer"><span className="system-dot" />Pi {config?.piVersion || "—"}<span>Web 0.1</span></div>
+        <div className="account-footer"><div><span className="system-dot" /><strong>{user?.email || "正在验证账户"}</strong><small>Pi {config?.piVersion || "—"}</small></div><a href="/cdn-cgi/access/logout" title="退出登录"><LogOut size={15} /></a></div>
       </aside>
 
       <main className="main-content">
@@ -524,6 +601,7 @@ export function App() {
         )}
       </main>
       <CreateRunDialog open={createOpen} onClose={() => setCreateOpen(false)} onCreated={handleCreated} config={config} />
+      <CredentialsDialog open={credentialsOpen} onClose={() => setCredentialsOpen(false)} config={config} onChanged={setConfig} />
     </div>
   );
 }

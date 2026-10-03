@@ -44,6 +44,7 @@ export interface RunEvent {
 
 export interface Run {
   id: string;
+  ownerId: string;
   title: string;
   task: string;
   repository: string;
@@ -88,4 +89,15 @@ export interface ConfigStatus {
   developer: { provider: string; model: string; credentialConfigured: boolean };
   reviewer: { provider: string; model: string; credentialConfigured: boolean };
   realRunsAvailable: boolean;
+}
+
+export interface CurrentUser {
+  id: string;
+  email: string;
+}
+
+export interface CredentialStatus {
+  developerConfigured: boolean;
+  reviewerConfigured: boolean;
+  updatedAt: string | null;
 }

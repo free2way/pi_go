@@ -26,12 +26,12 @@ export class RunStore {
     }
   }
 
-  listRuns() {
-    return [...this.data.runs].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  listRuns(ownerId: string) {
+    return this.data.runs.filter((run) => run.ownerId === ownerId).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
-  getRun(id: string) {
-    return this.data.runs.find((run) => run.id === id);
+  getRun(id: string, ownerId?: string) {
+    return this.data.runs.find((run) => run.id === id && (!ownerId || run.ownerId === ownerId));
   }
 
   async createRun(run: Run, event: Omit<RunEvent, "seq">) {
@@ -87,4 +87,3 @@ export class RunStore {
     return this.writeQueue;
   }
 }
-

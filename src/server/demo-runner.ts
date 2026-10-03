@@ -43,10 +43,11 @@ const finding: Finding = {
   resolved: false,
 };
 
-export function baseDemoRun(input: { title: string; task: string; repository: string }): Run {
+export function baseDemoRun(input: { title: string; task: string; repository: string }, ownerId: string): Run {
   const now = new Date().toISOString();
   return {
     id: `run_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`,
+    ownerId,
     title: input.title,
     task: input.task,
     repository: input.repository || "demo/auth-service",

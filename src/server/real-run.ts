@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 import type { CreateRunInput, Run } from "../shared/types.js";
 
-export function baseRealRun(input: CreateRunInput): Run {
+export function baseRealRun(input: CreateRunInput, ownerId: string): Run {
   const now = new Date().toISOString();
   const id = `run_${randomUUID().replaceAll("-", "").slice(0, 16)}`;
   return {
     id,
+    ownerId,
     title: input.title,
     task: input.task,
     repository: input.repository,
