@@ -1,0 +1,11 @@
+.git
+.env
+.codex-tmp-ssh-key
+node_modules
+dist
+data
+deploy/docker/.env
+deploy/docker/workspace
+npm-debug.log*
+*.pem
+*.key

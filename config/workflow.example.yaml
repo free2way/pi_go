@@ -1,0 +1,56 @@
+version: 1
+
+workspace:
+  root: ${PI_WORKSPACE_ROOT}
+  strategy: git-worktree
+  requireCleanRepository: true
+  branchPrefix: ai-run/
+  keepFailedWorkspace: true
+
+developer:
+  provider: ${PI_DEVELOPER_PROVIDER}
+  model: ${PI_DEVELOPER_MODEL}
+  thinkingLevel: high
+  tools:
+    - read
+    - write
+    - edit
+    - bash
+  instructionsFile: prompts/developer.md
+
+reviewer:
+  provider: ${PI_REVIEWER_PROVIDER}
+  model: ${PI_REVIEWER_MODEL}
+  thinkingLevel: high
+  # The reviewer runs against a disposable snapshot, so even a shell command
+  # cannot mutate the developer's working tree.
+  isolation: disposable-snapshot
+  tools:
+    - read
+    - bash
+  instructionsFile: prompts/reviewer.md
+
+checks:
+  # Replace these commands per repository. Empty/missing scripts should be a
+  # configuration error, not silently treated as success.
+  commands:
+    - npm run lint
+    - npm run typecheck
+    - npm test
+  timeoutSeconds: 900
+
+loop:
+  maxReviewRounds: ${PI_MAX_REVIEW_ROUNDS}
+  stopOnSameFindingTwice: true
+  onLimit: needs_human
+  approvalRequiresChecksPassing: true
+
+limits:
+  runTimeoutSeconds: ${PI_RUN_TIMEOUT_SECONDS}
+  maxChangedFiles: 100
+  maxDiffBytes: 1000000
+
+ui:
+  eventTransport: sse
+  retainEventDays: 30
+

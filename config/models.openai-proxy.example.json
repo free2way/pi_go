@@ -1,0 +1,16 @@
+{
+  "providers": {
+    "openai-proxy": {
+      "baseUrl": "https://pr.ai2note.com/v1",
+      "api": "openai-completions",
+      "apiKey": "$OPENAI_API_KEY",
+      "models": [
+        {
+          "id": "gpt-5.6-sol",
+          "name": "GPT-5.6 Sol",
+          "reasoning": true
+        }
+      ]
+    }
+  }
+}

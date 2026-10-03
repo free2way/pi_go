@@ -1,0 +1,11 @@
+node_modules/
+dist/
+data/*.json
+.env
+.env.*
+!.env.example
+.codex-tmp-ssh-key/
+deploy/docker/workspace/*
+!deploy/docker/workspace/.gitkeep
+*.tgz
+npm-debug.log*
