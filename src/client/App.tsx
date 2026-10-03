@@ -25,6 +25,7 @@ import {
   Code2,
   Cpu,
   FileCode2,
+  FolderGit2,
   GitBranch,
   GitPullRequestArrow,
   KeyRound,
@@ -49,6 +50,7 @@ import {
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ConfigStatus, CurrentUser, Finding, ProjectInfo, Run, RunEvent, RunMode, RunState } from "../shared/types";
 import { api } from "./api";
+import { WorkspacesPage } from "./WorkspacesPage";
 
 type Tab = "activity" | "agents" | "review" | "diff" | "checks";
 type FlowNodeData = {
@@ -472,6 +474,7 @@ export function App() {
   const [config, setConfig] = useState<ConfigStatus>();
   const [user, setUser] = useState<CurrentUser>();
   const [tab, setTab] = useState<Tab>("activity");
+  const [view, setView] = useState<"run" | "workspaces">("run");
   const [createOpen, setCreateOpen] = useState(false);
   const [credentialsOpen, setCredentialsOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -515,6 +518,7 @@ export function App() {
     setSelectedId(created.id);
     setRun(created);
     setEvents([]);
+    setView("run");
   };
 
   const handleDelete = async (target: Run) => {
@@ -539,7 +543,8 @@ export function App() {
         <div className="sidebar-top"><Logo /><button className="icon-button mobile-only" onClick={() => setSidebarOpen(false)}><X size={18} /></button></div>
         <button className="new-run" onClick={() => setCreateOpen(true)}><Plus size={17} />新建任务<span>⌘ K</span></button>
         <nav className="primary-nav">
-          <a className="active" href="#workflow"><GitBranch size={16} />工作流</a>
+          <button type="button" className={view === "run" ? "active" : ""} onClick={() => setView("run")}><GitBranch size={16} />工作流</button>
+          <button type="button" className={view === "workspaces" ? "active" : ""} onClick={() => setView("workspaces")}><FolderGit2 size={16} />工作区</button>
           <button type="button" onClick={() => setCredentialsOpen(true)}><KeyRound size={16} />个人模型 Key<span className="nav-badge">BYOK</span></button>
           <a href="#system"><Activity size={16} />运行状态</a>
         </nav>
@@ -547,7 +552,7 @@ export function App() {
         <div className="run-list">
           {runs.map((item) => (
             <div className={`run-item ${selectedId === item.id ? "selected" : ""}`} key={item.id}>
-              <button className="run-item-main" onClick={() => { setSelectedId(item.id); setSidebarOpen(false); }}>
+              <button className="run-item-main" onClick={() => { setSelectedId(item.id); setSidebarOpen(false); setView("run"); }}>
                 <span className={`run-state-dot status-${item.state}`} />
                 <span><strong>{item.title}</strong><small>{item.repository} · R{item.round}</small></span>
                 <ChevronRight size={14} className="run-item-chevron" />
@@ -572,15 +577,21 @@ export function App() {
       <main className="main-content">
         <header className="topbar">
           <button className="icon-button mobile-only" onClick={() => setSidebarOpen(true)}><Menu size={19} /></button>
-          <div className="breadcrumb"><span>WORKFLOWS</span><ChevronRight size={13} /><strong>{run?.id.slice(0, 12) || "OVERVIEW"}</strong></div>
+          <div className="breadcrumb">
+            {view === "workspaces"
+              ? <><span>WORKSPACES</span><ChevronRight size={13} /><strong>工作区</strong></>
+              : <><span>WORKFLOWS</span><ChevronRight size={13} /><strong>{run?.id.slice(0, 12) || "OVERVIEW"}</strong></>}
+          </div>
           <div className="topbar-actions">
-            {run?.mode === "demo" ? <span className="demo-chip"><Sparkles size={13} />演示数据</span> : run && <span className="demo-chip real-chip"><Code2 size={13} />真实工作区</span>}
-            {run && !terminalStates.includes(run.state) && <button className="button danger-small" onClick={() => void api.cancelRun(run.id)}><Square size={12} />停止</button>}
+            {view === "run" && (run?.mode === "demo" ? <span className="demo-chip"><Sparkles size={13} />演示数据</span> : run && <span className="demo-chip real-chip"><Code2 size={13} />真实工作区</span>)}
+            {view === "run" && run && !terminalStates.includes(run.state) && <button className="button danger-small" onClick={() => void api.cancelRun(run.id)}><Square size={12} />停止</button>}
             <button className="icon-button"><PanelRightClose size={17} /></button>
           </div>
         </header>
 
-        {!run ? (
+        {view === "workspaces" ? (
+          <WorkspacesPage config={config} runs={runs} onOpenCredentials={() => setCredentialsOpen(true)} />
+        ) : !run ? (
           <section className="welcome-state">
             <div className="welcome-orbit"><div><Bot size={32} /></div><i /><i /><i /></div>
             <span className="eyebrow">MULTI-MODEL ENGINEERING</span>

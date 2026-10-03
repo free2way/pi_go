@@ -9,8 +9,11 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     },
   });
   if (!response.ok) {
-    const error = (await response.json().catch(() => ({}))) as { error?: string };
-    throw new Error(error.error || `Request failed: ${response.status}`);
+    const error = (await response.json().catch(() => ({}))) as { error?: string; code?: string };
+    const failure = new Error(error.error || `Request failed: ${response.status}`) as Error & { code?: string; status?: number };
+    failure.code = error.code;
+    failure.status = response.status;
+    throw failure;
   }
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
@@ -30,6 +33,8 @@ export const api = {
   cloneWorkspace: (body: { url: string; name: string }) =>
     request<Workspace>("/api/workspaces/clone", { method: "POST", body: JSON.stringify(body) }),
   refreshWorkspace: (id: string) => request<Workspace>(`/api/workspaces/${id}/refresh`, { method: "POST" }),
+  patchWorkspace: (id: string, body: { defaultChecks?: string[]; defaultBranch?: string }) =>
+    request<Workspace>(`/api/workspaces/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   unregisterWorkspace: (id: string) => request<void>(`/api/workspaces/${id}`, { method: "DELETE" }),
   runs: () => request<Run[]>("/api/runs"),
   run: (id: string) => request<Run>(`/api/runs/${id}`),
