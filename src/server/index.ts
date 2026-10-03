@@ -213,9 +213,9 @@ function vaultKeyFor(request: FastifyRequest) {
 app.get("/api/health", async (_request, reply) => {
   try {
     await db.query("SELECT 1");
-    return { status: "ok", service: "pigo-web", version: "0.6.0", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.6.1", db: "ok" };
   } catch {
-    return reply.code(503).send({ status: "error", service: "pigo-web", version: "0.6.0", db: "unavailable" });
+    return reply.code(503).send({ status: "error", service: "pigo-web", version: "0.6.1", db: "unavailable" });
   }
 });
 app.get("/api/me", async (request) => auth.user(request));

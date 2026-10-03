@@ -25,8 +25,14 @@ function describeError(cause: unknown): string {
       return "工作区不存在，可能已被解除注册。";
     case "WORKSPACE_OUTSIDE_ROOT":
       return "路径越界：只能使用受控根目录内的相对路径，符号链接同样不允许指向根目录之外。";
-    case "WORKSPACE_INVALID":
-      return (cause as Error).message || "目录校验失败：需要受控根目录内有效的 Git 仓库。";
+    case "WORKSPACE_INVALID": {
+      const raw = (cause as Error).message || "";
+      if (raw.includes("does not exist")) return "目录不存在：请确认相对路径正确，且位于受控项目根目录内。";
+      if (raw.includes("Not a Git repository")) return "该目录不是有效的 Git 仓库（缺少 .git）。";
+      if (raw.includes("Invalid workspace name")) return "名称不合法：只能包含字母、数字、点、连字符和下划线（1–80 个字符）。";
+      if (raw.includes("Invalid workspace path")) return "路径不合法：只允许受控项目根目录内的相对路径，不允许 ../ 或绝对路径。";
+      return raw || "目录校验失败：需要受控项目根目录内有效的 Git 仓库。";
+    }
     case "WORKSPACES_DISABLED":
       return "服务器未启用工作区功能（PI_WORKSPACES_ENABLED=false）。";
     default:
