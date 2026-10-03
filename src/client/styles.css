@@ -49,12 +49,18 @@ button { color: inherit; }
 .nav-badge { margin-left: auto; min-width: 18px; height: 18px; border-radius: 5px; background: #20262c; color: #8f99a4; display: grid; place-items: center; font: 9px "DM Mono", monospace; }
 .sidebar-section-head { display: flex; justify-content: space-between; align-items: center; padding: 0 9px; margin: 25px 0 8px; color: #535d67; font: 500 9px "DM Mono", monospace; letter-spacing: .11em; text-transform: uppercase; }
 .run-list { display: grid; gap: 3px; overflow-y: auto; min-height: 70px; max-height: 34vh; scrollbar-width: thin; }
-.run-list button { width: 100%; min-height: 51px; border: 1px solid transparent; background: transparent; border-radius: 8px; display: grid; grid-template-columns: 8px 1fr 14px; gap: 9px; align-items: center; text-align: left; padding: 7px 8px; cursor: pointer; color: var(--muted); }
-.run-list button:hover { background: #101419; }
-.run-list button.selected { background: #14181d; border-color: #20262d; color: var(--text); }
+.run-item { position: relative; display: flex; }
+.run-item-main { width: 100%; min-height: 51px; border: 1px solid transparent; background: transparent; border-radius: 8px; display: grid; grid-template-columns: 8px 1fr 14px; gap: 9px; align-items: center; text-align: left; padding: 7px 8px; cursor: pointer; color: var(--muted); }
+.run-item-main:hover { background: #101419; }
+.run-item.selected .run-item-main { background: #14181d; border-color: #20262d; color: var(--text); }
 .run-list strong { display: block; font-size: 11px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 160px; }
 .run-list small { display: block; font: 9px "DM Mono", monospace; color: #59626c; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 160px; }
-.run-list button > svg { opacity: .35; }
+.run-item-main > svg { opacity: .35; }
+.run-item-chevron { transition: opacity .15s ease; }
+.run-item:hover .run-item-chevron, .run-item:focus-within .run-item-chevron { opacity: 0; }
+.run-item-delete { position: absolute; right: 5px; top: 50%; transform: translateY(-50%); width: 26px; height: 26px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 7px; background: transparent; color: #6b7680; opacity: 0; cursor: pointer; transition: opacity .15s ease, color .15s ease, background .15s ease, border-color .15s ease; }
+.run-item:hover .run-item-delete, .run-item:focus-within .run-item-delete { opacity: 1; }
+.run-item-delete:hover { color: #e08383; background: rgba(242,113,113,.08); border-color: rgba(242,113,113,.16); }
 .run-state-dot { width: 6px; height: 6px; border-radius: 50%; background: #454e58; }
 .run-state-dot.status-developing, .run-state-dot.status-checking, .run-state-dot.status-reviewing, .run-state-dot.status-preparing { background: var(--accent); box-shadow: 0 0 8px rgba(223,248,84,.4); }
 .run-state-dot.status-completed { background: var(--green); }
@@ -272,6 +278,7 @@ button { color: inherit; }
   .content-grid { grid-template-columns: minmax(0, 1fr); }
   .flow-wrap { height: 370px; }
   .flow-card { width: 158px; }
+  .run-item-delete { opacity: 1; }
   .demo-chip { display: none; }
 }
 

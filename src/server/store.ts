@@ -78,6 +78,15 @@ export class RunStore {
     };
   }
 
+  async deleteRun(id: string) {
+    const index = this.data.runs.findIndex((run) => run.id === id);
+    if (index === -1) throw new Error(`Run not found: ${id}`);
+    this.data.runs.splice(index, 1);
+    delete this.data.events[id];
+    this.listeners.delete(id);
+    await this.persist();
+  }
+
   private persist() {
     const attempt = this.writeQueue
       .catch((error) => {

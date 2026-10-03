@@ -3,7 +3,10 @@ import type { ConfigStatus, CredentialStatus, CurrentUser, ProjectInfo, Run, Run
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
     ...init,
-    headers: { "Content-Type": "application/json", ...init?.headers },
+    headers: {
+      ...(init?.body ? { "Content-Type": "application/json" } : {}),
+      ...init?.headers,
+    },
   });
   if (!response.ok) {
     const error = (await response.json().catch(() => ({}))) as { error?: string };
@@ -27,4 +30,5 @@ export const api = {
   createRun: (body: { title: string; task: string; repository: string; mode: "demo" | "real"; checks?: string[] }) =>
     request<Run>("/api/runs", { method: "POST", body: JSON.stringify(body) }),
   cancelRun: (id: string) => request<Run>(`/api/runs/${id}/cancel`, { method: "POST" }),
+  deleteRun: (id: string) => request<void>(`/api/runs/${id}`, { method: "DELETE" }),
 };

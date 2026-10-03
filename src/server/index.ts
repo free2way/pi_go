@@ -275,6 +275,16 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/cancel", async (request, rep
   return store.getRun(run.id, auth.user(request).id);
 });
 
+app.delete<{ Params: { id: string } }>("/api/runs/:id", async (request, reply) => {
+  const run = store.getRun(request.params.id, auth.user(request).id);
+  if (!run) return reply.code(404).send({ error: "Run not found" });
+  if (!["completed", "failed", "cancelled", "needs_human"].includes(run.state)) {
+    return reply.code(409).send({ error: `Cannot delete a run in ${run.state}; cancel it first` });
+  }
+  await store.deleteRun(run.id);
+  return reply.code(204).send();
+});
+
 app.post<{ Params: { id: string } }>("/api/internal/runs/:id/update", { bodyLimit: 4 * 1024 * 1024 }, async (request, reply) => {
   if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
   const parsed = internalUpdateSchema.safeParse(request.body);

@@ -41,6 +41,7 @@ import {
   Sparkles,
   Square,
   TerminalSquare,
+  Trash2,
   X,
   XCircle,
   Zap,
@@ -516,6 +517,22 @@ export function App() {
     setEvents([]);
   };
 
+  const handleDelete = async (target: Run) => {
+    if (!terminalStates.includes(target.state)) {
+      window.alert("任务仍在运行，请先点击右上角「停止」，结束后再删除。");
+      return;
+    }
+    if (!window.confirm(`删除任务「${target.title}」？任务记录与事件会一并删除（代码仍保留在服务器 worktree）。`)) return;
+    try {
+      await api.deleteRun(target.id);
+      const next = await api.runs();
+      setRuns(next);
+      if (selectedId === target.id) setSelectedId(next[0]?.id);
+    } catch (cause) {
+      window.alert(`删除失败：${(cause as Error).message}`);
+    }
+  };
+
   return (
     <div className="app-shell">
       <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
@@ -529,11 +546,16 @@ export function App() {
         <div className="sidebar-section-head"><span>最近任务</span><Search size={14} /></div>
         <div className="run-list">
           {runs.map((item) => (
-            <button className={selectedId === item.id ? "selected" : ""} key={item.id} onClick={() => { setSelectedId(item.id); setSidebarOpen(false); }}>
-              <span className={`run-state-dot status-${item.state}`} />
-              <span><strong>{item.title}</strong><small>{item.repository} · R{item.round}</small></span>
-              <ChevronRight size={14} />
-            </button>
+            <div className={`run-item ${selectedId === item.id ? "selected" : ""}`} key={item.id}>
+              <button className="run-item-main" onClick={() => { setSelectedId(item.id); setSidebarOpen(false); }}>
+                <span className={`run-state-dot status-${item.state}`} />
+                <span><strong>{item.title}</strong><small>{item.repository} · R{item.round}</small></span>
+                <ChevronRight size={14} className="run-item-chevron" />
+              </button>
+              <button className="run-item-delete" title="删除任务" onClick={() => void handleDelete(item)}>
+                <Trash2 size={13} />
+              </button>
+            </div>
           ))}
           {!runs.length && !loading && <div className="sidebar-empty">还没有任务</div>}
         </div>

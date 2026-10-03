@@ -78,4 +78,28 @@ describe("RunStore", () => {
     expect(persisted.events[run.id]).toHaveLength(3);
     expect(store.getEvents(run.id).map((event) => event.seq)).toEqual([1, 2, 3]);
   });
+
+  it("deletes a run together with its events", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "pigo-store-"));
+    const file = path.join(directory, "runs.json");
+    const store = new RunStore(file);
+    await store.init();
+    const run = baseDemoRun({ title: "Delete me", task: "A sufficiently long test task", repository: "test/repo" }, "owner-a");
+    await store.createRun(run, {
+      runId: run.id,
+      round: 1,
+      source: "system",
+      type: "run.created",
+      message: "created",
+      at: new Date().toISOString(),
+    });
+
+    await store.deleteRun(run.id);
+
+    expect(store.getRun(run.id)).toBeUndefined();
+    expect(store.getEvents(run.id)).toEqual([]);
+    const persisted = JSON.parse(await readFile(file, "utf8")) as { runs: unknown[]; events: Record<string, unknown[]> };
+    expect(persisted.runs).toHaveLength(0);
+    expect(persisted.events[run.id]).toBeUndefined();
+  });
 });
