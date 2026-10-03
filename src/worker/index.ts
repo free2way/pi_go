@@ -67,6 +67,27 @@ function authorized(request: IncomingMessage) {
   return header.length === expected.length && timingSafeEqual(header, expected);
 }
 
+const maxCallbackBytes = 3 * 1024 * 1024;
+
+function encodeCallbackBody(input: {
+  patch?: Partial<Run>;
+  event?: Omit<RunEvent, "seq" | "runId" | "at">;
+}) {
+  let body = JSON.stringify(input);
+  if (Buffer.byteLength(body) <= maxCallbackBytes) return body;
+  const patch = input.patch as Record<string, unknown> | undefined;
+  if (patch && typeof patch.diff === "string") patch.diff = patch.diff.slice(0, 400_000);
+  body = JSON.stringify(input);
+  if (Buffer.byteLength(body) > maxCallbackBytes && Array.isArray(patch?.checks)) {
+    for (const check of patch.checks as Array<Record<string, unknown>>) {
+      if (typeof check.output === "string") check.output = check.output.slice(-4_000);
+    }
+    body = JSON.stringify(input);
+  }
+  if (Buffer.byteLength(body) > maxCallbackBytes) throw new Error("Callback payload exceeds the 3 MiB safety limit");
+  return body;
+}
+
 async function postUpdate(runId: string, input: {
   patch?: Partial<Run>;
   event?: Omit<RunEvent, "seq" | "runId" | "at">;
@@ -77,7 +98,7 @@ async function postUpdate(runId: string, input: {
       Authorization: `Bearer ${internalToken}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(input),
+    body: encodeCallbackBody(input),
     signal: AbortSignal.timeout(15_000),
   });
   if (!response.ok) throw new Error(`Callback failed: ${response.status}`);

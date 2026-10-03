@@ -275,7 +275,7 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/cancel", async (request, rep
   return store.getRun(run.id, auth.user(request).id);
 });
 
-app.post<{ Params: { id: string } }>("/api/internal/runs/:id/update", { bodyLimit: 1024 * 1024 }, async (request, reply) => {
+app.post<{ Params: { id: string } }>("/api/internal/runs/:id/update", { bodyLimit: 4 * 1024 * 1024 }, async (request, reply) => {
   if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
   const parsed = internalUpdateSchema.safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: "Invalid internal update", details: parsed.error.issues });
