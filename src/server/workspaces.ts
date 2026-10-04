@@ -82,9 +82,14 @@ export class WorkspaceService {
   async list(ownerKeys: string[]): Promise<Workspace[]> {
     if (ownerKeys.length === 0) return [];
     const placeholders = ownerKeys.map((_, index) => `$${index + 1}`).join(", ");
+    // AUD-02: owned workspaces plus explicitly granted ones (shared access).
     const rows = (await this.db.query(
-      `SELECT * FROM workspaces WHERE owner_id IN (${placeholders}) AND status != 'unregistered' ORDER BY updated_at DESC`,
-      ownerKeys,
+      `SELECT * FROM workspaces
+       WHERE (owner_id IN (${placeholders})
+              OR id IN (SELECT workspace_id FROM workspace_grants WHERE user_id IN (${placeholders})))
+         AND status != 'unregistered'
+       ORDER BY updated_at DESC`,
+      [...ownerKeys, ...ownerKeys],
     )).rows as WorkspaceRow[];
     return rows.map(toWorkspace);
   }
@@ -95,9 +100,28 @@ export class WorkspaceService {
     return toWorkspace(row);
   }
 
-  async register(ownerId: string, relativePath: string): Promise<Workspace> {
+  async register(ownerId: string, relativePath: string, options: { isAdmin?: boolean } = {}): Promise<Workspace> {
     const result = await this.verifyOnWorker(relativePath);
-    return this.persist(ownerId, result, null);
+    return this.persist(ownerId, result, null, options);
+  }
+
+  /**
+   * AUD-02 / AT-WS-011: a physical repository belongs to exactly one owner. A
+   * second user either already owns it, holds an explicit grant, or is rejected.
+   */
+  private async resolvePathOwnership(tx: Db, ownerId: string, canonicalPath: string, isAdmin: boolean, currentId?: string):
+  Promise<{ sharedWorkspaceId?: string }> {
+    if (!canonicalPath) return {};
+    const existing = (await tx.query("SELECT id, owner_id FROM workspaces WHERE canonical_path = $1", [canonicalPath])).rows[0] as { id: string; owner_id: string } | undefined;
+    if (!existing || existing.id === currentId) return {};
+    if (existing.owner_id === ownerId || isAdmin) return { sharedWorkspaceId: existing.id };
+    const grant = (await tx.query("SELECT 1 AS ok FROM workspace_grants WHERE workspace_id = $1 AND user_id = $2", [existing.id, ownerId])).rows[0];
+    if (grant) return { sharedWorkspaceId: existing.id };
+    throw new WorkspaceError(
+      "WORKSPACE_PATH_TAKEN",
+      "该物理仓库已归属于其他用户；如需共享，请联系管理员在 workspace_grants 中授权",
+      409,
+    );
   }
 
   async clone(ownerId: string, url: string, name: string): Promise<Workspace> {
@@ -160,11 +184,17 @@ export class WorkspaceService {
     return result;
   }
 
-  private async persist(ownerId: string, result: WorkspaceVerifyResult, repositoryUrl: string | null): Promise<Workspace> {
+  private async persist(ownerId: string, result: WorkspaceVerifyResult, repositoryUrl: string | null, options: { isAdmin?: boolean } = {}): Promise<Workspace> {
     const now = new Date().toISOString();
     const name = result.name!;
     return this.db.withTransaction(async (tx) => {
       const existing = (await tx.query("SELECT * FROM workspaces WHERE owner_id = $1 AND name = $2", [ownerId, name])).rows[0] as WorkspaceRow | undefined;
+      const ownership = await this.resolvePathOwnership(tx, ownerId, result.canonicalPath ?? "", options.isAdmin ?? false, existing?.id);
+      if (ownership.sharedWorkspaceId && !existing) {
+        // AUD-02: a granted (or admin) caller shares the owner's workspace record
+        // instead of creating a second row for the same physical repository.
+        return toWorkspace((await tx.query("SELECT * FROM workspaces WHERE id = $1", [ownership.sharedWorkspaceId])).rows[0] as WorkspaceRow);
+      }
       if (existing) {
         await tx.query(`
           UPDATE workspaces
@@ -199,8 +229,11 @@ export class WorkspaceService {
     if (ownerKeys.length === 0) return undefined;
     const placeholders = ownerKeys.map((_, index) => `$${index + 2}`).join(", ");
     return (await this.db.query(
-      `SELECT * FROM workspaces WHERE id = $1 AND owner_id IN (${placeholders})`,
-      [id, ...ownerKeys],
+      `SELECT * FROM workspaces
+       WHERE id = $1
+         AND (owner_id IN (${placeholders})
+              OR id IN (SELECT workspace_id FROM workspace_grants WHERE user_id IN (${placeholders})))`,
+      [id, ...ownerKeys, ...ownerKeys],
     )).rows[0] as WorkspaceRow | undefined;
   }
 }

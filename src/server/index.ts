@@ -333,7 +333,7 @@ app.get("/api/health", async (_request, reply) => {
   try {
     await pingDatabase();
     alerts.clear("database_unavailable");
-    return { status: "ok", service: "pigo-web", version: "0.16.3", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.17.0", db: "ok" };
   } catch (error) {
     // AT-REL-005: fail loudly instead of pretending the service is healthy.
     alerts.raise({
@@ -342,7 +342,7 @@ app.get("/api/health", async (_request, reply) => {
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
       details: { error: (error as Error).message.slice(0, 200) },
     });
-    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.16.3", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.17.0", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
   }
 });
 
@@ -357,7 +357,7 @@ interface StorageStatus {
 app.get("/api/health/detail", async (request, reply) => {
   const internal = safeTokenMatch(request.headers.authorization);
   if (!internal && !auth.user(request)) return reply.code(401).send({ error: "Unauthorized" });
-  const health: Record<string, unknown> = { version: "0.16.3", at: new Date().toISOString() };
+  const health: Record<string, unknown> = { version: "0.17.0", at: new Date().toISOString() };
   try {
     await pingDatabase();
     health.database = { status: "ok" };
@@ -450,10 +450,15 @@ app.get("/api/config/status", async (request): Promise<ConfigStatus> => {
   };
 });
 
-app.get("/api/projects", async (_request, reply) => {
+app.get("/api/projects", async (request, reply) => {
+  // AUD-02: the legacy global project listing is owner scoped (admins see all).
+  const admin = await identities.isAdmin(auth.user(request).id);
   if (!realRunsEnabled) return reply.code(503).send({ error: "Real runs are disabled" });
   try {
-    return await workerRequest("/projects");
+    const projects = await workerRequest<Array<{ relativePath: string }>>("/projects");
+    if (admin) return projects;
+    const allowed = new Set((await workspaces.list(ownerKeysFor(request))).map((item) => item.rootPath));
+    return projects.filter((project) => allowed.has(project.relativePath) || allowed.has(project.relativePath.replace(/^\/+/, "")));
   } catch (error) {
     return reply.code(503).send({ error: `Worker unavailable: ${(error as Error).message}` });
   }
@@ -496,7 +501,9 @@ app.post("/api/workspaces/register", async (request, reply) => {
   const parsed = workspaceRegisterSchema.safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
   try {
-    return reply.code(201).send(await workspaces.register(auth.user(request).id, parsed.data.relativePath));
+    // AUD-02: only the owner (or an admin) may claim a physical repository path.
+    const isAdmin = await identities.isAdmin(auth.user(request).id);
+    return reply.code(201).send(await workspaces.register(auth.user(request).id, parsed.data.relativePath, { isAdmin }));
   } catch (error) {
     return workspaceErrorReply(reply, error);
   }

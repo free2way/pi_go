@@ -91,4 +91,25 @@ describe("workspace service", () => {
     expect(redactGitUrl("https://user:token@example.com/repo.git")).toBe("https://***@example.com/repo.git");
     expect(redactGitUrl("https://example.com/repo.git")).toBe("https://example.com/repo.git");
   });
+
+  it("rejects a second owner for the same physical repository (AUD-02)", async () => {
+    const db = await createTestDb();
+    const service = new WorkspaceService(db, (async () => ({ ok: true, name: "private-project", relativePath: "private-project", canonicalPath: "/srv/projects/private-project", branch: "main", head: "abc", dirty: false, dirtyFiles: [] })) as unknown as ConstructorParameters<typeof WorkspaceService>[1]);
+    const first = await service.register("owner-a", "private-project");
+    expect(first.id).toBeTruthy();
+
+    await expect(service.register("owner-b", "private-project")).rejects.toMatchObject({ code: "WORKSPACE_PATH_TAKEN", status: 409 });
+
+    // Re-registering by the same owner stays idempotent.
+    const again = await service.register("owner-a", "private-project");
+    expect(again.id).toBe(first.id);
+
+    // An explicit grant shares the owner's workspace record instead of cloning it.
+    await db.query("INSERT INTO workspace_grants (workspace_id, user_id, granted_by, created_at) VALUES ($1, $2, $3, $4)", [first.id, "owner-b", "admin", new Date().toISOString()]);
+    const shared = await service.register("owner-b", "private-project");
+    expect(shared.id).toBe(first.id);
+    expect((await service.list(["owner-b"])).map((item) => item.id)).toEqual([first.id]);
+    expect(await service.refresh(["owner-b"], first.id)).toMatchObject({ id: first.id });
+  });
+
 });

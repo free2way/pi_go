@@ -56,6 +56,12 @@ export class IdentityService {
     return row?.legacy_owner_id ?? undefined;
   }
 
+  /** AUD-02: admins may claim any workspace path and see the global project list. */
+  async isAdmin(userId: string): Promise<boolean> {
+    const row = (await this.db.query("SELECT role FROM users WHERE id = $1", [userId])).rows[0] as { role: string } | undefined;
+    return row?.role === "admin";
+  }
+
   async resolve(input: IdentityInput): Promise<UserRecord> {
     const maxAttempts = 5;
     for (let attempt = 1; ; attempt += 1) {
