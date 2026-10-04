@@ -5,6 +5,7 @@ import { mkdir, readdir, realpath, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
 import type { CheckResult, DevelopmentPlan, Finding, ProjectInfo, Run, RunEvent, RunState, SubAgentTask, WorkspaceVerifyResult } from "../shared/types.js";
+import { CheckpointTracker, memoryCheckpointClient, stages, type Checkpoint, type CheckpointClient, type StoredChecks, type StoredReview } from "./checkpoints.js";
 import { conflictFreeBatches, executionWaves, fallbackPlan, parseDevelopmentPlan } from "./orchestrator.js";
 import { UsageTracker, addUsage, assistantErrorFromEvent, assistantTextFromEvent, emptyUsage, toRunUsage, toolNameFromEvent, type UsageTotals } from "./pi-events.js";
 import { apiKeyEnvName, classifyProviderError, providerErrorSummary } from "./provider-errors.js";
@@ -40,11 +41,73 @@ type JobInput = {
     developer: string;
     reviewer: string;
   };
+  /** Persisted job row used for heartbeats and stale-worker recovery (REL-002). */
+  jobId?: string;
+  /** True when this execution resumes a job that a previous worker left unfinished. */
+  recovery?: boolean;
   /** Human-in-the-loop resume: reuse the existing worktree and continue with the next round. */
   resume?: { instruction?: string };
   /** Human-in-the-loop: re-run only the reviewer against the current worktree. */
   retryReview?: boolean;
 };
+
+const workerId = process.env.PI_WORKER_ID || `worker-${process.pid}`;
+
+async function internalRequest(pathName: string, init?: RequestInit) {
+  const response = await fetch(`${callbackBase}/api/internal${pathName}`, {
+    ...init,
+    headers: { Authorization: `Bearer ${internalToken}`, "Content-Type": "application/json", ...init?.headers },
+    signal: AbortSignal.timeout(15_000),
+  });
+  const body = await response.json().catch(() => ({})) as Record<string, unknown>;
+  if (!response.ok) throw new Error(String(body.error || `Internal request failed: ${response.status}`));
+  return body;
+}
+
+const checkpointClient: CheckpointClient = {
+  list: async (runId) => {
+    const body = await internalRequest(`/runs/${encodeURIComponent(runId)}/checkpoints`);
+    return (body.checkpoints ?? []) as Checkpoint[];
+  },
+  save: async (runId, input) => {
+    await internalRequest(`/runs/${encodeURIComponent(runId)}/checkpoints`, { method: "POST", body: JSON.stringify(input) });
+  },
+};
+
+const jobApi = {
+  claim: (jobId: string) => internalRequest(`/jobs/${encodeURIComponent(jobId)}/claim`, { method: "POST", body: JSON.stringify({ workerId }) }),
+  heartbeat: (jobId: string) => internalRequest(`/jobs/${encodeURIComponent(jobId)}/heartbeat`, { method: "POST", body: JSON.stringify({ workerId }) }),
+  finish: (jobId: string, state: string, error?: string) => internalRequest(`/jobs/${encodeURIComponent(jobId)}/finish`, { method: "POST", body: JSON.stringify({ workerId, state, error }) }),
+  pending: async () => (await internalRequest(`/jobs/pending?workerId=${encodeURIComponent(workerId)}`)).jobs as PendingJob[],
+};
+
+type PendingJob = {
+  jobId: string;
+  kind: string;
+  run: Run;
+  checks: string[];
+  credentials: { developer: string; reviewer: string };
+};
+
+/** Keeps a claimed job's heartbeat fresh so only a truly dead worker is reclaimed. */
+function startJobHeartbeat(jobId: string | undefined) {
+  if (!jobId) return () => undefined;
+  void jobApi.claim(jobId).catch((error) => console.warn(`[jobs] claim failed: ${(error as Error).message}`));
+  const timer = setInterval(() => {
+    void jobApi.heartbeat(jobId).catch((error) => console.warn(`[jobs] heartbeat failed: ${(error as Error).message}`));
+  }, 20_000);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
+
+async function loadTracker(runId: string) {
+  try {
+    return await new CheckpointTracker(checkpointClient, runId).load();
+  } catch (error) {
+    console.warn(`[checkpoints] unavailable for ${runId}: ${(error as Error).message}`);
+    return new CheckpointTracker(memoryCheckpointClient(), runId);
+  }
+}
 
 function redactJobSecrets(message: string, credentials: JobInput["credentials"]) {
   return [credentials.developer, credentials.reviewer].reduce(
@@ -458,11 +521,30 @@ async function orchestrateSubAgents(input: {
   credentials: JobInput["credentials"];
   signal: AbortSignal;
   usage: UsageTotals;
+  tracker: CheckpointTracker;
 }) {
   const integrationNotes: string[] = [];
+  const restored: string[] = [];
   for (const wave of executionWaves(input.plan.tasks)) {
-    const runnable = wave.filter((task) => task.dependsOn.every((id) => input.plan.tasks.find((item) => item.id === id)?.status === "merged"));
-    for (const task of wave.filter((item) => !runnable.includes(item))) {
+    // REL-003 / AT-REL-002: sub-agents that finished before a restart are not
+    // executed again; their committed work is already in the integration worktree.
+    for (const task of wave) {
+      if (!input.tracker.isCompleted(stages.task(task.id))) continue;
+      const stored = input.tracker.payload<{ status?: string; summary?: string; durationMs?: number }>(stages.task(task.id)) ?? {};
+      task.status = stored.status === "failed" ? "failed" : "merged";
+      task.summary = stored.summary ?? "从检查点恢复：该 Sub Agent 已完成";
+      task.durationMs = stored.durationMs;
+      restored.push(task.title);
+    }
+    if (restored.length > 0) {
+      await postUpdate(input.run.id, {
+        patch: { plan: input.plan },
+        event: { round: input.run.round, source: "system", type: "subagents.restored", message: `从检查点恢复 ${restored.length} 个已完成 Sub Agent，跳过重复模型调用` },
+      });
+      restored.length = 0;
+    }
+    const runnable = wave.filter((task) => task.status === "planned" && task.dependsOn.every((id) => input.plan.tasks.find((item) => item.id === id)?.status === "merged"));
+    for (const task of wave.filter((item) => item.status === "planned" && !runnable.includes(item))) {
       task.status = "failed";
       task.summary = "A dependency failed to merge";
       integrationNotes.push(`${task.title}: skipped because a dependency failed`);
@@ -499,6 +581,11 @@ async function orchestrateSubAgents(input: {
         try {
           if (result.error) {
             integrationNotes.push(`${result.task.title}: ${result.error}`);
+            await input.tracker.complete(stages.task(result.task.id), {
+              status: "failed",
+              summary: result.task.summary,
+              durationMs: result.task.durationMs,
+            });
             continue;
           }
           if (result.commit) {
@@ -509,10 +596,20 @@ async function orchestrateSubAgents(input: {
               result.task.summary = `Merge conflict from ${result.branch}`;
               integrationNotes.push(`${result.task.title}: merge ${result.branch} manually (${(merged.stderr || merged.stdout).trim().slice(0, 160)})`);
               keepBranch = true;
+              await input.tracker.complete(stages.task(result.task.id), {
+                status: "failed",
+                summary: result.task.summary,
+                durationMs: result.task.durationMs,
+              });
               continue;
             }
           }
           result.task.status = "merged";
+          await input.tracker.complete(stages.task(result.task.id), {
+            status: "merged",
+            summary: result.task.summary,
+            durationMs: result.task.durationMs,
+          });
           await postUpdate(input.run.id, { event: { round: input.run.round, source: "developer", type: "subagent.merged", message: `Sub Agent「${result.task.title}」已合并` } });
         } finally {
           await removeSubAgentWorktree(input.project, result.worktree);
@@ -681,6 +778,12 @@ async function executeJob(input: JobInput, controller: AbortController) {
   const run = input.run;
   const started = Date.now();
   const usage: UsageTotals = emptyUsage();
+  const tracker = await loadTracker(run.id);
+  // A re-claimed job (worker restart) resumes against the checkpoints already
+  // recorded for this run: reuse the worktree and skip finished stages (REL-002/003).
+  const recovering = Boolean(!input.resume && !input.retryReview && (input.recovery || tracker.size > 0));
+  const stopHeartbeat = startJobHeartbeat(input.jobId);
+  let outcomeState: "done" | "failed" | "cancelled" = "done";
   try {
     const project = await resolveProject(run.repository);
     const dirty = await git(project, ["status", "--porcelain"], controller.signal);
@@ -688,8 +791,13 @@ async function executeJob(input: JobInput, controller: AbortController) {
     const projectHead = await git(project, ["rev-parse", "HEAD"], controller.signal);
     if (!/^[a-f0-9]{64}$/.test(run.ownerId)) throw new Error("Invalid run owner");
     const worktree = path.join(runsRoot, run.ownerId, run.id);
-    const reuseWorktree = Boolean(input.resume || input.retryReview);
+    const reuseWorktree = Boolean(input.resume || input.retryReview || recovering);
     const humanInstruction = input.resume?.instruction?.trim() || "";
+    if (recovering) {
+      await postUpdate(run.id, {
+        event: { round: run.round, source: "system", type: "run.recovered", message: `Worker 恢复未完成任务：从 ${tracker.size} 个检查点继续，不重复已完成的模型调用` },
+      });
+    }
 
     let baseCommit = projectHead;
     if (reuseWorktree) {
@@ -721,32 +829,49 @@ async function executeJob(input: JobInput, controller: AbortController) {
       await executeRetryReview({ run, worktree, baseCommit, credentials: input.credentials, controller, usage, started });
       return;
     }
-
     await update(run, "developing", "developer", "agent.started", `${run.developer.model} 主 Agent 开始评估工作量`, { summary: "主 Agent 正在分析任务并决定是否拆分 Sub Agent" });
 
-    let feedback = input.resume ? unresolvedFeedback(run.findings) : "";
-    let findings: Finding[] = input.resume ? [...(run.findings ?? [])] : [];
+    let feedback = input.resume || recovering ? unresolvedFeedback(run.findings) : "";
+    let findings: Finding[] = input.resume || recovering ? [...(run.findings ?? [])] : [];
     let plan: DevelopmentPlan | undefined;
-    const firstRound = input.resume ? Math.max(2, run.round) : 1;
+    const firstRound = input.resume ? Math.max(2, run.round) : recovering ? Math.max(1, run.round) : 1;
     for (let round = firstRound; round <= run.maxRounds; round += 1) {
       run.round = round;
       await postUpdate(run.id, { patch: { round }, event: { round, source: "system", type: "round.started", message: `开始第 ${round} 轮开发` } });
-      if (round === 1) {
-        plan = await planDevelopment(run, worktree, input.credentials, controller.signal, usage);
+      const developmentDone = tracker.isCompleted(stages.development(round));
+      if (developmentDone) {
+        // AT-REL-002: the developer stage already finished before the restart, so
+        // no developer model call is repeated; continue with checks and review.
+        plan = tracker.payload<DevelopmentPlan>(stages.planning) ?? plan ?? fallbackPlan(run.task);
         run.plan = plan;
-        await postUpdate(run.id, {
-          patch: { plan, usage: toRunUsage(usage) },
-          event: {
-            round,
-            source: "developer",
-            type: "plan.created",
-            message: plan.tasks.length === 1
-              ? `主 Agent 判定为${plan.complexity}任务，由单 Agent 完成`
-              : `主 Agent 判定为${plan.complexity}任务，自动拆分为 ${plan.tasks.length} 个 Sub Agent`,
-          },
-        });
+        await update(run, "developing", "system", "checkpoint.development_restored", `第 ${round} 轮开发已由检查点确认完成，跳过重复的模型调用`, { plan });
+        feedback = unresolvedFeedback(run.findings);
+        findings = [...(run.findings ?? [])];
+      } else if (round === 1) {
+        const storedPlan = tracker.isCompleted(stages.planning) ? tracker.payload<DevelopmentPlan>(stages.planning) : undefined;
+        plan = storedPlan ?? await planDevelopment(run, worktree, input.credentials, controller.signal, usage);
+        run.plan = plan;
+        if (storedPlan) {
+          await postUpdate(run.id, {
+            patch: { plan, usage: toRunUsage(usage) },
+            event: { round, source: "system", type: "plan.restored", message: "从检查点恢复开发计划，跳过已完成的主 Agent 规划调用" },
+          });
+        } else {
+          await postUpdate(run.id, {
+            patch: { plan, usage: toRunUsage(usage) },
+            event: {
+              round,
+              source: "developer",
+              type: "plan.created",
+              message: plan.tasks.length === 1
+                ? `主 Agent 判定为${plan.complexity}任务，由单 Agent 完成`
+                : `主 Agent 判定为${plan.complexity}任务，自动拆分为 ${plan.tasks.length} 个 Sub Agent`,
+            },
+          });
+          await tracker.complete(stages.planning, plan);
+        }
         if (plan.tasks.length > 1) {
-          const integrationNotes = await orchestrateSubAgents({ run, project, worktree, plan, credentials: input.credentials, signal: controller.signal, usage });
+          const integrationNotes = await orchestrateSubAgents({ run, project, worktree, plan, credentials: input.credentials, signal: controller.signal, usage, tracker });
           const integrationPrompt = [
             "You are the lead integration agent. Work only in the current Git worktree.",
             `Original task: ${run.task}`,
@@ -783,20 +908,37 @@ async function executeJob(input: JobInput, controller: AbortController) {
         repairSections.push("Inspect the existing combined implementation, make the required fixes, and update tests.", "Do not push, deploy, delete the repository, or read credentials.");
         await runDeveloperAgent({ run, worktree, credentials: input.credentials, signal: controller.signal, prompt: repairSections.join("\n\n"), sessionSuffix: `repair-${round}`, activityPrefix: "修复 Agent", usage });
       }
+      if (!developmentDone) await tracker.complete(stages.development(round), { round, at: new Date().toISOString() });
       const diff = await collectDiff(worktree, controller.signal, baseCommit);
       await update(run, "checking", "checks", "checks.started", "Developer 完成，开始确定性检查", { diff, summary: "正在运行项目检查", usage: toRunUsage(usage) });
-      const checked = await runChecks(run, worktree, input.checks, controller.signal);
+      const storedChecks = tracker.isCompleted(stages.checks(round)) ? tracker.payload<StoredChecks>(stages.checks(round)) : undefined;
+      if (storedChecks) {
+        await postUpdate(run.id, { event: { round, source: "checks", type: "checks.checkpoint_restored", message: `从检查点恢复第 ${round} 轮检查结果，未重复执行检查命令` } });
+      }
+      const checked = storedChecks ?? await runChecks(run, worktree, input.checks, controller.signal);
+      if (!storedChecks) await tracker.complete(stages.checks(round), checked);
       if (!checked.passed) {
         feedback = `The deterministic checks failed. Fix these failures:\n${checked.results.filter((item) => item.status === "failed").map((item) => `${item.command}\n${item.output}`).join("\n\n")}`;
-        await update(run, "developing", "checks", "checks.returned", "检查失败，已退回 Developer 修复", { summary: "检查失败，等待修复" });
+        await update(run, "developing", "checks", "checks.returned", "检查失败，已退回 Developer 修复", { summary: "检查失败，等待修复", ...(storedChecks ? {} : { checks: checked.results }) });
         continue;
       }
 
       const latestDiff = await collectDiff(worktree, controller.signal, baseCommit);
       await update(run, "reviewing", "reviewer", "review.started", `${run.reviewer.model} 开始独立只读审核`, { diff: latestDiff, summary: "Reviewer Agent 正在审核" });
-      const outcome = await performReview({ run, worktree, credentials: input.credentials, round, diff: latestDiff, signal: controller.signal, usage, started });
-      if (outcome.stopped) return;
-      const review = outcome.review;
+      // AT-REL-003: a review that already produced a verdict is reused, so a
+      // restarted worker can never emit two conflicting verdicts for one round.
+      let review: ReviewResult;
+      const storedReview = tracker.isCompleted(stages.review(round)) ? tracker.payload<StoredReview>(stages.review(round)) : undefined;
+      if (storedReview) {
+        review = storedReview;
+        await postUpdate(run.id, { event: { round, source: "system", type: "review.checkpoint_restored", message: "从检查点恢复本轮审核结论，跳过重复的审核模型调用" } });
+      } else {
+        await tracker.start(stages.review(round));
+        const outcome = await performReview({ run, worktree, credentials: input.credentials, round, diff: latestDiff, signal: controller.signal, usage, started });
+        if (outcome.stopped) return;
+        review = outcome.review;
+        await tracker.complete(stages.review(round), review);
+      }
       findings = mergeFindings(findings, review.findings);
       if (review.verdict === "approved") {
         await update(run, "completed", "reviewer", "review.approved", "独立审核通过，代码保留在任务 worktree", {
@@ -814,24 +956,56 @@ async function executeJob(input: JobInput, controller: AbortController) {
     await update(run, "needs_human", "system", "run.needs_human", "达到最大审核轮次，需要人工处理", { findings, usage: toRunUsage(usage), durationMs: Date.now() - started });
   } catch (error) {
     const cancelled = controller.signal.aborted;
+    outcomeState = cancelled ? "cancelled" : "failed";
     const safeMessage = redactJobSecrets((error as Error).message, input.credentials).slice(0, 2_000);
     const followup = Boolean(input.resume || input.retryReview);
-    const state: RunState = cancelled ? "cancelled" : followup ? "needs_human" : "failed";
-    const type = cancelled ? "run.cancelled" : followup ? "run.resume_failed" : "run.failed";
+    const state: RunState = cancelled ? "cancelled" : followup || recovering ? "needs_human" : "failed";
+    const type = cancelled ? "run.cancelled" : followup ? "run.resume_failed" : recovering ? "run.recovery_failed" : "run.failed";
     const kind = cancelled ? undefined : classifyProviderError(safeMessage);
     const message = cancelled
       ? "任务已取消"
-      : `${followup ? "恢复执行失败，保持人工处理" : "真实运行失败"}（${kind}）：${safeMessage}`;
+      : `${followup ? "恢复执行失败，保持人工处理" : recovering ? "Worker 恢复执行失败，保持人工处理" : "真实运行失败"}（${kind}）：${safeMessage}`;
     await update(run, state, "system", type, message, {
       summary: cancelled ? "已取消" : providerErrorSummary(kind ?? "unknown", safeMessage).slice(0, 800),
       usage: toRunUsage(usage),
       durationMs: Date.now() - started,
     }).catch(() => undefined);
   } finally {
+    stopHeartbeat();
+    if (input.jobId) {
+      await jobApi.finish(input.jobId, outcomeState).catch((error) => console.warn(`[jobs] finish failed: ${(error as Error).message}`));
+    }
     input.credentials.developer = "";
     input.credentials.reviewer = "";
     active.delete(run.id);
   }
+}
+
+/** Picks up jobs that were never delivered or whose worker died mid-run (REL-002). */
+async function reclaimPendingJobs() {
+  if (active.size >= maxActiveJobs) return 0;
+  let jobs: PendingJob[] = [];
+  try {
+    jobs = await jobApi.pending();
+  } catch (error) {
+    console.warn(`[jobs] reclaim failed: ${(error as Error).message}`);
+    return 0;
+  }
+  let started = 0;
+  for (const job of jobs) {
+    if (active.size >= maxActiveJobs) break;
+    if (active.has(job.run.id)) continue;
+    if (!job.credentials?.developer || !job.credentials?.reviewer) {
+      console.warn(`[jobs] skipping ${job.jobId}: credentials unavailable`);
+      continue;
+    }
+    const controller = new AbortController();
+    active.set(job.run.id, controller);
+    started += 1;
+    void executeJob({ run: job.run, checks: job.checks, credentials: job.credentials, jobId: job.jobId, recovery: true }, controller);
+  }
+  if (started > 0) console.warn(`[jobs] reclaimed ${started} unfinished job(s) after restart`);
+  return started;
 }
 
 const server = createServer(async (request, response) => {
@@ -858,12 +1032,16 @@ const server = createServer(async (request, response) => {
     if (request.method === "POST" && url.pathname === "/jobs") {
       const body = await readJson(request) as unknown as JobInput;
       if (!body.run?.id || body.run.mode !== "real" || !Array.isArray(body.checks) || !body.credentials?.developer || !body.credentials?.reviewer) return json(response, 400, { error: "Invalid job" });
-      if (active.has(body.run.id)) return json(response, 409, { error: "Job already active" });
+      // Dispatch is at-least-once: a run already executing locally is not an error.
+      if (active.has(body.run.id)) return json(response, 202, { accepted: true, runId: body.run.id, note: "already running" });
       if (active.size >= maxActiveJobs) return json(response, 429, { error: "Worker capacity reached; retry after an active job finishes" });
       const controller = new AbortController();
       active.set(body.run.id, controller);
       void executeJob(body, controller);
       return json(response, 202, { accepted: true, runId: body.run.id });
+    }
+    if (request.method === "GET" && url.pathname === "/jobs/capacity") {
+      return json(response, 200, { workerId, capacity: maxActiveJobs - active.size, active: [...active.keys()] });
     }
     const cancelMatch = url.pathname.match(/^\/jobs\/([^/]+)\/cancel$/);
     if (request.method === "POST" && cancelMatch) {
@@ -880,4 +1058,7 @@ const server = createServer(async (request, response) => {
 
 server.listen(port, host, () => {
   process.stdout.write(`pigo-worker listening on http://${host}:${port}\n`);
+  void reclaimPendingJobs();
+  const timer = setInterval(() => { void reclaimPendingJobs(); }, 60_000);
+  timer.unref?.();
 });

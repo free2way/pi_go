@@ -1,5 +1,5 @@
 import type { CheckResult, Finding, Run, RunEvent, RunState } from "../shared/types.js";
-import type { RunStore } from "./store.js";
+import type { RunStoreLike } from "./store.js";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -70,7 +70,7 @@ export function baseDemoRun(input: { title: string; task: string; repository: st
   };
 }
 
-export async function runDemo(store: RunStore, runId: string) {
+export async function runDemo(store: RunStoreLike, runId: string) {
   const startedAt = Date.now();
   const emit = async (
     state: RunState,

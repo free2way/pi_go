@@ -30,7 +30,7 @@ describe("RunStore", () => {
       at: new Date().toISOString(),
     });
 
-    expect(store.getEvents(run.id).map((event) => event.seq)).toEqual([1, 2]);
+    expect((await store.getEvents(run.id)).map((event) => event.seq)).toEqual([1, 2]);
     expect(store.listRuns("owner-a")).toHaveLength(1);
     expect(store.listRuns("owner-b")).toHaveLength(0);
     expect(store.getRun(run.id, "owner-b")).toBeUndefined();
@@ -76,7 +76,7 @@ describe("RunStore", () => {
     });
     const persisted = JSON.parse(await readFile(file, "utf8")) as { events: Record<string, unknown[]> };
     expect(persisted.events[run.id]).toHaveLength(3);
-    expect(store.getEvents(run.id).map((event) => event.seq)).toEqual([1, 2, 3]);
+    expect((await store.getEvents(run.id)).map((event) => event.seq)).toEqual([1, 2, 3]);
   });
 
   it("deletes a run together with its events", async () => {
@@ -97,7 +97,7 @@ describe("RunStore", () => {
     await store.deleteRun(run.id);
 
     expect(store.getRun(run.id)).toBeUndefined();
-    expect(store.getEvents(run.id)).toEqual([]);
+    expect(await store.getEvents(run.id)).toEqual([]);
     const persisted = JSON.parse(await readFile(file, "utf8")) as { runs: unknown[]; events: Record<string, unknown[]> };
     expect(persisted.runs).toHaveLength(0);
     expect(persisted.events[run.id]).toBeUndefined();

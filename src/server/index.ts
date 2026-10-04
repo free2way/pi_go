@@ -2,18 +2,20 @@ import fastifyStatic from "@fastify/static";
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import { timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import type { ConfigStatus, CurrentUser, ModelCatalogResponse, Run, Workspace } from "../shared/types.js";
+import type { ConfigStatus, CurrentUser, ModelCatalogResponse, Run, RunEvent, Workspace } from "../shared/types.js";
 import { Authenticator } from "./auth.js";
 import { CredentialVault } from "./credential-vault.js";
-import { createDb, createPool, runMigrations } from "./db.js";
+import { createDb, createPool, newId, runMigrations } from "./db.js";
 import { baseDemoRun, runDemo } from "./demo-runner.js";
 import { IdentityService } from "./identity.js";
 import { availableModels, defaultSelections, loadModelCatalog, validateModelSelection } from "./model-catalog.js";
 import { baseRealRun } from "./real-run.js";
-import { RunStore } from "./store.js";
+import { PostgresRunStore } from "./run-store-pg.js";
+import type { RunStoreLike } from "./store.js";
 import { WorkspaceError, WorkspaceService } from "./workspaces.js";
 
 const app = Fastify({
@@ -40,19 +42,38 @@ if (process.env.PI_AUTH_MODE === "cloudflare" && !publicOrigin) throw new Error(
 
 const modelCatalog = loadModelCatalog();
 const modelDefaults = defaultSelections();
-const store = new RunStore(dataFile);
 const vault = new CredentialVault(vaultFile, vaultSecret, {
   developer: modelDefaults.developer.provider,
   reviewer: modelDefaults.reviewer.provider,
 });
 const auth = new Authenticator();
-await Promise.all([store.init(), vault.init()]);
+await vault.init();
 
 const databaseUrl = process.env.PI_DATABASE_URL;
 if (!databaseUrl) throw new Error("PI_DATABASE_URL is required (postgresql://user:password@host:5432/database)");
 const pool = createPool(databaseUrl);
 const db = createDb(pool);
 await runMigrations(db);
+
+// REL-001: runs, events, agents, checks, findings, artifacts, checkpoints and
+// jobs live in PostgreSQL. A legacy runs.json is imported once and kept intact.
+const store: RunStoreLike = new PostgresRunStore(db);
+const jobQueue = store instanceof PostgresRunStore ? store : undefined;
+await store.init();
+if (store instanceof PostgresRunStore && existsSync(dataFile)) {
+  try {
+    const legacy = JSON.parse(await readFile(dataFile, "utf8")) as { runs?: Run[]; events?: Record<string, RunEvent[]> };
+    if ((legacy.runs ?? []).length > 0) {
+      const before = await store.statistics();
+      if (before.counts.runs === 0) {
+        const result = await store.importLegacy({ runs: legacy.runs ?? [], events: legacy.events ?? {} });
+        app.log.info({ ...result }, "imported legacy runs.json into PostgreSQL");
+      }
+    }
+  } catch (error) {
+    app.log.warn({ error: (error as Error).message }, "legacy runs.json import skipped");
+  }
+}
 const identities = new IdentityService(db);
 const workspacesEnabled = process.env.PI_WORKSPACES_ENABLED !== "false";
 const workspaces = new WorkspaceService(db, workerRequest);
@@ -85,6 +106,12 @@ const credentialSchema = z.object({
   .refine((value) => !value.provider || Boolean(value.apiKey), "apiKey is required when provider is set");
 
 const runStateSchema = z.enum(["queued", "preparing", "developing", "checking", "reviewing", "completed", "needs_human", "failed", "cancelled"]);
+const checkpointSchema = z.object({
+  stageKey: z.string().trim().min(1).max(120),
+  status: z.enum(["running", "completed", "failed"]),
+  payload: z.unknown().optional(),
+  idempotencyKey: z.string().trim().min(1).max(200).optional(),
+});
 const findingSchema = z.object({
   id: z.string().min(1).max(120),
   severity: z.enum(["critical", "high", "medium", "low"]),
@@ -150,6 +177,8 @@ const internalEventSchema = z.object({
 const internalUpdateSchema = z.object({
   patch: runPatchSchema.optional(),
   event: internalEventSchema.optional(),
+  /** Optional at-least-once delivery key so a retried callback is not double counted (AT-REL-004). */
+  deliveryId: z.string().min(1).max(160).optional(),
 }).strict();
 
 const credentialWrites = new Map<string, number[]>();
@@ -216,6 +245,13 @@ function ownerKeysFor(request: FastifyRequest) {
   return user.legacyOwnerId ? [user.id, user.legacyOwnerId] : [user.id];
 }
 
+/** Narrows vault lookups into a complete credential pair or nothing. */
+function requireCredentials(input: { developer?: string; reviewer?: string }): { developer: string; reviewer: string } | undefined {
+  const { developer, reviewer } = input;
+  if (!developer || !reviewer) return undefined;
+  return { developer, reviewer };
+}
+
 /** Credentials written before the internal-user migration live under the legacy owner key. */
 function vaultKeyFor(request: FastifyRequest) {
   const user = auth.user(request);
@@ -225,9 +261,9 @@ function vaultKeyFor(request: FastifyRequest) {
 app.get("/api/health", async (_request, reply) => {
   try {
     await db.query("SELECT 1");
-    return { status: "ok", service: "pigo-web", version: "0.10.0", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.11.0", db: "ok" };
   } catch {
-    return reply.code(503).send({ status: "error", service: "pigo-web", version: "0.10.0", db: "unavailable" });
+    return reply.code(503).send({ status: "error", service: "pigo-web", version: "0.11.0", db: "unavailable" });
   }
 });
 app.get("/api/me", async (request) => auth.user(request));
@@ -379,9 +415,10 @@ app.get<{ Params: { id: string } }>("/api/runs/:id", async (request, reply) => {
   return run;
 });
 
-app.get<{ Params: { id: string }; Querystring: { after?: string } }>("/api/runs/:id/events", async (request, reply) => {
+app.get<{ Params: { id: string }; Querystring: { after?: string; limit?: string } }>("/api/runs/:id/events", async (request, reply) => {
   if (!store.getRun(request.params.id, ownerKeysFor(request))) return reply.code(404).send({ error: "Run not found" });
-  return store.getEvents(request.params.id, Number(request.query.after || 0));
+  const limit = Math.min(Math.max(Number(request.query.limit || 500), 1), 1_000);
+  return store.getEvents(request.params.id, Number(request.query.after || 0), limit);
 });
 
 app.get<{ Params: { id: string }; Querystring: { after?: string } }>("/api/runs/:id/stream", async (request, reply) => {
@@ -389,8 +426,22 @@ app.get<{ Params: { id: string }; Querystring: { after?: string } }>("/api/runs/
   const after = Number(request.headers["last-event-id"] || request.query.after || 0);
   reply.hijack();
   reply.raw.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive", "X-Accel-Buffering": "no" });
-  const send = (event: ReturnType<typeof store.getEvents>[number]) => reply.raw.write(`id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`);
-  for (const event of store.getEvents(request.params.id, after)) send(event);
+  const send = (event: RunEvent) => reply.raw.write(`id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`);
+  // AT-REL-008: replay in bounded pages so a client that lagged far behind is
+  // caught up without holding every event in web memory.
+  const pageSize = 500;
+  let cursor = Number.isFinite(after) ? after : 0;
+  try {
+    for (;;) {
+      const page = await store.getEvents(request.params.id, cursor, pageSize);
+      for (const event of page) send(event);
+      if (page.length === 0) break;
+      cursor = page[page.length - 1].seq;
+      if (page.length < pageSize) break;
+    }
+  } catch (error) {
+    app.log.error({ error: (error as Error).message, runId: request.params.id }, "event replay failed");
+  }
   const unsubscribe = store.subscribe(request.params.id, send);
   const heartbeat = setInterval(() => reply.raw.write(": heartbeat\n\n"), 15_000);
   request.raw.on("close", () => { clearInterval(heartbeat); unsubscribe(); });
@@ -426,11 +477,11 @@ app.post("/api/runs", async (request, reply) => {
     const reviewerCheck = validateModelSelection(modelCatalog, "reviewer", reviewerSelection, configured);
     if (!reviewerCheck.ok) return reply.code(422).send({ error: reviewerCheck.message, code: reviewerCheck.code });
 
-    const credentials = {
+    const credentials = requireCredentials({
       developer: vault.get(vaultKeyFor(request), developerCheck.entry.provider),
       reviewer: vault.get(vaultKeyFor(request), reviewerCheck.entry.provider),
-    };
-    if (!credentials.developer || !credentials.reviewer) {
+    });
+    if (!credentials) {
       return reply.code(403).send({ error: "所选模型的 provider 凭据不完整，请在「模型与凭据」页配置", code: "PERSONAL_CREDENTIALS_REQUIRED" });
     }
     const run = baseRealRun({
@@ -442,7 +493,7 @@ app.post("/api/runs", async (request, reply) => {
     }, user.id);
     await store.createRun(run, { runId: run.id, round: 1, source: "system", type: "run.created", message: "真实任务已创建，正在交给隔离 Pi Worker", at: new Date().toISOString() });
     try {
-      await workerRequest("/jobs", { method: "POST", body: JSON.stringify({ run, checks: parsed.data.checks, credentials }) });
+      await dispatchJob(run, parsed.data.checks, {}, credentials);
       credentials.developer = "";
       credentials.reviewer = "";
       return reply.code(201).send(store.getRun(run.id, user.id));
@@ -480,6 +531,66 @@ app.delete<{ Params: { id: string } }>("/api/runs/:id", async (request, reply) =
   await store.deleteRun(run.id);
   return reply.code(204).send();
 });
+
+// ---------------------------------------------------------------- job queue (REL-002)
+
+const JOB_STALE_MS = Number(process.env.PI_JOB_STALE_SECONDS || 120) * 1_000;
+
+function jobCredentialsFor(run: Run): { developer: string; reviewer: string } | undefined {
+  const developer = vault.get(run.ownerId, run.developer.provider);
+  const reviewer = vault.get(run.ownerId, run.reviewer.provider);
+  if (!developer || !reviewer) return undefined;
+  return { developer, reviewer };
+}
+
+/** Creates a durable job row and pushes it to the worker; the row survives a restart. */
+async function dispatchJob(
+  run: Run,
+  checks: string[],
+  payload: Record<string, unknown>,
+  credentials: { developer: string; reviewer: string },
+) {
+  if (!jobQueue) throw new Error("Job queue unavailable (PostgreSQL store required)");
+  const jobId = newId("job");
+  const kind = "run";
+  await jobQueue.createJob({ id: jobId, runId: run.id, kind, payload: { ...payload, checks } });
+  await jobQueue.reserveJob(jobId);
+  try {
+    await workerRequest("/jobs", {
+      method: "POST",
+      body: JSON.stringify({ run, checks, credentials, jobId, ...payload }),
+    });
+    return { jobId, accepted: true as const };
+  } catch (error) {
+    const message = (error as Error).message;
+    if (/capacity/i.test(message)) {
+      // REL-002: stay queued instead of failing the run; the worker claims it
+      // as soon as capacity frees up (or after a restart).
+      await store.appendEvent({
+        runId: run.id,
+        round: run.round,
+        source: "system",
+        type: "run.queued",
+        message: "Worker 当前繁忙，任务保持在队列中等待领取",
+        at: new Date().toISOString(),
+      });
+      return { jobId, accepted: false as const };
+    }
+    await jobQueue.finishJob(jobId, "failed", message.slice(0, 500));
+    throw error;
+  }
+}
+
+/** Re-queues jobs whose worker stopped heartbeating (worker restart, AT-REL-002/003). */
+async function requeueStaleJobs() {
+  if (!jobQueue) return;
+  try {
+    const requeued = await jobQueue.requeueStaleJobs(JOB_STALE_MS);
+    if (requeued.length > 0) app.log.warn({ requeued }, "re-queued stale jobs after worker heartbeat loss");
+  } catch (error) {
+    app.log.error({ error: (error as Error).message }, "stale job requeue failed");
+  }
+}
 
 const resumeSchema = z.object({
   instruction: z.string().trim().max(2_000).optional(),
@@ -523,15 +634,12 @@ async function dispatchFollowupJob(
   }
 
   try {
-    await workerRequest("/jobs", {
-      method: "POST",
-      body: JSON.stringify({
-        run: updated,
-        checks: run.checks.map((check) => check.command),
-        credentials,
-        ...(options.kind === "resume" ? { resume: { instruction } } : { retryReview: true }),
-      }),
-    });
+    await dispatchJob(
+      updated,
+      run.checks.map((check) => check.command),
+      options.kind === "resume" ? { resume: { instruction } } : { retryReview: true },
+      credentials,
+    );
     credentials.developer = "";
     credentials.reviewer = "";
     return reply.code(201).send(store.getRun(run.id, ownerKeysFor(request)));
@@ -567,9 +675,95 @@ app.post<{ Params: { id: string } }>("/api/internal/runs/:id/update", { bodyLimi
   if (!parsed.success) return reply.code(400).send({ error: "Invalid internal update", details: parsed.error.issues });
   const run = store.getRun(request.params.id);
   if (!run) return reply.code(404).send({ error: "Run not found" });
-  const { patch, event } = parsed.data;
+  const { patch, event, deliveryId } = parsed.data;
   if (patch) await store.updateRun(run.id, patch as Partial<Run>);
-  if (event) await store.appendEvent({ ...event, runId: run.id, at: new Date().toISOString() });
+  if (event) await store.appendEvent({ ...event, runId: run.id, at: new Date().toISOString() }, { deliveryId });
+  return { ok: true };
+});
+
+// ------------------------------------------- internal job + checkpoint API (REL-002/003)
+
+app.get<{ Querystring: { workerId?: string } }>("/api/internal/jobs/pending", async (request, reply) => {
+  if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
+  if (!jobQueue) return reply.code(503).send({ error: "Job queue unavailable" });
+  await requeueStaleJobs();
+  const jobs = await jobQueue.listPendingJobs({ staleAfterMs: JOB_STALE_MS });
+  const payloads: Array<Record<string, unknown>> = [];
+  for (const job of jobs) {
+    const run = store.getRun(job.runId);
+    if (!run) {
+      await jobQueue.finishJob(job.id, "failed", "Run missing");
+      continue;
+    }
+    if (["completed", "failed", "cancelled", "needs_human"].includes(run.state)) {
+      await jobQueue.finishJob(job.id, "done");
+      continue;
+    }
+    const credentials = jobCredentialsFor(run);
+    if (!credentials) {
+      await jobQueue.finishJob(job.id, "failed", "Credentials unavailable for the pinned providers");
+      continue;
+    }
+    const payload = (job.payload ?? {}) as Record<string, unknown>;
+    payloads.push({
+      jobId: job.id,
+      kind: job.kind,
+      run,
+      checks: Array.isArray(payload.checks) ? payload.checks : [],
+      credentials,
+    });
+  }
+  return { jobs: payloads };
+});
+
+app.post<{ Params: { id: string } }>("/api/internal/jobs/:id/claim", async (request, reply) => {
+  if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
+  if (!jobQueue) return reply.code(503).send({ error: "Job queue unavailable" });
+  const workerId = String((request.body as { workerId?: unknown })?.workerId ?? "unknown").slice(0, 120);
+  const job = await jobQueue.claimJob(request.params.id, workerId);
+  if (!job) return reply.code(409).send({ error: "Job is not claimable" });
+  return { ok: true, job };
+});
+
+app.post<{ Params: { id: string } }>("/api/internal/jobs/:id/heartbeat", async (request, reply) => {
+  if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
+  if (!jobQueue) return reply.code(503).send({ error: "Job queue unavailable" });
+  const workerId = String((request.body as { workerId?: unknown })?.workerId ?? "unknown").slice(0, 120);
+  await jobQueue.heartbeatJob(request.params.id, workerId);
+  return { ok: true };
+});
+
+app.post<{ Params: { id: string } }>("/api/internal/jobs/:id/finish", async (request, reply) => {
+  if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
+  if (!jobQueue) return reply.code(503).send({ error: "Job queue unavailable" });
+  const body = (request.body ?? {}) as { state?: unknown; error?: unknown };
+  const state = body.state === "failed" || body.state === "cancelled" ? body.state : "done";
+  await jobQueue.finishJob(request.params.id, state, body.error === undefined ? undefined : String(body.error).slice(0, 500));
+  return { ok: true };
+});
+
+app.get<{ Params: { id: string } }>("/api/internal/runs/:id/checkpoints", async (request, reply) => {
+  if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
+  if (!jobQueue) return reply.code(503).send({ error: "Checkpoints unavailable" });
+  const run = store.getRun(request.params.id);
+  if (!run) return reply.code(404).send({ error: "Run not found" });
+  return { checkpoints: await jobQueue.listCheckpoints(run.id) };
+});
+
+app.post<{ Params: { id: string } }>("/api/internal/runs/:id/checkpoints", async (request, reply) => {
+  if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
+  if (!jobQueue) return reply.code(503).send({ error: "Checkpoints unavailable" });
+  const parsed = checkpointSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid checkpoint", details: parsed.error.issues });
+  const run = store.getRun(request.params.id);
+  if (!run) return reply.code(404).send({ error: "Run not found" });
+  await jobQueue.saveCheckpoint({
+    runId: run.id,
+    stageKey: parsed.data.stageKey,
+    status: parsed.data.status,
+    payload: parsed.data.payload,
+    idempotencyKey: parsed.data.idempotencyKey ?? `${run.id}:${parsed.data.stageKey}`,
+  });
   return { ok: true };
 });
 
@@ -588,5 +782,11 @@ for (const signal of ["SIGTERM", "SIGINT"] as const) {
     void pool.end().finally(() => process.exit(0));
   });
 }
+
+// REL-002: jobs left unfinished by a stopped worker are re-queued and (when the
+// worker is back) pushed again, so a run never stalls silently.
+await requeueStaleJobs();
+const jobRecoveryTimer = setInterval(() => { void requeueStaleJobs(); }, 60_000);
+jobRecoveryTimer.unref?.();
 
 await app.listen({ port, host });

@@ -109,6 +109,108 @@ export const databaseMigrations: Migration[] = [
       ALTER TABLE workspaces ADD COLUMN git_dirty_files_json TEXT NOT NULL DEFAULT '[]';
     `,
   },
+  {
+    id: 3,
+    name: "runs-events-agents-checks-findings-checkpoints-jobs",
+    sql: `
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        state TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_seq INTEGER NOT NULL DEFAULT 0,
+        document_json TEXT NOT NULL
+      );
+      CREATE INDEX idx_runs_owner ON runs(owner_id, updated_at);
+      CREATE INDEX idx_runs_state ON runs(state, updated_at);
+
+      CREATE TABLE run_events (
+        run_id TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        at TEXT NOT NULL,
+        round INTEGER NOT NULL DEFAULT 0,
+        source TEXT NOT NULL,
+        type TEXT NOT NULL,
+        message TEXT NOT NULL,
+        meta_json TEXT,
+        delivery_id TEXT,
+        PRIMARY KEY (run_id, seq)
+      );
+      CREATE UNIQUE INDEX idx_run_events_delivery ON run_events(run_id, delivery_id);
+      CREATE INDEX idx_run_events_at ON run_events(run_id, seq);
+
+      CREATE TABLE run_agents (
+        run_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        status TEXT NOT NULL,
+        branch TEXT,
+        summary TEXT,
+        duration_ms INTEGER,
+        PRIMARY KEY (run_id, agent_id)
+      );
+
+      CREATE TABLE run_checks (
+        run_id TEXT NOT NULL,
+        check_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        command TEXT NOT NULL,
+        status TEXT NOT NULL,
+        duration_ms INTEGER,
+        PRIMARY KEY (run_id, check_id)
+      );
+
+      CREATE TABLE run_findings (
+        run_id TEXT NOT NULL,
+        finding_id TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        file TEXT,
+        line INTEGER,
+        title TEXT NOT NULL,
+        resolved INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (run_id, finding_id)
+      );
+
+      CREATE TABLE run_artifacts (
+        run_id TEXT NOT NULL,
+        artifact_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        bytes INTEGER NOT NULL DEFAULT 0,
+        sha256 TEXT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (run_id, artifact_id)
+      );
+
+      CREATE TABLE run_checkpoints (
+        run_id TEXT NOT NULL,
+        stage_key TEXT NOT NULL,
+        status TEXT NOT NULL,
+        payload_json TEXT,
+        idempotency_key TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (run_id, stage_key)
+      );
+
+      CREATE TABLE jobs (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        state TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        worker_id TEXT,
+        claimed_at TEXT,
+        heartbeat_at TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX idx_jobs_state ON jobs(state, updated_at);
+      CREATE INDEX idx_jobs_run ON jobs(run_id, created_at);
+    `,
+  },
 ];
 
 export async function runMigrations(db: Db) {
