@@ -808,14 +808,20 @@ async function executeJob(input: JobInput, controller: AbortController) {
       const head = await git(worktree, ["rev-parse", "HEAD"], controller.signal);
       const pending = await git(worktree, ["status", "--porcelain"], controller.signal);
       baseCommit = await git(project, ["merge-base", projectHead, run.branch], controller.signal).catch(() => projectHead);
+      const recoveryLabel = input.retryReview
+        ? `重试审核：复用现有 worktree（HEAD ${head.slice(0, 7)}）`
+        : input.resume
+          ? `人工恢复：复用已有 worktree（HEAD ${head.slice(0, 7)}${pending ? "，包含未提交的人工修改" : ""}）`
+          : `Worker 恢复：复用已有 worktree（HEAD ${head.slice(0, 7)}${pending ? "，包含未提交的修改" : ""}）`;
       await update(run,
         input.retryReview ? "reviewing" : "preparing",
         "system",
-        input.retryReview ? "review.retry_started" : "run.resume_detected",
-        input.retryReview
-          ? `重试审核：复用现有 worktree（HEAD ${head.slice(0, 7)}）`
-          : `人工恢复：复用已有 worktree（HEAD ${head.slice(0, 7)}${pending ? "，包含未提交的人工修改" : ""}）`,
-        { worktree: path.relative(workspaceRoot, worktree), summary: input.retryReview ? "Reviewer Agent 正在重新审核" : "人工恢复：正在准备继续执行" });
+        input.retryReview ? "review.retry_started" : input.resume ? "run.resume_detected" : "run.recovery_detected",
+        recoveryLabel,
+        {
+          worktree: path.relative(workspaceRoot, worktree),
+          summary: input.retryReview ? "Reviewer Agent 正在重新审核" : input.resume ? "人工恢复：正在准备继续执行" : "Worker 恢复：正在从检查点继续执行",
+        });
       if (humanInstruction) {
         await postUpdate(run.id, { event: { round: run.round, source: "system", type: "run.resume_instruction", message: `人工指令：${humanInstruction.slice(0, 500)}` } });
       }

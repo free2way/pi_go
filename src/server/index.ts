@@ -536,11 +536,23 @@ app.delete<{ Params: { id: string } }>("/api/runs/:id", async (request, reply) =
 
 const JOB_STALE_MS = Number(process.env.PI_JOB_STALE_SECONDS || 120) * 1_000;
 
-function jobCredentialsFor(run: Run): { developer: string; reviewer: string } | undefined {
-  const developer = vault.get(run.ownerId, run.developer.provider);
-  const reviewer = vault.get(run.ownerId, run.reviewer.provider);
-  if (!developer || !reviewer) return undefined;
-  return { developer, reviewer };
+/**
+ * Credentials for a run outside a request context (job recovery has no session).
+ * Credentials may live under the internal user id or its legacy owner key, so
+ * both are tried before giving up (AT-REL-002).
+ */
+async function jobCredentialsFor(run: Run): Promise<{ developer: string; reviewer: string } | undefined> {
+  const candidates = [run.ownerId];
+  const legacy = await identities.legacyOwnerFor(run.ownerId).catch(() => undefined);
+  if (legacy) candidates.push(legacy);
+  for (const key of candidates) {
+    const credentials = requireCredentials({
+      developer: vault.get(key, run.developer.provider),
+      reviewer: vault.get(key, run.reviewer.provider),
+    });
+    if (credentials) return credentials;
+  }
+  return undefined;
 }
 
 /** Creates a durable job row and pushes it to the worker; the row survives a restart. */
@@ -699,9 +711,18 @@ app.get<{ Querystring: { workerId?: string } }>("/api/internal/jobs/pending", as
       await jobQueue.finishJob(job.id, "done");
       continue;
     }
-    const credentials = jobCredentialsFor(run);
+    const credentials = await jobCredentialsFor(run);
     if (!credentials) {
       await jobQueue.finishJob(job.id, "failed", "Credentials unavailable for the pinned providers");
+      await store.updateRun(run.id, { state: "needs_human", summary: "恢复执行失败：该任务所用模型的 provider 凭据不可用，请在「模型与凭据」页检查" }).catch(() => undefined);
+      await store.appendEvent({
+        runId: run.id,
+        round: run.round,
+        source: "system",
+        type: "run.recovery_blocked",
+        message: "Worker 重启后无法恢复：缺少该任务 provider 的凭据（任务未丢失，可在配置凭据后重新恢复）",
+        at: new Date().toISOString(),
+      }).catch(() => undefined);
       continue;
     }
     const payload = (job.payload ?? {}) as Record<string, unknown>;

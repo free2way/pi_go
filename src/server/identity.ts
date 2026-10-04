@@ -50,6 +50,12 @@ function toUser(row: UserRow): UserRecord {
 export class IdentityService {
   constructor(private readonly db: Db) {}
 
+  /** Resolves the pre-migration owner key for a user (used when re-reading credentials). */
+  async legacyOwnerFor(userId: string): Promise<string | undefined> {
+    const row = (await this.db.query("SELECT legacy_owner_id FROM users WHERE id = $1", [userId])).rows[0] as { legacy_owner_id: string | null } | undefined;
+    return row?.legacy_owner_id ?? undefined;
+  }
+
   async resolve(input: IdentityInput): Promise<UserRecord> {
     const maxAttempts = 5;
     for (let attempt = 1; ; attempt += 1) {
