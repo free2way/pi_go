@@ -445,7 +445,12 @@ async function prepareRunDirectory(input: {
   }
   await mkdir(path.dirname(runDir), { recursive: true });
   if (exists) await rm(runDir, { recursive: true, force: true });
-  await serializeWorktreeMutation(() => git(project, ["clone", "--local", "--no-hardlinks", "--quiet", project, runDir], signal));
+  // The file transport is allowed only for this clone (the source is an
+  // operator-registered local workspace); every other Git call keeps it off.
+  await serializeWorktreeMutation(() => git(project, [
+    "-c", "protocol.file.allow=always",
+    "clone", "--local", "--no-hardlinks", "--quiet", project, runDir,
+  ], signal));
   await git(runDir, ["config", "core.hooksPath", "/dev/null"], signal);
   await git(runDir, ["config", "credential.helper", ""], signal);
   await git(runDir, ["config", "gc.auto", "0"], signal);
