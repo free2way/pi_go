@@ -75,9 +75,21 @@ export class DockerApi {
     });
   }
 
+  /** `/_ping` answers with plain "OK", not JSON (Docker API convention). */
   async ping() {
-    await this.request<Record<string, never>>("GET", "/_ping");
-    return true;
+    return new Promise<boolean>((resolve, reject) => {
+      const request = http.request({ socketPath: this.socketPath, path: `/${this.apiVersion}/_ping`, method: "GET" }, (response) => {
+        let text = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => { text += chunk; });
+        response.on("end", () => {
+          if ((response.statusCode ?? 0) < 400 && text.trim().length > 0) resolve(true);
+          else reject(new Error(`docker ping failed: ${response.statusCode ?? 0} ${text.slice(0, 80)}`));
+        });
+      });
+      request.on("error", (error) => reject(new Error(`docker ping error: ${error.message}`)));
+      request.end();
+    });
   }
 
   async inspectImage(image: string) {
