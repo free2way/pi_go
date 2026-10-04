@@ -19,12 +19,14 @@ describe("baseRealRun", () => {
       title: "Add a regression test",
       task: "Implement the requested change and add a regression test.",
       repository: "example-project",
+      workspaceId: "ws_example",
       mode: "real",
       checks: ["npm test", "npm run typecheck"],
     }, "owner-a");
 
     expect(run.mode).toBe("real");
     expect(run.ownerId).toBe("owner-a");
+    expect(run.workspaceId).toBe("ws_example");
     expect(run.developer).toEqual({ provider: "deepseek", model: "deepseek-flash" });
     expect(run.reviewer).toEqual({ provider: "openai-proxy", model: "gpt-5.6-sol" });
     expect(run.maxRounds).toBe(3);

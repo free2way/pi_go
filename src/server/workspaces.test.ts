@@ -17,6 +17,7 @@ const verifyOk = (overrides: Partial<WorkspaceVerifyResult> = {}): WorkspaceVeri
   branch: "main",
   head: "abc1234",
   dirty: false,
+  dirtyFiles: [],
   ...overrides,
 });
 
@@ -26,7 +27,7 @@ describe("workspace service", () => {
     const workspace = await service.register("owner-a", "pi_go");
 
     expect(workspace.name).toBe("pi_go");
-    expect(workspace.git).toEqual({ branch: "main", head: "abc1234", dirty: false });
+    expect(workspace.git).toEqual({ branch: "main", head: "abc1234", dirty: false, dirtyFiles: [] });
     expect(workspace.status).toBe("active");
     expect(await service.list(["owner-a"])).toHaveLength(1);
     expect(await service.list(["owner-b"])).toHaveLength(0);
@@ -52,12 +53,12 @@ describe("workspace service", () => {
   it("refreshes git metadata and marks invalid workspaces", async () => {
     let mode: "ok" | "missing" = "ok";
     const { service } = await createService(async () => mode === "ok"
-      ? verifyOk({ head: "def5678", dirty: true })
+      ? verifyOk({ head: "def5678", dirty: true, dirtyFiles: [" M src/server/index.ts", "?? notes.md"] })
       : { ok: false, code: "WORKSPACE_INVALID", error: "Workspace path does not exist" });
 
     const workspace = await service.register("owner-a", "pi_go");
     const refreshed = await service.refresh(["owner-a"], workspace.id);
-    expect(refreshed.git).toEqual({ branch: "main", head: "def5678", dirty: true });
+    expect(refreshed.git).toEqual({ branch: "main", head: "def5678", dirty: true, dirtyFiles: [" M src/server/index.ts", "?? notes.md"] });
 
     mode = "missing";
     await expect(service.refresh(["owner-a"], workspace.id)).rejects.toThrow(WorkspaceError);

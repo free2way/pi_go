@@ -102,6 +102,13 @@ export const databaseMigrations: Migration[] = [
       CREATE INDEX idx_workspaces_owner ON workspaces(owner_id, status);
     `,
   },
+  {
+    id: 2,
+    name: "workspace-dirty-files",
+    sql: `
+      ALTER TABLE workspaces ADD COLUMN git_dirty_files_json TEXT NOT NULL DEFAULT '[]';
+    `,
+  },
 ];
 
 export async function runMigrations(db: Db) {

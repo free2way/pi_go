@@ -1,4 +1,4 @@
-import type { ConfigStatus, CredentialStatus, CurrentUser, ProjectInfo, Run, RunEvent, Workspace } from "../shared/types";
+import type { ConfigStatus, CredentialStatus, CurrentUser, Run, RunEvent, Workspace } from "../shared/types";
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -26,7 +26,6 @@ export const api = {
   saveCredentials: (body: { developerApiKey?: string; reviewerApiKey?: string }) =>
     request<CredentialStatus>("/api/credentials", { method: "PUT", body: JSON.stringify(body) }),
   deleteCredentials: () => request<void>("/api/credentials", { method: "DELETE" }),
-  projects: () => request<ProjectInfo[]>("/api/projects"),
   workspaces: () => request<{ workspaces: Workspace[] }>("/api/workspaces"),
   registerWorkspace: (body: { relativePath: string }) =>
     request<Workspace>("/api/workspaces/register", { method: "POST", body: JSON.stringify(body) }),
@@ -39,7 +38,7 @@ export const api = {
   runs: () => request<Run[]>("/api/runs"),
   run: (id: string) => request<Run>(`/api/runs/${id}`),
   events: (id: string) => request<RunEvent[]>(`/api/runs/${id}/events`),
-  createRun: (body: { title: string; task: string; repository: string; mode: "demo" | "real"; checks?: string[] }) =>
+  createRun: (body: { title: string; task: string; repository?: string; workspaceId?: string; mode: "demo" | "real"; checks?: string[] }) =>
     request<Run>("/api/runs", { method: "POST", body: JSON.stringify(body) }),
   cancelRun: (id: string) => request<Run>(`/api/runs/${id}/cancel`, { method: "POST" }),
   deleteRun: (id: string) => request<void>(`/api/runs/${id}`, { method: "DELETE" }),

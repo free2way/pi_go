@@ -10,6 +10,7 @@ export function baseRealRun(input: CreateRunInput, ownerId: string): Run {
     title: input.title,
     task: input.task,
     repository: input.repository,
+    workspaceId: input.workspaceId,
     branch: `pigo/${id.replace("run_", "")}`,
     mode: "real",
     state: "queued",

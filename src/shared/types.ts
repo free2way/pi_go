@@ -69,6 +69,7 @@ export interface Run {
   title: string;
   task: string;
   repository: string;
+  workspaceId?: string;
   branch: string;
   mode: RunMode;
   state: RunState;
@@ -108,6 +109,7 @@ export interface CreateRunInput {
   title: string;
   task: string;
   repository: string;
+  workspaceId?: string;
   mode: RunMode;
   checks?: string[];
 }
@@ -138,6 +140,7 @@ export interface WorkspaceGitInfo {
   branch: string | null;
   head: string | null;
   dirty: boolean;
+  dirtyFiles: string[];
 }
 
 export interface Workspace {
@@ -168,4 +171,5 @@ export interface WorkspaceVerifyResult {
   branch?: string;
   head?: string;
   dirty?: boolean;
+  dirtyFiles?: string[];
 }

@@ -199,7 +199,11 @@ async function verifyWorkspace(relativePath: string): Promise<WorkspaceVerifyRes
   if (!isGit) return { ok: false, code: "WORKSPACE_INVALID", error: "Not a Git repository" };
   const branch = await git(candidate, ["branch", "--show-current"]).catch(() => "");
   const head = await git(candidate, ["rev-parse", "HEAD"]).catch(() => "");
-  const dirty = Boolean(await git(candidate, ["status", "--porcelain"]).catch(() => ""));
+  const status = await git(candidate, ["status", "--porcelain"]).catch(() => "");
+  const dirty = Boolean(status);
+  const dirtyFiles = status
+    ? status.split("\n").map((line) => line.trim()).filter(Boolean).slice(0, 20).map((line) => line.slice(0, 200))
+    : [];
   return {
     ok: true,
     relativePath,
@@ -208,6 +212,7 @@ async function verifyWorkspace(relativePath: string): Promise<WorkspaceVerifyRes
     branch: branch || undefined,
     head: head || undefined,
     dirty,
+    dirtyFiles,
   };
 }
 

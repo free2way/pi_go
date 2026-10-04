@@ -48,7 +48,7 @@ import {
   Zap,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { ConfigStatus, CurrentUser, Finding, ProjectInfo, Run, RunEvent, RunMode, RunState } from "../shared/types";
+import type { ConfigStatus, CurrentUser, Finding, Run, RunEvent, RunMode, RunState, Workspace } from "../shared/types";
 import { api } from "./api";
 import { WorkspacesPage } from "./WorkspacesPage";
 
@@ -230,30 +230,44 @@ function ProviderStatus({ label, provider, model, ready, icon: Icon }: {
   );
 }
 
-function CreateRunDialog({ open, onClose, onCreated, config }: {
+function CreateRunDialog({ open, onClose, onCreated, config, onGoWorkspaces }: {
   open: boolean;
   onClose: () => void;
   onCreated: (run: Run) => void;
   config?: ConfigStatus;
+  onGoWorkspaces: () => void;
 }) {
   const [title, setTitle] = useState("修复并发刷新竞态");
   const [repository, setRepository] = useState("demo/auth-service");
   const [task, setTask] = useState("修复 token 并发刷新导致的重复请求问题，补充失败清理与并发回归测试，确保 lint、类型检查和单元测试全部通过。");
   const [mode, setMode] = useState<RunMode>("demo");
   const [checks, setChecks] = useState("npm test");
-  const [projects, setProjects] = useState<ProjectInfo[]>([]);
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [workspaceId, setWorkspaceId] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
     if (!open || !config?.realRunsAvailable) return;
-    void api.projects().then((items) => {
-      setProjects(items);
-      if (items[0]) setRepository((current) => current.startsWith("demo/") ? items[0].relativePath : current);
+    void api.workspaces().then(({ workspaces: items }) => {
+      const active = items.filter((item) => item.status === "active");
+      setWorkspaces(active);
+      const preferred = active.find((item) => !item.git?.dirty) ?? active[0];
+      if (preferred) {
+        setWorkspaceId(preferred.id);
+        if (preferred.defaultChecks.length > 0) setChecks(preferred.defaultChecks.join("\n"));
+      }
     }).catch((cause) => setError((cause as Error).message));
   }, [open, config?.realRunsAvailable]);
 
   if (!open) return null;
+  const selectedWorkspace = workspaces.find((item) => item.id === workspaceId);
+  const selectedDirty = Boolean(selectedWorkspace?.git?.dirty);
+  const selectWorkspace = (nextId: string) => {
+    setWorkspaceId(nextId);
+    const next = workspaces.find((item) => item.id === nextId);
+    if (next) setChecks(next.defaultChecks.join("\n") || "npm test");
+  };
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     setSubmitting(true);
@@ -261,10 +275,11 @@ function CreateRunDialog({ open, onClose, onCreated, config }: {
     try {
       const run = await api.createRun({
         title,
-        repository,
         task,
         mode,
-        checks: mode === "real" ? checks.split("\n").map((item) => item.trim()).filter(Boolean) : [],
+        ...(mode === "real"
+          ? { workspaceId, checks: checks.split("\n").map((item) => item.trim()).filter(Boolean) }
+          : { repository, checks: [] }),
       });
       onCreated(run);
       onClose();
@@ -283,23 +298,47 @@ function CreateRunDialog({ open, onClose, onCreated, config }: {
         </div>
         <div className="mode-picker">
           <button type="button" className={mode === "demo" ? "active" : ""} onClick={() => { setMode("demo"); setRepository("demo/auth-service"); }}><Sparkles size={14} />流程演示</button>
-          <button type="button" className={mode === "real" ? "active" : ""} disabled={!config?.realRunsAvailable || projects.length === 0} onClick={() => { setMode("real"); if (projects[0]) setRepository(projects[0].relativePath); }}><Code2 size={14} />真实开发</button>
+          <button type="button" className={mode === "real" ? "active" : ""} disabled={!config?.realRunsAvailable} onClick={() => setMode("real")}><Code2 size={14} />真实开发</button>
         </div>
         <div className="demo-notice">
           {mode === "demo" ? <><Sparkles size={16} />演示事件不会调用模型或修改仓库。</> : <><ShieldCheck size={16} />真实任务将在隔离 Git worktree 中修改代码，不会自动推送或合并。</>}
         </div>
         <label>任务名称<input value={title} onChange={(event) => setTitle(event.target.value)} /></label>
         {mode === "real" ? (
-          <label>开发项目<select value={repository} onChange={(event) => setRepository(event.target.value)}>
-            {projects.map((project) => <option value={project.relativePath} key={project.id}>{project.name} · {project.branch}{project.dirty ? " · 有未提交修改" : ""}</option>)}
-          </select></label>
+          workspaces.length === 0 ? (
+            <div className="workspace-empty-notice">
+              <AlertTriangle size={15} />
+              <div><strong>还没有注册工作区</strong><span>真实任务只能选择已注册且健康的工作区，请先在工作区页面注册或克隆一个仓库。</span></div>
+              <button type="button" className="button secondary" onClick={onGoWorkspaces}>前往工作区</button>
+            </div>
+          ) : (
+            <>
+              <label>开发工作区<select value={workspaceId} onChange={(event) => selectWorkspace(event.target.value)}>
+                {workspaces.map((workspace) => (
+                  <option value={workspace.id} key={workspace.id}>
+                    {workspace.name} · {workspace.git?.branch || "—"}{workspace.git?.dirty ? " · 有未提交修改" : ""}
+                  </option>
+                ))}
+              </select></label>
+              {selectedDirty && (
+                <div className="dirty-warning">
+                  <AlertTriangle size={15} />
+                  <div>
+                    <strong>工作区存在未提交修改</strong>
+                    <span>真实任务默认拒绝在 dirty 仓库上启动。请先提交或清理，然后刷新 Git 状态。</span>
+                    {selectedWorkspace?.git?.dirtyFiles?.length ? <code>{selectedWorkspace.git.dirtyFiles.slice(0, 5).join(" · ")}{selectedWorkspace.git.dirtyFiles.length > 5 ? " …" : ""}</code> : null}
+                  </div>
+                </div>
+              )}
+            </>
+          )
         ) : <label>仓库<input value={repository} onChange={(event) => setRepository(event.target.value)} /></label>}
         <label>需求与验收条件<textarea rows={5} value={task} onChange={(event) => setTask(event.target.value)} /></label>
         {mode === "real" && <label>检查命令（每行一个）<textarea rows={3} value={checks} onChange={(event) => setChecks(event.target.value)} placeholder="npm test" /></label>}
         {error && <div className="form-error">{error}</div>}
         <div className="modal-actions">
           <button type="button" className="button secondary" onClick={onClose}>取消</button>
-          <button type="submit" className="button primary" disabled={submitting}>
+          <button type="submit" className="button primary" disabled={submitting || (mode === "real" && (!workspaceId || selectedDirty))}>
             {submitting ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}{mode === "real" ? "开始真实开发" : "运行演示"}
           </button>
         </div>
@@ -653,7 +692,7 @@ export function App() {
           </div>
         )}
       </main>
-      <CreateRunDialog open={createOpen} onClose={() => setCreateOpen(false)} onCreated={handleCreated} config={config} />
+      <CreateRunDialog open={createOpen} onClose={() => setCreateOpen(false)} onCreated={handleCreated} config={config} onGoWorkspaces={() => { setCreateOpen(false); setView("workspaces"); }} />
       <CredentialsDialog open={credentialsOpen} onClose={() => setCredentialsOpen(false)} config={config} onChanged={setConfig} />
     </div>
   );

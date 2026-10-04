@@ -28,6 +28,7 @@ type WorkspaceRow = {
   git_branch: string | null;
   git_head: string | null;
   git_dirty: number | null;
+  git_dirty_files_json: string;
   last_checked_at: string | null;
   created_at: string;
   updated_at: string;
@@ -47,7 +48,7 @@ function toWorkspace(row: WorkspaceRow): Workspace {
     defaultChecks: JSON.parse(row.default_checks_json) as string[],
     status: row.status as WorkspaceStatus,
     git: row.git_head
-      ? { branch: row.git_branch, head: row.git_head, dirty: Boolean(row.git_dirty) }
+      ? { branch: row.git_branch, head: row.git_head, dirty: Boolean(row.git_dirty), dirtyFiles: JSON.parse(row.git_dirty_files_json || "[]") as string[] }
       : null,
     lastCheckedAt: row.last_checked_at,
     createdAt: row.created_at,
@@ -124,9 +125,9 @@ export class WorkspaceService {
     }
     await this.db.query(`
       UPDATE workspaces
-      SET status = 'active', canonical_path = $1, git_branch = $2, git_head = $3, git_dirty = $4, last_checked_at = $5, updated_at = $6
-      WHERE id = $7
-    `, [result.canonicalPath ?? row.canonical_path, result.branch ?? null, result.head ?? null, result.dirty ? 1 : 0, now, now, row.id]);
+      SET status = 'active', canonical_path = $1, git_branch = $2, git_head = $3, git_dirty = $4, git_dirty_files_json = $5, last_checked_at = $6, updated_at = $7
+      WHERE id = $8
+    `, [result.canonicalPath ?? row.canonical_path, result.branch ?? null, result.head ?? null, result.dirty ? 1 : 0, JSON.stringify(result.dirtyFiles ?? []), now, now, row.id]);
     return toWorkspace((await this.db.query("SELECT * FROM workspaces WHERE id = $1", [row.id])).rows[0] as WorkspaceRow);
   }
 
@@ -168,21 +169,21 @@ export class WorkspaceService {
         await tx.query(`
           UPDATE workspaces
           SET root_path = $1, canonical_path = $2, repository_url = COALESCE($3, repository_url), status = 'active',
-              default_branch = COALESCE(default_branch, $4), git_branch = $5, git_head = $6, git_dirty = $7, last_checked_at = $8, updated_at = $9
-          WHERE id = $10
+              default_branch = COALESCE(default_branch, $4), git_branch = $5, git_head = $6, git_dirty = $7, git_dirty_files_json = $8, last_checked_at = $9, updated_at = $10
+          WHERE id = $11
         `, [
           result.relativePath ?? existing.root_path, result.canonicalPath ?? existing.canonical_path, repositoryUrl,
-          result.branch ?? null, result.branch ?? null, result.head ?? null, result.dirty ? 1 : 0, now, now, existing.id,
+          result.branch ?? null, result.branch ?? null, result.head ?? null, result.dirty ? 1 : 0, JSON.stringify(result.dirtyFiles ?? []), now, now, existing.id,
         ]);
         return toWorkspace((await tx.query("SELECT * FROM workspaces WHERE id = $1", [existing.id])).rows[0] as WorkspaceRow);
       }
       const id = newId("ws");
       await tx.query(`
-        INSERT INTO workspaces (id, owner_id, node_id, name, type, root_path, canonical_path, repository_url, default_branch, default_checks_json, status, git_branch, git_head, git_dirty, last_checked_at, created_at, updated_at)
-        VALUES ($1, $2, 'server', $3, 'server', $4, $5, $6, $7, '[]', 'active', $8, $9, $10, $11, $12, $13)
+        INSERT INTO workspaces (id, owner_id, node_id, name, type, root_path, canonical_path, repository_url, default_branch, default_checks_json, status, git_branch, git_head, git_dirty, git_dirty_files_json, last_checked_at, created_at, updated_at)
+        VALUES ($1, $2, 'server', $3, 'server', $4, $5, $6, $7, '[]', 'active', $8, $9, $10, $11, $12, $13, $14)
       `, [
         id, ownerId, name, result.relativePath ?? name, result.canonicalPath ?? "", repositoryUrl,
-        result.branch ?? null, result.branch ?? null, result.head ?? null, result.dirty ? 1 : 0, now, now, now,
+        result.branch ?? null, result.branch ?? null, result.head ?? null, result.dirty ? 1 : 0, JSON.stringify(result.dirtyFiles ?? []), now, now, now,
       ]);
       return toWorkspace((await tx.query("SELECT * FROM workspaces WHERE id = $1", [id])).rows[0] as WorkspaceRow);
     });

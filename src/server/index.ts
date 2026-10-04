@@ -5,7 +5,7 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import type { ConfigStatus, CurrentUser, Run } from "../shared/types.js";
+import type { ConfigStatus, CurrentUser, Run, Workspace } from "../shared/types.js";
 import { Authenticator } from "./auth.js";
 import { CredentialVault } from "./credential-vault.js";
 import { createDb, createPool, runMigrations } from "./db.js";
@@ -56,14 +56,15 @@ const createRunSchema = z.object({
   title: z.string().trim().min(2).max(80),
   task: z.string().trim().min(10).max(10_000),
   repository: z.string().trim().max(240).default("demo/auth-service"),
+  workspaceId: z.string().trim().min(1).max(80).optional(),
   mode: z.enum(["demo", "real"]).default("demo"),
   checks: z.array(z.string().trim().min(1).max(500)).max(8).default([]),
 }).superRefine((value, context) => {
   if (value.mode === "real" && value.checks.length === 0) {
     context.addIssue({ code: "custom", path: ["checks"], message: "Real runs require at least one check command" });
   }
-  if (value.mode === "real" && (!/^[a-zA-Z0-9._/-]+$/.test(value.repository) || value.repository.includes(".."))) {
-    context.addIssue({ code: "custom", path: ["repository"], message: "Invalid project path" });
+  if (value.mode === "real" && !value.workspaceId) {
+    context.addIssue({ code: "custom", path: ["workspaceId"], message: "Real runs require a registered workspace" });
   }
 });
 
@@ -213,9 +214,9 @@ function vaultKeyFor(request: FastifyRequest) {
 app.get("/api/health", async (_request, reply) => {
   try {
     await db.query("SELECT 1");
-    return { status: "ok", service: "pigo-web", version: "0.6.1", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.7.0", db: "ok" };
   } catch {
-    return reply.code(503).send({ status: "error", service: "pigo-web", version: "0.6.1", db: "unavailable" });
+    return reply.code(503).send({ status: "error", service: "pigo-web", version: "0.7.0", db: "unavailable" });
   }
 });
 app.get("/api/me", async (request) => auth.user(request));
@@ -368,10 +369,24 @@ app.post("/api/runs", async (request, reply) => {
   if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
   const user = auth.user(request);
   if (parsed.data.mode === "real") {
+    // WS-008: real runs may only target the user's own registered, healthy workspaces.
+    let workspace: Workspace;
+    try {
+      workspace = await workspaces.refresh(ownerKeysFor(request), parsed.data.workspaceId!);
+    } catch (error) {
+      return workspaceErrorReply(reply, error);
+    }
+    if (workspace.git?.dirty) {
+      return reply.code(409).send({
+        error: "工作区存在未提交修改，请先提交或清理后再创建真实任务",
+        code: "WORKSPACE_DIRTY",
+        dirtyFiles: workspace.git.dirtyFiles,
+      });
+    }
     if (!realRunsEnabled || !internalToken) return reply.code(503).send({ error: "Real agent execution is disabled", code: "REAL_RUNNER_NOT_AVAILABLE" });
     const credentials = vault.get(vaultKeyFor(request));
     if (!credentials) return reply.code(403).send({ error: "Configure both personal model keys before starting a real run", code: "PERSONAL_CREDENTIALS_REQUIRED" });
-    const run = baseRealRun(parsed.data, user.id);
+    const run = baseRealRun({ ...parsed.data, repository: workspace.rootPath, workspaceId: workspace.id }, user.id);
     await store.createRun(run, { runId: run.id, round: 1, source: "system", type: "run.created", message: "真实任务已创建，正在交给隔离 Pi Worker", at: new Date().toISOString() });
     try {
       await workerRequest("/jobs", { method: "POST", body: JSON.stringify({ run, checks: parsed.data.checks, credentials }) });
