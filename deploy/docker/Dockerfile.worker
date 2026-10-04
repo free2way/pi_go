@@ -9,6 +9,12 @@ RUN npx tsup src/worker/index.ts --format esm --platform node --out-dir dist --c
 FROM local/pi-coding-agent:1.0.0
 WORKDIR /app
 COPY --from=build /build/dist/index.js /app/worker.js
+# SEC-004: the worker keeps its own container-local Pi state directory (mounted
+# as a named volume) and only sees a read-only provider definition. Pre-creating
+# it here makes Docker initialise the empty volume with `node` ownership, so the
+# credential store stays writable for the non-root worker user.
+USER root
+RUN mkdir -p /home/node/.pi/agent && chown -R node:node /home/node/.pi
 USER node
 EXPOSE 3200
 CMD ["node", "/app/worker.js"]

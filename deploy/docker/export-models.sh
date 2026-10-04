@@ -11,36 +11,43 @@ set -euo pipefail
 PROJECT_DIR="${PI_PIGO_DIR:-/app/pi-agent}"
 RUNTIME_CONTAINER="${PI_RUNTIME_CONTAINER:-pi-agent-runtime-1}"
 OUTPUT="${1:-$PROJECT_DIR/pi-models.json}"
+RAW_FILE="$(mktemp)"
 
-RAW="$(docker exec "$RUNTIME_CONTAINER" cat /home/node/.pi/agent/models.json 2>/dev/null || echo '{"providers":{}}')"
+if ! docker exec "$RUNTIME_CONTAINER" cat /home/node/.pi/agent/models.json > "$RAW_FILE" 2>/dev/null; then
+  echo '{"providers":{}}' > "$RAW_FILE"
+fi
 
-python3 - "$OUTPUT" <<PY
+python3 - "$RAW_FILE" "$OUTPUT" <<'PY'
 import json
 import re
 import sys
 
-raw = json.loads('''$RAW''')
-secret_like = re.compile(r"^(?!\\$[A-Z_][A-Z0-9_]*$)[A-Za-z0-9_\\-]{16,}$")
+with open(sys.argv[1], encoding="utf-8") as handle:
+    raw = json.load(handle)
+
+env_reference = re.compile(r"^\$[A-Z_][A-Z0-9_]*$")
+secret_key = re.compile(r"(api[_-]?key|token|secret|password)", re.IGNORECASE)
 
 
-def sanitize(value):
+def sanitize(value, key=""):
     if isinstance(value, dict):
-        return {key: sanitize(item) for key, item in value.items()}
+        return {item: sanitize(child, item) for item, child in value.items()}
     if isinstance(value, list):
-        return [sanitize(item) for item in value]
-    if isinstance(value, str) and secret_like.match(value):
-        # Drop literal keys: the worker injects the current provider key through
-        # its environment, so definitions must reference \$ENV, never embed it.
+        return [sanitize(item, key) for item in value]
+    if isinstance(value, str) and secret_key.search(key) and not env_reference.match(value):
+        # Literal credentials never leave the configuration volume; the worker
+        # injects the current provider key through its environment instead.
         return ""
     return value
 
 
-with open(sys.argv[1], "w", encoding="utf-8") as handle:
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
     json.dump(sanitize(raw), handle, ensure_ascii=False, indent=2)
     handle.write("\n")
-print(f"wrote {sys.argv[1]}")
+print(f"wrote {sys.argv[2]}")
 PY
 
+rm -f "$RAW_FILE"
 chmod 644 "$OUTPUT"
 echo "--- sanitized definitions ---"
 cat "$OUTPUT"
