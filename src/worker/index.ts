@@ -8,6 +8,7 @@ import type { CheckResult, DevelopmentPlan, Finding, ProjectInfo, Run, RunEvent,
 import { CheckpointTracker, memoryCheckpointClient, stages, type Checkpoint, type CheckpointClient, type StoredChecks, type StoredReview } from "./checkpoints.js";
 import { conflictFreeBatches, executionWaves, fallbackPlan, parseDevelopmentPlan } from "./orchestrator.js";
 import { UsageTracker, addUsage, assistantErrorFromEvent, assistantTextFromEvent, emptyUsage, toRunUsage, toolNameFromEvent, type UsageTotals } from "./pi-events.js";
+import { scrubEnvironment } from "./pi-env.js";
 import { apiKeyEnvName, classifyProviderError, providerErrorSummary } from "./provider-errors.js";
 import { sleep, withProviderRetry } from "./provider-retry.js";
 import { parseReview, type ReviewResult } from "./review-protocol.js";
@@ -380,9 +381,9 @@ async function runPi(input: {
   let lastAssistantError: string | undefined;
   const tracker = new UsageTracker();
   let activityQueue = Promise.resolve();
-  const childEnvironment = { ...process.env };
-  delete childEnvironment.DEEPSEEK_API_KEY;
-  delete childEnvironment.OPENAI_API_KEY;
+  // SEC-003/010: only the current role's credential reaches the agent process;
+  // the worker's own tokens and the other role's key are stripped.
+  const childEnvironment = scrubEnvironment(process.env, [input.apiKeyEnvironmentName]);
   childEnvironment[input.apiKeyEnvironmentName] = input.apiKey;
   const result = await command("pi", args, {
     cwd: input.cwd,
@@ -692,7 +693,14 @@ async function runChecks(run: Run, worktree: string, commands: string[], signal:
     const started = Date.now();
     const current: CheckResult = { id: `check-${index + 1}`, name: `Check ${index + 1}`, command: checkCommand, status: "running" };
     await update(run, "checking", "checks", "check.started", `执行检查：${checkCommand}`, { checks: [...results, current] });
-    const result = await command("/bin/sh", ["-lc", checkCommand], { cwd: worktree, signal, timeoutMs: 600_000 });
+    // SEC-004/010: check commands run with the worker's secrets stripped, so a
+    // malicious check cannot read the internal callback token or provider keys.
+    const result = await command("/bin/sh", ["-lc", checkCommand], {
+      cwd: worktree,
+      signal,
+      timeoutMs: 600_000,
+      env: scrubEnvironment(process.env),
+    });
     results.push({
       ...current,
       status: result.code === 0 ? "passed" : "failed",
