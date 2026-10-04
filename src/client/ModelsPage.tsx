@@ -82,8 +82,8 @@ export function ModelsPage({ config, onChanged }: { config?: ConfigStatus; onCha
           <strong>{config?.realRunsAvailable ? "真实执行已启用" : "真实执行尚未就绪"}</strong>
           <span>
             {config?.realRunsAvailable
-              ? "开发与审核模型均有可用凭据，可以创建真实任务。"
-              : `默认开发模型需要 ${catalog?.defaultDeveloper.provider ?? "—"} 凭据，默认审核模型需要 ${catalog?.defaultReviewer.provider ?? "—"} 凭据。`}
+              ? "已配置至少一个 provider 凭据；创建任务时会按所选开发/审核模型组合做可用性预检。"
+              : "真实任务执行需要至少一个已验证的 provider Key，请在下方配置。"}
           </span>
         </div>
       </div>
@@ -108,7 +108,10 @@ export function ModelsPage({ config, onChanged }: { config?: ConfigStatus; onCha
                     <div className="model-tags">
                       {entry.roles.map((role) => <span key={role}>{roleLabel[role]}</span>)}
                       {entry.reasoning && <span>推理</span>}
-                      <span className={entry.available ? "ok" : "warn"}>{entry.available ? "可用" : "缺凭据"}</span>
+                      {/* AUD-08: distinguish configured-but-unverified from missing. */}
+                      <span className={entry.available ? "ok" : "warn"}>
+                        {entry.available ? (entry.verified ? "已校验可用" : "可用") : entry.unavailableReason === "credential_missing" ? "缺凭据" : "待校验"}
+                      </span>
                     </div>
                   </div>
                 ))}

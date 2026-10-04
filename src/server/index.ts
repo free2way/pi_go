@@ -13,8 +13,9 @@ import { CredentialVault } from "./credential-vault.js";
 import { createDb, createPool, newId, runMigrations } from "./db.js";
 import { baseDemoRun, runDemo } from "./demo-runner.js";
 import { IdentityService } from "./identity.js";
-import { availableModels, defaultSelections, loadModelCatalog, validateModelSelection } from "./model-catalog.js";
+import { availableModels, defaultSelections, loadModelCatalog, preflightRunModels, type RuntimeCapability } from "./model-catalog.js";
 import { baseRealRun } from "./real-run.js";
+import { createProviderProbe, providerProbeDisabled } from "./provider-probe.js";
 import { RateLimiter } from "./rate-limit.js";
 import { PostgresRunStore } from "./run-store-pg.js";
 import type { RunStoreLike } from "./store.js";
@@ -50,6 +51,11 @@ const vault = new CredentialVault(vaultFile, vaultSecret, {
 });
 const auth = new Authenticator();
 await vault.init();
+// AUD-08 / AT-MODEL-004: live provider probe used to verify credentials. It is
+// injectable and never throws; a failed probe simply leaves a key unverified.
+const providerProbe = createProviderProbe();
+// AT-MODEL-001: capability overrides reported by a probe, keyed `provider/model`.
+const runtimeCapabilities = new Map<string, RuntimeCapability>();
 
 const databaseUrl = process.env.PI_DATABASE_URL;
 if (!databaseUrl) throw new Error("PI_DATABASE_URL is required (postgresql://user:password@host:5432/database)");
@@ -333,7 +339,7 @@ app.get("/api/health", async (_request, reply) => {
   try {
     await pingDatabase();
     alerts.clear("database_unavailable");
-    return { status: "ok", service: "pigo-web", version: "0.17.1", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.18.0", db: "ok" };
   } catch (error) {
     // AT-REL-005: fail loudly instead of pretending the service is healthy.
     alerts.raise({
@@ -342,7 +348,7 @@ app.get("/api/health", async (_request, reply) => {
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
       details: { error: (error as Error).message.slice(0, 200) },
     });
-    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.17.1", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.18.0", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
   }
 });
 
@@ -357,7 +363,7 @@ interface StorageStatus {
 app.get("/api/health/detail", async (request, reply) => {
   const internal = safeTokenMatch(request.headers.authorization);
   if (!internal && !auth.user(request)) return reply.code(401).send({ error: "Unauthorized" });
-  const health: Record<string, unknown> = { version: "0.17.1", at: new Date().toISOString() };
+  const health: Record<string, unknown> = { version: "0.18.0", at: new Date().toISOString() };
   try {
     await pingDatabase();
     health.database = { status: "ok" };
@@ -417,7 +423,25 @@ app.put("/api/credentials", async (request, reply) => {
     if (parsed.data.reviewerApiKey) writes.push({ provider: modelDefaults.reviewer.provider, apiKey: parsed.data.reviewerApiKey });
   }
   let status = vault.status(userId);
-  for (const write of writes) status = await vault.set(userId, write);
+  for (const write of writes) {
+    status = await vault.set(userId, write);
+    // AUD-08 / AT-MODEL-004: verify the key against the provider before it can be
+    // considered available. `PI_MODEL_PROBE_MODE=off` is the explicit opt-out for
+    // providers without a reachable /models endpoint.
+    if (providerProbeDisabled()) {
+      status = await vault.markVerified(userId, write.provider, []);
+      continue;
+    }
+    const probe = await providerProbe(write).catch(() => undefined);
+    if (probe?.ok) {
+      status = await vault.markVerified(userId, write.provider, probe.models);
+      for (const [model, capability] of Object.entries(probe.capabilities ?? {})) {
+        runtimeCapabilities.set(`${write.provider}/${model}`, capability);
+      }
+    } else {
+      status = await vault.markUnverified(userId, write.provider);
+    }
+  }
   return status;
 });
 
@@ -430,23 +454,35 @@ app.delete<{ Querystring: { provider?: string } }>("/api/credentials", async (re
 });
 
 app.get("/api/models", async (request): Promise<ModelCatalogResponse> => {
-  const configured = new Set(vault.configuredProviders(vaultKeyFor(request)));
+  const availability = vault.providerAvailability(vaultKeyFor(request));
   return {
-    models: availableModels(modelCatalog, configured),
+    models: availableModels(modelCatalog, availability, Object.fromEntries(runtimeCapabilities)),
     defaultDeveloper: modelDefaults.developer,
     defaultReviewer: modelDefaults.reviewer,
+    // AUD-08 / AT-MODEL-001: surface the provider-reported verifiedModels.
+    verifiedProviders: availability.map((item) => ({
+      provider: item.provider,
+      verifiedAt: item.verifiedAt,
+      verifiedModels: item.verifiedModels,
+    })),
   };
 });
 
 app.get("/api/config/status", async (request): Promise<ConfigStatus> => {
   const credentials = vault.status(vaultKeyFor(request));
   const configured = new Set(credentials.providers.map((item) => item.provider));
+  // AUD-09 / AT-MODEL-006/007: execution availability is decoupled from the
+  // default provider/credential pairing. As long as at least one provider is
+  // configured the user may enter the real-run form; the actual per-role model
+  // combination is preflighted when the run is created (AT-MODEL-008).
   return {
     demoMode,
     piVersion: process.env.PI_VERSION || "1.0.0",
     developer: { provider: modelDefaults.developer.provider, model: modelDefaults.developer.model, credentialConfigured: configured.has(modelDefaults.developer.provider) },
     reviewer: { provider: modelDefaults.reviewer.provider, model: modelDefaults.reviewer.model, credentialConfigured: configured.has(modelDefaults.reviewer.provider) },
-    realRunsAvailable: realRunsEnabled && Boolean(internalToken) && configured.has(modelDefaults.developer.provider) && configured.has(modelDefaults.reviewer.provider),
+    realRunsAvailable: realRunsEnabled && Boolean(internalToken) && configured.size > 0,
+    configuredProviders: [...configured],
+    verifiedProviders: credentials.providers.filter((item) => item.verifiedAt !== null).map((item) => item.provider),
   };
 });
 
@@ -645,18 +681,23 @@ app.post("/api/runs", async (request, reply) => {
       });
     }
 
-    // MODEL-007/008: resolve the exact models and preflight them before queueing.
-    const configured = new Set(vault.configuredProviders(vaultKeyFor(request)));
-    const developerSelection = parsed.data.developerModel ?? modelDefaults.developer;
-    const reviewerSelection = parsed.data.reviewerModel ?? modelDefaults.reviewer;
-    const developerCheck = validateModelSelection(modelCatalog, "developer", developerSelection, configured);
-    if (!developerCheck.ok) return reply.code(422).send({ error: developerCheck.message, code: developerCheck.code });
-    const reviewerCheck = validateModelSelection(modelCatalog, "reviewer", reviewerSelection, configured);
-    if (!reviewerCheck.ok) return reply.code(422).send({ error: reviewerCheck.message, code: reviewerCheck.code });
+    // AUD-08 / AT-MODEL-008 + AUD-09 / AT-MODEL-007: preflight the exact
+    // provider/model combination for every role the run will use (planner and
+    // developer share the developer selection; reviewer has its own) before
+    // queueing. A single provider that serves both roles is enough.
+    const availability = vault.providerAvailability(vaultKeyFor(request));
+    const selections = {
+      developer: parsed.data.developerModel ?? modelDefaults.developer,
+      reviewer: parsed.data.reviewerModel ?? modelDefaults.reviewer,
+    };
+    const preflight = preflightRunModels(modelCatalog, selections, availability);
+    if (!preflight.ok) return reply.code(422).send({ error: preflight.message, code: preflight.code, role: preflight.role });
+    const developerEntry = preflight.roles.developer;
+    const reviewerEntry = preflight.roles.reviewer;
 
     const credentials = requireCredentials({
-      developer: vault.get(vaultKeyFor(request), developerCheck.entry.provider),
-      reviewer: vault.get(vaultKeyFor(request), reviewerCheck.entry.provider),
+      developer: vault.get(vaultKeyFor(request), developerEntry.provider),
+      reviewer: vault.get(vaultKeyFor(request), reviewerEntry.provider),
     });
     if (!credentials) {
       return reply.code(403).send({ error: "所选模型的 provider 凭据不完整，请在「模型与凭据」页配置", code: "PERSONAL_CREDENTIALS_REQUIRED" });
@@ -671,16 +712,16 @@ app.post("/api/runs", async (request, reply) => {
       ...parsed.data,
       repository: workspace.rootPath,
       workspaceId: workspace.id,
-      developerModel: { provider: developerCheck.entry.provider, model: developerCheck.entry.model },
-      reviewerModel: { provider: reviewerCheck.entry.provider, model: reviewerCheck.entry.model },
+      developerModel: { provider: developerEntry.provider, model: developerEntry.model },
+      reviewerModel: { provider: reviewerEntry.provider, model: reviewerEntry.model },
     }, user.id);
     // GAP-01: freeze the reproducible inputs with the run.
     run.baseSha = workspace.git?.head ?? undefined;
     run.budget = readRunBudget();
     run.pipelineVersion = PIPELINE_VERSION;
     run.credentialVersions = {
-      developer: credentialFingerprint(vault.get(vaultKeyFor(request), developerCheck.entry.provider)),
-      reviewer: credentialFingerprint(vault.get(vaultKeyFor(request), reviewerCheck.entry.provider)),
+      developer: credentialFingerprint(vault.get(vaultKeyFor(request), developerEntry.provider)),
+      reviewer: credentialFingerprint(vault.get(vaultKeyFor(request), reviewerEntry.provider)),
     };
     await store.createRun(run, { runId: run.id, round: 1, source: "system", type: "run.created", message: "真实任务已创建，正在交给隔离 Pi Worker", at: new Date().toISOString() });
     try {

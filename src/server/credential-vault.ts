@@ -1,7 +1,7 @@
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { CredentialStatus } from "../shared/types.js";
+import type { CredentialStatus, ProviderAvailability } from "../shared/types.js";
 
 /** Credentials the worker receives for a single job (resolved from the run's pinned models). */
 export type ModelCredentials = {
@@ -19,6 +19,8 @@ type ProviderRecord = {
   apiKey: EncryptedValue;
   updatedAt: string;
   verifiedAt: string | null;
+  /** AUD-08 / AT-MODEL-001: provider-reported model ids from the last probe. */
+  verifiedModels: string[] | null;
 };
 
 type UserRecord = {
@@ -86,6 +88,22 @@ export class CredentialVault {
     return Object.keys(this.data.users[userId]?.providers ?? {});
   }
 
+  /**
+   * AUD-08 / AT-MODEL-004: configured vs. verified state per provider, without
+   * decrypting the key. `verifiedAt === null` means the credential has not been
+   * live-verified and must not be treated as available.
+   */
+  providerAvailability(userId: string): ProviderAvailability[] {
+    const record = this.data.users[userId];
+    if (!record) return [];
+    return Object.entries(record.providers).map(([provider, value]) => ({
+      provider,
+      configured: true,
+      verifiedAt: value.verifiedAt ?? null,
+      verifiedModels: value.verifiedModels ?? null,
+    }));
+  }
+
   status(userId: string): CredentialStatus {
     const record = this.data.users[userId];
     const providers = Object.entries(record?.providers ?? {}).map(([provider, value]) => ({
@@ -93,6 +111,8 @@ export class CredentialVault {
       configured: true,
       masked: mask(this.decrypt(userId, provider, value.apiKey)),
       updatedAt: value.updatedAt,
+      verifiedAt: value.verifiedAt ?? null,
+      verifiedModels: value.verifiedModels ?? null,
     }));
     const configured = new Set(providers.map((item) => item.provider));
     return {
@@ -116,9 +136,38 @@ export class CredentialVault {
       apiKey: this.encrypt(userId, input.provider, input.apiKey),
       updatedAt: now,
       verifiedAt: null,
+      verifiedModels: null,
     };
     current.updatedAt = now;
     this.data.users[userId] = current;
+    await this.persist();
+    return this.status(userId);
+  }
+
+  /**
+   * AUD-08 / AT-MODEL-004: records a successful live probe. `models` is the
+   * provider-reported model id list; an empty list means "the credential works
+   * but the provider did not enumerate models", so no per-model restriction is
+   * applied.
+   */
+  async markVerified(userId: string, provider: string, models: string[]) {
+    const record = this.data.users[userId]?.providers?.[provider];
+    if (!record) return this.status(userId);
+    const now = new Date().toISOString();
+    record.verifiedAt = now;
+    record.verifiedModels = Array.isArray(models) ? models.slice(0, 500) : null;
+    this.data.users[userId].updatedAt = now;
+    await this.persist();
+    return this.status(userId);
+  }
+
+  /** Records a failed/incomplete probe so the credential is shown as unverified. */
+  async markUnverified(userId: string, provider: string) {
+    const record = this.data.users[userId]?.providers?.[provider];
+    if (!record) return this.status(userId);
+    if (record.verifiedAt === null && record.verifiedModels === null) return this.status(userId);
+    record.verifiedAt = null;
+    record.verifiedModels = null;
     await this.persist();
     return this.status(userId);
   }
@@ -148,6 +197,7 @@ export class CredentialVault {
           apiKey: this.encrypt(userId, provider, apiKey),
           updatedAt: record.updatedAt,
           verifiedAt: null,
+          verifiedModels: null,
         };
       }
       users[userId] = { providers, updatedAt: record.updatedAt };

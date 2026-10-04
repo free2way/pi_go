@@ -265,7 +265,11 @@ function CreateRunDialog({ open, onClose, onCreated, config, onGoWorkspaces }: {
       const pick = (selection: { provider: string; model: string }, role: "developer" | "reviewer") => {
         const exact = modelResult.models.find((entry) => entry.provider === selection.provider && entry.model === selection.model);
         if (exact) return exact.id;
-        return modelResult.models.find((entry) => entry.roles.includes(role) && entry.available)?.id ?? "";
+        // AUD-09: prefer a verified model but still allow choosing any model for
+        // the role — the run preflight reports the precise blocking reason.
+        return modelResult.models.find((entry) => entry.roles.includes(role) && entry.available)?.id
+          ?? modelResult.models.find((entry) => entry.roles.includes(role))?.id
+          ?? "";
       };
       setDeveloperModelId(pick(modelResult.defaultDeveloper, "developer"));
       setReviewerModelId(pick(modelResult.defaultReviewer, "reviewer"));

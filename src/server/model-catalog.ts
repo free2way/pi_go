@@ -1,10 +1,21 @@
-import type { ModelCatalogEntry, ModelInfo, ModelRole, ModelSelection } from "../shared/types.js";
+import type {
+  ModelCatalogEntry,
+  ModelInfo,
+  ModelRole,
+  ModelSelection,
+  ProviderAvailability,
+} from "../shared/types.js";
 
 /**
  * Built-in allowlist. The entries mirror the providers and models configured for
- * this deployment; `PI_MODEL_CATALOG_JSON` replaces the list, and the role
+ * this deployment. When no explicit `PI_MODEL_CATALOG_JSON` is set the role
  * defaults from `PI_DEVELOPER_PROVIDER/MODEL` and `PI_REVIEWER_PROVIDER/MODEL`
- * are always merged in so a custom catalog can never hide the configured defaults.
+ * are merged in so the builtin catalog cannot hide the configured defaults.
+ *
+ * AUD-08 / AT-MODEL-002: an explicit operator allowlist is STRICT. It is used
+ * verbatim — no defaults are appended and role mappings are not extended. If a
+ * role ends up without a usable model, preflight reports a configuration error
+ * instead of silently widening the catalog.
  */
 export const builtinModelCatalog: ModelCatalogEntry[] = [
   { id: "deepseek/deepseek-flash", provider: "deepseek", model: "deepseek-flash", label: "DeepSeek Flash", toolCalling: true, reasoning: false, roles: ["developer"], status: "available" },
@@ -47,6 +58,12 @@ export function parseModelCatalogJson(raw: string | undefined): ModelCatalogEntr
   }
 }
 
+/** True when the operator supplied an explicit JSON allowlist (even an empty one). */
+export function hasExplicitModelCatalog(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env.PI_MODEL_CATALOG_JSON?.trim();
+  return Boolean(raw && raw.startsWith("["));
+}
+
 function roleDefault(env: NodeJS.ProcessEnv, role: ModelRole, fallback: ModelSelection): ModelSelection {
   if (role === "developer") {
     return {
@@ -61,7 +78,12 @@ function roleDefault(env: NodeJS.ProcessEnv, role: ModelRole, fallback: ModelSel
 }
 
 export function loadModelCatalog(env: NodeJS.ProcessEnv = process.env): ModelCatalogEntry[] {
-  const entries = parseModelCatalogJson(env.PI_MODEL_CATALOG_JSON) ?? [...builtinModelCatalog];
+  // AUD-08 / AT-MODEL-002: an explicit allowlist is authoritative. It is never
+  // widened with defaults and its role mappings are never extended.
+  if (hasExplicitModelCatalog(env)) {
+    return parseModelCatalogJson(env.PI_MODEL_CATALOG_JSON) ?? [];
+  }
+  const entries = [...builtinModelCatalog];
   const defaults = {
     developer: roleDefault(env, "developer", { provider: "deepseek", model: "deepseek-flash" }),
     reviewer: roleDefault(env, "reviewer", { provider: "openai-proxy", model: "gpt-5.6-sol" }),
@@ -99,16 +121,57 @@ export function findModel(entries: ModelCatalogEntry[], provider: string, model:
   return entries.find((entry) => entry.provider === provider && entry.model === model);
 }
 
+export type ProviderAvailabilityIndex = Map<string, ProviderAvailability>;
+export type ProviderAvailabilityInput = Set<string> | ProviderAvailability[] | ProviderAvailabilityIndex;
+
+function normalizeAvailability(input: ProviderAvailabilityInput): ProviderAvailabilityIndex {
+  if (input instanceof Map) return input;
+  const index: ProviderAvailabilityIndex = new Map();
+  if (input instanceof Set) {
+    // A bare Set is the legacy "these providers are usable" shorthand.
+    for (const provider of input) {
+      index.set(provider, { provider, configured: true, verifiedAt: null, verifiedModels: null, verified: true });
+    }
+    return index;
+  }
+  for (const item of input) index.set(item.provider, item);
+  return index;
+}
+
+export type ProviderModelState = "missing" | "unverified" | "model_unverified" | "ready";
+
+/** AUD-08 / AT-MODEL-004: a stored key is not "available" until a live probe verified it. */
+export function providerModelState(
+  availability: ProviderAvailabilityInput,
+  provider: string,
+  model: string,
+): ProviderModelState {
+  const index = normalizeAvailability(availability);
+  const record = index.get(provider);
+  if (!record || !record.configured) return "missing";
+  const verified = record.verified ?? record.verifiedAt !== null;
+  if (!verified) return "unverified";
+  if (Array.isArray(record.verifiedModels) && record.verifiedModels.length > 0 && !record.verifiedModels.includes(model)) {
+    return "model_unverified";
+  }
+  return "ready";
+}
+
 export type ModelValidation =
   | { ok: true; entry: ModelCatalogEntry }
-  | { ok: false; code: "MODEL_NOT_FOUND" | "MODEL_NOT_ALLOWED" | "MODEL_UNAVAILABLE"; message: string };
+  | { ok: false; code: "MODEL_NOT_FOUND" | "MODEL_NOT_ALLOWED" | "MODEL_UNAVAILABLE" | "MODEL_NOT_AVAILABLE" | "MODEL_CONFIG_INVALID"; message: string };
 
 export function validateModelSelection(
   entries: ModelCatalogEntry[],
   role: ModelRole,
   selection: ModelSelection,
-  configuredProviders: Set<string>,
+  availability: ProviderAvailabilityInput,
 ): ModelValidation {
+  if (!entries.some((entry) => entry.roles.includes(role))) {
+    // AUD-08 / AT-MODEL-002: an explicit allowlist can leave a role uncovered;
+    // report the configuration error instead of falling back to a default.
+    return { ok: false, code: "MODEL_CONFIG_INVALID", message: `允许目录未包含可用于${role === "developer" ? "开发" : "审核"}角色的模型，请修正模型目录配置` };
+  }
   const entry = findModel(entries, selection.provider, selection.model);
   if (!entry) {
     return { ok: false, code: "MODEL_NOT_FOUND", message: `模型 ${selection.provider}/${selection.model} 不在允许目录中` };
@@ -116,19 +179,76 @@ export function validateModelSelection(
   if (!entry.roles.includes(role)) {
     return { ok: false, code: "MODEL_NOT_ALLOWED", message: `模型 ${entry.label} 不允许用于${role === "developer" ? "开发" : "审核"}角色` };
   }
-  if (!configuredProviders.has(entry.provider)) {
+  const state = providerModelState(availability, entry.provider, entry.model);
+  if (state === "missing") {
     return { ok: false, code: "MODEL_UNAVAILABLE", message: `尚未配置 ${entry.provider} 的凭据，无法使用 ${entry.label}` };
+  }
+  if (state === "unverified") {
+    return { ok: false, code: "MODEL_NOT_AVAILABLE", message: `${entry.provider} 的凭据尚未通过可用性校验，请在「模型与凭据」页重新保存或校验 Key` };
+  }
+  if (state === "model_unverified") {
+    return { ok: false, code: "MODEL_NOT_AVAILABLE", message: `${entry.label} 未在该 provider 实际可用的模型列表中，无法使用` };
   }
   return { ok: true, entry };
 }
 
-export function availableModels(entries: ModelCatalogEntry[], configuredProviders: Set<string>): ModelInfo[] {
+/** Optional runtime capability overrides captured from a provider probe. */
+export interface RuntimeCapability {
+  toolCalling?: boolean;
+  reasoning?: boolean;
+  contextWindow?: number;
+}
+
+export function availableModels(
+  entries: ModelCatalogEntry[],
+  availability: ProviderAvailabilityInput,
+  runtime?: Record<string, RuntimeCapability>,
+): ModelInfo[] {
+  const index = normalizeAvailability(availability);
   return entries.map((entry) => {
-    const hasCredential = configuredProviders.has(entry.provider);
-    return {
-      ...entry,
-      available: hasCredential && entry.roles.length > 0,
-      unavailableReason: hasCredential ? null : "credential_missing",
-    };
+    const runtimeCapability = runtime?.[`${entry.provider}/${entry.model}`];
+    const merged = runtimeCapability ? { ...entry, ...runtimeCapability } : entry;
+    const record = index.get(entry.provider);
+    if (!entry.roles.length) {
+      return { ...merged, available: false, unavailableReason: "role_restricted", verified: false, verifiedAt: record?.verifiedAt ?? null };
+    }
+    const state = providerModelState(index, entry.provider, entry.model);
+    const verifiedAt = record?.verifiedAt ?? null;
+    if (state === "ready") {
+      return { ...merged, available: true, unavailableReason: null, verified: true, verifiedAt };
+    }
+    const unavailableReason = state === "missing" ? "credential_missing" : state === "unverified" ? "credential_unverified" : "model_unverified";
+    return { ...merged, available: false, unavailableReason, verified: false, verifiedAt };
   });
+}
+
+export type RunPreflightFailure = {
+  ok: false;
+  role: ModelRole;
+  code: "MODEL_NOT_FOUND" | "MODEL_NOT_ALLOWED" | "MODEL_UNAVAILABLE" | "MODEL_NOT_AVAILABLE" | "MODEL_CONFIG_INVALID";
+  message: string;
+};
+
+export type RunPreflightResult =
+  | { ok: true; roles: { developer: ModelCatalogEntry; reviewer: ModelCatalogEntry } }
+  | RunPreflightFailure;
+
+/**
+ * AUD-08 / AT-MODEL-008: before a run is enqueued, verify that every role the run
+ * will use is usable. The planner and developer both execute on the developer
+ * selection (see worker/index.ts), and the reviewer on the reviewer selection.
+ * A failure here rejects the run early with a clear code instead of failing mid-run.
+ */
+export function preflightRunModels(
+  entries: ModelCatalogEntry[],
+  selections: { developer: ModelSelection; reviewer: ModelSelection },
+  availability: ProviderAvailabilityInput,
+): RunPreflightResult {
+  const resolved: Partial<Record<ModelRole, ModelCatalogEntry>> = {};
+  for (const role of ["developer", "reviewer"] as ModelRole[]) {
+    const check = validateModelSelection(entries, role, selections[role], availability);
+    if (!check.ok) return { ok: false, role, code: check.code, message: check.message };
+    resolved[role] = check.entry;
+  }
+  return { ok: true, roles: { developer: resolved.developer!, reviewer: resolved.reviewer! } };
 }

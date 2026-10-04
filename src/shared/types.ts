@@ -190,7 +190,17 @@ export interface ConfigStatus {
   piVersion: string;
   developer: { provider: string; model: string; credentialConfigured: boolean };
   reviewer: { provider: string; model: string; credentialConfigured: boolean };
+  /**
+   * AUD-09 / AT-MODEL-006/007: execution availability is decoupled from the
+   * default provider/credential combination. It is true as long as real runs are
+   * enabled and the user has at least one provider credential; the actual
+   * per-role model combination is preflighted when a run is created.
+   */
   realRunsAvailable: boolean;
+  /** Providers the current user has a configured credential for. */
+  configuredProviders?: string[];
+  /** Configured providers whose key was live-verified (AUD-08 / AT-MODEL-004). */
+  verifiedProviders?: string[];
 }
 
 export interface CurrentUser {
@@ -208,7 +218,26 @@ export interface CredentialStatus {
     configured: boolean;
     masked: string | null;
     updatedAt: string | null;
+    /** AUD-08 / AT-MODEL-004: last successful live probe, null when unverified. */
+    verifiedAt?: string | null;
+    /** AUD-08 / AT-MODEL-001: provider-reported model ids captured by the probe. */
+    verifiedModels?: string[] | null;
   }>;
+}
+
+/**
+ * AUD-08 / AT-MODEL-004: what we actually know about a provider credential.
+ * `configured` only means a key is stored; `verifiedAt`/`verifiedModels` come
+ * from a live provider preflight. A length-valid key on its own is never enough
+ * to call a model available.
+ */
+export interface ProviderAvailability {
+  provider: string;
+  configured: boolean;
+  verifiedAt: string | null;
+  verifiedModels: string[] | null;
+  /** Convenience flag; when omitted it is derived from `verifiedAt !== null`. */
+  verified?: boolean;
 }
 
 export type ModelRole = "developer" | "reviewer";
@@ -227,7 +256,11 @@ export interface ModelCatalogEntry {
 
 export interface ModelInfo extends ModelCatalogEntry {
   available: boolean;
-  unavailableReason: "credential_missing" | "role_restricted" | null;
+  unavailableReason: "credential_missing" | "credential_unverified" | "model_unverified" | "role_restricted" | null;
+  /** AUD-08 / AT-MODEL-001: model is backed by a verified runtime probe. */
+  verified?: boolean;
+  /** AUD-08 / AT-MODEL-004: when the backing provider key was last verified. */
+  verifiedAt?: string | null;
 }
 
 export interface ModelSelection {
@@ -239,6 +272,11 @@ export interface ModelCatalogResponse {
   models: ModelInfo[];
   defaultDeveloper: ModelSelection;
   defaultReviewer: ModelSelection;
+  /**
+   * AUD-08 / AT-MODEL-001: provider-level runtime verification, so the UI can
+   * surface the concrete verifiedModels captured from the Pi/provider probe.
+   */
+  verifiedProviders?: Array<{ provider: string; verifiedAt: string | null; verifiedModels: string[] | null }>;
 }
 
 export type WorkspaceStatus = "active" | "unregistered" | "invalid";

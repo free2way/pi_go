@@ -123,6 +123,27 @@ describe("CredentialVault", () => {
     expect(JSON.stringify(migrated)).not.toContain("legacy-dev-key");
   });
 
+  it("tracks configured vs verified credentials (AT-MODEL-004)", async () => {
+    const file = await vaultFile();
+    const vault = new CredentialVault(file, secretFor(21));
+    await vault.init();
+    await vault.set("owner-a", { provider: "deepseek", apiKey: "dev-secret-value" });
+
+    const before = vault.providerAvailability("owner-a");
+    expect(before).toEqual([{ provider: "deepseek", configured: true, verifiedAt: null, verifiedModels: null }]);
+    expect(vault.status("owner-a").providers[0].verifiedAt).toBeNull();
+
+    await vault.markVerified("owner-a", "deepseek", ["deepseek-chat"]);
+    const after = vault.providerAvailability("owner-a");
+    expect(after[0].verifiedAt).not.toBeNull();
+    expect(after[0].verifiedModels).toEqual(["deepseek-chat"]);
+    expect(vault.status("owner-a").providers[0].verifiedModels).toEqual(["deepseek-chat"]);
+
+    // Rotating the key resets verification until the new key is probed again.
+    await vault.set("owner-a", { provider: "deepseek", apiKey: "rotated-secret-value" });
+    expect(vault.providerAvailability("owner-a")[0].verifiedAt).toBeNull();
+  });
+
   it("keeps persisting after a transient write failure", async () => {
     const file = await vaultFile();
     const directory = path.dirname(file);
