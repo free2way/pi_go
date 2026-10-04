@@ -330,4 +330,31 @@ describe("PostgresRunStore", () => {
     expect(store.getRun(run.id)?.title).toBe("外部进程创建");
   });
 
+
+  it("refreshes a stale cached snapshot when the database moved on", async () => {
+    const db = await createTestDb();
+    const store = new PostgresRunStore(db);
+    await store.init();
+    const base = { id: "run_stale_cache", ownerId: "owner-1", state: "running", mode: "real", round: 1, checks: [], events: [], artifacts: [], task: "t" };
+    const older = { ...base, title: "旧快照", updatedAt: "2026-01-01T00:00:00.000Z" };
+    const newer = { ...base, title: "新快照", state: "cancelled", updatedAt: "2026-01-01T01:00:00.000Z" };
+    await db.query(
+      "INSERT INTO runs (id, owner_id, state, mode, last_seq, document_json, updated_at, created_at) VALUES ($1, $2, 'running', 'real', 1, $3, $4, $5)",
+      [base.id, base.ownerId, JSON.stringify(older), older.updatedAt, older.updatedAt],
+    );
+    await store.hydrate(base.id);
+    expect(store.getRun(base.id)?.title).toBe("旧快照");
+
+    // Another process cancels the run: the cached snapshot must not keep serving cancelled=false.
+    await db.query("UPDATE runs SET document_json = $2, updated_at = $3, last_seq = 2 WHERE id = $1", [base.id, JSON.stringify(newer), newer.updatedAt]);
+    await store.hydrate(base.id);
+    expect(store.getRun(base.id)?.state).toBe("cancelled");
+    expect(store.getRun(base.id)?.title).toBe("新快照");
+
+    // And a strictly newer cache is never downgraded by an older database row.
+    await db.query("UPDATE runs SET document_json = $2, updated_at = $3 WHERE id = $1", [base.id, JSON.stringify({ ...base, title: "更旧", updatedAt: "2025-12-31T00:00:00.000Z" }), "2025-12-31T00:00:00.000Z"]);
+    await store.hydrate(base.id);
+    expect(store.getRun(base.id)?.title).toBe("新快照");
+  });
+
 });
