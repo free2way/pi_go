@@ -89,7 +89,7 @@ export class WorkspaceService {
               OR id IN (SELECT workspace_id FROM workspace_grants WHERE user_id IN (${placeholders})))
          AND status != 'unregistered'
        ORDER BY updated_at DESC`,
-      [...ownerKeys, ...ownerKeys],
+      ownerKeys,
     )).rows as WorkspaceRow[];
     return rows.map(toWorkspace);
   }
@@ -233,7 +233,7 @@ export class WorkspaceService {
        WHERE id = $1
          AND (owner_id IN (${placeholders})
               OR id IN (SELECT workspace_id FROM workspace_grants WHERE user_id IN (${placeholders})))`,
-      [id, ...ownerKeys, ...ownerKeys],
+      [id, ...ownerKeys],
     )).rows[0] as WorkspaceRow | undefined;
   }
 }
