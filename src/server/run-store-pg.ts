@@ -541,6 +541,17 @@ export class PostgresRunStore implements RunStoreLike {
   }
 
   /**
+   * Keeps a claimable job in the queue while recording why it could not be
+   * served this cycle (e.g. the run is not visible yet on this web instance).
+   * Deliberately does not touch `attempts`/`state`: a transient condition must
+   * not burn the job's retry budget or strand the run in `queued`.
+   */
+  async deferJob(id: string, reason: string) {
+    const now = new Date().toISOString();
+    await this.db.query("UPDATE jobs SET last_error = $2, updated_at = $3 WHERE id = $1 AND state = 'queued'", [id, reason, now]);
+  }
+
+  /**
    * Jobs a worker may pick up: never claimed, or claimed by a worker whose
    * heartbeat went stale (worker restart, AT-REL-002/003).
    */
