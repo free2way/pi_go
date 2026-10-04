@@ -38,5 +38,8 @@ export function baseRealRun(input: CreateRunInput, ownerId: string): Run {
     usage: { inputTokens: 0, outputTokens: 0, estimatedCost: 0 },
     durationMs: 0,
     lastSeq: 0,
+    // GAP-01: reproducible inputs travel with the run.
+    ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+    ...(input.acceptanceCriteria ? { acceptanceCriteria: input.acceptanceCriteria } : {}),
   };
 }

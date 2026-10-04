@@ -33,4 +33,21 @@ describe("baseRealRun", () => {
     expect(run.branch).toMatch(/^pigo\/[a-f0-9]{16}$/);
     expect(run.checks.map((check) => check.command)).toEqual(["npm test", "npm run typecheck"]);
   });
+
+  it("carries the idempotency key and acceptance criteria (GAP-01)", () => {
+    const run = baseRealRun({
+      title: "idempotent",
+      task: "create runs idempotently and keep acceptance criteria with the run",
+      repository: "/srv/ws",
+      workspaceId: "ws_1",
+      mode: "real",
+      checks: ["npm test"],
+      idempotencyKey: "audit-key-1234",
+      acceptanceCriteria: "checks pass and reviewer approves",
+    }, "owner");
+    expect(run.idempotencyKey).toBe("audit-key-1234");
+    expect(run.acceptanceCriteria).toContain("reviewer approves");
+    expect(run.branch.startsWith("pigo/")).toBe(true);
+  });
+
 });

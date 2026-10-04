@@ -179,6 +179,10 @@ export interface CreateRunInput {
   checks?: string[];
   developerModel?: ModelSelection;
   reviewerModel?: ModelSelection;
+  /** GAP-01: idempotent creation key; the same key returns the existing run. */
+  idempotencyKey?: string;
+  /** GAP-01: acceptance criteria captured with the task. */
+  acceptanceCriteria?: string;
 }
 
 export interface ConfigStatus {
