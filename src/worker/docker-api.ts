@@ -118,7 +118,7 @@ export class DockerApi {
   }
 
   /** Streams stdout/stderr lines until the container exits (or the signal aborts). */
-  logsFollow(id: string, onLine: (line: string) => void, signal?: AbortSignal): Promise<void> {
+  logsFollow(id: string, onLine: (line: string, stream: "stdout" | "stderr") => void, signal?: AbortSignal): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       const request = http.request({
         socketPath: this.socketPath,
@@ -131,10 +131,16 @@ export class DockerApi {
           buffer += chunk;
           const lines = buffer.split("\n");
           buffer = lines.pop() ?? "";
-          for (const line of lines) onLine(stripMultiplexHeader(line));
+          for (const line of lines) {
+            const frame = splitMultiplexFrame(line);
+            onLine(frame.text, frame.stream);
+          }
         });
         response.on("end", () => {
-          if (buffer) onLine(stripMultiplexHeader(buffer));
+          if (buffer) {
+            const frame = splitMultiplexFrame(buffer);
+            onLine(frame.text, frame.stream);
+          }
           resolve();
         });
         response.on("error", reject);
@@ -152,7 +158,9 @@ export class DockerApi {
  * Docker's multiplexed log stream prefixes each frame with an 8 byte header on
  * non-TTY containers; strip it so callers see plain lines.
  */
-function stripMultiplexHeader(line: string) {
-  if (line.length > 8 && /^[\x00-\x02][\x00\x01\x02]/.test(line)) return line.slice(8);
-  return line;
+function splitMultiplexFrame(line: string): { stream: "stdout" | "stderr"; text: string } {
+  if (line.length > 8 && /^[\x00-\x02][\x00\x01\x02]/.test(line)) {
+    return { stream: line.charCodeAt(0) === 2 ? "stderr" : "stdout", text: line.slice(8) };
+  }
+  return { stream: "stdout", text: line };
 }

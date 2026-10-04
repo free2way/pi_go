@@ -98,10 +98,14 @@ let sandboxMode: "container" | "process" = "process";
 let sandboxReason: string | undefined = "not initialised";
 
 const imageForSandbox = sandboxImage;
+/** Extra bind mounts for the sandbox container (operator/test escape hatch). */
+const sandboxExtraBinds = (process.env.PI_SANDBOX_EXTRA_BINDS || "").split(",").map((item) => item.trim()).filter(Boolean);
+/** Extra environment variable names to pass through into the sandbox. */
+const sandboxExtraEnv = (process.env.PI_SANDBOX_EXTRA_ENV || "").split(",").map((item) => item.trim()).filter(Boolean);
 
 /** Environment handed to a sandboxed process: nothing but runtime basics and the role credential. */
 function sandboxEnvironment(extra: Record<string, string>) {
-  const passthrough = ["PATH", "HOME", "LANG", "LC_ALL", "TZ", "TERM", "OPENAI_BASE_URL"];
+  const passthrough = ["PATH", "HOME", "LANG", "LC_ALL", "TZ", "TERM", "OPENAI_BASE_URL", ...sandboxExtraEnv];
   const env: Record<string, string> = {};
   for (const name of passthrough) {
     const value = process.env[name];
@@ -157,14 +161,18 @@ async function runInSandbox(input: SandboxRunInput): Promise<CommandResult> {
     network: input.network,
     labels: { "pigo.label": input.label.slice(0, 60) },
   });
+  spec.HostConfig.Binds.push(...sandboxExtraBinds);
 
   const name = `pigo-task-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   const containerId = await docker.createContainer(name, spec);
   let stdout = "";
   let stderr = "";
-  const logs = docker.logsFollow(containerId, (line) => {
-    stdout += `${line}
-`;
+  const logs = docker.logsFollow(containerId, (line, stream) => {
+    if (stream === "stderr") {
+      stderr += `${line}\n`;
+      return;
+    }
+    stdout += `${line}\n`;
     input.onStdoutLine?.(line);
   }, input.signal).catch((error) => { stderr += String(error.message); });
   const timer = setTimeout(() => { void docker.killContainer(containerId).catch(() => undefined); }, input.timeoutMs);

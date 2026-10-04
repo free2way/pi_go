@@ -288,7 +288,7 @@ app.get("/api/health", async (_request, reply) => {
   try {
     await pingDatabase();
     alerts.clear("database_unavailable");
-    return { status: "ok", service: "pigo-web", version: "0.14.2", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.14.3", db: "ok" };
   } catch (error) {
     // AT-REL-005: fail loudly instead of pretending the service is healthy.
     alerts.raise({
@@ -297,7 +297,7 @@ app.get("/api/health", async (_request, reply) => {
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
       details: { error: (error as Error).message.slice(0, 200) },
     });
-    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.14.2", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.14.3", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
   }
 });
 
@@ -312,7 +312,7 @@ interface StorageStatus {
 app.get("/api/health/detail", async (request, reply) => {
   const internal = safeTokenMatch(request.headers.authorization);
   if (!internal && !auth.user(request)) return reply.code(401).send({ error: "Unauthorized" });
-  const health: Record<string, unknown> = { version: "0.14.2", at: new Date().toISOString() };
+  const health: Record<string, unknown> = { version: "0.14.3", at: new Date().toISOString() };
   try {
     await pingDatabase();
     health.database = { status: "ok" };
