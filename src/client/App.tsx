@@ -653,7 +653,11 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    void Promise.all([api.config().then(setConfig), api.me().then(setUser), refreshRuns()]).finally(() => setLoading(false));
+    // 失败也要收敛：无 catch 的 Promise.all 在 500 时会抛出未处理拒绝
+    // （e2e 曾捕获到 pageerror "Internal Server Error"），这里降级为保持外壳可用。
+    void Promise.all([api.config().then(setConfig), api.me().then(setUser), refreshRuns()])
+      .catch(() => undefined)
+      .finally(() => setLoading(false));
   }, [refreshRuns]);
 
   useEffect(() => {

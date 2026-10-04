@@ -12,9 +12,19 @@ import { defineConfig, devices } from "@playwright/test";
  *                         (default developer@localhost)
  *   PI_E2E_WORKSPACE_PATH optional controlled relative path; enables the
  *                         positive workspace-registration assertions when set
+ *   PI_E2E_LIVE          set to `1` to unlock the production-only acceptance
+ *                         scenarios (E2E-01..08); they stay `fixme` otherwise
  *
  * Tests self-skip (never fail) when browsers are not installed or the server
  * is unreachable, so `npm run e2e:browser` is safe to run in any environment.
+ *
+ * Projects:
+ * - `chromium` (Desktop Chrome) runs every spec except `@mobile`-tagged tests.
+ * - `mobile` (390x844, isMobile, hasTouch — Chromium engine) runs only
+ *   `@mobile`-tagged tests. It is deliberately Chromium-based rather than
+ *   `devices["iPhone 13"]` (which defaults to WebKit) so the suite has no extra
+ *   browser dependency; add a WebKit project if Safari rendering must be covered.
+ * Run one project with `--project=chromium` / `--project=mobile`.
  */
 const baseURL = process.env.PI_E2E_BASE_URL ?? "http://127.0.0.1:3100";
 const devEmail = process.env.PI_E2E_DEV_EMAIL ?? "developer@localhost";
@@ -35,6 +45,7 @@ export default defineConfig({
     screenshot: "only-on-failure",
   },
   projects: [
-    { name: "chromium", use: { ...devices["Desktop Chrome"] } },
+    { name: "chromium", grepInvert: /@mobile/, use: { ...devices["Desktop Chrome"] } },
+    { name: "mobile", grep: /@mobile/, use: { browserName: "chromium", viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true } },
   ],
 });
