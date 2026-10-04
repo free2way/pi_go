@@ -196,8 +196,20 @@ docker compose --env-file .env down
 | AT-SEC-012 | 缺 token / 错误值 / 错误长度 → 401；常量时间比较；正确 token 200 |
 | AT-SEC-013 | 8MB 请求体、20 万字符任务、5MB 内部 patch 全部 413，服务保持健康 |
 
-### 残余风险（需决策）
+### 每任务容器沙箱（v0.14.0～v0.14.5，按业主决策采用）
 
-- **AT-SEC-007**：同一 Worker 容器内，Agent 与检查命令仍可读取 `/workspace` 下其他项目的**只读**内容（同 UID、共享挂载命名空间）。要彻底隔离需：为每个任务启用独立容器，或允许 `seccomp=unconfined` 后使用 bubblewrap 命名空间沙箱，或改造为 `git clone --shared` + 只读挂载源仓库（仍无法阻止读取）。
-- **SEC-006 / AT-SEC-010 的网络部分**：容器无入站端口，出站未做目的地 allowlist；检查命令与 Agent 共享容器网络。要做目的地 allowlist 需要 egress 代理或网络命名空间支持。
-- 上述两项在容器权限模型不变的前提下无法满足，建议按“每任务容器”或“命名空间沙箱（需放宽 seccomp）”方案推进。
+- **实现**：Worker 通过挂载的 Docker Socket（`group_add` 加入宿主 docker 组，非 root）为**每次 Agent 调用**与**每条检查命令**单独创建容器（`local/pigo-sandbox:0.1.0`，与运行时同镜像）。容器规格（`src/worker/sandbox.ts`）：
+  - 只挂载：本次运行的 worktree、该仓库的 `.git` 元数据（worktree 提交需要）、只读的 `pi-models.json`、本次运行的 Pi 状态目录（`<worktree>.state`）；
+  - 其余项目工作区、交互式配置卷、数据库口令、内部回调 token 全部不可见；
+  - `--user node`、`--cap-drop ALL`、`no-new-privileges`、只读根文件系统、`/tmp` 与 `~/.cache` tmpfs、pids/mem/cpu 上限；
+  - 检查命令 `network=none`（无出网），Agent 调用使用 `pi-agent-network`（仅 provider 出网）；
+  - 容器结束即删除，状态目录随运行清理；启动前预建 `<state>/agent`（node 属主）以保证 Pi 可写会话/凭据存储。
+- **验证（生产 v0.14.5，真实模型调用）**：运行 `run_ade63448ea2047ff` 全流程完成（规划 → 开发 → 检查 → 审核通过，成本 $0.0028）；检查命令在沙箱内的输出为
+  `workdir=/workspace/runs/<owner>/<run>`、`SOURCE_BLOCKED`（无法读取源仓库文件）、`HOME_WRITABLE`、`NETWORK_BLOCKED`。
+- **验证（隔离 e2e v0.14.4）**：原子角色凭据可见性（planner/developer 仅 `DEEPSEEK_API_KEY`，reviewer 仅 `OPENAI_API_KEY`）、reviewer `--tools read,grep,find,ls`、无遗留沙箱容器、diff 不含沙箱状态目录。
+
+### 残余风险（已记录）
+
+- Agent 调用容器仍需出网（调用 provider），未做目的地 allowlist；如需严格限制，需在宿主侧加 egress 代理或防火墙策略。
+- Worker 持有 Docker Socket 即具备创建容器的能力：请勿在同机运行不可信工作负载；共享主机场景建议改用 socket proxy。
+- 检查命令在沙箱内无网络，若某项目检查确实需要联网（如 `npm install`），需临时调整 `PI_SANDBOX_MODE=process` 或改用离线缓存方案。
