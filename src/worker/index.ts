@@ -167,17 +167,19 @@ async function runInSandbox(input: SandboxRunInput): Promise<CommandResult> {
   const containerId = await docker.createContainer(name, spec);
   let stdout = "";
   let stderr = "";
-  const logs = docker.logsFollow(containerId, (line, stream) => {
-    if (stream === "stderr") {
-      stderr += `${line}\n`;
-      return;
-    }
-    stdout += `${line}\n`;
-    input.onStdoutLine?.(line);
-  }, input.signal).catch((error) => { stderr += String(error.message); });
   const timer = setTimeout(() => { void docker.killContainer(containerId).catch(() => undefined); }, input.timeoutMs);
   try {
     await docker.startContainer(containerId);
+    // Logs are read after the container starts: Docker only exposes the full
+    // log of a started container, and `follow=1` then streams to completion.
+    const logs = docker.logsFollow(containerId, (line, stream) => {
+      if (stream === "stderr") {
+        stderr += `${line}\n`;
+        return;
+      }
+      stdout += `${line}\n`;
+      input.onStdoutLine?.(line);
+    }, input.signal).catch((error) => { stderr += String(error.message); });
     const { StatusCode } = await docker.waitContainer(containerId);
     await logs;
     return { code: StatusCode, stdout, stderr };
