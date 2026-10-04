@@ -34,7 +34,8 @@ import { batchItemFailure, batchItemSuccess, parseBatchRunIds, summarizeBatch, M
 import { buildDeploymentStatus, parseDeployLog, resolveDeployLogPath, type DeploymentStatus } from "./deployments.js";
 import { FAILURE_SCAN_LIMIT, USAGE_RUN_SCAN_LIMIT, buildSystemStatus, utcDayStart, type DeploymentInfo, type FailureEventRow, type StateCountRow, type SystemStatusInput, type TodayRunRow } from "./system-status.js";
 import { mergeConflictReply, type MergeResult } from "../shared/merge.js";
-import { buildDeployHookPayload, buildMergeRecord, planMergeGate, planPostMergeDeploy, type MergeRecord, type PostMergeDeployPlan } from "./run-merge.js";
+import { buildDeployHookPayload, planMergeGate, planPostMergeDeploy, type MergeRecord, type PostMergeDeployPlan } from "./run-merge.js";
+import { coordinateApprovedMerge, replayPendingMerge } from "./merge-approval.js";
 import { buildMergeRequestPayload, mergeRequestUnavailable, patchFileName, resolveMergeRequestConfig, selectPatch, type PatchSelection } from "./run-patch.js";
 import { planReopen, reopenEventMeta } from "./run-reopen.js";
 import type { RunStoreLike } from "./store.js";
@@ -538,7 +539,7 @@ app.get("/api/health", async (_request, reply) => {
   try {
     await pingDatabase();
     alerts.clear("database_unavailable");
-    return { status: "ok", service: "pigo-web", version: "0.22.1", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.23.0", db: "ok" };
   } catch (error) {
     // AT-REL-005: fail loudly instead of pretending the service is healthy.
     alerts.raise({
@@ -547,7 +548,7 @@ app.get("/api/health", async (_request, reply) => {
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
       details: { error: (error as Error).message.slice(0, 200) },
     });
-    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.22.1", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.23.0", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
   }
 });
 
@@ -562,7 +563,7 @@ interface StorageStatus {
 app.get("/api/health/detail", async (request, reply) => {
   const internal = safeTokenMatch(request.headers.authorization);
   if (!internal && !auth.user(request)) return reply.code(401).send({ error: "Unauthorized" });
-  const health: Record<string, unknown> = { version: "0.22.1", at: new Date().toISOString() };
+  const health: Record<string, unknown> = { version: "0.23.0", at: new Date().toISOString() };
   try {
     await pingDatabase();
     health.database = { status: "ok" };
@@ -722,8 +723,11 @@ const SYSTEM_FAILURE_TYPE_PATTERNS = ["%storage_error%", "%budget_exhausted%", "
  * summaries are returned — never credentials, environment values or paths.
  * Every query is bounded and each section degrades to `unavailable` on failure.
  */
-app.get("/api/system/status", async () => {
+app.get("/api/system/status", async (request) => {
   const now = new Date().toISOString();
+  // B7: failure summaries are admin-only; every authenticated user still gets
+  // the category counts (recent details are suppressed below).
+  const audience: "admin" | "user" = (await identities.isAdmin(auth.user(request).id)) ? "admin" : "user";
   const [deployments, workerHealth] = await Promise.all([
     readDeploymentStatus().catch(() => null),
     workerRequest<{ activeJobs?: number; version?: string; storage?: string }>("/health", undefined, 3_000).catch(() => undefined),
@@ -806,6 +810,7 @@ app.get("/api/system/status", async () => {
 
   return buildSystemStatus({
     now,
+    audience,
     versions: { web: deployments?.web.version ?? null, worker: workerVersion },
     infrastructure,
     jobStates,
@@ -951,8 +956,14 @@ app.get<{ Querystring: { query?: string; state?: string } }>("/api/runs", async 
 });
 
 app.get<{ Params: { id: string } }>("/api/runs/:id", async (request, reply) => {
-  const run = store.getRun(request.params.id, ownerKeysFor(request));
+  let run = store.getRun(request.params.id, ownerKeysFor(request));
   if (!run) return reply.code(404).send({ error: "Run not found" });
+  // B1: a run whose worker merge succeeded but whose record write failed carries
+  // a `committed_unrecorded` marker; converge it on read so the database never
+  // stays silent about an already-merged workspace.
+  if (run.mergePending) {
+    run = (await replayPendingMerge(store, run.id)) ?? run;
+  }
   return run;
 });
 
@@ -1405,64 +1416,71 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/approve", async (request, re
   const mergeGate = planMergeGate({ requested: parsed.data.mergeIntoWorkspace === true, isAdmin: await identities.isAdmin(user.id) });
   if (mergeGate.kind === "forbidden") return reply.code(403).send({ error: mergeGate.message, code: mergeGate.code });
 
-  let merge: MergeRecord | undefined;
-  if (mergeGate.kind === "ready") {
-    const targetBranch = run.workspaceId
-      ? await workspaces.get(ownerKeysFor(request), run.workspaceId).then((workspace) => workspace.defaultBranch ?? undefined).catch(() => undefined)
-      : undefined;
-    const mergeResult = await workerRequest<MergeResult>(`/runs/${encodeURIComponent(run.id)}/merge`, {
-      method: "POST",
-      body: JSON.stringify({ ownerId: run.ownerId, repository: run.repository, branch: run.branch, targetBranch, message: note }),
-    }).catch((error) => ({ ok: false as const, code: "MERGE_UNAVAILABLE", error: (error as Error).message } as const));
-    if (!mergeResult.ok) {
-      if (mergeResult.code === "MERGE_CONFLICT") {
-        const conflict = mergeConflictReply(mergeResult.conflictingPaths ?? []);
-        return reply.code(conflict.status).send({ error: conflict.message, code: conflict.code, conflictingPaths: conflict.conflictingPaths });
-      }
-      const status = ["RUN_DIRECTORY_MISSING", "WORKSPACE_DIRTY", "TARGET_BRANCH_UNAVAILABLE", "MERGE_FETCH_FAILED", "TARGET_BRANCH_UNKNOWN"].includes(mergeResult.code) ? 409 : 503;
-      return reply.code(status).send({ error: mergeResult.error, code: mergeResult.code });
-    }
-    merge = buildMergeRecord({
-      commit: mergeResult.commit,
-      strategy: mergeResult.strategy,
-      targetBranch: mergeResult.targetBranch,
-      mergedAt: now,
-      mergedBy: user.id,
-    });
-  }
-
   // B2: durable acceptance snapshot (findings, diff identity, checks, usage).
   const acceptance = await acceptanceSnapshotFor(run, { acceptedAt: now, acceptedBy: user.id, note, acknowledgedOpenFindings: plan.acknowledged });
   const summary = note ? `人工审批通过：${note}` : "人工审批通过，交付已确认";
+
+  let merge: MergeRecord | undefined;
   let updated: Run;
-  try {
-    updated = await store.updateRun(run.id, {
-      state: "completed",
-      approvedAt: now,
-      approvedBy: user.id,
-      summary,
-      acceptance,
-      ...(merge ? { merge } : {}),
-      ...(note
-        ? { humanNotes: appendHumanNote(run.humanNotes, { at: now, kind: "approve_accept", note, by: user.id }) }
-        : {}),
+  if (mergeGate.kind === "ready") {
+    // B1: two-phase, idempotent approve-and-merge. Git is only touched after the
+    // merge is durably claimed (phase 1 CAS), and a DB failure while recording
+    // the result is compensated by a replay on later reads (phase 2).
+    const targetBranch = run.workspaceId
+      ? await workspaces.get(ownerKeysFor(request), run.workspaceId).then((workspace) => workspace.defaultBranch ?? undefined).catch(() => undefined)
+      : undefined;
+    const outcome = await coordinateApprovedMerge(store, {
+      run,
+      token: newId("mergetok"),
+      targetBranch: targetBranch ?? null,
+      startedAt: now,
+      approval: { acceptedAt: now, acceptedBy: user.id, summary, note: note ?? null, acceptance },
+      callWorker: (branch) =>
+        workerRequest<MergeResult>(`/runs/${encodeURIComponent(run.id)}/merge`, {
+          method: "POST",
+          body: JSON.stringify({ ownerId: run.ownerId, repository: run.repository, branch: run.branch, targetBranch: branch ?? undefined, message: note }),
+        }),
     });
-  } catch (error) {
-    const conflict = conflictReplyFor(error);
-    if (conflict) return reply.code(conflict.status).send({ error: conflict.message, code: conflict.code });
-    throw error;
+    if (outcome.kind === "conflict") return reply.code(outcome.status).send({ error: outcome.message, code: outcome.code });
+    if (outcome.kind === "worker-error") {
+      if (outcome.code === "MERGE_CONFLICT") {
+        const conflict = mergeConflictReply(outcome.conflictingPaths ?? []);
+        return reply.code(conflict.status).send({ error: conflict.message, code: conflict.code, conflictingPaths: conflict.conflictingPaths });
+      }
+      return reply.code(outcome.status).send({ error: outcome.error, code: outcome.code });
+    }
+    if (outcome.kind === "record-failed") {
+      // The worker already merged: the durable `committed_unrecorded` intent
+      // makes a later read converge the record instead of staying silent.
+      return reply.code(outcome.status).send({
+        error: `工作区已合并，但合并记录写入失败，将在后续读取时自动补偿：${outcome.error}`,
+        code: outcome.code,
+        merge: outcome.merge,
+      });
+    }
+    merge = outcome.merge;
+    updated = outcome.run;
+  } else {
+    try {
+      updated = await store.updateRun(run.id, {
+        state: "completed",
+        approvedAt: now,
+        approvedBy: user.id,
+        summary,
+        acceptance,
+        ...(note
+          ? { humanNotes: appendHumanNote(run.humanNotes, { at: now, kind: "approve_accept", note, by: user.id }) }
+          : {}),
+      });
+    } catch (error) {
+      const conflict = conflictReplyFor(error);
+      if (conflict) return reply.code(conflict.status).send({ error: conflict.message, code: conflict.code });
+      throw error;
+    }
   }
-  if (merge) {
-    await store.appendEvent({
-      runId: run.id,
-      round: run.round,
-      source: "system",
-      type: "run.merged",
-      message: `已合并到 ${merge.targetBranch}（${merge.strategy}）：${merge.commit.slice(0, 10)}`,
-      at: now,
-      meta: { ...merge },
-    });
-  }
+
+  // The `run.merged` event is appended (idempotently, keyed by the commit) by
+  // the merge coordinator; only the approval event is appended here.
   await store.appendEvent({
     runId: run.id,
     round: run.round,

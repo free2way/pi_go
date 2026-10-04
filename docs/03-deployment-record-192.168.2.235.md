@@ -313,3 +313,45 @@ v0.15.2 → v0.16.x（隔离 e2e 验证）→ 生产 v0.18.0 → v0.19.0 → v0.
 - SSE 溢出仅自动重连，无显式提示。
 - `docs/03` §5 校正即本段（对既有证据的重新验证与降级说明）。
 
+## v0.22.1 升级记录（2026-10-04，Asia/Shanghai）
+
+升级日期：2026-10-04。主机 `192.168.2.235`，compose 项目 `pi-agent`，生产容器
+`pi-agent-web-1` / `pi-agent-worker-1`。runtime 与 postgres 未重建。
+
+| 项 | 值 |
+| --- | --- |
+| 当前版本 | **v0.22.1**，健康检查正常，链路健康 |
+| 镜像回滚标签 | web `prev39`、worker `prev35` |
+| 单元测试基线（部署时） | 463 tests / 64 files 全绿 |
+| `npm run gate:release` | 6 PASS / 1 SKIP（SKIP 为未设置 `PI_DATABASE_URL` 的真库并发检查） |
+| Playwright 浏览器 e2e | 26 tests，其中 7 项生产专有场景为 `fixme`（需 `PI_E2E_LIVE=1`） |
+
+> 记录口径：上表的测试/门禁数字是**部署当时**的实测值。仓库仍在并行开发中，
+> 后续本地重跑的 test/file 计数可能高于该值，属预期，不代表回归。
+
+### 本版本能力（v0.22.x）
+
+- 系统状态页（`GET /api/system/status`，`docs/11`）：版本、数据库/Worker 健康、
+  队列、当日用量与最近异常集中展示；只读、字段缺失返回 `unavailable`/`null`。
+- 对话日志、参与方代号与返修分支展示（`src/shared/chat.ts`）。
+- 闭环与审批自动化（`docs/10`）：导出补丁、创建合并请求、审批即合并、验收快照、
+  重新打开、批量操作、部署面板。
+- 发布门禁与演练工具（`docs/09`）：`gate:release`、`gate:acceptance`、密钥扫描、
+  provider 演练、演练归档与回滚 runbook。
+
+### 标准 Compose 配置覆盖（B3，仓库侧）
+
+- `deploy/docker/compose.yaml` 现在把 v0.22 的 `PI_*` 设置转发到**读取它们的服务**：
+  web（server）侧包含模型目录/探测、合并请求、合并后部署钩子、版本与回滚标签、
+  `PI_DEPLOY_LOG`、运行预算、限流、告警、制品与 pipeline 开关；worker 侧包含插件
+  白名单/请求/固定校验、运行预算、磁盘水位、provider 重试、planner 思考级别、
+  回调上限、工作区锁与沙箱/Docker 参数。
+- 部署日志目录以只读方式挂载进 web：`${PI_DEPLOY_LOG_HOST_DIR:-./backups}:/app/pi-agent/backups:ro`，
+  web 内 `PI_DEPLOY_LOG` 默认 `/app/pi-agent/backups/deploy.log`；目录/文件缺失时
+  `/api/deployments` 返回 `log.available=false`，不报错。
+- `.env.example` 已同步全部变量（仅占位符与注释）。
+- 新增配置覆盖校验：`npm run test:config`（并入 `npm run validate:compose`），
+  断言每个关键变量到达正确服务且部署日志只读挂载，缺失时打印精确 diff 并非零退出。
+  该能力为**仓库侧**变更，尚未在任何生产主机上执行验证。
+
+

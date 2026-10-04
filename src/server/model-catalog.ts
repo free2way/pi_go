@@ -26,7 +26,7 @@ export const builtinModelCatalog: ModelCatalogEntry[] = [
   { id: "openai-proxy/gpt-5.6-luna", provider: "openai-proxy", model: "gpt-5.6-luna", label: "GPT-5.6 Luna", toolCalling: true, reasoning: true, roles: ["developer", "reviewer"], status: "available" },
 ];
 
-function normalizeEntry(raw: unknown, index: number): ModelCatalogEntry | undefined {
+function normalizeEntry(raw: unknown, _index: number): ModelCatalogEntry | undefined {
   if (!raw || typeof raw !== "object") return undefined;
   const item = raw as Record<string, unknown>;
   const provider = String(item.provider || "").trim();

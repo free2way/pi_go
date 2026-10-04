@@ -18,6 +18,7 @@ const NOW = "2026-10-04T12:00:00.000Z";
 function baseInput(overrides: Partial<SystemStatusInput> = {}): SystemStatusInput {
   return {
     now: NOW,
+    audience: "admin",
     versions: { web: "0.22.0", worker: "0.22.0" },
     infrastructure: { database: { status: "ok" }, worker: { status: "ok", activeJobs: 2 } },
     jobStates: [],
@@ -205,5 +206,52 @@ describe("system-status: failures", () => {
     const long = sanitizeFailureSummary("x".repeat(300));
     expect(long.length).toBeLessThanOrEqual(160);
     expect(long.endsWith("…")).toBe(true);
+  });
+});
+
+describe("system-status: role-scoped failure summaries (B7)", () => {
+  const rows = [
+    { at: "2026-10-04T11:00:00.000Z", type: "run.storage_error", message: "读取 /app/runs/abc 失败" },
+    { at: "2026-10-04T10:00:00.000Z", type: "review.provider_error", message: "provider timeout" },
+  ];
+
+  it("gives an admin the recent summaries and timestamps", () => {
+    const status = buildSystemStatus(baseInput({ audience: "admin", failures: rows }));
+    expect(status.failures.status).toBe("ok");
+    expect(status.failures.recent).toHaveLength(2);
+    expect(status.failures.recent[0]).toMatchObject({ type: "run.storage_error", at: "2026-10-04T11:00:00.000Z" });
+    expect(status.failures.recent[0].summary).toBe("读取 [path] 失败");
+  });
+
+  it("gives a non-admin only the category counts, never a message or time summary", () => {
+    const status = buildSystemStatus(baseInput({ audience: "user", failures: rows }));
+    // Counts are preserved for everyone.
+    expect(status.failures.status).toBe("ok");
+    expect(status.failures.byCategory.storage).toBe(1);
+    expect(status.failures.byCategory.provider).toBe(1);
+    expect(status.failures.total).toBe(2);
+    // No message text and no timestamps reach a non-admin.
+    expect(status.failures.recent).toEqual([]);
+    expect(JSON.stringify(status.failures)).not.toContain("失败");
+    expect(JSON.stringify(status.failures)).not.toContain("timeout");
+    expect(JSON.stringify(status.failures)).not.toContain("2026-10-04T11:00");
+  });
+
+  it("defaults to the least-privilege (non-admin) view", () => {
+    const status = buildSystemStatus(baseInput({ audience: undefined, failures: rows }));
+    expect(status.failures.recent).toEqual([]);
+    expect(status.failures.total).toBe(2);
+  });
+
+  it("keeps the unavailable and empty states identical for both roles", () => {
+    for (const audience of ["admin", "user"] as const) {
+      const unavailable = buildSystemStatus(baseInput({ audience, failures: null }));
+      expect(unavailable.failures.status).toBe("unavailable");
+      expect(unavailable.failures.recent).toEqual([]);
+      const empty = buildSystemStatus(baseInput({ audience, failures: [] }));
+      expect(empty.failures.status).toBe("ok");
+      expect(empty.failures.total).toBe(0);
+      expect(empty.failures.recent).toEqual([]);
+    }
   });
 });

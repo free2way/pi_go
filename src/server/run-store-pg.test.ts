@@ -437,5 +437,93 @@ describe("PostgresRunStore", () => {
     expect(Number(stored.revision)).toBe(2);
   });
 
+  // ------------------------------------------------------------------ B5 delete
+
+  const RUN_ID_TABLES = [
+    "run_events",
+    "run_agents",
+    "run_checks",
+    "run_findings",
+    "run_artifacts",
+    "run_usage_role",
+    "run_checkpoints",
+    "run_deliveries",
+    "jobs",
+  ];
+
+  async function orphanCounts(db: Awaited<ReturnType<typeof createTestDb>>, runId: string) {
+    const counts: Record<string, number> = {};
+    for (const table of RUN_ID_TABLES) {
+      const row = (await db.query(`SELECT COUNT(*) AS total FROM ${table} WHERE run_id = $1`, [runId])).rows[0];
+      counts[table] = Number(row.total);
+    }
+    return counts;
+  }
+
+  it("deletes run, jobs and deliveries together, leaving no orphan rows (B5)", async () => {
+    const db = await createTestDb();
+    const store = new PostgresRunStore(db);
+    await store.init();
+    const run = makeRun({
+      diff: "diff --git a/x b/x\n",
+      checks: [{ id: "c1", name: "npm test", command: "npm test", status: "passed" }],
+      findings: [{ id: "f1", severity: "high", file: "src/a.ts", line: 1, title: "t", evidence: "e", requiredChange: "r", resolved: false }],
+      plan: {
+        complexity: "small",
+        rationale: "r",
+        strategy: "single",
+        tasks: [{ id: "implementation", title: "实现", description: "d", files: [], dependsOn: [], status: "completed" }],
+      },
+      usageRoles: [{ role: "developer", provider: "deepseek", model: "deepseek-flash", inputTokens: 1, outputTokens: 2, estimatedCost: 0.01, calls: 1 }],
+    });
+    await store.createRun(run, event(run.id, "run.created"));
+    await store.createJob({ id: "job_1", runId: run.id, kind: "run", payload: { runId: run.id } });
+    await store.saveCheckpoint({ runId: run.id, stageKey: "planning", status: "completed" });
+    await store.applyDelivery({ runId: run.id, deliveryId: "job_1:1", patch: { summary: "one" } });
+    await store.saveArtifact({ runId: run.id, artifactId: "review", kind: "text", content: "body" });
+
+    // Every dependent table actually has rows before the delete.
+    const before = await orphanCounts(db, run.id);
+    for (const table of RUN_ID_TABLES) expect(before[table]).toBeGreaterThan(0);
+
+    await store.deleteRun(run.id);
+
+    expect(store.getRun(run.id)).toBeUndefined();
+    const after = await orphanCounts(db, run.id);
+    for (const table of RUN_ID_TABLES) expect(`${table}=${after[table]}`).toBe(`${table}=0`);
+    expect(Number((await db.query("SELECT COUNT(*) AS total FROM runs")).rows[0].total)).toBe(0);
+
+    // A deleted run cannot be deleted twice.
+    await expect(store.deleteRun(run.id)).rejects.toThrow(/Run not found/);
+  });
+
+  it("keeps the cache and database intact when the delete transaction fails (B5)", async () => {
+    const db = await createTestDb();
+    const store = new PostgresRunStore(db);
+    await store.init();
+    const run = makeRun();
+    await store.createRun(run, event(run.id, "run.created"));
+    await store.createJob({ id: "job_1", runId: run.id, kind: "run", payload: { runId: run.id } });
+
+    const failing = new Proxy(db, {
+      get(target, property, receiver) {
+        if (property === "withTransaction") {
+          return async () => { throw new Error("injected delete failure"); };
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const broken = new PostgresRunStore(failing as typeof db);
+    await broken.init();
+    await expect(broken.deleteRun(run.id)).rejects.toThrow(/injected delete failure/);
+
+    // The cache still serves the run and the database still owns every row.
+    expect(broken.getRun(run.id)?.id).toBe(run.id);
+    const after = await orphanCounts(db, run.id);
+    expect(after.run_events).toBeGreaterThan(0);
+    expect(after.jobs).toBeGreaterThan(0);
+    expect(Number((await db.query("SELECT COUNT(*) AS total FROM runs WHERE id = $1", [run.id])).rows[0].total)).toBe(1);
+  });
+
 });
 

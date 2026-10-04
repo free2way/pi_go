@@ -57,6 +57,12 @@ flowchart LR
 - [192.168.2.235 部署记录](docs/03-deployment-record-192.168.2.235.md)
 - [完整开发规格说明书](docs/04-product-development-specification.md)
 - [验收测试规格与交付清单](docs/05-acceptance-test-specification.md)
+- [2026-10-04 代码审核与验收准入报告](docs/06-code-review-acceptance-report.md)
+- [141 条验收用例代码证据矩阵](docs/07-acceptance-code-evidence.md)
+- [v0.20.2 最新代码审核与验收准入报告](docs/08-code-review-acceptance-report-v0.20.2.md)
+- [发布门禁与可靠性演练工具](docs/09-release-gate-and-drills.md)
+- [闭环与审批自动化](docs/10-closure-approval-automation.md)
+- [系统状态仪表盘](docs/11-system-status-dashboard.md)
 - [工作流配置样例](config/workflow.example.yaml)
 - [环境变量样例](.env.example)
 
@@ -66,8 +72,27 @@ flowchart LR
 npm install
 npm run typecheck
 npm test
+npm run lint          # 0 errors / 0 warnings
 npm run build
+npm run validate:compose   # 结构校验 + v0.22 标准 Compose 配置覆盖
+npm run test:config        # 仅配置覆盖（也可 npm run validate:compose）
 ```
+
+发布/验收门禁（详见 [docs/09](docs/09-release-gate-and-drills.md)）：
+
+| 命令 | 用途 | 缺失前置条件 / lint warning |
+| --- | --- | --- |
+| `npm run gate:release` | 日常开发自检（宽松） | 真库检查记 SKIP；warning 不阻断 |
+| `npm run gate:acceptance` | 验收（严格） | 一律 **FAIL**；要求 lint 0 warning、真库与 Playwright 实跑 |
+
+```bash
+# 验收：必须提供真库连接串与已运行的部署地址
+PI_DATABASE_URL='postgresql://user:pass@host:5432/pigo' \
+PI_E2E_BASE_URL='http://127.0.0.1:3100' \
+npm run gate:acceptance
+```
+
+`gate:acceptance` 在本地无真库 / 无部署地址时会**如期失败**，属预期；本地开发自检请用 `gate:release`。
 
 ## 边界说明
 

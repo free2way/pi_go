@@ -28,7 +28,7 @@
 | # | 步骤 | 命令 |
 | --- | --- | --- |
 | 1 | 类型检查 | `npm run typecheck` |
-| 2 | 单元测试 | `npm test`（vitest，`src/**`，当前基线 370 tests / 54 files） |
+| 2 | 单元测试 | `npm test`（vitest，`src/**`，v0.22.1 记录基线 463 tests / 64 files） |
 | 3 | Lint | `npm run lint`（0 errors） |
 | 4 | 构建 | `npm run build`（输出 `dist/`，供第 7 步加载） |
 | 5 | Compose 结构校验 | `npm run validate:compose` |
@@ -221,11 +221,68 @@ npm run drill:rollback -- --web local/pigo-web:prev1 --worker local/pigo-worker:
 - 演练产物归档在 `backups/drills/<timestamp>/`，manifest 哈希随备份一起保留，作为 RPO/RTO 与
   "真实并行 Sub Agent" 的签字证据来源。
 
+## 7. 严格验收门禁 `npm run gate:acceptance`
+
+`gate:release` 面向日常开发，允许 SKIP、允许 lint warning；**验收**要求证据完整，因此新增
+`gate:acceptance`（`scripts/acceptance-gate.mjs`），与 `gate:release` **共用**同一套步骤排序、
+聚合与表格渲染（`scripts/release-gate-lib.mjs`），仅收紧判定：
+
+| 维度 | `gate:release`（开发） | `gate:acceptance`（验收） |
+| --- | --- | --- |
+| 缺失前置条件 | 记为 `SKIP` 并打印原因 | **FAIL**，打印缺失的前置条件 |
+| Lint warning | 只要求退出码 0（允许 warning） | 解析 `✖ N problems (0 errors, M warnings)`，要求 **M = 0** |
+| 真库并发校验 | 未设置 `PI_DATABASE_URL`/`DATABASE_URL` 则 SKIP | 未设置即 **FAIL**（必须实跑） |
+| Playwright 浏览器套件 | 不纳入 | 设置 `PI_E2E_BASE_URL` 时执行；未设置即 **FAIL** |
+
+固定步骤与 `gate:release` 一致：`typecheck` → `test` → `lint` → `build` → `validate:compose`
+→ `scan:secrets`，随后是**必需**的 `pg-concurrency` 与 `e2e-browser`。
+
+```bash
+# 完整验收（需要真库与可达的部署地址）
+PI_DATABASE_URL='postgresql://user:pass@host:5432/pigo' \
+PI_E2E_BASE_URL='http://127.0.0.1:3100' \
+npm run gate:acceptance
+
+# 只打印计划（会标出哪些前置条件缺失将导致 FAIL）
+npm run gate:acceptance -- --dry-run
+npm run gate:acceptance -- --help
+```
+
+- 退出码：仅当所有步骤 PASS 时为 `0`；任一 FAIL（含"应跑未跑"）为 `1`。
+- 注意：Playwright 套件在生产专有场景（`E2E-01..08`）缺少 `PI_E2E_LIVE=1` 时为 `fixme`，
+  这是用例级设计而非门禁失败；门禁要求的是"套件实际执行且进程退出 0"。
+- 本地无真库 / 无部署地址时，`gate:acceptance` **如期失败**——这是预期行为，不要用它替代
+  `gate:release` 做本地开发自检。
+
+## 8. 标准 Compose 配置覆盖 `npm run test:config`
+
+v0.22 复核发现标准 Compose 未转发新增的 `PI_*` 设置，功能"存在于代码却无法在标准部署中开启"。
+现由 `scripts/compose-config-coverage.mjs` 守护：
+
+- 断言一组关键变量分别到达**读取它们的服务**（`src/server/**` → `web`，`src/worker/**` → `worker`），
+  覆盖模型目录/探测、合并请求与合并后部署钩子、版本/回滚标签/`PI_DEPLOY_LOG`、运行预算、
+  限流、告警、插件白名单/固定校验、磁盘水位、provider 重试、planner 思考级别、沙箱/Docker 参数；
+- 断言部署日志目录以只读方式挂载进 web（`…:/app/pi-agent/backups:ro`）；
+- 纯文本解析（不依赖 Docker daemon），缺失时逐条打印 `service: missing environment variable NAME`
+  并以非零码退出。
+
+该检查同时作为 `npm run validate:compose` 的一部分执行，因此 `gate:release` / `gate:acceptance`
+都会带上它，回归时无法静默通过。变量清单维护在 `scripts/compose-config-coverage.mjs` 的
+`CRITICAL_ENV`；新增关键变量时同步 `.env.example`。
+
+```bash
+npm run test:config
+npm run test:config -- --json   # 机器可读结果
+```
+
+
 ## 6. 安全默认值速查
 
 | 脚本 | 默认行为 | 执行开关 | 凭据来源 |
 | --- | --- | --- | --- |
 | `release-gate.mjs` | 运行本地只读检查；真库检查自动 SKIP | 设置 `PI_DATABASE_URL` 纳入真库检查 | 环境变量 |
+| `acceptance-gate.mjs` | 与 `gate:release` 同序；缺前置条件 / 有 warning / 未跑真库或 e2e 一律 FAIL | 必须设置 `PI_DATABASE_URL` 与 `PI_E2E_BASE_URL` | 环境变量 |
+| `compose-config-coverage.mjs` | 只读解析 compose；缺失关键变量时打印 diff 并退出 1 | — | 无 |
 | `secret-scan.sh` | 只读扫描，输出脱敏 | — | 无 |
 | `provider-drill.mjs` | 缺少 env 即打印 usage 退出；`--dry-run` 不发请求 | 提供必需 env | 仅环境变量 |
 | `drill-archive.sh` | dry-run，打印将执行的脚本 | `--apply`（非交互还需 `--yes`） | 主机既有部署环境 |

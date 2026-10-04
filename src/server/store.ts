@@ -36,6 +36,17 @@ export interface SaveArtifactInput {
   createdAt?: string;
 }
 
+/**
+ * B1: a guard evaluated against the authoritative run inside the write
+ * transaction. Returning `allow: false` performs no write at all.
+ */
+export type UpdateGuard = (run: Run) => { allow: true } | { allow: false; code: string; message: string };
+
+/** B1: result of a guarded CAS write; a rejection carries the authoritative run. */
+export type GuardedUpdateResult =
+  | { ok: true; run: Run }
+  | { ok: false; code: string; message: string; run: Run };
+
 /** Storage contract shared by the JSON (dev/test) and PostgreSQL (REL-001) stores. */
 export interface RunStoreLike {
   init(): Promise<void>;
@@ -43,6 +54,14 @@ export interface RunStoreLike {
   getRun(id: string, owner?: string | string[]): Run | undefined;
   createRun(run: Run, event: Omit<RunEvent, "seq">): Promise<Run>;
   updateRun(id: string, patch: Partial<Run>): Promise<Run>;
+  /**
+   * B1: guarded compare-and-swap. The authoritative run is read (and, on the
+   * PostgreSQL store, locked) inside the write transaction; the patch is only
+   * applied when `guard` allows it. A rejection performs no write and returns
+   * the current run so the caller can replan instead of clobbering a
+   * concurrent winner.
+   */
+  updateRunGuarded(id: string, guard: UpdateGuard, patch: Partial<Run>): Promise<GuardedUpdateResult>;
   appendEvent(event: Omit<RunEvent, "seq">, options?: AppendEventOptions): Promise<RunEvent>;
   getEvents(runId: string, after?: number, limit?: number): Promise<RunEvent[]>;
   subscribe(runId: string, listener: EventListener): () => void;
@@ -104,6 +123,19 @@ export class RunStore implements RunStoreLike {
     this.projectArtifact(run);
     await this.persist();
     return run;
+  }
+
+  /**
+   * B1: guarded update for the JSON store. Single-process by design, so the
+   * guard is evaluated against the current run before the patch is applied.
+   */
+  async updateRunGuarded(id: string, guard: UpdateGuard, patch: Partial<Run>): Promise<GuardedUpdateResult> {
+    const run = this.getRun(id);
+    if (!run) throw new Error(`Run not found: ${id}`);
+    const decision = guard(run);
+    if (!decision.allow) return { ok: false, code: decision.code, message: decision.message, run };
+    const updated = await this.updateRun(id, patch);
+    return { ok: true, run: updated };
   }
 
   async appendEvent(event: Omit<RunEvent, "seq">, options: AppendEventOptions = {}) {

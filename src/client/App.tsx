@@ -52,7 +52,6 @@ import {
   ShieldCheck,
   Sparkles,
   Square,
-  TerminalSquare,
   Trash2,
   X,
   XCircle,

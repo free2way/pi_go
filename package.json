@@ -1,6 +1,6 @@
 {
   "name": "pigo-web",
-  "version": "0.22.1",
+  "version": "0.23.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -14,12 +14,14 @@
     "start": "node dist/server/index.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:scripts": "node --test scripts/release-gate-lib.test.mjs",
+    "test:scripts": "node --test scripts/*.test.mjs",
+    "test:config": "node scripts/compose-config-coverage.mjs",
     "validate:compose": "node deploy/docker/validate-compose.mjs",
     "test:pg:concurrency": "node scripts/pg-concurrency-check.mjs",
     "lint": "eslint .",
     "e2e:browser": "playwright test",
     "gate:release": "node scripts/release-gate.mjs",
+    "gate:acceptance": "node scripts/acceptance-gate.mjs",
     "scan:secrets": "bash scripts/secret-scan.sh",
     "drill:providers": "node scripts/provider-drill.mjs",
     "drill:archive": "bash scripts/drill-archive.sh",

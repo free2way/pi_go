@@ -74,6 +74,12 @@ export interface TodayRunRow {
 export interface SystemStatusInput {
   /** ISO timestamp; defaults to now. Injected so tests are deterministic. */
   now?: string;
+  /**
+   * B7: who is reading. `"user"` (default, least privilege) receives failure
+   * category counts only; `"admin"` additionally receives the recent sanitised
+   * summaries and timestamps.
+   */
+  audience?: "admin" | "user";
   versions: {
     web: string | null;
     worker: string | null;
@@ -144,6 +150,10 @@ export interface FailureSummary {
   total: number;
   scanned: number;
   truncated: boolean;
+  /**
+   * B7: recent failure details. Populated for admins; an empty array for
+   * non-admin readers, who only receive the category counts above.
+   */
   recent: Array<{
     at: string | null;
     type: string;
@@ -349,7 +359,7 @@ function buildUsage(todayRuns: Array<TodayRunRow | null> | null, date: string): 
   };
 }
 
-function buildFailures(rows: FailureEventRow[] | null): FailureSummary {
+function buildFailures(rows: FailureEventRow[] | null, includeDetails: boolean): FailureSummary {
   const byCategory: Record<FailureCategory, number> = { storage: 0, budget: 0, provider: 0, failure_artifact: 0, other: 0 };
   if (!rows) {
     return { status: "unavailable", windowHours: FAILURE_WINDOW_HOURS, byCategory, total: 0, scanned: 0, truncated: false, recent: [] };
@@ -370,7 +380,10 @@ function buildFailures(rows: FailureEventRow[] | null): FailureSummary {
     total: parsed.length,
     scanned: rows.length,
     truncated: rows.length >= FAILURE_SCAN_LIMIT,
-    recent: parsed.slice(0, FAILURE_RECENT_LIMIT).map(({ at, type, category, summary }) => ({ at, type, category, summary })),
+    // B7: a non-admin reader gets counts only — no message text or timestamps.
+    recent: includeDetails
+      ? parsed.slice(0, FAILURE_RECENT_LIMIT).map(({ at, type, category, summary }) => ({ at, type, category, summary }))
+      : [],
   };
 }
 
@@ -378,6 +391,7 @@ function buildFailures(rows: FailureEventRow[] | null): FailureSummary {
 export function buildSystemStatus(input: SystemStatusInput): SystemStatusResponse {
   const now = typeof input.now === "string" && parseIsoMs(input.now) !== null ? input.now : new Date().toISOString();
   const nowMs = parseIsoMs(now) as number;
+  const includeFailureDetails = (input.audience ?? "user") === "admin";
   return {
     schemaVersion: SYSTEM_STATUS_SCHEMA_VERSION,
     at: now,
@@ -386,7 +400,7 @@ export function buildSystemStatus(input: SystemStatusInput): SystemStatusRespons
     queue: buildQueue(input.jobStates, nowMs),
     runs: buildRuns(input.runStates, nowMs),
     usage: buildUsage(input.todayRuns, utcDay(now)),
-    failures: buildFailures(input.failures),
+    failures: buildFailures(input.failures, includeFailureDetails),
     deployments: input.deployments ?? null,
   };
 }

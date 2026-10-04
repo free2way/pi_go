@@ -7,8 +7,10 @@ import type {
   ArtifactContent,
   ArtifactRecord,
   EventListener,
+  GuardedUpdateResult,
   RunStoreLike,
   SaveArtifactInput,
+  UpdateGuard,
 } from "./store.js";
 
 export type JobState = "queued" | "claimed" | "done" | "failed" | "cancelled";
@@ -212,6 +214,41 @@ export class PostgresRunStore implements RunStoreLike {
     });
     this.cache.set(id, next);
     return next;
+  }
+
+  /**
+   * B1: guarded compare-and-swap. The guard is evaluated against the row read
+   * (and locked via `FOR UPDATE`) inside the transaction, so two concurrent
+   * approvals cannot both claim a merge. A lost revision race is retried
+   * against the freshly committed row, where the guard now sees the winner's
+   * marker and rejects; only after a successful commit is the cache updated.
+   */
+  async updateRunGuarded(id: string, guard: UpdateGuard, patch: Partial<Run>): Promise<GuardedUpdateResult> {
+    const maxAttempts = 3;
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        const result = await this.db.withTransaction(async (tx) => {
+          const row = await this.loadRunRow(tx, id);
+          if (!row) throw new Error(`Run not found: ${id}`);
+          const decision = guard(row.run);
+          if (!decision.allow) {
+            return { ok: false as const, code: decision.code, message: decision.message, run: row.run };
+          }
+          if (patch.state && patch.state !== row.run.state) {
+            assertTransition(row.run.state, patch.state);
+          }
+          const candidate = this.mergePatch(row.run, patch);
+          const persisted = await this.casWrite(tx, id, row.revision, candidate);
+          await this.project(tx, persisted);
+          return { ok: true as const, run: persisted };
+        });
+        if (result.ok) this.cache.set(id, result.run);
+        return result;
+      } catch (error) {
+        if (error instanceof RunConflictError && attempt < maxAttempts) continue;
+        throw error;
+      }
+    }
   }
 
   /**
@@ -438,10 +475,14 @@ export class PostgresRunStore implements RunStoreLike {
     };
   }
 
+  /**
+   * B5: deletes the run and every dependent row in one transaction. The read
+   * cache is only evicted after the commit succeeds, so a failed transaction
+   * leaves both the cache and the database exactly as they were. `jobs` and
+   * `run_deliveries` are deleted too — they are keyed by `run_id` and would
+   * otherwise become orphan rows.
+   */
   async deleteRun(id: string) {
-    if (!this.cache.has(id)) throw new Error(`Run not found: ${id}`);
-    this.cache.delete(id);
-    this.listeners.delete(id);
     await this.db.withTransaction(async (tx) => {
       await tx.query("DELETE FROM run_events WHERE run_id = $1", [id]);
       await tx.query("DELETE FROM run_agents WHERE run_id = $1", [id]);
@@ -450,8 +491,14 @@ export class PostgresRunStore implements RunStoreLike {
       await tx.query("DELETE FROM run_artifacts WHERE run_id = $1", [id]);
       await tx.query("DELETE FROM run_usage_role WHERE run_id = $1", [id]);
       await tx.query("DELETE FROM run_checkpoints WHERE run_id = $1", [id]);
-      await tx.query("DELETE FROM runs WHERE id = $1", [id]);
+      await tx.query("DELETE FROM run_deliveries WHERE run_id = $1", [id]);
+      await tx.query("DELETE FROM jobs WHERE run_id = $1", [id]);
+      const deleted = await tx.query("DELETE FROM runs WHERE id = $1 RETURNING id", [id]);
+      if (deleted.rows.length === 0) throw new Error(`Run not found: ${id}`);
     });
+    // AUD-06: only a committed deletion may evict the read cache.
+    this.cache.delete(id);
+    this.listeners.delete(id);
   }
 
   // -------------------------------------------------- artifacts (GAP-04 / AUD-16)

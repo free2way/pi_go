@@ -83,12 +83,51 @@ services:
       PI_REAL_RUNS_ENABLED: ${PI_REAL_RUNS_ENABLED:-false}
       PI_WORKER_URL: http://worker:3200
       PI_INTERNAL_TOKEN: ${PI_INTERNAL_TOKEN:-}
+      # AUD-08 (v0.22): explicit model allowlist. Empty string = the builtin
+      # catalog merged with the role defaults; a JSON array is strict/verbatim.
+      PI_MODEL_CATALOG_JSON: ${PI_MODEL_CATALOG_JSON:-}
+      # AUD-08: `probe` (default) or `off` (operator asserts stored keys).
+      PI_MODEL_PROBE_MODE: ${PI_MODEL_PROBE_MODE:-probe}
+      PI_PROVIDER_PROBE_BASE_URL: ${PI_PROVIDER_PROBE_BASE_URL:-}
+      PI_STARTUP_CREDENTIAL_PROBE_BUDGET_MS: ${PI_STARTUP_CREDENTIAL_PROBE_BUDGET_MS:-10000}
+      # A1 (docs/10): opt-in merge-request creation; PI_MERGE_REQUEST_URL enables it.
+      PI_MERGE_REQUEST_URL: ${PI_MERGE_REQUEST_URL:-}
+      PI_MERGE_REQUEST_TOKEN: ${PI_MERGE_REQUEST_TOKEN:-}
+      PI_MERGE_REQUEST_PROJECT: ${PI_MERGE_REQUEST_PROJECT:-}
+      PI_MERGE_REQUEST_TARGET_BRANCH: ${PI_MERGE_REQUEST_TARGET_BRANCH:-}
+      # A2: optional post-merge deploy hook (`https://…` or `cmd: <command>`).
+      PI_POST_MERGE_DEPLOY_HOOK: ${PI_POST_MERGE_DEPLOY_HOOK:-}
+      # A3: read-only deployment panel sources.
+      PI_WEB_VERSION: ${PI_WEB_VERSION:-}
+      PI_WORKER_VERSION: ${PI_WORKER_VERSION:-}
+      PI_ROLLBACK_TAGS: ${PI_ROLLBACK_TAGS:-}
+      PI_DEPLOY_LOG: ${PI_DEPLOY_LOG:-/app/pi-agent/backups/deploy.log}
+      # COST-002: run-level budgets; 0 = unlimited (see docs/03, docs/04).
+      PI_RUN_MAX_TOKENS: ${PI_RUN_MAX_TOKENS:-0}
+      PI_RUN_MAX_COST_USD: ${PI_RUN_MAX_COST_USD:-0}
+      PI_RUN_MAX_MODEL_CALLS: ${PI_RUN_MAX_MODEL_CALLS:-0}
+      PI_RUN_MAX_DURATION_SECONDS: ${PI_RUN_MAX_DURATION_SECONDS:-0}
+      # SEC-008: per-user write rate limits.
+      PI_RUN_CREATE_PER_MINUTE: ${PI_RUN_CREATE_PER_MINUTE:-20}
+      PI_RUN_ACTIONS_PER_MINUTE: ${PI_RUN_ACTIONS_PER_MINUTE:-30}
+      # REL-005: alert webhook and cooldown.
+      PI_ALERT_WEBHOOK: ${PI_ALERT_WEBHOOK:-}
+      PI_ALERT_COOLDOWN_SECONDS: ${PI_ALERT_COOLDOWN_SECONDS:-900}
+      PI_ARTIFACT_MAX_DOWNLOAD_BYTES: ${PI_ARTIFACT_MAX_DOWNLOAD_BYTES:-5242880}
+      PI_JOB_STALE_SECONDS: ${PI_JOB_STALE_SECONDS:-120}
+      PI_PIPELINE_VERSION: ${PI_PIPELINE_VERSION:-pigo-pipeline-1}
+      PI_WORKSPACES_ENABLED: ${PI_WORKSPACES_ENABLED:-true}
     ports:
       - target: 3100
         published: "3100"
         host_ip: ${PI_WEB_BIND_ADDRESS:?Set PI_WEB_BIND_ADDRESS in the deployment environment}
     volumes:
       - pigo-web-data:/app/data
+      # A3: deployment log for the read-only panel, mounted read-only. Host dir
+      # defaults to <project-dir>/backups (the compose file is copied to
+      # /app/pi-agent on the host). When the directory/file is absent the mount
+      # is empty and `/api/deployments` reports log.available=false.
+      - ${PI_DEPLOY_LOG_HOST_DIR:-./backups}:/app/pi-agent/backups:ro
     networks:
       - pi-network
     depends_on:
@@ -140,6 +179,38 @@ services:
       PI_SANDBOX_NETWORK: ${PI_SANDBOX_NETWORK:-pi-agent-network}
       PI_HOST_WORKSPACE_ROOT: ${PI_HOST_WORKSPACE_ROOT:-/app/pi-agent/workspace}
       PI_SANDBOX_MODELS_FILE: ${PI_SANDBOX_MODELS_FILE:-/app/pi-agent/pi-models.json}
+      # v0.22: worker identity, reported by /health and the deployment panel.
+      PI_WORKER_ID: ${PI_WORKER_ID:-}
+      PI_WORKER_VERSION: ${PI_WORKER_VERSION:-}
+      # GAP-02 (v0.22): plugins are default-off; only allowlisted resources load.
+      PI_PLUGIN_ALLOWLIST: ${PI_PLUGIN_ALLOWLIST:-}
+      PI_PLUGIN_REQUESTS: ${PI_PLUGIN_REQUESTS:-}
+      PI_PLUGIN_REQUIRE_PIN: ${PI_PLUGIN_REQUIRE_PIN:-false}
+      PI_PLUGIN_ALLOW_PROJECT: ${PI_PLUGIN_ALLOW_PROJECT:-false}
+      PI_PLUGIN_CONTAINER_DIR: ${PI_PLUGIN_CONTAINER_DIR:-/opt/pigo/plugins}
+      # COST-002: run-level budgets; 0 = unlimited. Max duration falls back to
+      # PI_RUN_TIMEOUT_SECONDS when unset (empty string here preserves that).
+      PI_RUN_MAX_TOKENS: ${PI_RUN_MAX_TOKENS:-0}
+      PI_RUN_MAX_COST_USD: ${PI_RUN_MAX_COST_USD:-0}
+      PI_RUN_MAX_MODEL_CALLS: ${PI_RUN_MAX_MODEL_CALLS:-0}
+      PI_RUN_MAX_DURATION_SECONDS: ${PI_RUN_MAX_DURATION_SECONDS:-}
+      # REL-010: workspace disk watermarks.
+      PI_MIN_FREE_DISK_MB: ${PI_MIN_FREE_DISK_MB:-2048}
+      PI_CRITICAL_FREE_DISK_MB: ${PI_CRITICAL_FREE_DISK_MB:-}
+      # REL-005: bounded provider retry/backoff.
+      PI_PROVIDER_ATTEMPTS: ${PI_PROVIDER_ATTEMPTS:-3}
+      PI_PROVIDER_BACKOFF_MS: ${PI_PROVIDER_BACKOFF_MS:-2000}
+      PI_PROVIDER_MAX_BACKOFF_MS: ${PI_PROVIDER_MAX_BACKOFF_MS:-30000}
+      # COST-006: planner reasoning effort.
+      PI_PLANNER_THINKING: ${PI_PLANNER_THINKING:-low}
+      PI_CALLBACK_MAX_BYTES: ${PI_CALLBACK_MAX_BYTES:-}
+      PI_WORKSPACE_LOCK_STALE_SECONDS: ${PI_WORKSPACE_LOCK_STALE_SECONDS:-300}
+      # Sandbox / docker plumbing (defaults match the code).
+      PI_DOCKER_SOCKET: ${PI_DOCKER_SOCKET:-/var/run/docker.sock}
+      PI_DOCKER_API_VERSION: ${PI_DOCKER_API_VERSION:-v1.43}
+      PI_GIT_EMPTY_CONFIG: ${PI_GIT_EMPTY_CONFIG:-/dev/null}
+      PI_SANDBOX_EXTRA_BINDS: ${PI_SANDBOX_EXTRA_BINDS:-}
+      PI_SANDBOX_EXTRA_ENV: ${PI_SANDBOX_EXTRA_ENV:-}
     volumes:
       - ./workspace:/workspace
       # The worker creates the per-task sandbox containers through the Docker

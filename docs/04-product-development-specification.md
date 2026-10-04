@@ -920,3 +920,31 @@ plugins:
 - 无未关闭的 S0/S1 缺陷；
 - 已完成备份、恢复、灰度和回滚演练；
 - 研发、测试和产品负责人完成验收签字。
+
+## 20. v0.22.x 能力清单（2026-10-04 增补）
+
+> 本节补充 §3（其基线为 2026-10-03）之后交付的能力。条目依据**仓库内的代码与单测**
+> 记录，除另有说明外不代表已在真实 provider / OTP / 生产环境验证。
+
+| 能力 | 入口 / 关键文件 | 依据 |
+| --- | --- | --- |
+| 系统状态页 | `GET /api/system/status`、`src/server/system-status.ts`、`src/client/SystemStatusPage.tsx`、`docs/11` | `system-status.test.ts`（15）、`system-status-view.test.ts`（7）；只读，段缺失返回 `unavailable`/`null` |
+| 对话日志 + 参与方代号 + 返修分支 | `src/shared/chat.ts`、`App.tsx` 对话视图 | `chat` 相关单测；返修分支按轮次派生展示 |
+| 审批分流：接受交付 / 继续开发 | `POST /api/runs/:id/approve`、`/resume`、`/retry-review` | `approve.test.ts`、`run-merge.test.ts` |
+| 验收快照 | `mode:"accept"` 写入 `run.acceptance`（意见、diff 身份、检查计数、用量、受理人） | `acceptance.test.ts`；事件名 `run.approved` 向后兼容 |
+| 重新打开已交付任务 | `POST /api/runs/:id/reopen`（`completed → needs_human` 受控边） | 状态机守卫单测 |
+| 批量操作 | `POST /api/runs/batch`（continue/accept/cleanup，去重上限 50） | 逐条结果与汇总，部分失败逐条报告 |
+| 导出补丁 | `GET /api/runs/:id/patch`（`text/x-patch`） | 优先持久化 diff 制品，缺失时重生成；目录已清理返回 404 |
+| 创建合并请求 | `POST /api/runs/:id/merge-request`（`PI_MERGE_REQUEST_*`） | 未配置返回 `409 MERGE_REQUEST_NOT_CONFIGURED`；token 不下发浏览器 |
+| 审批即合并 | `approve` + `mergeIntoWorkspace:true`（仅管理员） | 快进或生成合并提交，永不 force-push；冲突 `409 MERGE_CONFLICT` |
+| 部署面板 | `GET /api/deployments`（`PI_WEB_VERSION`/`PI_WORKER_VERSION`/`PI_ROLLBACK_TAGS`/`PI_DEPLOY_LOG`） | `deployments.test.ts`；日志缺失 `log.available=false` |
+| 发布门禁与演练 | `npm run gate:release`（宽松）、`npm run gate:acceptance`（严格）、`scan:secrets`、`drill:providers`/`drill:archive`/`drill:rollback` | `release-gate-lib.test.mjs`、`compose-config-coverage.test.mjs`；`docs/09` |
+| 标准 Compose 配置覆盖 | `deploy/docker/compose.yaml`、`.env.example`、`npm run test:config` | 断言关键 `PI_*` 变量到达正确服务 + 部署日志只读挂载，`validate:compose` 一并执行 |
+
+边界（与 §3.2 一致，仍未验证）：
+
+- 未执行真实 provider 闭环、未执行 Cloudflare 邮件 OTP 登录测试；
+- 插件**版本固定 / 篡改检测**仍未实现（`PI_PLUGIN_REQUIRE_PIN` 仅覆盖“必须带 pin”，不含第三方镜像签名）；
+- 系统状态页、部署面板的纯函数与展示映射有单测，但真实 PostgreSQL / 真实 Worker `/health` /
+  真实部署日志解析仅在生产联调时才能最终确认（见 `docs/11` §5）。
+

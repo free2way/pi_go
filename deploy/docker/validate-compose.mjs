@@ -8,9 +8,11 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { checkComposeCoverage } from "../../scripts/compose-config-coverage.mjs";
 
 const file = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "compose.yaml");
-const lines = readFileSync(file, "utf8").split("\n");
+const text = readFileSync(file, "utf8");
+const lines = text.split("\n");
 
 function serviceBlock(name) {
   const start = lines.findIndex((line) => line === `  ${name}:`);
@@ -50,9 +52,13 @@ if (!listItems(web, "volumes").every((entry) => !entry.includes("docker.sock")))
   problems.push("web must not mount the docker socket");
 }
 
+// v0.22 (B3): every critical PI_* variable must reach the service that reads it,
+// and the deployment log must be mounted read-only for the deployment panel.
+for (const problem of checkComposeCoverage(text).problems) problems.push(problem);
+
 if (problems.length > 0) {
   console.error("compose validation failed:");
   for (const problem of problems) console.error(` - ${problem}`);
   process.exit(1);
 }
-console.log("compose structure OK (worker volumes + group_add, web isolation)");
+console.log("compose structure OK (worker volumes + group_add, web isolation, v0.22 config coverage)");

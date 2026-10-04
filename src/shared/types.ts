@@ -202,6 +202,13 @@ export interface Run {
   humanNotes?: HumanNote[];
   /** A2: the merge commit, when an admin accepted with `mergeIntoWorkspace`. */
   merge?: RunMergeRecord;
+  /**
+   * B1: durable two-phase marker for an in-flight admin merge. Phase 1 writes it
+   * to claim the merge before the worker touches Git; phase 2 clears it when the
+   * merge record is committed. A crash between the worker merge and the DB write
+   * leaves it as `committed_unrecorded` so a replay can converge the row.
+   */
+  mergePending?: RunMergePending;
   /** B1: when a delivered run was reopened (state moved back to needs_human). */
   reopenedAt?: string;
   reopenedBy?: string;
@@ -216,6 +223,41 @@ export interface RunMergeRecord {
   targetBranch: string;
   mergedAt: string;
   mergedBy: string;
+}
+
+/** B1: lifecycle of the durable merge marker between the two phases. */
+export type MergePendingState = "in_progress" | "committed_unrecorded";
+
+/**
+ * B1: durable marker that claims a merge for one approval attempt and, when the
+ * worker has already produced a commit but the run row could not be updated,
+ * carries everything a replay needs to converge the database.
+ */
+export interface RunMergePending {
+  /** Unique per attempt; a CAS guard uses it so two approvals cannot both merge. */
+  token: string;
+  state: MergePendingState;
+  sourceBranch: string;
+  targetBranch: string | null;
+  startedAt: string;
+  startedBy: string;
+  /**
+   * The approval payload captured before the worker call, so a replay can
+   * finish the accept (state/acceptance/notes) without the original request.
+   */
+  approval: {
+    acceptedAt: string;
+    acceptedBy: string;
+    summary: string;
+    note: string | null;
+    acceptance: AcceptanceSnapshot;
+  };
+  /** Worker-reported commit/strategy, recorded once the merge succeeded. */
+  commit?: string;
+  strategy?: RunMergeRecord["strategy"];
+  mergedAt?: string;
+  attempts?: number;
+  lastError?: string;
 }
 
 /**
