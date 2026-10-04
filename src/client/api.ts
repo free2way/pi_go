@@ -28,6 +28,66 @@ export interface BatchSummary {
   results: Array<{ runId: string; ok: boolean; code?: string; error?: string; state?: string }>;
 }
 
+/** SYS-01: availability marker shared by every system status section. */
+export type SystemSectionStatus = "ok" | "unavailable";
+
+/** SYS-01: read-only system status returned by `GET /api/system/status`. */
+export interface SystemStatusResponse {
+  schemaVersion: number;
+  at: string;
+  versions: { web: string | null; worker: string | null };
+  infrastructure: {
+    database: { status: SystemSectionStatus; error?: string };
+    worker: { status: "ok" | "unreachable" | "unknown"; activeJobs?: number; storage?: "ok" | "low" | "critical" };
+  };
+  queue: {
+    status: SystemSectionStatus;
+    byState: Record<string, number>;
+    total: number;
+    active: number;
+    oldestQueuedAt: string | null;
+    oldestQueuedAgeMs: number | null;
+  };
+  runs: {
+    status: SystemSectionStatus;
+    byState: Record<string, number>;
+    total: number;
+    active: { queued: number; preparing: number; developing: number; checking: number; reviewing: number; total: number };
+    oldestQueuedAt: string | null;
+    oldestQueuedAgeMs: number | null;
+  };
+  usage: {
+    status: SystemSectionStatus;
+    date: string;
+    basis: "runs-updated-today";
+    scannedRuns: number;
+    truncated: boolean;
+    modelCalls: number | null;
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+    estimatedCost: number;
+  };
+  failures: {
+    status: SystemSectionStatus;
+    windowHours: number;
+    byCategory: Record<string, number>;
+    total: number;
+    scanned: number;
+    truncated: boolean;
+    recent: Array<{ at: string | null; type: string; category: string; summary: string }>;
+  };
+  /** Deployment summary reusing `/api/deployments`, minus the server-side log path. */
+  deployments: {
+    web: { version: string | null };
+    worker: { version: string | null };
+    rollbackTags: string[];
+    records: DeploymentRecord[];
+    log: { available: boolean; error?: string };
+    at: string;
+  } | null;
+}
+
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -84,6 +144,7 @@ export const api = {
   createMergeRequest: (id: string) =>
     request<{ ok: boolean; mergeRequest: { url: string | null; id: string | null; number: string | null } }>(`/api/runs/${id}/merge-request`, { method: "POST" }),
   deployments: () => request<DeploymentStatus>("/api/deployments"),
+  systemStatus: () => request<SystemStatusResponse>("/api/system/status"),
   reopenRun: (id: string, body: { note?: string; confirm?: boolean } = {}) =>
     request<Run>(`/api/runs/${id}/reopen`, { method: "POST", body: JSON.stringify(body) }),
   batchRuns: (body: { action: "continue" | "accept" | "cleanup"; runIds: string[]; note?: string; acknowledgeOpenFindings?: boolean }) =>

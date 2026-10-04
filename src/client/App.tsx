@@ -67,6 +67,7 @@ import { runStateLabels, requirementSummary } from "./requirement-history";
 import { MAX_BUFFERED_EVENTS, mergeRunEvents, shouldAcceptRun } from "./run-events";
 import { createRunSelectionGuard, eventsForRun, isRunSelected, pickSelectedRun } from "./run-selection";
 import { ModelsPage } from "./ModelsPage";
+import { SystemStatusPage } from "./SystemStatusPage";
 import { WorkspacesPage } from "./WorkspacesPage";
 
 type Tab = "activity" | "agents" | "review" | "diff" | "checks" | "budget";
@@ -624,7 +625,7 @@ function AcceptancePanel({ run }: { run: Run }) {
  * A3: compact read-only deployment panel. Every unknown state is shown as such;
  * a missing deploy log is reported instead of pretending there were no deploys.
  */
-function DeploymentPanel() {
+function DeploymentPanel({ onOpenSystemStatus }: { onOpenSystemStatus?: () => void }) {
   const [status, setStatus] = useState<DeploymentStatus>();
   const [error, setError] = useState("");
   useEffect(() => {
@@ -632,8 +633,13 @@ function DeploymentPanel() {
   }, []);
   const unknown = <span className="deploy-unknown">未知</span>;
   return (
-    <div className="deployments-card" id="system">
-      <div className="providers-title"><span>DEPLOYMENTS</span><Activity size={13} /></div>
+    <div className="deployments-card">
+      <div className="providers-title">
+        <span>DEPLOYMENTS</span>
+        {onOpenSystemStatus
+          ? <button type="button" className="deploy-open" title="打开系统状态" onClick={onOpenSystemStatus}>系统状态<Activity size={12} /></button>
+          : <Activity size={13} />}
+      </div>
       {error ? <div className="form-error">部署状态不可用：{error}</div> : null}
       <div className="deploy-row"><span>Web</span><strong>{status?.web.version ?? unknown}</strong></div>
       <div className="deploy-row"><span>Worker</span><strong>{status?.worker.version ?? unknown}</strong></div>
@@ -1028,7 +1034,7 @@ export function App() {
   // Item-1: which rework branch's detail panel is open; Item-2: the chat round filter.
   const [reworkRound, setReworkRound] = useState<number | null>(null);
   const [chatRoundFilter, setChatRoundFilter] = useState<number | null>(null);
-  const [view, setView] = useState<"run" | "workspaces" | "models" | "history">("run");
+  const [view, setView] = useState<"run" | "workspaces" | "models" | "history" | "system">("run");
   const [createOpen, setCreateOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -1237,7 +1243,8 @@ export function App() {
           <button type="button" className={view === "history" ? "active" : ""} onClick={() => setView("history")}><History size={16} />需求历史</button>
           <button type="button" className={view === "workspaces" ? "active" : ""} onClick={() => setView("workspaces")}><FolderGit2 size={16} />工作区</button>
           <button type="button" className={view === "models" ? "active" : ""} onClick={() => setView("models")}><Cpu size={16} />模型与凭据</button>
-          <a href="#system"><Activity size={16} />运行状态</a>
+          {/* SYS-01: this used to be a dead `#system` anchor into the sidebar deployment card; it now opens the system status dashboard. */}
+          <button type="button" className={view === "system" ? "active" : ""} onClick={() => setView("system")}><Activity size={16} />系统状态</button>
         </nav>
         <div className="sidebar-section-head"><span>最近任务</span><span className="sidebar-head-actions"><Search size={14} /><button className="sidebar-cleanup" type="button" title="清理 7 天前已结束的任务" onClick={() => void handleCleanup()}><Trash2 size={13} /></button></span></div>
         {batchSelected.size > 0 && (
@@ -1274,7 +1281,7 @@ export function App() {
           <button className="manage-credentials" type="button" onClick={() => setView("models")}><KeyRound size={13} />配置或轮换个人 Key</button>
           <div className={`credential-warning ${config.realRunsAvailable ? "runner-ready" : ""}`}><AlertTriangle size={13} />{config.realRunsAvailable ? "真实执行已启用" : "真实执行尚未启用"}</div>
         </div>}
-        <DeploymentPanel />
+        <DeploymentPanel onOpenSystemStatus={() => setView("system")} />
         <div className="account-footer"><div><span className="system-dot" /><strong>{user?.email || "正在验证账户"}</strong><small>Pi {config?.piVersion || "—"}</small></div><a href="/cdn-cgi/access/logout" title="退出登录"><LogOut size={15} /></a></div>
       </aside>
 
@@ -1286,9 +1293,11 @@ export function App() {
               ? <><span>WORKSPACES</span><ChevronRight size={13} /><strong>工作区</strong></>
               : view === "models"
                 ? <><span>MODELS</span><ChevronRight size={13} /><strong>模型与凭据</strong></>
-                : view === "history"
-                  ? <><span>HISTORY</span><ChevronRight size={13} /><strong>需求历史</strong></>
-                  : <><span>WORKFLOWS</span><ChevronRight size={13} /><strong>{activeRun?.id.slice(0, 12) || "OVERVIEW"}</strong></>}
+                : view === "system"
+                  ? <><span>SYSTEM</span><ChevronRight size={13} /><strong>系统状态</strong></>
+                  : view === "history"
+                    ? <><span>HISTORY</span><ChevronRight size={13} /><strong>需求历史</strong></>
+                    : <><span>WORKFLOWS</span><ChevronRight size={13} /><strong>{activeRun?.id.slice(0, 12) || "OVERVIEW"}</strong></>}
           </div>
           <div className="topbar-actions">
             {view === "run" && (activeRun?.mode === "demo" ? <span className="demo-chip"><Sparkles size={13} />演示数据</span> : activeRun && <span className="demo-chip real-chip"><Code2 size={13} />真实工作区</span>)}
@@ -1297,7 +1306,9 @@ export function App() {
           </div>
         </header>
 
-        {view === "models" ? (
+        {view === "system" ? (
+          <SystemStatusPage />
+        ) : view === "models" ? (
           <ModelsPage config={config} onChanged={() => { void api.config().then(setConfig); }} />
         ) : view === "workspaces" ? (
           <WorkspacesPage config={config} runs={runs} onOpenCredentials={() => setView("models")} />

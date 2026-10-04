@@ -2254,7 +2254,8 @@ const server = createServer(async (request, response) => {
     const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
     if (request.method === "GET" && url.pathname === "/health") {
       const storage = await storageStatus();
-      return json(response, 200, { status: "ok", service: "pigo-worker", activeJobs: active.size, storage: storage.state });
+      const version = (process.env.PI_WORKER_VERSION ?? "").trim();
+      return json(response, 200, { status: "ok", service: "pigo-worker", version: version || null, activeJobs: active.size, storage: storage.state });
     }
     if (request.method === "GET" && url.pathname === "/health/storage") return json(response, 200, await storageStatus());
     if (!authorized(request)) return json(response, 401, { error: "Unauthorized" });
