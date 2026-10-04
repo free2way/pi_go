@@ -82,7 +82,7 @@ export interface ChatMessage {
 }
 
 /** The human action a stored requirement note came from. */
-export type HumanNoteKind = "approve_continue" | "approve_accept" | "resume" | "reject";
+export type HumanNoteKind = "approve_continue" | "approve_accept" | "resume" | "reject" | "reopen";
 
 /**
  * A durable, human-authored note attached to a run (approve note, resume
@@ -200,6 +200,40 @@ export interface Run {
    * without it and must be treated as an empty array.
    */
   humanNotes?: HumanNote[];
+  /** A2: the merge commit, when an admin accepted with `mergeIntoWorkspace`. */
+  merge?: RunMergeRecord;
+  /** B1: when a delivered run was reopened (state moved back to needs_human). */
+  reopenedAt?: string;
+  reopenedBy?: string;
+  /** B2: durable snapshot of what the operator accepted. */
+  acceptance?: AcceptanceSnapshot;
+}
+
+/** A2: recorded outcome of merging a run branch into the workspace default branch. */
+export interface RunMergeRecord {
+  commit: string;
+  strategy: "fast-forward" | "merge-commit";
+  targetBranch: string;
+  mergedAt: string;
+  mergedBy: string;
+}
+
+/**
+ * B2: durable record of an accepted delivery. Additive and backward compatible.
+ * `null` identity fields mean genuinely unknown, never a fabricated zero.
+ */
+export interface AcceptanceSnapshot {
+  acceptedAt: string;
+  acceptedBy: string;
+  note: string | null;
+  acknowledgedOpenFindings: boolean;
+  findings: {
+    resolved: { count: number; ids: string[] };
+    remaining: { count: number; items: Array<{ id: string; severity: Finding["severity"] }> };
+  };
+  diff: { artifactId: string | null; sha256: string | null; bytes: number | null };
+  checks: { total: number; passed: number; failed: number };
+  usage: { inputTokens: number; outputTokens: number; estimatedCost: number; modelCalls: number };
 }
 
 export interface RunUsage {
@@ -268,6 +302,8 @@ export interface ConfigStatus {
    * and must never be presented as such.
    */
   assertedProviders?: string[];
+  /** A1: true when `PI_MERGE_REQUEST_*` is configured, so the UI can enable MR. */
+  mergeRequestConfigured?: boolean;
 }
 
 export interface CurrentUser {

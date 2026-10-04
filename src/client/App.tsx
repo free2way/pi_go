@@ -61,7 +61,7 @@ import {
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { chatChannelLabels, chatCounts, chatMessageView, chatMessagesFromEvents, chatParticipantLabels, chatTabs, filterChatMessages, isReviewMessage, messageFindings, reworkBranchDetails, reworkBranchRounds, type ChatTab, type ReworkBranchDetail } from "../shared/chat";
 import type { ChatMessage, ConfigStatus, CurrentUser, Finding, ModelCatalogResponse, Run, RunArtifact, RunEvent, RunMode, RunRoleUsage, RunState, Workspace } from "../shared/types";
-import { api } from "./api";
+import { api, type DeploymentStatus } from "./api";
 import { HistoryPage } from "./HistoryPage";
 import { runStateLabels, requirementSummary } from "./requirement-history";
 import { MAX_BUFFERED_EVENTS, mergeRunEvents, shouldAcceptRun } from "./run-events";
@@ -531,21 +531,49 @@ function SubAgentsPanel({ run }: { run: Run }) {
   );
 }
 
-function DiffPanel({ run, artifacts }: { run: Run; artifacts: RunArtifact[] }) {
+function DiffPanel({ run, artifacts, mergeRequestConfigured }: { run: Run; artifacts: RunArtifact[]; mergeRequestConfigured?: boolean }) {
   const diffArtifact = artifacts.find((artifact) => artifact.artifactId === "diff");
-  const downloadUrl = api.artifactDownloadUrl(run.id, "diff");
+  // A1: the export route always resolves the authoritative patch (artifact,
+  // inline diff, or a worker regeneration), so it is preferred over the raw
+  // artifact download.
+  const exportUrl = api.runPatchUrl(run.id);
+  const [mrState, setMrState] = useState<"" | "busy" | "done" | "error">("");
+  const [mrMessage, setMrMessage] = useState("");
+  const createMergeRequest = async () => {
+    setMrState("busy");
+    setMrMessage("");
+    try {
+      const result = await api.createMergeRequest(run.id);
+      setMrState("done");
+      setMrMessage(result.mergeRequest.url ? `已创建合并请求：${result.mergeRequest.url}` : "已创建合并请求");
+    } catch (cause) {
+      setMrState("error");
+      setMrMessage((cause as Error).message);
+    }
+  };
   return (
     <div className="diff-panel">
       <div className="artifact-bar">
-        {diffArtifact || run.diff ? (
-          <a className="button secondary" href={downloadUrl} download>
+        {diffArtifact ? (
+          <a className="button secondary" href={api.artifactDownloadUrl(run.id, "diff")} download>
             <Download size={14} />下载完整 Diff (.patch)
-            {diffArtifact ? <em>{diffArtifact.bytes} bytes · {diffArtifact.sha256?.slice(0, 12)}</em> : null}
+            <em>{diffArtifact.bytes} bytes · {diffArtifact.sha256?.slice(0, 12)}</em>
           </a>
+        ) : null}
+        {diffArtifact || run.diff ? (
+          <a className="button secondary" href={exportUrl} download>
+            <Download size={14} />导出补丁 (.patch)
+          </a>
+        ) : null}
+        {mergeRequestConfigured ? (
+          <button type="button" className="button secondary" disabled={mrState === "busy"} onClick={() => void createMergeRequest()}>
+            {mrState === "busy" ? <LoaderCircle className="spin" size={14} /> : <GitPullRequestArrow size={14} />}创建合并请求
+          </button>
         ) : null}
         {diffArtifact?.baseSha ? <code className="artifact-base">base {diffArtifact.baseSha.slice(0, 10)}</code> : null}
         <span className="artifact-hint">页面预览可能被截断；完整内容以制品下载为准。</span>
       </div>
+      {mrMessage ? <div className={mrState === "error" ? "form-error" : "artifact-hint"}>{mrMessage}</div> : null}
       {run.diff ? (
         <pre className="diff-view">{run.diff.split("\n").map((line, index) => (
           <span className={line.startsWith("+") ? "diff-add" : line.startsWith("-") ? "diff-remove" : line.startsWith("@@") ? "diff-hunk" : ""} key={`${index}-${line}`}>{line}{"\n"}</span>
@@ -554,6 +582,79 @@ function DiffPanel({ run, artifacts }: { run: Run; artifacts: RunArtifact[] }) {
     </div>
   );
 }
+
+/**
+ * B2: durable record of what was accepted — findings split, diff identity,
+ * checks summary and usage, with a copy button for the full JSON.
+ */
+function AcceptancePanel({ run }: { run: Run }) {
+  const [copied, setCopied] = useState(false);
+  const snapshot = run.acceptance;
+  if (!snapshot) return null;
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(snapshot, null, 2));
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      setCopied(false);
+    }
+  };
+  return (
+    <section className="panel acceptance-panel">
+      <div className="panel-head">
+        <div><span className="eyebrow">ACCEPTANCE SNAPSHOT</span><h3>验收快照</h3></div>
+        <button type="button" className="button secondary" onClick={() => void copy()}>
+          {copied ? <Check size={14} /> : <Copy size={14} />}{copied ? "已复制" : "复制 JSON"}
+        </button>
+      </div>
+      <div className="acceptance-grid">
+        <div><span>受理人</span><strong>{snapshot.acceptedBy}</strong><small>{formatClock(snapshot.acceptedAt)}</small></div>
+        <div><span>已解决 / 待处理意见</span><strong>{snapshot.findings.resolved.count} / {snapshot.findings.remaining.count}</strong><small>{snapshot.acknowledgedOpenFindings ? "已确认接受未解决意见" : "无未解决意见"}</small></div>
+        <div><span>检查</span><strong>{snapshot.checks.passed} 通过 / {snapshot.checks.failed} 失败</strong><small>共 {snapshot.checks.total} 项</small></div>
+        <div><span>Diff 制品</span><strong>{snapshot.diff.sha256 ? snapshot.diff.sha256.slice(0, 12) : "未知"}</strong><small>{snapshot.diff.bytes === null ? "字节数未知" : `${snapshot.diff.bytes} bytes`}</small></div>
+        <div><span>模型调用 / 成本</span><strong>{snapshot.usage.modelCalls} 次 · ${snapshot.usage.estimatedCost.toFixed(3)}</strong><small>输入 {compactNumber(snapshot.usage.inputTokens)} · 输出 {compactNumber(snapshot.usage.outputTokens)}</small></div>
+        <div><span>验收备注</span><strong>{snapshot.note ?? "无"}</strong><small>{run.merge ? `已合并 ${run.merge.commit.slice(0, 10)} → ${run.merge.targetBranch}` : "未合并"}</small></div>
+      </div>
+    </section>
+  );
+}
+
+/**
+ * A3: compact read-only deployment panel. Every unknown state is shown as such;
+ * a missing deploy log is reported instead of pretending there were no deploys.
+ */
+function DeploymentPanel() {
+  const [status, setStatus] = useState<DeploymentStatus>();
+  const [error, setError] = useState("");
+  useEffect(() => {
+    void api.deployments().then(setStatus).catch((cause) => setError((cause as Error).message));
+  }, []);
+  const unknown = <span className="deploy-unknown">未知</span>;
+  return (
+    <div className="deployments-card" id="system">
+      <div className="providers-title"><span>DEPLOYMENTS</span><Activity size={13} /></div>
+      {error ? <div className="form-error">部署状态不可用：{error}</div> : null}
+      <div className="deploy-row"><span>Web</span><strong>{status?.web.version ?? unknown}</strong></div>
+      <div className="deploy-row"><span>Worker</span><strong>{status?.worker.version ?? unknown}</strong></div>
+      <div className="deploy-row"><span>回滚标签</span><strong>{status?.rollbackTags.length ? status.rollbackTags.join("、") : unknown}</strong></div>
+      <div className="deploy-row"><span>部署日志</span><strong>{status ? (status.log.available ? `${status.records.length} 条` : "不可用") : unknown}</strong></div>
+      {status?.records.length ? (
+        <ul className="deploy-records">
+          {status.records.slice(0, 3).map((record, index) => (
+            <li key={`${record.raw}-${index}`}>
+              <code>{record.version ?? "—"}</code>
+              <span>{record.role ?? record.status ?? "记录"}</span>
+              <small>{record.at ?? ""}</small>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+      {status && !status.log.available ? <small className="deploy-hint">部署日志不可用（{status.log.path}）</small> : null}
+    </div>
+  );
+}
+
 
 function ChecksPanel({ run }: { run: Run }) {
   return (
@@ -830,6 +931,8 @@ function HumanInterventionPanel({ run, onUpdated }: { run: Run; onUpdated: (run:
   const [instruction, setInstruction] = useState("");
   const [busy, setBusy] = useState<"" | "resume" | "review" | "terminate" | "continue" | "approve" | "reject">("");
   const [error, setError] = useState("");
+  // A2: admin-only merge on accept; the server enforces the admin check.
+  const [mergeIntoWorkspace, setMergeIntoWorkspace] = useState(false);
   const unresolved = run.findings.filter((item) => !item.resolved).length;
 
   const act = async (kind: "resume" | "review" | "terminate" | "continue" | "approve" | "reject") => {
@@ -837,9 +940,7 @@ function HumanInterventionPanel({ run, onUpdated }: { run: Run; onUpdated: (run:
     if (kind === "terminate" && !window.confirm(`终止任务「${run.title}」？\n\n任务会标记为已取消；代码与 worktree 全部保留，不会自动合并。`)) return;
     if (kind === "reject" && !window.confirm(`拒绝任务「${run.title}」的交付？\n\n任务将标记为已取消；代码与 worktree 全部保留。`)) return;
     if (kind === "approve" && !window.confirm(
-      unresolved > 0
-        ? `任务「${run.title}」仍有 ${unresolved} 条未解决意见。\n\n确认接受交付？这些意见会被记录为已知接受，不会继续修复。`
-        : `确认通过任务「${run.title}」的交付？\n\n任务将标记为已通过；worktree 中的代码不会自动推送或合并。`,
+      `${unresolved > 0 ? `任务「${run.title}」仍有 ${unresolved} 条未解决意见。\n\n确认接受交付？这些意见会被记录为已知接受，不会继续修复。` : `确认通过任务「${run.title}」的交付？`}${mergeIntoWorkspace ? "\n\n已勾选「合并到工作区默认分支」：将先合并再完成（冲突会被拒绝，工作区保持不变）。" : "\n\nworktree 中的代码不会自动推送或合并。"}`,
     )) return;
     setBusy(kind);
     try {
@@ -855,6 +956,7 @@ function HumanInterventionPanel({ run, onUpdated }: { run: Run; onUpdated: (run:
           mode: "accept",
           note: instruction.trim() || undefined,
           acknowledgeOpenFindings: unresolved > 0,
+          mergeIntoWorkspace,
         }));
       } else if (kind === "reject") {
         onUpdated(await api.rejectRun(run.id, { reason: instruction.trim() || undefined }));
@@ -879,6 +981,10 @@ function HumanInterventionPanel({ run, onUpdated }: { run: Run; onUpdated: (run:
       </p>
       <label>人工指令 / 审批备注（可选，随恢复或审批记录）
         <textarea rows={3} value={instruction} onChange={(event) => setInstruction(event.target.value)} placeholder="例如：优先修复凭据隔离问题；其余按审核意见逐条处理。" disabled={Boolean(busy)} />
+      </label>
+      <label className="merge-option">
+        <input type="checkbox" checked={mergeIntoWorkspace} onChange={(event) => setMergeIntoWorkspace(event.target.checked)} disabled={Boolean(busy)} />
+        审批通过后合并到工作区默认分支（仅管理员；冲突会被拒绝且不修改工作区）
       </label>
       {error && <div className="form-error">{error}</div>}
       <div className="human-actions">
@@ -926,6 +1032,9 @@ export function App() {
   const [createOpen, setCreateOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [loading, setLoading] = useState(true);
+  // B3: run ids selected for a batch operation.
+  const [batchSelected, setBatchSelected] = useState<Set<string>>(new Set());
+  const [batchBusy, setBatchBusy] = useState(false);
 
   const refreshRuns = useCallback(async () => {
     const next = await api.runs();
@@ -1073,6 +1182,51 @@ export function App() {
     }
   };
 
+  /** B1: reopen a completed run (owner-confirmed; the server allows admins freely). */
+  const handleReopen = async (target: Run) => {
+    if (!window.confirm(`重新打开任务「${target.title}」？\n\n任务会回到「需要人工处理」，分支与 worktree 保持原样。`)) return;
+    try {
+      applyRun(await api.reopenRun(target.id, { confirm: true }));
+    } catch (cause) {
+      window.alert(`重新打开失败：${(cause as Error).message}`);
+    }
+  };
+
+  const toggleBatch = (id: string) => {
+    setBatchSelected((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  /** B3: run a batch action over the selected runs; partial failures are listed. */
+  const handleBatch = async (action: "accept" | "continue" | "cleanup") => {
+    const selected = runs.filter((item) => batchSelected.has(item.id));
+    const ids = selected.map((item) => item.id);
+    if (ids.length === 0) return;
+    if (action === "cleanup") {
+      if (!window.confirm(`清理选中的 ${ids.length} 个已结束任务？\n\n任务记录、事件与制品会一并删除；worktree 保留在服务器。`)) return;
+    } else if (action === "accept") {
+      const openCount = selected.reduce((total, item) => total + item.findings.filter((finding) => !finding.resolved).length, 0);
+      if (!window.confirm(`批量接受 ${ids.length} 个任务的交付？${openCount > 0 ? `\n\n其中共有 ${openCount} 条未解决意见将被记录为已知接受。` : ""}`)) return;
+    } else if (!window.confirm(`将选中的 ${ids.length} 个任务退回开发再跑一轮？`)) return;
+    setBatchBusy(true);
+    try {
+      const summary = await api.batchRuns({ action, runIds: ids, acknowledgeOpenFindings: true });
+      await refreshRuns();
+      const failed = summary.results.filter((result) => !result.ok);
+      const label = action === "accept" ? "接受交付" : action === "continue" ? "继续开发" : "清理";
+      window.alert(`批量${label}完成：成功 ${summary.succeeded}，失败 ${summary.failed}${failed.length ? `\n${failed.slice(0, 5).map((result) => `${result.runId.slice(0, 12)}：${result.error ?? result.code ?? "失败"}`).join("\n")}` : ""}`);
+      setBatchSelected(new Set());
+    } catch (cause) {
+      window.alert(`批量操作失败：${(cause as Error).message}`);
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
   return (
     <div className="app-shell">
       <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
@@ -1086,9 +1240,21 @@ export function App() {
           <a href="#system"><Activity size={16} />运行状态</a>
         </nav>
         <div className="sidebar-section-head"><span>最近任务</span><span className="sidebar-head-actions"><Search size={14} /><button className="sidebar-cleanup" type="button" title="清理 7 天前已结束的任务" onClick={() => void handleCleanup()}><Trash2 size={13} /></button></span></div>
+        {batchSelected.size > 0 && (
+          <div className="batch-bar">
+            <span>已选 {batchSelected.size} 个</span>
+            <button type="button" className="button secondary" disabled={batchBusy} onClick={() => void handleBatch("accept")}>接受交付</button>
+            <button type="button" className="button secondary" disabled={batchBusy} onClick={() => void handleBatch("continue")}>继续开发</button>
+            <button type="button" className="button danger-text" disabled={batchBusy} onClick={() => void handleBatch("cleanup")}>清理</button>
+            <button type="button" className="button secondary" disabled={batchBusy} onClick={() => setBatchSelected(new Set())}>取消</button>
+          </div>
+        )}
         <div className="run-list">
           {runs.map((item) => (
             <div className={`run-item ${selectedId === item.id ? "selected" : ""}`} key={item.id}>
+              <label className="run-select" title="选择以进行批量操作">
+                <input type="checkbox" checked={batchSelected.has(item.id)} onChange={() => toggleBatch(item.id)} />
+              </label>
               <button className="run-item-main" onClick={() => { setSelectedId(item.id); setSidebarOpen(false); setView("run"); }}>
                 <span className={`run-state-dot status-${item.state}`} />
                 <span><strong>{item.title}</strong><small>{item.repository} · R{item.round}</small></span>
@@ -1108,6 +1274,7 @@ export function App() {
           <button className="manage-credentials" type="button" onClick={() => setView("models")}><KeyRound size={13} />配置或轮换个人 Key</button>
           <div className={`credential-warning ${config.realRunsAvailable ? "runner-ready" : ""}`}><AlertTriangle size={13} />{config.realRunsAvailable ? "真实执行已启用" : "真实执行尚未启用"}</div>
         </div>}
+        <DeploymentPanel />
         <div className="account-footer"><div><span className="system-dot" /><strong>{user?.email || "正在验证账户"}</strong><small>Pi {config?.piVersion || "—"}</small></div><a href="/cdn-cgi/access/logout" title="退出登录"><LogOut size={15} /></a></div>
       </aside>
 
@@ -1159,7 +1326,14 @@ export function App() {
                 <h1>{activeRun.title}</h1>
                 <p>{activeRun.summary}</p>
               </div>
-              <div className="run-round"><span>REVIEW ROUND</span><strong>{activeRun.round}<em>/ {activeRun.maxRounds}</em></strong></div>
+              <div className="run-round">
+                <span>REVIEW ROUND</span><strong>{activeRun.round}<em>/ {activeRun.maxRounds}</em></strong>
+                {activeRun.state === "completed" && (
+                  <button type="button" className="button secondary reopen-button" onClick={() => void handleReopen(activeRun)}>
+                    <RotateCcw size={14} />重新打开
+                  </button>
+                )}
+              </div>
             </section>
 
             {activeRun.state === "needs_human" && (
@@ -1171,6 +1345,8 @@ export function App() {
                 }}
               />
             )}
+
+            <AcceptancePanel run={activeRun} />
 
             <section className="metrics-grid">
               <div className="metric"><span><Activity size={14} />状态</span><strong>{runStateLabels[activeRun.state]}</strong><small>{running} 个任务运行中</small></div>
@@ -1213,7 +1389,7 @@ export function App() {
                   {tab === "activity" && <ActivityPanel events={events} />}
                   {tab === "agents" && <SubAgentsPanel run={activeRun} />}
                   {tab === "review" && <ReviewPanel findings={activeRun.findings} />}
-                  {tab === "diff" && <DiffPanel run={activeRun} artifacts={artifacts} />}
+                  {tab === "diff" && <DiffPanel run={activeRun} artifacts={artifacts} mergeRequestConfigured={config?.mergeRequestConfigured} />}
                   {tab === "checks" && <ChecksPanel run={activeRun} />}
                   {tab === "budget" && <BudgetPanel run={activeRun} />}
                 </div>

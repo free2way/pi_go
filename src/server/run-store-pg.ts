@@ -26,7 +26,10 @@ const runTransitions: Record<string, ReadonlyArray<string>> = {
   // GAP-04 / AT-RUN-009: a human may approve the delivered worktree (completed)
   // or reject/terminate it (cancelled).
   needs_human: ["queued", "reviewing", "checking", "developing", "completed", "cancelled", "failed"],
-  completed: [],
+  // B1: a delivered run may be reopened by an admin (or a confirmed owner) and
+  // returns to needs_human; it is never rewound straight to development and its
+  // branch/worktree is left intact.
+  completed: ["needs_human"],
   failed: [],
   cancelled: [],
 };

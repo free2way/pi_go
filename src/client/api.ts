@@ -1,5 +1,34 @@
 import type { ConfigStatus, CredentialStatus, CurrentUser, ModelCatalogResponse, ModelSelection, Run, RunArtifact, RunEvent, RunState, Workspace } from "../shared/types";
 
+/** A3: read-only deployment status returned by `GET /api/deployments`. */
+export interface DeploymentRecord {
+  at: string | null;
+  version: string | null;
+  role: string | null;
+  commit: string | null;
+  status: string | null;
+  note: string | null;
+  raw: string;
+}
+
+export interface DeploymentStatus {
+  web: { version: string | null };
+  worker: { version: string | null };
+  rollbackTags: string[];
+  records: DeploymentRecord[];
+  log: { available: boolean; path: string; error?: string };
+  at: string;
+}
+
+export interface BatchSummary {
+  action: "continue" | "accept" | "cleanup";
+  total: number;
+  succeeded: number;
+  failed: number;
+  results: Array<{ runId: string; ok: boolean; code?: string; error?: string; state?: string }>;
+}
+
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
     ...init,
@@ -50,10 +79,19 @@ export const api = {
   events: (id: string) => request<RunEvent[]>(`/api/runs/${id}/events`),
   artifacts: (id: string) => request<{ artifacts: RunArtifact[] }>(`/api/runs/${id}/artifacts`),
   artifactDownloadUrl: (id: string, artifactId: string) => `/api/runs/${id}/artifacts/${encodeURIComponent(artifactId)}/download`,
+  /** A1: full run patch (regenerated on the worker when no artifact body exists). */
+  runPatchUrl: (id: string) => `/api/runs/${id}/patch`,
+  createMergeRequest: (id: string) =>
+    request<{ ok: boolean; mergeRequest: { url: string | null; id: string | null; number: string | null } }>(`/api/runs/${id}/merge-request`, { method: "POST" }),
+  deployments: () => request<DeploymentStatus>("/api/deployments"),
+  reopenRun: (id: string, body: { note?: string; confirm?: boolean } = {}) =>
+    request<Run>(`/api/runs/${id}/reopen`, { method: "POST", body: JSON.stringify(body) }),
+  batchRuns: (body: { action: "continue" | "accept" | "cleanup"; runIds: string[]; note?: string; acknowledgeOpenFindings?: boolean }) =>
+    request<BatchSummary>("/api/runs/batch", { method: "POST", body: JSON.stringify(body) }),
   createRun: (body: { title: string; task: string; repository?: string; workspaceId?: string; mode: "demo" | "real"; checks?: string[]; developerModel?: ModelSelection; reviewerModel?: ModelSelection }) =>
     request<Run>("/api/runs", { method: "POST", body: JSON.stringify(body) }),
   cancelRun: (id: string) => request<Run>(`/api/runs/${id}/cancel`, { method: "POST" }),
-  approveRun: (id: string, body: { mode?: "continue" | "accept"; note?: string; acknowledgeOpenFindings?: boolean } = {}) =>
+  approveRun: (id: string, body: { mode?: "continue" | "accept"; note?: string; acknowledgeOpenFindings?: boolean; mergeIntoWorkspace?: boolean } = {}) =>
     request<Run>(`/api/runs/${id}/approve`, { method: "POST", body: JSON.stringify(body) }),
   rejectRun: (id: string, body: { reason?: string } = {}) =>
     request<Run>(`/api/runs/${id}/reject`, { method: "POST", body: JSON.stringify(body) }),

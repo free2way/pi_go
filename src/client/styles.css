@@ -573,3 +573,29 @@ button { color: inherit; }
 .chat-finding-head code { color: #5f6973; font: 8px "DM Mono", monospace; }
 .chat-finding p { display: flex; align-items: flex-start; gap: 5px; margin: 6px 0 0; color: #98a2ac; font-size: 9px; line-height: 1.55; }
 .chat-round-filter { display: inline-flex; align-items: center; gap: 4px; color: #f0b57e !important; border-color: rgba(243,166,90,.4) !important; background: rgba(243,166,90,.08) !important; }
+
+/* A1–A3 / B1 / B3: export, merge, deployments, reopen, acceptance, batch. */
+.batch-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 4px 0 8px; padding: 7px 8px; border: 1px solid var(--line-soft); border-radius: 8px; background: #0d1115; }
+.batch-bar > span { color: #8b96a0; font: 9px "DM Mono", monospace; margin-right: auto; }
+.batch-bar .button { height: 26px; padding: 0 8px; font-size: 9px; }
+.run-select { display: grid; place-items: center; padding: 0 2px 0 6px; }
+.run-select input { width: 13px; height: 13px; accent-color: #dfF854; cursor: pointer; }
+.deployments-card { margin-top: 8px; border: 1px solid var(--line-soft); border-radius: 10px; padding: 10px 11px; background: #0d1115; }
+.deploy-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 6px; font-size: 10px; }
+.deploy-row > span { color: #747f89; }
+.deploy-row strong { color: #c3cbd3; font-weight: 600; }
+.deploy-unknown { color: #6b7680; font-weight: 400; }
+.deploy-records { list-style: none; margin: 7px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.deploy-records li { display: flex; align-items: center; gap: 6px; font-size: 9px; color: #8b96a0; }
+.deploy-records code { color: #dfd07f; font: 9px "DM Mono", monospace; }
+.deploy-records small { margin-left: auto; color: #5f6973; }
+.deploy-hint { display: block; margin-top: 6px; color: #6b7680; font-size: 9px; }
+.merge-option { display: flex !important; align-items: center; gap: 7px; color: #98a2ac !important; font-size: 10px !important; margin-top: 11px !important; }
+.merge-option input { accent-color: #dfF854; }
+.reopen-button { margin-top: 8px; height: 30px; font-size: 10px; }
+.acceptance-panel { margin-top: 16px; }
+.acceptance-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 8px; padding: 14px 17px; }
+.acceptance-grid > div { display: flex; flex-direction: column; gap: 3px; border: 1px solid var(--line-soft); border-radius: 8px; padding: 9px 11px; background: #0d1115; }
+.acceptance-grid span { color: #747f89; font-size: 9px; }
+.acceptance-grid strong { color: #dfe3e7; font-size: 12px; }
+.acceptance-grid small { color: #6b7680; font-size: 9px; }

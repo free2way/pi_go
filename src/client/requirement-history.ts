@@ -41,6 +41,7 @@ const NOTE_KIND_LABELS: Record<HumanNoteKind, string> = {
   approve_accept: "接受交付",
   resume: "恢复下一轮",
   reject: "拒绝交付",
+  reopen: "重新打开",
 };
 
 export function humanNoteKindLabel(kind: HumanNoteKind): string {

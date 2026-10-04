@@ -1,0 +1,70 @@
+/**
+ * A2 — pure merge planning shared by the web server (admin gate + response
+ * shaping) and the worker (the actual Git commands). Keeping the decision logic
+ * here means the conflict/fast-forward semantics are unit-testable without a
+ * real git remote, worker or docker.
+ */
+
+export type MergeStrategy = "fast-forward" | "merge-commit";
+
+/**
+ * A merge is only fast-forwarded when the workspace's default branch is already
+ * an ancestor of the run branch. Otherwise a real merge commit is required;
+ * force-pushing or rewriting history is never an option.
+ */
+export function planMergeStrategy(input: { headIsAncestor: boolean }): MergeStrategy {
+  return input.headIsAncestor ? "fast-forward" : "merge-commit";
+}
+
+/**
+ * Parses `git diff --name-only --diff-filter=U` output (one unmerged path per
+ * line) or a porcelain status block into a stable, de-duplicated, bounded list
+ * of conflicting paths. Never invents paths from unrelated output.
+ */
+export function parseConflictingPaths(output: string | null | undefined, limit = 50): string[] {
+  const text = typeof output === "string" ? output : "";
+  const paths = new Set<string>();
+  for (const rawLine of text.split("\n")) {
+    const line = rawLine.replace(/\r$/, "");
+    if (!line.trim()) continue;
+    const porcelain = /^([ MADRCU?!]{2})\s+(.+)$/.exec(line);
+    if (porcelain) {
+      // Porcelain status: only unmerged codes are conflicts; ordinary modified
+      // entries (` M`, `??`, ...) must never be reported as conflicting.
+      if (/^(?:UU|AA|DD|AU|UA|DU|UD)$/.test(porcelain[1])) paths.add(porcelain[2].trim());
+      continue;
+    }
+    paths.add(line.trim());
+  }
+  return [...paths].filter(Boolean).slice(0, limit);
+}
+
+export interface MergeConflictReply {
+  status: 409;
+  code: "MERGE_CONFLICT";
+  message: string;
+  conflictingPaths: string[];
+}
+
+/** Client-visible shape of a refused merge (workspace left untouched). */
+export function mergeConflictReply(paths: string[]): MergeConflictReply {
+  const conflictingPaths = [...new Set(paths.filter(Boolean))].slice(0, 50);
+  return {
+    status: 409,
+    code: "MERGE_CONFLICT",
+    message: `合并存在冲突（${conflictingPaths.length} 个文件），已中止且未修改工作区：${conflictingPaths.slice(0, 5).join("、")}`,
+    conflictingPaths,
+  };
+}
+
+/** Body the worker returns from `POST /runs/:id/merge`. */
+export interface MergeOutcome {
+  ok: true;
+  commit: string;
+  targetBranch: string;
+  strategy: MergeStrategy;
+}
+
+export type MergeResult =
+  | MergeOutcome
+  | { ok: false; code: string; error: string; conflictingPaths?: string[] };

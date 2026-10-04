@@ -3,6 +3,7 @@ import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
@@ -28,6 +29,13 @@ import { conflictReplyFor } from "./request-errors.js";
 import { appendHumanNote } from "./run-notes.js";
 import { resumeDeadlinePatch } from "./run-deadline-base.js";
 import { parseRunSearch, searchRuns } from "./run-search.js";
+import { buildAcceptanceSnapshot } from "./acceptance.js";
+import { batchItemFailure, batchItemSuccess, parseBatchRunIds, summarizeBatch, MAX_BATCH_RUN_IDS, type BatchItemOutcome } from "./batch-runs.js";
+import { buildDeploymentStatus, parseDeployLog, resolveDeployLogPath } from "./deployments.js";
+import { mergeConflictReply, type MergeResult } from "../shared/merge.js";
+import { buildDeployHookPayload, buildMergeRecord, planMergeGate, planPostMergeDeploy, type MergeRecord, type PostMergeDeployPlan } from "./run-merge.js";
+import { buildMergeRequestPayload, mergeRequestUnavailable, patchFileName, resolveMergeRequestConfig, selectPatch, type PatchSelection } from "./run-patch.js";
+import { planReopen, reopenEventMeta } from "./run-reopen.js";
 import type { RunStoreLike } from "./store.js";
 import { WorkspaceError, WorkspaceService } from "./workspaces.js";
 
@@ -137,6 +145,9 @@ const alerts = new AlertManager(createAlertSink({
 }));
 const identities = new IdentityService(db);
 const workspacesEnabled = process.env.PI_WORKSPACES_ENABLED !== "false";
+// A1: merge-request creation is opt-in via PI_MERGE_REQUEST_*; when unset the
+// route refuses clearly (409 MERGE_REQUEST_NOT_CONFIGURED) instead of guessing.
+const mergeRequestConfig = resolveMergeRequestConfig(process.env);
 const workspaces = new WorkspaceService(db, workerRequest);
 const userCache = new Map<string, CurrentUser>();
 
@@ -335,6 +346,92 @@ async function persistTerminalDiffArtifact(run: Run | undefined) {
 /** AUD-16: download cap so one artifact can never be streamed without bound. */
 const ARTIFACT_DOWNLOAD_MAX_BYTES = Number(process.env.PI_ARTIFACT_MAX_DOWNLOAD_BYTES || 5 * 1024 * 1024);
 
+type RunPatchResolution =
+  | { ok: true; selection: PatchSelection }
+  | { ok: false; status: 409 | 503; code: string; error: string };
+
+/**
+ * A1: resolves the authoritative patch for a run. Prefers the stored artifact
+ * (full body), falls back to the inline diff, and only then asks the worker to
+ * regenerate it from the run directory the same way it does during execution.
+ * A regenerated body is persisted so later downloads do not need the worker.
+ */
+async function resolveRunPatch(run: Run): Promise<RunPatchResolution> {
+  const artifact = await store.getArtifact(run.id, "diff").catch(() => undefined);
+  const direct = selectPatch({
+    artifact: artifact
+      ? { artifactId: artifact.artifactId, content: artifact.content, sha256: artifact.sha256, bytes: artifact.bytes }
+      : undefined,
+    runDiff: run.diff,
+    baseSha: artifact?.baseSha ?? run.baseSha,
+  });
+  if (direct) return { ok: true, selection: direct };
+
+  let generated: { diff?: string; baseSha?: string | null };
+  try {
+    generated = await workerRequest<{ diff?: string; baseSha?: string | null }>(`/runs/${encodeURIComponent(run.id)}/diff`, {
+      method: "POST",
+      body: JSON.stringify({ ownerId: run.ownerId, baseSha: run.baseSha, repository: run.repository }),
+    });
+  } catch (error) {
+    return { ok: false, status: 503, code: "PATCH_UNAVAILABLE", error: `无法生成补丁：${(error as Error).message}` };
+  }
+  const selection = selectPatch({
+    artifact: artifact
+      ? { artifactId: artifact.artifactId, content: artifact.content, sha256: artifact.sha256, bytes: artifact.bytes }
+      : undefined,
+    runDiff: run.diff,
+    worktreeDiff: generated.diff,
+    baseSha: generated.baseSha ?? run.baseSha,
+  });
+  if (!selection) return { ok: false, status: 409, code: "PATCH_UNAVAILABLE", error: "该任务没有可导出的补丁" };
+  if (selection.origin === "worktree") {
+    await store
+      .saveArtifact({ runId: run.id, artifactId: "diff", kind: "patch", content: selection.content, baseSha: selection.baseSha, createdAt: run.updatedAt })
+      .catch((error) => app.log.warn({ runId: run.id, error: (error as Error).message }, "failed to persist regenerated diff artifact"));
+  }
+  return { ok: true, selection };
+}
+
+/**
+ * A2: calls the optional post-merge deploy hook. Never silently skipped: an
+ * unset hook, an unsupported value, a failed webhook and a failed command all
+ * produce an explicit, recorded outcome.
+ */
+async function runPostMergeDeploy(plan: PostMergeDeployPlan, payload: Record<string, unknown>): Promise<{
+  configured: boolean;
+  kind: "webhook" | "command" | "none";
+  status: "ok" | "failed" | "not_configured" | "unsupported";
+  detail: string;
+}> {
+  if (!plan.configured) return { configured: false, kind: "none", status: "not_configured", detail: plan.reason };
+  if (plan.kind === "unsupported") return { configured: true, kind: "none", status: "unsupported", detail: plan.reason };
+  if (plan.kind === "webhook") {
+    try {
+      const response = await fetch(plan.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(30_000),
+      });
+      return response.ok
+        ? { configured: true, kind: "webhook", status: "ok", detail: `HTTP ${response.status}` }
+        : { configured: true, kind: "webhook", status: "failed", detail: `HTTP ${response.status}` };
+    } catch (error) {
+      return { configured: true, kind: "webhook", status: "failed", detail: (error as Error).message.slice(0, 200) };
+    }
+  }
+  // Operator-configured command. Bounded and run with a scrubbed environment;
+  // run metadata is passed on stdin, never interpolated into the command.
+  return new Promise((resolve) => {
+    const child = execFile("/bin/sh", ["-c", plan.command], { timeout: 60_000, maxBuffer: 1_000_000, env: { PATH: process.env.PATH ?? "" } }, (error, stdout, stderr) => {
+      if (error) return resolve({ configured: true, kind: "command", status: "failed", detail: `${(error as Error).message.slice(0, 160)} ${String(stderr).slice(0, 200)}`.trim() });
+      resolve({ configured: true, kind: "command", status: "ok", detail: String(stdout).trim().slice(0, 200) || `exit 0` });
+    });
+    child.stdin?.end(JSON.stringify(payload));
+  });
+}
+
 function tooManyRequests(reply: FastifyReply, retryAfterMs: number) {
   reply.header("Retry-After", String(Math.max(1, Math.ceil(retryAfterMs / 1000))));
   return reply.code(429).send({ error: "请求过于频繁，请稍后再试", code: "RATE_LIMITED" });
@@ -440,7 +537,7 @@ app.get("/api/health", async (_request, reply) => {
   try {
     await pingDatabase();
     alerts.clear("database_unavailable");
-    return { status: "ok", service: "pigo-web", version: "0.21.9", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.22.0", db: "ok" };
   } catch (error) {
     // AT-REL-005: fail loudly instead of pretending the service is healthy.
     alerts.raise({
@@ -449,7 +546,7 @@ app.get("/api/health", async (_request, reply) => {
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
       details: { error: (error as Error).message.slice(0, 200) },
     });
-    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.21.9", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.22.0", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
   }
 });
 
@@ -464,7 +561,7 @@ interface StorageStatus {
 app.get("/api/health/detail", async (request, reply) => {
   const internal = safeTokenMatch(request.headers.authorization);
   if (!internal && !auth.user(request)) return reply.code(401).send({ error: "Unauthorized" });
-  const health: Record<string, unknown> = { version: "0.21.9", at: new Date().toISOString() };
+  const health: Record<string, unknown> = { version: "0.22.0", at: new Date().toISOString() };
   try {
     await pingDatabase();
     health.database = { status: "ok" };
@@ -589,7 +686,29 @@ app.get("/api/config/status", async (request): Promise<ConfigStatus> => {
     configuredProviders: [...configured],
     verifiedProviders: credentials.providers.filter((item) => item.verification === "live").map((item) => item.provider),
     assertedProviders: credentials.providers.filter((item) => item.verification === "operator_asserted").map((item) => item.provider),
+    // A1: only presence is exposed; the URL/token never reach the browser.
+    mergeRequestConfigured: mergeRequestConfig.configured,
   };
+});
+
+/**
+ * A3: read-only deployment status. The deploy log is read defensively: a missing
+ * file reports `available: false` and an empty record list, never an error.
+ */
+app.get("/api/deployments", async () => {
+  const logPath = resolveDeployLogPath(process.env);
+  let records = [] as ReturnType<typeof parseDeployLog>;
+  let logAvailable = false;
+  let logError: string | undefined;
+  try {
+    const content = await readFile(logPath, "utf8");
+    records = parseDeployLog(content);
+    logAvailable = true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT") logError = (error as Error).message;
+  }
+  return buildDeploymentStatus({ env: process.env, records, logPath, logAvailable, logError });
 });
 
 app.get("/api/projects", async (request, reply) => {
@@ -762,6 +881,85 @@ app.get<{ Params: { id: string; artifactId: string } }>("/api/runs/:id/artifacts
   reply.header("Content-Type", contentType);
   reply.header("Content-Disposition", `attachment; filename="${run.id}-${request.params.artifactId}.${extension}"`);
   return reply.send(content);
+});
+
+/**
+ * A1: download the run's full patch as a `.patch` file. Reuses the stored diff
+ * artifact; when no artifact body exists, the worker regenerates it from the run
+ * directory. Never returns an empty or silently-truncated patch.
+ */
+app.get<{ Params: { id: string } }>("/api/runs/:id/patch", async (request, reply) => {
+  const run = store.getRun(request.params.id, ownerKeysFor(request));
+  if (!run) return reply.code(404).send({ error: "Run not found" });
+  const resolved = await resolveRunPatch(run);
+  if (!resolved.ok) return reply.code(resolved.status).send({ error: resolved.error, code: resolved.code });
+  if (resolved.selection.bytes > ARTIFACT_DOWNLOAD_MAX_BYTES) {
+    return reply.code(413).send({ error: `补丁过大（${resolved.selection.bytes} 字节），超过下载上限`, code: "PATCH_TOO_LARGE" });
+  }
+  reply.header("Content-Type", "text/x-patch; charset=utf-8");
+  reply.header("Content-Disposition", `attachment; filename="${patchFileName(run.id)}"`);
+  return reply.send(resolved.selection.content);
+});
+
+/**
+ * A1: open a merge request through the configured `PI_MERGE_REQUEST_*` webhook.
+ * When the feature is not configured the route refuses clearly with 409
+ * MERGE_REQUEST_NOT_CONFIGURED (it is never silently skipped).
+ */
+app.post<{ Params: { id: string } }>("/api/runs/:id/merge-request", async (request, reply) => {
+  const actionLimit = runActions.check(auth.user(request).id);
+  if (!actionLimit.allowed) return tooManyRequests(reply, actionLimit.retryAfterMs);
+  const run = store.getRun(request.params.id, ownerKeysFor(request));
+  if (!run) return reply.code(404).send({ error: "Run not found" });
+  if (!mergeRequestConfig.configured) {
+    const refusal = mergeRequestUnavailable(mergeRequestConfig);
+    return reply.code(refusal.status).send({ error: refusal.message, code: refusal.code });
+  }
+  const resolved = await resolveRunPatch(run);
+  if (!resolved.ok) return reply.code(resolved.status).send({ error: resolved.error, code: resolved.code });
+
+  const workspaceDefault = run.workspaceId
+    ? await workspaces.get(ownerKeysFor(request), run.workspaceId).then((workspace) => workspace.defaultBranch ?? undefined).catch(() => undefined)
+    : undefined;
+  const payload = buildMergeRequestPayload({
+    run,
+    patch: resolved.selection,
+    targetBranch: mergeRequestConfig.targetBranch ?? workspaceDefault,
+    project: mergeRequestConfig.project,
+    requestedBy: auth.user(request).id,
+  });
+  try {
+    const response = await fetch(mergeRequestConfig.url!, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(mergeRequestConfig.token ? { Authorization: `Bearer ${mergeRequestConfig.token}` } : {}),
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(20_000),
+    });
+    const body = (await response.json().catch(() => ({}))) as { error?: unknown; url?: unknown; id?: unknown; number?: unknown };
+    if (!response.ok) {
+      return reply.code(502).send({ error: `合并请求创建失败：${String(body.error ?? response.status).slice(0, 200)}`, code: "MERGE_REQUEST_FAILED" });
+    }
+    const mergeRequest = {
+      url: typeof body.url === "string" ? body.url : null,
+      id: typeof body.id === "string" || typeof body.id === "number" ? String(body.id) : null,
+      number: typeof body.number === "string" || typeof body.number === "number" ? String(body.number) : null,
+    };
+    await store.appendEvent({
+      runId: run.id,
+      round: run.round,
+      source: "system",
+      type: "run.merge_requested",
+      message: "已创建合并请求",
+      at: new Date().toISOString(),
+      meta: { ...mergeRequest, patchSha256: resolved.selection.sha256, patchBytes: resolved.selection.bytes },
+    });
+    return { ok: true, mergeRequest };
+  } catch (error) {
+    return reply.code(502).send({ error: `合并请求创建失败：${(error as Error).message.slice(0, 200)}`, code: "MERGE_REQUEST_FAILED" });
+  }
 });
 
 app.get<{ Params: { id: string }; Querystring: { after?: string } }>("/api/runs/:id/stream", async (request, reply) => {
@@ -953,6 +1151,9 @@ const approveSchema = z.object({
   mode: z.enum(["continue", "accept"]).optional(),
   note: z.string().trim().max(2_000).optional(),
   acknowledgeOpenFindings: z.boolean().optional(),
+  // A2: admin option — merge the run branch into the workspace default branch
+  // before completing. Absent/`false` keeps the plain accept behavior unchanged.
+  mergeIntoWorkspace: z.boolean().optional(),
 });
 const rejectSchema = z.object({ reason: z.string().trim().max(2_000).optional() });
 
@@ -962,20 +1163,24 @@ const rejectSchema = z.object({ reason: z.string().trim().max(2_000).optional() 
  * (AUD-05 `payload.resume`), so the six open findings are actually worked on
  * instead of being silently accepted. Mirrors the worker/credentials guards of
  * `dispatchFollowupJob`; on a rejected job the run returns to needs_human.
+ *
+ * A2/B3: the core is extracted from the HTTP adapter so the batch route can run
+ * it per run and shape an individual outcome (no Fastify reply involved).
  */
-async function dispatchContinueJob(
-  request: FastifyRequest<{ Params: { id: string } }>,
-  reply: FastifyReply,
+type ContinueResult =
+  | { ok: true; run: Run }
+  | { ok: false; status: number; code?: string; error: string };
+
+async function startContinue(
   run: Run,
-  options: { note?: string; plan: Extract<ApprovePlan, { decision: "continue" }>; userId: string },
-) {
-  const openFindings = options.plan.openFindings;
-  if (run.mode !== "real") return reply.code(409).send({ error: "只有真实任务支持「继续开发」", code: "RUN_NOT_RESUMABLE" });
-  if (!realRunsEnabled || !internalToken) return reply.code(503).send({ error: "Real agent execution is disabled", code: "REAL_RUNNER_NOT_AVAILABLE" });
-  const developerKey = vault.get(vaultKeyFor(request), run.developer.provider);
-  const reviewerKey = vault.get(vaultKeyFor(request), run.reviewer.provider);
+  options: { note?: string; plan: Extract<ApprovePlan, { decision: "continue" }>; userId: string; vaultKey: string },
+): Promise<ContinueResult> {
+  if (run.mode !== "real") return { ok: false, status: 409, code: "RUN_NOT_RESUMABLE", error: "只有真实任务支持「继续开发」" };
+  if (!realRunsEnabled || !internalToken) return { ok: false, status: 503, code: "REAL_RUNNER_NOT_AVAILABLE", error: "Real agent execution is disabled" };
+  const developerKey = vault.get(options.vaultKey, run.developer.provider);
+  const reviewerKey = vault.get(options.vaultKey, run.reviewer.provider);
   if (!developerKey || !reviewerKey) {
-    return reply.code(403).send({ error: "该任务所用模型的 provider 凭据缺失，请在「模型与凭据」页配置", code: "PERSONAL_CREDENTIALS_REQUIRED" });
+    return { ok: false, status: 403, code: "PERSONAL_CREDENTIALS_REQUIRED", error: "该任务所用模型的 provider 凭据缺失，请在「模型与凭据」页配置" };
   }
   const credentials = { developer: developerKey, reviewer: reviewerKey };
 
@@ -999,7 +1204,7 @@ async function dispatchContinueJob(
     });
   } catch (error) {
     const conflict = conflictReplyFor(error);
-    if (conflict) return reply.code(conflict.status).send({ error: conflict.message, code: conflict.code });
+    if (conflict) return { ok: false, status: conflict.status, code: conflict.code, error: conflict.message };
     throw error;
   }
   await store.appendEvent({
@@ -1016,7 +1221,7 @@ async function dispatchContinueJob(
     await dispatchJob(updated, run.checks.map((check) => check.command), { resume: { instruction: options.note } }, credentials);
     credentials.developer = "";
     credentials.reviewer = "";
-    return reply.code(201).send({ ...store.getRun(run.id, ownerKeysFor(request)), openFindings });
+    return { ok: true, run: store.getRun(run.id) ?? updated };
   } catch (error) {
     credentials.developer = "";
     credentials.reviewer = "";
@@ -1029,8 +1234,41 @@ async function dispatchContinueJob(
       message: `Worker 拒绝任务：${(error as Error).message}`,
       at: new Date().toISOString(),
     });
-    return reply.code(503).send({ error: (error as Error).message });
+    return { ok: false, status: 503, error: (error as Error).message };
   }
+}
+
+async function dispatchContinueJob(
+  request: FastifyRequest<{ Params: { id: string } }>,
+  reply: FastifyReply,
+  run: Run,
+  options: { note?: string; plan: Extract<ApprovePlan, { decision: "continue" }>; userId: string },
+) {
+  const openFindings = options.plan.openFindings;
+  const result = await startContinue(run, { ...options, vaultKey: vaultKeyFor(request) });
+  if (!result.ok) return reply.code(result.status).send({ error: result.error, ...(result.code ? { code: result.code } : {}) });
+  return reply.code(201).send({ ...result.run, openFindings });
+}
+
+/**
+ * B2: builds the durable acceptance snapshot for a run, preferring the stored
+ * diff artifact's identity over re-hashing the inline diff.
+ */
+async function acceptanceSnapshotFor(run: Run, input: {
+  acceptedAt: string;
+  acceptedBy: string;
+  note?: string;
+  acknowledgedOpenFindings?: boolean;
+}) {
+  const artifact = await store.getArtifact(run.id, "diff").catch(() => undefined);
+  return buildAcceptanceSnapshot({
+    run,
+    acceptedAt: input.acceptedAt,
+    acceptedBy: input.acceptedBy,
+    note: input.note,
+    acknowledgedOpenFindings: input.acknowledgedOpenFindings,
+    artifact: artifact ? { artifactId: artifact.artifactId, sha256: artifact.sha256, bytes: artifact.bytes } : undefined,
+  });
 }
 
 app.post<{ Params: { id: string } }>("/api/runs/:id/approve", async (request, reply) => {
@@ -1058,13 +1296,48 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/approve", async (request, re
   }
 
   const now = new Date().toISOString();
+  // A2: optional admin merge. When the flag is absent nothing changes.
+  const mergeGate = planMergeGate({ requested: parsed.data.mergeIntoWorkspace === true, isAdmin: await identities.isAdmin(user.id) });
+  if (mergeGate.kind === "forbidden") return reply.code(403).send({ error: mergeGate.message, code: mergeGate.code });
+
+  let merge: MergeRecord | undefined;
+  if (mergeGate.kind === "ready") {
+    const targetBranch = run.workspaceId
+      ? await workspaces.get(ownerKeysFor(request), run.workspaceId).then((workspace) => workspace.defaultBranch ?? undefined).catch(() => undefined)
+      : undefined;
+    const mergeResult = await workerRequest<MergeResult>(`/runs/${encodeURIComponent(run.id)}/merge`, {
+      method: "POST",
+      body: JSON.stringify({ ownerId: run.ownerId, repository: run.repository, branch: run.branch, targetBranch, message: note }),
+    }).catch((error) => ({ ok: false as const, code: "MERGE_UNAVAILABLE", error: (error as Error).message } as const));
+    if (!mergeResult.ok) {
+      if (mergeResult.code === "MERGE_CONFLICT") {
+        const conflict = mergeConflictReply(mergeResult.conflictingPaths ?? []);
+        return reply.code(conflict.status).send({ error: conflict.message, code: conflict.code, conflictingPaths: conflict.conflictingPaths });
+      }
+      const status = ["RUN_DIRECTORY_MISSING", "WORKSPACE_DIRTY", "TARGET_BRANCH_UNAVAILABLE", "MERGE_FETCH_FAILED", "TARGET_BRANCH_UNKNOWN"].includes(mergeResult.code) ? 409 : 503;
+      return reply.code(status).send({ error: mergeResult.error, code: mergeResult.code });
+    }
+    merge = buildMergeRecord({
+      commit: mergeResult.commit,
+      strategy: mergeResult.strategy,
+      targetBranch: mergeResult.targetBranch,
+      mergedAt: now,
+      mergedBy: user.id,
+    });
+  }
+
+  // B2: durable acceptance snapshot (findings, diff identity, checks, usage).
+  const acceptance = await acceptanceSnapshotFor(run, { acceptedAt: now, acceptedBy: user.id, note, acknowledgedOpenFindings: plan.acknowledged });
+  const summary = note ? `人工审批通过：${note}` : "人工审批通过，交付已确认";
   let updated: Run;
   try {
     updated = await store.updateRun(run.id, {
       state: "completed",
       approvedAt: now,
       approvedBy: user.id,
-      summary: note ? `人工审批通过：${note}` : "人工审批通过，交付已确认",
+      summary,
+      acceptance,
+      ...(merge ? { merge } : {}),
       ...(note
         ? { humanNotes: appendHumanNote(run.humanNotes, { at: now, kind: "approve_accept", note, by: user.id }) }
         : {}),
@@ -1074,16 +1347,44 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/approve", async (request, re
     if (conflict) return reply.code(conflict.status).send({ error: conflict.message, code: conflict.code });
     throw error;
   }
+  if (merge) {
+    await store.appendEvent({
+      runId: run.id,
+      round: run.round,
+      source: "system",
+      type: "run.merged",
+      message: `已合并到 ${merge.targetBranch}（${merge.strategy}）：${merge.commit.slice(0, 10)}`,
+      at: now,
+      meta: { ...merge },
+    });
+  }
   await store.appendEvent({
     runId: run.id,
     round: run.round,
     source: "system",
     type: "run.approved",
-    message: note ? `人工审批通过：${note}` : "人工审批通过，交付已确认",
+    message: summary,
     at: now,
-    meta: approveEventMeta(plan, user.id),
+    meta: { ...approveEventMeta(plan, user.id), acceptance, ...(merge ? { merge } : {}) },
   });
-  return { ...updated, acceptedOpenFindings: plan.openFindings };
+
+  // A2: post-merge deploy hook. An unset hook is reported explicitly, never
+  // silently skipped.
+  let deploy: Awaited<ReturnType<typeof runPostMergeDeploy>> | undefined;
+  if (merge) {
+    const deployPlan = planPostMergeDeploy(process.env.PI_POST_MERGE_DEPLOY_HOOK);
+    deploy = await runPostMergeDeploy(deployPlan, buildDeployHookPayload({ run, merge }));
+    await store.appendEvent({
+      runId: run.id,
+      round: run.round,
+      source: "system",
+      type: "run.post_merge_deploy",
+      message: deploy.status === "ok" ? `合并后部署钩子已执行（${deploy.kind}）` : `合并后部署钩子未执行：${deploy.detail}`,
+      at: new Date().toISOString(),
+      meta: { ...deploy },
+    });
+  }
+  return { ...updated, acceptedOpenFindings: plan.openFindings, acceptance, ...(merge ? { merge } : {}), ...(deploy ? { deploy } : {}) };
 });
 
 app.post<{ Params: { id: string } }>("/api/runs/:id/reject", async (request, reply) => {
@@ -1120,6 +1421,64 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/reject", async (request, rep
     message: reason ? `人工拒绝交付：${reason}` : "人工拒绝交付，任务已终止",
     at: now,
     meta: { rejectedBy: user.id },
+  });
+  return updated;
+});
+
+/**
+ * B1: reopen a delivered run. Moves `completed` back to `needs_human` (guarded
+ * state-machine edge), records `run.reopened` plus the operator's note, and
+ * leaves the run branch/worktree intact. Admins may reopen any run; the owner
+ * must pass `confirm: true`.
+ */
+const reopenSchema = z.object({
+  note: z.string().trim().max(2_000).optional(),
+  confirm: z.boolean().optional(),
+});
+
+app.post<{ Params: { id: string } }>("/api/runs/:id/reopen", async (request, reply) => {
+  const actionLimit = runActions.check(auth.user(request).id);
+  if (!actionLimit.allowed) return tooManyRequests(reply, actionLimit.retryAfterMs);
+  const parsed = reopenSchema.safeParse(request.body ?? {});
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
+  const user = auth.user(request);
+  const isAdminUser = await identities.isAdmin(user.id);
+  let run = store.getRun(request.params.id, ownerKeysFor(request));
+  const isOwner = Boolean(run);
+  // Admins may reopen a run they do not own.
+  if (!run && isAdminUser) run = store.getRun(request.params.id);
+  if (!run) return reply.code(404).send({ error: "Run not found" });
+
+  const plan = planReopen({ state: run.state, isAdmin: isAdminUser, isOwner, confirm: parsed.data.confirm });
+  if (!plan.allowed) return reply.code(plan.status).send({ error: plan.message, code: plan.code });
+
+  const now = new Date().toISOString();
+  const note = parsed.data.note?.trim();
+  const summary = note ? `重新打开任务：${note}` : "任务已重新打开，等待人工处理";
+  let updated: Run;
+  try {
+    updated = await store.updateRun(run.id, {
+      state: plan.targetState,
+      summary,
+      reopenedAt: now,
+      reopenedBy: user.id,
+      ...(note
+        ? { humanNotes: appendHumanNote(run.humanNotes, { at: now, kind: "reopen", note, by: user.id }) }
+        : {}),
+    });
+  } catch (error) {
+    const conflict = conflictReplyFor(error);
+    if (conflict) return reply.code(conflict.status).send({ error: conflict.message, code: conflict.code });
+    throw error;
+  }
+  await store.appendEvent({
+    runId: run.id,
+    round: run.round,
+    source: "system",
+    type: "run.reopened",
+    message: summary,
+    at: now,
+    meta: reopenEventMeta({ reopenedBy: user.id, reason: plan.reason, note }),
   });
   return updated;
 });
@@ -1183,6 +1542,99 @@ app.post("/api/runs/cleanup", async (request, reply) => {
   }
   if (deleted.length > 0) app.log.info({ actor: user.id, deleted }, "cleaned up finished runs");
   return { dryRun: false, deleted: deleted.length, runIds: deleted, matched: matched.length, storage };
+});
+
+/**
+ * B3: batch continue/accept/cleanup over an explicit, bounded list of runs.
+ * Owner scoped; every run gets its own outcome and partial failures are reported
+ * individually. Accept requires the same open-findings acknowledgement as the
+ * single-run path, and cleanup reuses the existing terminal-only semantics.
+ */
+const batchSchema = z.object({
+  action: z.enum(["continue", "accept", "cleanup"]),
+  runIds: z.array(z.string().trim().min(1).max(120)).max(MAX_BATCH_RUN_IDS),
+  note: z.string().trim().max(2_000).optional(),
+  acknowledgeOpenFindings: z.boolean().optional(),
+});
+
+app.post("/api/runs/batch", async (request, reply) => {
+  const actionLimit = runActions.check(auth.user(request).id);
+  if (!actionLimit.allowed) return tooManyRequests(reply, actionLimit.retryAfterMs);
+  const parsed = batchSchema.safeParse(request.body ?? {});
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
+  const ids = parseBatchRunIds(parsed.data.runIds);
+  if (!ids.ok) return reply.code(400).send({ error: ids.message, code: "BATCH_INVALID" });
+  const user = auth.user(request);
+  const note = parsed.data.note?.trim();
+  const outcomes: BatchItemOutcome[] = [];
+
+  for (const id of ids.ids) {
+    const run = store.getRun(id, ownerKeysFor(request));
+    if (!run) {
+      outcomes.push(batchItemFailure(id, 404, "RUN_NOT_FOUND", "Run not found"));
+      continue;
+    }
+    if (parsed.data.action === "cleanup") {
+      if (!TERMINAL_RUN_STATES.has(run.state)) {
+        outcomes.push(batchItemFailure(id, 409, "RUN_ACTIVE", `无法清理状态为 ${run.state} 的任务`));
+        continue;
+      }
+      try {
+        await store.deleteRun(run.id);
+        await cleanupRunDirectory(run, { dryRun: false, cleaner: runDirectoryCleaner });
+        outcomes.push(batchItemSuccess(id, run.state));
+      } catch (error) {
+        outcomes.push(batchItemFailure(id, 500, undefined, (error as Error).message));
+      }
+      continue;
+    }
+
+    if (run.state !== "needs_human") {
+      outcomes.push(batchItemFailure(id, 409, "RUN_NOT_APPROVABLE", "仅「需要人工处理」的任务可以审批"));
+      continue;
+    }
+    const plan = planApprove({
+      mode: parsed.data.action === "continue" ? "continue" : "accept",
+      acknowledgeOpenFindings: parsed.data.acknowledgeOpenFindings,
+      findings: run.findings,
+    });
+    if (plan.decision === "conflict") {
+      outcomes.push(batchItemFailure(id, plan.status, plan.code, plan.message));
+      continue;
+    }
+    if (plan.decision === "continue") {
+      const result = await startContinue(run, { note, plan, userId: user.id, vaultKey: vaultKeyFor(request) });
+      outcomes.push(result.ok ? batchItemSuccess(id, result.run.state) : batchItemFailure(id, result.status, result.code, result.error));
+      continue;
+    }
+
+    const now = new Date().toISOString();
+    try {
+      const acceptance = await acceptanceSnapshotFor(run, { acceptedAt: now, acceptedBy: user.id, note, acknowledgedOpenFindings: plan.acknowledged });
+      await store.updateRun(run.id, {
+        state: "completed",
+        approvedAt: now,
+        approvedBy: user.id,
+        summary: note ? `人工审批通过：${note}` : "批量审批通过，交付已确认",
+        acceptance,
+        ...(note ? { humanNotes: appendHumanNote(run.humanNotes, { at: now, kind: "approve_accept", note, by: user.id }) } : {}),
+      });
+      await store.appendEvent({
+        runId: run.id,
+        round: run.round,
+        source: "system",
+        type: "run.approved",
+        message: "批量审批通过",
+        at: now,
+        meta: { ...approveEventMeta(plan, user.id), acceptance, batch: true },
+      });
+      outcomes.push(batchItemSuccess(id, "completed"));
+    } catch (error) {
+      const conflict = conflictReplyFor(error);
+      outcomes.push(batchItemFailure(id, conflict?.status ?? 500, conflict?.code, conflict?.message ?? (error as Error).message));
+    }
+  }
+  return summarizeBatch(parsed.data.action, outcomes);
 });
 
 // ---------------------------------------------------------------- job queue (REL-002)

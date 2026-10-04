@@ -31,7 +31,8 @@ import {
   type MaterializedReviewSnapshot,
 } from "./review-snapshot.js";
 import { WorkspacePathError, prepareWorkspaceDirectory, resolveInsideRoot, sanitizeRelativePath, sanitizeWorkspaceName, validateCloneUrl } from "./workspace-paths.js";
-import { RunCleanupPathError, removeRunDirectory } from "./run-cleanup.js";
+import { RunCleanupPathError, planRunDirectoryRemoval, removeRunDirectory } from "./run-cleanup.js";
+import { parseConflictingPaths, planMergeStrategy } from "../shared/merge.js";
 import { WorkspaceLockManager, workspaceKeyFor } from "./workspace-lock.js";
 import { PiRunError, failureOutputForEvent } from "./agent-failure.js";
 import { captureFailedSubAgentWorktree } from "./subagent-artifacts.js";
@@ -2133,6 +2134,121 @@ async function reclaimPendingJobs() {
   return started;
 }
 
+/**
+ * A1: regenerates a run's full patch from its run directory, using the same
+ * `git add -N . && git diff <base>` path the worker uses while executing. Used
+ * by the web export route when no diff artifact body is stored (e.g. the run was
+ * accepted before artifacts existed). Read-only: it never mutates the worktree
+ * beyond the intent-to-add index entries the normal flow already creates.
+ */
+async function generateRunDiff(input: { ownerId: string; runId: string; baseSha?: string }) {
+  let plan;
+  try {
+    plan = planRunDirectoryRemoval(runsRoot, input.ownerId, input.runId);
+  } catch (error) {
+    if (error instanceof RunCleanupPathError) return { ok: false as const, status: 400, code: error.code, error: error.message };
+    throw error;
+  }
+  const exists = await stat(plan.worktree).then(() => true).catch(() => false);
+  if (!exists) return { ok: false as const, status: 404, code: "RUN_DIRECTORY_MISSING", error: "任务运行目录不存在（可能已被清理）" };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 120_000);
+  timer.unref?.();
+  try {
+    const baseRef = input.baseSha?.trim() || undefined;
+    const diff = await collectDiff(plan.worktree, controller.signal, baseRef);
+    return { ok: true as const, diff, baseSha: input.baseSha ?? null };
+  } catch (error) {
+    return { ok: false as const, status: 500, code: "DIFF_FAILED", error: (error as Error).message.slice(0, 300) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * A2: merges a run branch into the workspace's default branch. Fast-forwards
+ * when possible, otherwise creates a merge commit. Never force-pushes and never
+ * auto-resolves conflicts: on conflict it aborts the merge and reports the
+ * conflicting paths, leaving the workspace untouched.
+ */
+async function mergeRunBranch(input: {
+  ownerId: string;
+  runId: string;
+  repository: string;
+  branch: string;
+  targetBranch?: string;
+  message?: string;
+}) {
+  let plan;
+  try {
+    plan = planRunDirectoryRemoval(runsRoot, input.ownerId, input.runId);
+  } catch (error) {
+    if (error instanceof RunCleanupPathError) return { ok: false as const, status: 400, code: error.code, error: error.message };
+    throw error;
+  }
+  const runDirExists = await stat(plan.worktree).then(() => true).catch(() => false);
+  if (!runDirExists) return { ok: false as const, status: 404, code: "RUN_DIRECTORY_MISSING", error: "任务运行目录不存在（可能已被清理），无法合并" };
+
+  let project: string;
+  try {
+    project = await resolveProject(input.repository);
+  } catch (error) {
+    return { ok: false as const, status: 400, code: "WORKSPACE_INVALID", error: (error as Error).message };
+  }
+
+  const dirty = await git(project, ["status", "--porcelain"]).catch(() => undefined);
+  if (dirty === undefined) return { ok: false as const, status: 500, code: "GIT_FAILED", error: "无法读取工作区状态" };
+  if (dirty) return { ok: false as const, status: 409, code: "WORKSPACE_DIRTY", error: "工作区存在未提交改动，已拒绝合并（未修改工作区）" };
+
+  const currentBranch = await git(project, ["branch", "--show-current"]).catch(() => "");
+  const targetBranch = input.targetBranch?.trim() || currentBranch;
+  if (!targetBranch) return { ok: false as const, status: 409, code: "TARGET_BRANCH_UNKNOWN", error: "无法确定工作区默认分支" };
+  if (currentBranch !== targetBranch) {
+    const checkout = await runHardenedGit({ cwd: project, args: ["checkout", targetBranch], timeoutMs: 120_000 });
+    if (checkout.code !== 0) {
+      return { ok: false as const, status: 409, code: "TARGET_BRANCH_UNAVAILABLE", error: `无法切换到目标分支 ${targetBranch}：${checkout.stderr.trim().slice(0, 200)}` };
+    }
+  }
+
+  // Fetch the run branch into a temporary ref. The file transport is enabled for
+  // this one fetch (the run directory is a local clone), exactly as when cloning.
+  const tempRef = `refs/pigo/merge/${input.runId}`;
+  const fetchResult = await runHardenedGit({
+    cwd: project,
+    args: ["-c", "protocol.file.allow=always", "fetch", "--no-tags", plan.worktree, `+refs/heads/${input.branch}:${tempRef}`],
+    timeoutMs: 120_000,
+  });
+  if (fetchResult.code !== 0) {
+    await runHardenedGit({ cwd: project, args: ["update-ref", "-d", tempRef], timeoutMs: 30_000 }).catch(() => undefined);
+    return { ok: false as const, status: 409, code: "MERGE_FETCH_FAILED", error: `无法获取任务分支 ${input.branch}：${fetchResult.stderr.trim().slice(0, 200)}` };
+  }
+
+  const ancestor = await runHardenedGit({ cwd: project, args: ["merge-base", "--is-ancestor", "HEAD", tempRef], timeoutMs: 60_000 });
+  const strategy = planMergeStrategy({ headIsAncestor: ancestor.code === 0 });
+  const mergeArgs = strategy === "fast-forward"
+    ? ["merge", "--ff-only", tempRef]
+    : ["-c", "user.name=PiGO", "-c", "user.email=agent@pigo.local", "merge", "--no-ff", "--no-edit", "-m", input.message?.trim() || `Merge ${input.branch} into ${targetBranch}`, tempRef];
+  const merge = await runHardenedGit({ cwd: project, args: mergeArgs, timeoutMs: 300_000 });
+  if (merge.code !== 0) {
+    const conflictOutput = await runHardenedGit({ cwd: project, args: ["diff", "--name-only", "--diff-filter=U"], timeoutMs: 60_000 });
+    const conflictingPaths = parseConflictingPaths(conflictOutput.stdout);
+    await runHardenedGit({ cwd: project, args: ["merge", "--abort"], timeoutMs: 120_000 }).catch(() => undefined);
+    await runHardenedGit({ cwd: project, args: ["update-ref", "-d", tempRef], timeoutMs: 30_000 }).catch(() => undefined);
+    return {
+      ok: false as const,
+      status: 409,
+      code: "MERGE_CONFLICT",
+      error: "合并存在冲突，已中止且未修改工作区",
+      conflictingPaths,
+    };
+  }
+
+  const commit = await git(project, ["rev-parse", "HEAD"]).catch(() => "");
+  await runHardenedGit({ cwd: project, args: ["update-ref", "-d", tempRef], timeoutMs: 30_000 }).catch(() => undefined);
+  if (!commit) return { ok: false as const, status: 500, code: "MERGE_COMMIT_UNKNOWN", error: "合并完成但无法读取提交哈希" };
+  return { ok: true as const, commit, targetBranch, strategy };
+}
+
 const server = createServer(async (request, response) => {
   try {
     const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
@@ -2209,6 +2325,40 @@ const server = createServer(async (request, response) => {
         if (error instanceof RunCleanupPathError) return json(response, 400, { error: error.message, code: error.code });
         throw error;
       }
+    }
+    // A1: regenerate a run's full patch from its run directory on demand.
+    const diffMatch = url.pathname.match(/^\/runs\/([^/]+)\/diff$/);
+    if (request.method === "POST" && diffMatch) {
+      const runId = decodeURIComponent(diffMatch[1]);
+      const body = await readJson(request) as { ownerId?: unknown; baseSha?: unknown };
+      const result = await generateRunDiff({
+        ownerId: String(body.ownerId ?? ""),
+        runId,
+        baseSha: typeof body.baseSha === "string" ? body.baseSha : undefined,
+      });
+      if (!result.ok) return json(response, result.status, result);
+      return json(response, 200, result);
+    }
+    // A2: merge a run branch into the workspace default branch (admin-gated at
+    // the web layer). Never force-pushes; conflicts abort and leave the repo as-is.
+    const mergeMatch = url.pathname.match(/^\/runs\/([^/]+)\/merge$/);
+    if (request.method === "POST" && mergeMatch) {
+      const runId = decodeURIComponent(mergeMatch[1]);
+      if (active.has(runId)) return json(response, 409, { ok: false, code: "RUN_ACTIVE", error: "任务仍在执行，无法合并" });
+      const body = await readJson(request) as { ownerId?: unknown; repository?: unknown; branch?: unknown; targetBranch?: unknown; message?: unknown };
+      const repository = String(body.repository ?? "");
+      const branch = String(body.branch ?? "");
+      if (!repository || !branch) return json(response, 400, { ok: false, code: "MERGE_INPUT_INVALID", error: "repository and branch are required" });
+      const result = await mergeRunBranch({
+        ownerId: String(body.ownerId ?? ""),
+        runId,
+        repository,
+        branch,
+        targetBranch: typeof body.targetBranch === "string" ? body.targetBranch : undefined,
+        message: typeof body.message === "string" ? body.message : undefined,
+      });
+      if (!result.ok) return json(response, result.status, result);
+      return json(response, 200, result);
     }
     return json(response, 404, { error: "Not found" });
   } catch (error) {
