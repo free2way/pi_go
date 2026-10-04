@@ -12,3 +12,9 @@ deploy/docker/workspace/*
 !deploy/docker/workspace/.gitkeep
 *.tgz
 npm-debug.log*
+
+# Playwright artifacts
+playwright-report/
+test-results/
+blob-report/
+.playwright/

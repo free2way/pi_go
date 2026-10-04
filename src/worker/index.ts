@@ -17,6 +17,9 @@ import { blockingSeverities, parseReview, type ReviewResult } from "./review-pro
 import { buildContainerSpec, hostPathFor, resolveSandboxMode } from "./sandbox.js";
 import { mergeFindings, unresolvedFeedback } from "./review-findings.js";
 import { WorkspacePathError, resolveInsideRoot, sanitizeRelativePath, sanitizeWorkspaceName, validateCloneUrl } from "./workspace-paths.js";
+import { WorkspaceLockManager, workspaceKeyFor } from "./workspace-lock.js";
+import { PiRunError, failureOutputForEvent } from "./agent-failure.js";
+import { detectProjectPlugins, parsePluginPolicy, pluginArguments, pluginMounts, selectPlugins, type PluginDenial } from "./plugin-policy.js";
 
 const port = Number(process.env.PORT || 3200);
 const host = process.env.HOST || "localhost";
@@ -31,6 +34,16 @@ const maxSubagents = Number.isInteger(configuredMaxSubagents) ? Math.min(4, Math
 const configuredMaxActiveJobs = Number(process.env.PI_MAX_ACTIVE_JOBS || 1);
 const maxActiveJobs = Number.isInteger(configuredMaxActiveJobs) ? Math.min(4, Math.max(1, configuredMaxActiveJobs)) : 1;
 const active = new Map<string, AbortController>();
+// GAP-05 / AT-RUN-012: one run per workspace at a time. Lock files live under
+// the workspace root so a worker restart cannot leave a workspace locked: the
+// heartbeat goes stale and the next claim reclaims it.
+const configuredLockStale = Number(process.env.PI_WORKSPACE_LOCK_STALE_SECONDS || 300);
+const workspaceLockStaleMs = Number.isFinite(configuredLockStale) ? Math.max(30, configuredLockStale) * 1_000 : 300_000;
+const workspaceLocks = new WorkspaceLockManager({
+  directory: path.join(runsRoot, "_locks"),
+  workerId: process.env.PI_WORKER_ID || `worker-${process.pid}`,
+  staleMs: workspaceLockStaleMs,
+});
 const minFreeDiskMb = Math.max(64, Number(process.env.PI_MIN_FREE_DISK_MB || 2048));
 // Critical is a quarter of the configured minimum (2048 MB -> 512 MB by default),
 // so raising PI_MIN_FREE_DISK_MB also scales the hard stop threshold.
@@ -104,6 +117,52 @@ const sandboxExtraBinds = (process.env.PI_SANDBOX_EXTRA_BINDS || "").split(",").
 /** Extra environment variable names to pass through into the sandbox. */
 const sandboxExtraEnv = (process.env.PI_SANDBOX_EXTRA_ENV || "").split(",").map((item) => item.trim()).filter(Boolean);
 
+/**
+ * GAP-02: Pi plugins are default-off. Only resources in the operator allowlist
+ * are re-enabled through explicit `--extension/--skill/--prompt-template`
+ * flags; anything requested but not allowlisted produces a `plugin.denied`
+ * event instead of being silently dropped.
+ */
+const pluginPolicy = parsePluginPolicy({
+  allowlist: process.env.PI_PLUGIN_ALLOWLIST,
+  requests: process.env.PI_PLUGIN_REQUESTS,
+});
+const allowProjectPlugins = process.env.PI_PLUGIN_ALLOW_PROJECT === "true";
+/** Container directory that hosts read-only allowlisted plugin mounts. */
+const pluginContainerBase = process.env.PI_PLUGIN_CONTAINER_DIR || "/opt/pigo/plugins";
+
+const reportedPluginEvents = new Set<string>();
+async function reportPluginPolicy(runId: string, round: number, enabled: string[], denials: PluginDenial[]) {
+  if (reportedPluginEvents.size > 500) reportedPluginEvents.clear();
+  for (const denial of denials) {
+    const key = `${runId}:denied:${denial.path}:${denial.reason}`;
+    if (reportedPluginEvents.has(key)) continue;
+    reportedPluginEvents.add(key);
+    await postUpdate(runId, {
+      event: {
+        round,
+        source: "system",
+        type: "plugin.denied",
+        message: `插件未启用：${denial.path}（${denial.reason}）`,
+        meta: { path: denial.path, kind: denial.kind, reason: denial.reason },
+      },
+    }).catch(() => undefined);
+  }
+  const enabledKey = `${runId}:enabled`;
+  if (enabled.length > 0 && !reportedPluginEvents.has(enabledKey)) {
+    reportedPluginEvents.add(enabledKey);
+    await postUpdate(runId, {
+      event: {
+        round,
+        source: "system",
+        type: "plugin.enabled",
+        message: `已按 allowlist 启用 ${enabled.length} 个受控插件：${enabled.join("、")}`,
+        meta: { plugins: enabled },
+      },
+    }).catch(() => undefined);
+  }
+}
+
 /** Environment handed to a sandboxed process: nothing but runtime basics and the role credential. */
 function sandboxEnvironment(extra: Record<string, string>) {
   const passthrough = ["PATH", "HOME", "LANG", "LC_ALL", "TZ", "TERM", "OPENAI_BASE_URL", ...sandboxExtraEnv];
@@ -150,6 +209,7 @@ interface SandboxRunInput {
   signal: AbortSignal;
   onStdoutLine?: (line: string) => void;
   label: string;
+  pluginMounts?: Array<{ hostPath: string; containerPath: string }>;
 }
 
 /** Runs one invocation inside its own container and always cleans it up. */
@@ -173,6 +233,7 @@ async function runInSandbox(input: SandboxRunInput): Promise<CommandResult> {
     stateDir: "/home/node/.pi",
     stateMount: "bind",
     hostStateDir: hostPathFor(runStateDir, workspaceRoot, hostWorkspaceRoot),
+    ...(input.pluginMounts ? { pluginMounts: input.pluginMounts } : {}),
     env: input.env,
     argv: input.argv,
     network: input.network,
@@ -262,6 +323,93 @@ function startJobHeartbeat(jobId: string | undefined) {
   }, 20_000);
   timer.unref?.();
   return () => clearInterval(timer);
+}
+
+/** How often a lock holder proves it is still alive. */
+const workspaceLockHeartbeatMs = 30_000;
+
+/**
+ * GAP-05 / AT-RUN-012: jobs that could not start because another run holds the
+ * workspace lock. They are not failed — they stay queued locally and are
+ * retried as soon as the holder releases or its lock goes stale. The durable
+ * job row is never finished here, so a worker restart re-delivers it too.
+ */
+const deferredJobs = new Map<string, { input: JobInput; reason: string }>();
+let drainingDeferred = false;
+
+async function dispatchJob(input: JobInput, controller: AbortController) {
+  const key = workspaceKeyFor(input.run);
+  const result = await workspaceLocks.acquire(key, input.run.id);
+  if (!result.acquired) {
+    // Do not run, do not finish the job: leave it for the drain loop / durable
+    // requeue. `active` is cleared so capacity accounting stays honest.
+    active.delete(input.run.id);
+    const holder = result.holder;
+    const reason = holder
+      ? `工作区「${key}」正被运行 ${holder.runId} 占用（心跳 ${new Date(holder.heartbeatAt).toISOString()}）`
+      : `工作区「${key}」已被占用`;
+    deferredJobs.set(input.run.id, { input, reason });
+    await postUpdate(input.run.id, {
+      event: {
+        round: input.run.round,
+        source: "system",
+        type: "workspace.locked",
+        message: `保持排队：${reason}。等待其结束或锁过期（约 ${Math.round(workspaceLockStaleMs / 1000)} 秒）后自动重试。`,
+        meta: { workspace: key, holderRunId: holder?.runId, holderWorkerId: holder?.workerId, staleSeconds: Math.round(workspaceLockStaleMs / 1000) },
+      },
+    }).catch((error) => console.warn(`[jobs] could not record workspace.locked for ${input.run.id}: ${(error as Error).message}`));
+    console.warn(`[jobs] deferring ${input.run.id}: ${reason}`);
+    return false;
+  }
+
+  deferredJobs.delete(input.run.id);
+  if (result.reclaimedStale) {
+    await postUpdate(input.run.id, {
+      event: {
+        round: input.run.round,
+        source: "system",
+        type: "workspace.lock_reclaimed",
+        message: `工作区「${key}」上一个持有者（运行 ${result.reclaimedStale.runId}）的锁已过期，本次运行已接管。`,
+        meta: { workspace: key, staleRunId: result.reclaimedStale.runId, staleWorkerId: result.reclaimedStale.workerId },
+      },
+    }).catch(() => undefined);
+  }
+  const touch = setInterval(() => { void result.handle.touch().catch(() => undefined); }, workspaceLockHeartbeatMs);
+  touch.unref?.();
+  try {
+    await executeJob(input, controller);
+  } finally {
+    clearInterval(touch);
+    await result.handle.release().catch(() => undefined);
+    void drainDeferredJobs();
+  }
+  return true;
+}
+
+/** Retries locally deferred jobs whose workspace lock has freed up. */
+async function drainDeferredJobs() {
+  if (drainingDeferred || deferredJobs.size === 0) return 0;
+  drainingDeferred = true;
+  let started = 0;
+  try {
+    for (const [runId, entry] of [...deferredJobs]) {
+      if (active.has(runId)) { deferredJobs.delete(runId); continue; }
+      if (active.size >= maxActiveJobs) break;
+      if (workspaceLocks.isHeld(workspaceKeyFor(entry.input.run))) continue;
+      const controller = new AbortController();
+      active.set(runId, controller);
+      deferredJobs.delete(runId);
+      started += 1;
+      void dispatchJob(entry.input, controller).catch((error) => {
+        active.delete(runId);
+        console.error(`[jobs] deferred dispatch failed for ${runId}: ${(error as Error).message}`);
+      });
+    }
+  } finally {
+    drainingDeferred = false;
+  }
+  if (started > 0) console.warn(`[jobs] resumed ${started} deferred job(s) after the workspace lock freed up`);
+  return started;
 }
 
 async function loadTracker(runId: string) {
@@ -366,8 +514,10 @@ function command(commandName: string, args: string[], options: {
   env?: NodeJS.ProcessEnv;
   signal?: AbortSignal;
   timeoutMs?: number;
+  maxOutput?: number;
   onStdoutLine?: (line: string) => void;
 }): Promise<CommandResult> {
+  const captureLimit = options.maxOutput ?? maxOutput;
   return new Promise((resolve, reject) => {
     const child = spawn(commandName, args, {
       cwd: options.cwd,
@@ -380,10 +530,10 @@ function command(commandName: string, args: string[], options: {
     const timer = setTimeout(() => child.kill("SIGTERM"), options.timeoutMs || 1_800_000);
     const lines = readline.createInterface({ input: child.stdout });
     lines.on("line", (line) => {
-      stdout = `${stdout}${line}\n`.slice(-maxOutput);
+      stdout = `${stdout}${line}\n`.slice(-captureLimit);
       options.onStdoutLine?.(line);
     });
-    child.stderr.on("data", (chunk) => { stderr = `${stderr}${String(chunk)}`.slice(-maxOutput); });
+    child.stderr.on("data", (chunk) => { stderr = `${stderr}${String(chunk)}`.slice(-captureLimit); });
     child.on("error", (error) => {
       clearTimeout(timer);
       if (error.name === "AbortError") resolve({ code: 130, stdout, stderr: "aborted" });
@@ -401,7 +551,7 @@ function command(commandName: string, args: string[], options: {
  * repository-local config disabled, and with a scrubbed environment. Untrusted
  * code from a task can therefore never execute inside the Worker through Git.
  */
-async function git(cwd: string, args: string[], signal?: AbortSignal) {
+async function git(cwd: string, args: string[], signal?: AbortSignal, options: { maxOutput?: number } = {}) {
   const hardened = [
     "-c", "core.hooksPath=/dev/null",
     "-c", "credential.helper=",
@@ -415,6 +565,7 @@ async function git(cwd: string, args: string[], signal?: AbortSignal) {
     cwd,
     signal,
     timeoutMs: 120_000,
+    maxOutput: options.maxOutput,
     env: scrubEnvironment(process.env),
   });
   if (result.code !== 0) throw new Error(result.stderr.trim() || `git ${args[0]} failed`);
@@ -557,6 +708,8 @@ async function runPi(input: {
   apiKeyEnvironmentName: string;
   signal: AbortSignal;
   onActivity: (message: string) => Promise<void>;
+  /** COST/GAP-02: the calling role gates which allowlisted plugins are enabled. */
+  role?: RunRoleUsage["role"];
 }) {
   const args = [
     "--mode", "json",
@@ -569,6 +722,14 @@ async function runPi(input: {
     "--thinking", input.thinking === "low" || input.thinking === "medium" ? input.thinking : "high",
     "--tools", input.readOnly ? "read,grep,find,ls" : "read,bash,edit,write,grep,find,ls",
   ];
+  // GAP-02: re-enable only allowlisted resources. The `--no-*` flags above
+  // disable discovery (including project `.pi/extensions`); explicit paths still
+  // load, so the allowlist is the single source of truth.
+  const { enabled, denials } = selectPlugins(pluginPolicy, input.role ?? "developer");
+  const mounts = sandboxMode === "container" ? pluginMounts(enabled, pluginContainerBase) : [];
+  const containerPathByHost = new Map(mounts.map((mount) => [mount.hostPath, mount.containerPath]));
+  args.push(...pluginArguments(enabled, (hostPath) => containerPathByHost.get(hostPath) ?? hostPath));
+  const enabledLabels = enabled.map((entry) => `${entry.kind}:${entry.path}`);
   if (input.sessionId) args.push("--session-id", input.sessionId);
   else args.push("--no-session");
   args.push("--", input.prompt);
@@ -606,6 +767,7 @@ async function runPi(input: {
         signal: input.signal,
         onStdoutLine,
         label: "pi-agent",
+        ...(mounts.length > 0 ? { pluginMounts: mounts } : {}),
       })
     : await command("pi", args, {
         cwd: input.cwd,
@@ -615,15 +777,30 @@ async function runPi(input: {
         onStdoutLine,
       });
   await activityQueue;
-  if (result.code !== 0) throw new Error(result.stderr.trim() || `Pi exited with ${result.code}`);
+  // GAP-05: carry the captured output so a failed call's evidence is not lost.
+  if (result.code !== 0) {
+    throw new PiRunError(result.stderr.trim() || `Pi exited with ${result.code}`, {
+      code: result.code,
+      stdout: result.stdout,
+      stderr: result.stderr,
+    });
+  }
   if (lastAssistantError) throw new Error(lastAssistantError);
-  return { text: finalText.trim(), usage: tracker.totals };
+  return { text: finalText.trim(), usage: tracker.totals, plugins: { enabled: enabledLabels, denials } };
 }
+
+/** AUD-16: cap is high enough for realistic diffs; when it is hit the artifact
+ * says so explicitly instead of silently clipping. */
+const maxDiffOutput = 3_500_000;
 
 async function collectDiff(worktree: string, signal: AbortSignal, baseRef?: string) {
   await git(worktree, ["add", "-N", "."], signal);
   const args = baseRef ? ["diff", "--no-ext-diff", baseRef, "--", "."] : ["diff", "--no-ext-diff", "--", "."];
-  return (await git(worktree, args, signal)).slice(0, 120_000);
+  const diff = await git(worktree, args, signal, { maxOutput: maxDiffOutput });
+  if (diff.length >= maxDiffOutput) {
+    return `${diff}\n# [PiGO] diff truncated at ${maxDiffOutput} characters (AUD-16)\n`;
+  }
+  return diff;
 }
 
 /**
@@ -638,7 +815,7 @@ async function runPiWithRetry(
   budget?.reserve(context.role);
   let result: Awaited<ReturnType<typeof runPi>>;
   try {
-    result = await withProviderRetry(() => runPi(input), {
+    result = await withProviderRetry(() => runPi({ ...input, role: context.role }), {
     signal: input.signal,
     onRetry: async ({ attempt, delayMs, kind, message }) => {
       await postUpdate(context.runId, {
@@ -657,6 +834,8 @@ async function runPiWithRetry(
     budget?.recordUnknown();
     throw error;
   }
+  // GAP-02: surface allowlist decisions as audit events (never silent).
+  await reportPluginPolicy(context.runId, context.round, result.plugins.enabled, result.plugins.denials);
   if (budget) await budget.record(context.role, input, result.usage);
   return result;
 }
@@ -874,6 +1053,24 @@ async function runSubAgent(input: {
     input.task.status = "failed";
     input.task.summary = safeMessage.slice(0, 1_000);
     input.task.durationMs = Date.now() - startedAt;
+    // GAP-05 / AT-AGENT-008: keep a bounded, redacted tail of the failed call's
+    // output as a run event so the failure stays diagnosable after the
+    // sub-agent worktree is force-removed.
+    const captured = failureOutputForEvent(error);
+    if (captured) {
+      const meta: Record<string, unknown> = { taskId: input.task.id, exitCode: captured.exitCode };
+      if (captured.stdout) meta.stdoutTail = redactJobSecrets(captured.stdout, input.credentials);
+      if (captured.stderr) meta.stderrTail = redactJobSecrets(captured.stderr, input.credentials);
+      await postUpdate(input.run.id, {
+        event: {
+          round: input.run.round,
+          source: "developer",
+          type: "subagent.failure_output",
+          message: `Sub Agent「${input.task.title}」失败输出已保留（退出码 ${captured.exitCode}，每路最多 8 KB）`,
+          meta,
+        },
+      }).catch(() => undefined);
+    }
     await postUpdate(input.run.id, { event: { round: input.run.round, source: "developer", type: "subagent.failed", message: `Sub Agent「${input.task.title}」失败，将由集成 Agent 接管：${safeMessage.slice(0, 200)}` } });
     return { task: input.task, branch, worktree, error: safeMessage };
   }
@@ -1028,6 +1225,7 @@ async function runChecks(run: Run, worktree: string, commands: string[], signal:
       ...current,
       status: result.code === 0 ? "passed" : "failed",
       durationMs: Date.now() - started,
+      exitCode: result.code,
       output: `${result.stdout}\n${result.stderr}`.trim().slice(-12_000),
     });
     await postUpdate(run.id, { patch: { checks: [...results] }, event: { round: run.round, source: "checks", type: result.code === 0 ? "check.passed" : "check.failed", message: `${checkCommand} ${result.code === 0 ? "通过" : "失败"}` } });
@@ -1308,6 +1506,22 @@ async function executeJob(input: JobInput, controller: AbortController) {
         run.baseSha = prepared.baseSha;
         await postUpdate(run.id, { patch: { baseSha: prepared.baseSha } });
       }
+    }
+
+    // AT-PI-006: project-local plugin resources stay unloaded (the `--no-*`
+    // flags disable discovery); report them so an unapproved extension is
+    // visible in the run audit instead of silently ignored.
+    const ignoredPlugins = await detectProjectPlugins(worktree).catch(() => []);
+    if (ignoredPlugins.length > 0 && !allowProjectPlugins) {
+      await postUpdate(run.id, {
+        event: {
+          round: run.round,
+          source: "system",
+          type: "workspace.plugins_ignored",
+          message: `检测到仓库内插件资源但默认不加载：${ignoredPlugins.join("、")}。仅启用管理员 allowlist（PI_PLUGIN_ALLOWLIST）中的插件。`,
+          meta: { ignored: ignoredPlugins },
+        },
+      }).catch(() => undefined);
     }
 
     if (input.retryReview) {
@@ -1599,7 +1813,7 @@ async function reclaimPendingJobs() {
     started += 1;
     // AUD-05: only a job that actually started is a recovery; a queued job that
     // never ran begins normally (and creates its clone).
-    void executeJob({
+    void dispatchJob({
       run: job.run,
       checks: job.checks,
       credentials: job.credentials,
@@ -1607,7 +1821,10 @@ async function reclaimPendingJobs() {
       recovery: job.wasStarted,
       ...(job.resume ? { resume: job.resume } : {}),
       ...(job.retryReview ? { retryReview: true } : {}),
-    }, controller);
+    }, controller).catch((error) => {
+      active.delete(job.run.id);
+      console.error(`[jobs] reclaimed job ${job.jobId} failed to start: ${(error as Error).message}`);
+    });
   }
   if (started > 0) console.warn(`[jobs] reclaimed ${started} unfinished job(s) after restart`);
   return started;
@@ -1650,7 +1867,10 @@ const server = createServer(async (request, response) => {
       }
       const controller = new AbortController();
       active.set(body.run.id, controller);
-      void executeJob(body, controller);
+      void dispatchJob(body, controller).catch((error) => {
+        active.delete(body.run.id);
+        console.error(`[jobs] job ${body.run.id} failed to start: ${(error as Error).message}`);
+      });
       return json(response, 202, { accepted: true, runId: body.run.id });
     }
     if (request.method === "GET" && url.pathname === "/jobs/capacity") {
@@ -1674,9 +1894,21 @@ sandboxMode = resolvedSandbox.mode;
 sandboxReason = resolvedSandbox.reason;
 process.stdout.write(`[sandbox] mode=${sandboxMode}${sandboxReason ? ` (${sandboxReason})` : ""} image=${imageForSandbox}\n`);
 
+// GAP-05: never leave a workspace locked by a worker that is shutting down.
+for (const signal of ["SIGTERM", "SIGINT"] as const) {
+  process.once(signal, () => {
+    workspaceLocks.releaseAllSync();
+    process.exit(signal === "SIGINT" ? 130 : 143);
+  });
+}
+
 server.listen(port, host, () => {
   process.stdout.write(`pigo-worker listening on http://${host}:${port}\n`);
   void reclaimPendingJobs();
-  const timer = setInterval(() => { void reclaimPendingJobs(); }, 60_000);
+  const timer = setInterval(() => {
+    void reclaimPendingJobs();
+    // A deferred job whose holder went stale (crash) has no release event.
+    void drainDeferredJobs();
+  }, 60_000);
   timer.unref?.();
 });

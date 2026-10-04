@@ -14,8 +14,10 @@ import { createDb, createPool, newId, runMigrations } from "./db.js";
 import { baseDemoRun, runDemo } from "./demo-runner.js";
 import { IdentityService } from "./identity.js";
 import { availableModels, defaultSelections, loadModelCatalog, preflightRunModels, type RuntimeCapability } from "./model-catalog.js";
+import { RunEventStream } from "./event-stream.js";
 import { baseRealRun } from "./real-run.js";
 import { createProviderProbe, providerProbeDisabled } from "./provider-probe.js";
+import { verifyPendingCredentials } from "./credential-verification.js";
 import { RateLimiter } from "./rate-limit.js";
 import { PostgresRunStore } from "./run-store-pg.js";
 import type { RunStoreLike } from "./store.js";
@@ -56,6 +58,43 @@ await vault.init();
 const providerProbe = createProviderProbe();
 // AT-MODEL-001: capability overrides reported by a probe, keyed `provider/model`.
 const runtimeCapabilities = new Map<string, RuntimeCapability>();
+
+// AUD-08 cutover safety: credentials stored before live verification existed
+// have `verifiedAt === null` and would block every real run. Verify them once at
+// startup, bounded so boot is not delayed by more than ~10s. Logs carry provider
+// names and outcomes only — never key material.
+try {
+  const pending = vault.pendingVerifications();
+  if (pending.length > 0) {
+    const budgetMs = Number(process.env.PI_STARTUP_CREDENTIAL_PROBE_BUDGET_MS || 10_000);
+    const pass = verifyPendingCredentials({
+      listPending: () => pending,
+      readKey: (userId, provider) => vault.get(userId, provider),
+      probe: providerProbe,
+      markVerified: (userId, provider, models) => vault.markVerified(userId, provider, models),
+      markUnverified: (userId, provider) => vault.markUnverified(userId, provider),
+      probeDisabled: providerProbeDisabled,
+      log: (message, detail) => app.log.info(detail ?? {}, message),
+    }, { budgetMs });
+    const outcome = await Promise.race([
+      pass,
+      new Promise<undefined>((resolve) => {
+        const timer = setTimeout(() => resolve(undefined), budgetMs + 500);
+        timer.unref?.();
+      }),
+    ]);
+    if (outcome) {
+      app.log.info(
+        { pending: outcome.considered, verified: outcome.verified, unverified: outcome.unverified, skipped: outcome.skipped, deferred: outcome.deferred },
+        "startup credential verification pass finished",
+      );
+    } else {
+      app.log.warn({ pending: pending.length, budgetMs }, "startup credential verification pass exceeded its budget; continuing in the background");
+    }
+  }
+} catch (error) {
+  app.log.warn({ error: (error as Error).message }, "startup credential verification pass failed");
+}
 
 const databaseUrl = process.env.PI_DATABASE_URL;
 if (!databaseUrl) throw new Error("PI_DATABASE_URL is required (postgresql://user:password@host:5432/database)");
@@ -246,6 +285,34 @@ function credentialFingerprint(apiKey: string | undefined) {
 /** GAP-01: workflow/prompt/plugin policy snapshot. */
 const PIPELINE_VERSION = process.env.PI_PIPELINE_VERSION || "pigo-pipeline-1";
 
+/** Terminal run states (used for artifact persistence and cleanup). */
+const TERMINAL_RUN_STATES = new Set<Run["state"]>(["completed", "needs_human", "failed", "cancelled"]);
+
+/**
+ * AUD-16 / AT-GIT-004, AT-UI-005: persist the unified diff reported for a run as
+ * a downloadable artifact once the run reaches a terminal state. The body is the
+ * exact patch the worker produced against the run's pinned base SHA; storing it
+ * (instead of only length/hash) is what makes a full download possible.
+ */
+async function persistTerminalDiffArtifact(run: Run | undefined) {
+  if (!run || !TERMINAL_RUN_STATES.has(run.state) || !run.diff) return;
+  try {
+    await store.saveArtifact({
+      runId: run.id,
+      artifactId: "diff",
+      kind: "patch",
+      content: run.diff,
+      baseSha: run.baseSha ?? null,
+      createdAt: run.updatedAt,
+    });
+  } catch (error) {
+    app.log.warn({ runId: run.id, error: (error as Error).message }, "failed to persist diff artifact");
+  }
+}
+
+/** AUD-16: download cap so one artifact can never be streamed without bound. */
+const ARTIFACT_DOWNLOAD_MAX_BYTES = Number(process.env.PI_ARTIFACT_MAX_DOWNLOAD_BYTES || 5 * 1024 * 1024);
+
 function tooManyRequests(reply: FastifyReply, retryAfterMs: number) {
   reply.header("Retry-After", String(Math.max(1, Math.ceil(retryAfterMs / 1000))));
   return reply.code(429).send({ error: "请求过于频繁，请稍后再试", code: "RATE_LIMITED" });
@@ -339,7 +406,7 @@ app.get("/api/health", async (_request, reply) => {
   try {
     await pingDatabase();
     alerts.clear("database_unavailable");
-    return { status: "ok", service: "pigo-web", version: "0.18.0", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.19.0", db: "ok" };
   } catch (error) {
     // AT-REL-005: fail loudly instead of pretending the service is healthy.
     alerts.raise({
@@ -348,7 +415,7 @@ app.get("/api/health", async (_request, reply) => {
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
       details: { error: (error as Error).message.slice(0, 200) },
     });
-    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.18.0", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.19.0", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
   }
 });
 
@@ -363,7 +430,7 @@ interface StorageStatus {
 app.get("/api/health/detail", async (request, reply) => {
   const internal = safeTokenMatch(request.headers.authorization);
   if (!internal && !auth.user(request)) return reply.code(401).send({ error: "Unauthorized" });
-  const health: Record<string, unknown> = { version: "0.18.0", at: new Date().toISOString() };
+  const health: Record<string, unknown> = { version: "0.19.0", at: new Date().toISOString() };
   try {
     await pingDatabase();
     health.database = { status: "ok" };
@@ -609,30 +676,72 @@ app.get<{ Params: { id: string }; Querystring: { after?: string; limit?: string 
   return store.getEvents(request.params.id, Number(request.query.after || 0), limit);
 });
 
+// GAP-04 / AT-UI-005: artifact listing and download, authenticated like every
+// other run route and owner-scoped via ownerKeysFor.
+app.get<{ Params: { id: string } }>("/api/runs/:id/artifacts", async (request, reply) => {
+  if (!store.getRun(request.params.id, ownerKeysFor(request))) return reply.code(404).send({ error: "Run not found" });
+  return { artifacts: await store.listArtifacts(request.params.id) };
+});
+
+app.get<{ Params: { id: string; artifactId: string } }>("/api/runs/:id/artifacts/:artifactId/download", async (request, reply) => {
+  const run = store.getRun(request.params.id, ownerKeysFor(request));
+  if (!run) return reply.code(404).send({ error: "Run not found" });
+  const artifact = await store.getArtifact(request.params.id, request.params.artifactId);
+  // A run with a diff but no stored body (legacy/demo) still downloads the preview.
+  const content = artifact?.content ?? (request.params.artifactId === "diff" ? run.diff : undefined);
+  if (content === undefined) return reply.code(404).send({ error: "Artifact not found" });
+  const bytes = Buffer.byteLength(content, "utf8");
+  if (bytes > ARTIFACT_DOWNLOAD_MAX_BYTES) {
+    return reply.code(413).send({ error: `制品过大（${bytes} 字节），超过下载上限 ${ARTIFACT_DOWNLOAD_MAX_BYTES} 字节`, code: "ARTIFACT_TOO_LARGE" });
+  }
+  const kind = artifact?.kind ?? "patch";
+  const contentType = kind === "patch" ? "text/x-patch; charset=utf-8" : "application/octet-stream";
+  const extension = kind === "patch" ? "patch" : "txt";
+  reply.header("Content-Type", contentType);
+  reply.header("Content-Disposition", `attachment; filename="${run.id}-${request.params.artifactId}.${extension}"`);
+  return reply.send(content);
+});
+
 app.get<{ Params: { id: string }; Querystring: { after?: string } }>("/api/runs/:id/stream", async (request, reply) => {
   if (!store.getRun(request.params.id, ownerKeysFor(request))) return reply.code(404).send({ error: "Run not found" });
   const after = Number(request.headers["last-event-id"] || request.query.after || 0);
   reply.hijack();
   reply.raw.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive", "X-Accel-Buffering": "no" });
-  const send = (event: RunEvent) => reply.raw.write(`id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`);
-  // AT-REL-008: replay in bounded pages so a client that lagged far behind is
-  // caught up without holding every event in web memory.
-  const pageSize = 500;
-  let cursor = Number.isFinite(after) ? after : 0;
+  // AUD-17 / AT-UI-006: subscribe first, replay to a watermark, dedupe by seq.
+  // Backpressure policy: a per-connection queue cap closes the stream as
+  // `overflow`; the browser EventSource reconnects with `Last-Event-ID` and the
+  // next connection resumes from the watermark, so no event is silently lost.
+  const stream = new RunEventStream({
+    runId: request.params.id,
+    cursor: Number.isFinite(after) ? Math.max(0, after) : 0,
+    subscribe: (listener) => store.subscribe(request.params.id, listener),
+    fetchPage: (cursor, limit) => store.getEvents(request.params.id, cursor, limit),
+    send: (event) => reply.raw.write(`id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`),
+    bufferedBytes: () => reply.raw.writableLength,
+    heartbeat: () => reply.raw.write(": heartbeat\n\n"),
+    close: (reason, detail) => {
+      try {
+        if (reason === "overflow") reply.raw.write(`event: pigo.overflow\ndata: ${JSON.stringify({ reason, detail })}\n\n`);
+      } catch {
+        // The socket is already gone; ending below is best effort.
+      }
+      reply.raw.end();
+    },
+    log: (message, detail) => app.log.warn({ ...detail, runId: request.params.id }, message),
+  });
+  const onDrain = () => stream.resume();
+  reply.raw.on("drain", onDrain);
+  request.raw.on("close", () => {
+    reply.raw.off("drain", onDrain);
+    stream.stop();
+  });
   try {
-    for (;;) {
-      const page = await store.getEvents(request.params.id, cursor, pageSize);
-      for (const event of page) send(event);
-      if (page.length === 0) break;
-      cursor = page[page.length - 1].seq;
-      if (page.length < pageSize) break;
-    }
+    await stream.start();
   } catch (error) {
-    app.log.error({ error: (error as Error).message, runId: request.params.id }, "event replay failed");
+    app.log.error({ error: (error as Error).message, runId: request.params.id }, "event stream failed");
+    stream.stop();
+    reply.raw.end();
   }
-  const unsubscribe = store.subscribe(request.params.id, send);
-  const heartbeat = setInterval(() => reply.raw.write(": heartbeat\n\n"), 15_000);
-  request.raw.on("close", () => { clearInterval(heartbeat); unsubscribe(); });
 });
 
 app.post("/api/runs", async (request, reply) => {
@@ -764,6 +873,137 @@ app.delete<{ Params: { id: string } }>("/api/runs/:id", async (request, reply) =
   }
   await store.deleteRun(run.id);
   return reply.code(204).send();
+});
+
+// GAP-04 / AT-RUN-009: explicit human approval or rejection of a delivered
+// worktree. Both are guarded by the state machine (needs_human -> completed /
+// cancelled) and recorded as audit events.
+const approveSchema = z.object({ note: z.string().trim().max(2_000).optional() });
+const rejectSchema = z.object({ reason: z.string().trim().max(2_000).optional() });
+
+app.post<{ Params: { id: string } }>("/api/runs/:id/approve", async (request, reply) => {
+  const actionLimit = runActions.check(auth.user(request).id);
+  if (!actionLimit.allowed) return tooManyRequests(reply, actionLimit.retryAfterMs);
+  const parsed = approveSchema.safeParse(request.body ?? {});
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
+  const run = store.getRun(request.params.id, ownerKeysFor(request));
+  if (!run) return reply.code(404).send({ error: "Run not found" });
+  if (run.state !== "needs_human") return reply.code(409).send({ error: "仅「需要人工处理」的任务可以审批", code: "RUN_NOT_APPROVABLE" });
+  const user = auth.user(request);
+  const now = new Date().toISOString();
+  const note = parsed.data.note?.trim();
+  let updated: Run;
+  try {
+    updated = await store.updateRun(run.id, {
+      state: "completed",
+      approvedAt: now,
+      approvedBy: user.id,
+      summary: note ? `人工审批通过：${note}` : "人工审批通过，交付已确认",
+    });
+  } catch (error) {
+    if ((error as { code?: string }).code === "INVALID_STATE_TRANSITION") {
+      return reply.code(409).send({ error: (error as Error).message, code: "INVALID_STATE_TRANSITION" });
+    }
+    throw error;
+  }
+  await store.appendEvent({
+    runId: run.id,
+    round: run.round,
+    source: "system",
+    type: "run.approved",
+    message: note ? `人工审批通过：${note}` : "人工审批通过，交付已确认",
+    at: now,
+    meta: { approvedBy: user.id },
+  });
+  return updated;
+});
+
+app.post<{ Params: { id: string } }>("/api/runs/:id/reject", async (request, reply) => {
+  const actionLimit = runActions.check(auth.user(request).id);
+  if (!actionLimit.allowed) return tooManyRequests(reply, actionLimit.retryAfterMs);
+  const parsed = rejectSchema.safeParse(request.body ?? {});
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
+  const run = store.getRun(request.params.id, ownerKeysFor(request));
+  if (!run) return reply.code(404).send({ error: "Run not found" });
+  if (run.state !== "needs_human") return reply.code(409).send({ error: "仅「需要人工处理」的任务可以拒绝", code: "RUN_NOT_REJECTABLE" });
+  const user = auth.user(request);
+  const now = new Date().toISOString();
+  const reason = parsed.data.reason?.trim();
+  let updated: Run;
+  try {
+    updated = await store.updateRun(run.id, {
+      state: "cancelled",
+      summary: reason ? `人工拒绝交付：${reason}` : "人工拒绝交付，任务已终止",
+    });
+  } catch (error) {
+    if ((error as { code?: string }).code === "INVALID_STATE_TRANSITION") {
+      return reply.code(409).send({ error: (error as Error).message, code: "INVALID_STATE_TRANSITION" });
+    }
+    throw error;
+  }
+  if (run.mode === "real") await workerRequest(`/jobs/${encodeURIComponent(run.id)}/cancel`, { method: "POST" }).catch(() => undefined);
+  await store.appendEvent({
+    runId: run.id,
+    round: run.round,
+    source: "system",
+    type: "run.rejected",
+    message: reason ? `人工拒绝交付：${reason}` : "人工拒绝交付，任务已终止",
+    at: now,
+    meta: { rejectedBy: user.id },
+  });
+  return updated;
+});
+
+// GAP-04: owner-scoped (admins may pass scope=all) cleanup of finished runs and
+// their artifacts/events. Active runs are never touched.
+const cleanupSchema = z.object({
+  runIds: z.array(z.string().trim().min(1).max(120)).max(200).optional(),
+  states: z.array(runStateSchema).max(9).optional(),
+  olderThanDays: z.number().min(0).max(3_650).optional(),
+  scope: z.enum(["own", "all"]).default("own"),
+  dryRun: z.boolean().default(false),
+});
+
+app.post("/api/runs/cleanup", async (request, reply) => {
+  const actionLimit = runActions.check(auth.user(request).id);
+  if (!actionLimit.allowed) return tooManyRequests(reply, actionLimit.retryAfterMs);
+  const parsed = cleanupSchema.safeParse(request.body ?? {});
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
+  const user = auth.user(request);
+  if (parsed.data.scope === "all" && !(await identities.isAdmin(user.id))) {
+    return reply.code(403).send({ error: "仅管理员可以清理全部任务", code: "ADMIN_REQUIRED" });
+  }
+  let candidates: Run[];
+  if (parsed.data.scope === "all") {
+    const owners = (await db.query("SELECT DISTINCT owner_id FROM runs")).rows.map((row) => String(row.owner_id));
+    candidates = owners.flatMap((owner) => store.listRuns(owner));
+  } else {
+    candidates = store.listRuns(ownerKeysFor(request));
+  }
+  const allowedStates = new Set(parsed.data.states ?? []);
+  const idFilter = parsed.data.runIds ? new Set(parsed.data.runIds) : undefined;
+  const cutoff = parsed.data.olderThanDays === undefined ? undefined : Date.now() - parsed.data.olderThanDays * 86_400_000;
+  const matched = candidates.filter((run) => {
+    if (!TERMINAL_RUN_STATES.has(run.state)) return false;
+    if (allowedStates.size > 0 && !allowedStates.has(run.state)) return false;
+    if (idFilter && !idFilter.has(run.id)) return false;
+    if (cutoff !== undefined && new Date(run.updatedAt).getTime() > cutoff) return false;
+    return true;
+  });
+  if (parsed.data.dryRun) {
+    return { dryRun: true, matched: matched.length, runIds: matched.map((run) => run.id) };
+  }
+  const deleted: string[] = [];
+  for (const run of matched) {
+    try {
+      await store.deleteRun(run.id);
+      deleted.push(run.id);
+    } catch (error) {
+      app.log.warn({ runId: run.id, error: (error as Error).message }, "cleanup: failed to delete run");
+    }
+  }
+  if (deleted.length > 0) app.log.info({ actor: user.id, deleted }, "cleaned up finished runs");
+  return { dryRun: false, deleted: deleted.length, runIds: deleted, matched: matched.length };
 });
 
 // ---------------------------------------------------------------- job queue (REL-002)
@@ -943,10 +1183,13 @@ app.post<{ Params: { id: string } }>("/api/internal/runs/:id/update", { bodyLimi
         patch: patch as Partial<Run> | undefined,
         event: event ? { ...event, runId: run.id, at: new Date().toISOString() } : undefined,
       });
+      // AUD-16: the terminal callback carries the run diff; persist it in full.
+      if (result.applied) await persistTerminalDiffArtifact(store.getRun(run.id));
       return { ok: true, applied: result.applied, seq: result.seq };
     }
     if (patch) await store.updateRun(run.id, patch as Partial<Run>);
     if (event) await store.appendEvent({ ...event, runId: run.id, at: new Date().toISOString() });
+    if (patch) await persistTerminalDiffArtifact(store.getRun(run.id));
     return { ok: true, applied: true };
   } catch (error) {
     if ((error as { code?: string }).code === "INVALID_STATE_TRANSITION") {

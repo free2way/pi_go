@@ -281,6 +281,18 @@ export interface ModelCatalogResponse {
 
 export type WorkspaceStatus = "active" | "unregistered" | "invalid";
 
+/** GAP-04 / AUD-16: a downloadable run artifact (metadata only in listings). */
+export interface RunArtifact {
+  runId: string;
+  artifactId: string;
+  kind: string;
+  bytes: number;
+  sha256: string | null;
+  /** GAP-01: pinned base commit the patch was produced against. */
+  baseSha: string | null;
+  createdAt: string;
+}
+
 export interface WorkspaceGitInfo {
   branch: string | null;
   head: string | null;

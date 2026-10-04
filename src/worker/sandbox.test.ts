@@ -32,6 +32,17 @@ describe("buildContainerSpec", () => {
     expect(spec.WorkingDir).toBe("/workspace/runs/owner/run_1");
   });
 
+  it("mounts allowlisted plugins read-only and nothing when unconfigured (GAP-02)", () => {
+    const withoutPlugins = buildContainerSpec(base);
+    expect(withoutPlugins.HostConfig.Binds.some((bind) => bind.includes("/opt/pigo/plugins"))).toBe(false);
+
+    const spec = buildContainerSpec({
+      ...base,
+      pluginMounts: [{ hostPath: "/opt/pigo/review.ts", containerPath: "/opt/pigo/plugins/0-review.ts" }],
+    });
+    expect(spec.HostConfig.Binds).toContain("/opt/pigo/review.ts:/opt/pigo/plugins/0-review.ts:ro");
+  });
+
   it("applies the container security baseline (SEC-005)", () => {
     const spec = buildContainerSpec(base);
     expect(spec.User).toBe("node");

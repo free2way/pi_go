@@ -261,6 +261,15 @@ export const databaseMigrations: Migration[] = [
       CREATE UNIQUE INDEX idx_workspaces_canonical ON workspaces(canonical_path);
     `,
   },
+  {
+    id: 6,
+    name: "artifact-content-and-check-exit-code",
+    sql: `
+      ALTER TABLE run_artifacts ADD COLUMN content TEXT;
+      ALTER TABLE run_artifacts ADD COLUMN base_sha TEXT;
+      ALTER TABLE run_checks ADD COLUMN exit_code INTEGER;
+    `,
+  },
 ];
 
 export async function runMigrations(db: Db) {

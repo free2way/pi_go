@@ -1,7 +1,14 @@
 import { createHash } from "node:crypto";
 import type { Run, RunEvent } from "../shared/types.js";
 import type { Db } from "./db.js";
-import type { AppendEventOptions, EventListener, RunStoreLike } from "./store.js";
+import type {
+  AppendEventOptions,
+  ArtifactContent,
+  ArtifactRecord,
+  EventListener,
+  RunStoreLike,
+  SaveArtifactInput,
+} from "./store.js";
 
 export type JobState = "queued" | "claimed" | "done" | "failed" | "cancelled";
 
@@ -15,7 +22,9 @@ const runTransitions: Record<string, ReadonlyArray<string>> = {
   developing: ["checking", "reviewing", "cancelled", "failed", "needs_human"],
   checking: ["developing", "reviewing", "cancelled", "failed", "needs_human"],
   reviewing: ["developing", "completed", "cancelled", "failed", "needs_human"],
-  needs_human: ["queued", "reviewing", "checking", "developing", "cancelled", "failed"],
+  // GAP-04 / AT-RUN-009: a human may approve the delivered worktree (completed)
+  // or reject/terminate it (cancelled).
+  needs_human: ["queued", "reviewing", "checking", "developing", "completed", "cancelled", "failed"],
   completed: [],
   failed: [],
   cancelled: [],
@@ -343,6 +352,66 @@ export class PostgresRunStore implements RunStoreLike {
     });
   }
 
+  // -------------------------------------------------- artifacts (GAP-04 / AUD-16)
+
+  /** GAP-04: artifact metadata for a run, newest first; content is excluded. */
+  async listArtifacts(runId: string): Promise<ArtifactRecord[]> {
+    const result = await this.db.query(
+      "SELECT run_id, artifact_id, kind, bytes, sha256, base_sha, created_at FROM run_artifacts WHERE run_id = $1 ORDER BY created_at DESC",
+      [runId],
+    );
+    return result.rows.map((row) => this.mapArtifact(row));
+  }
+
+  /** Reads artifact metadata + content from PostgreSQL so the download is authoritative. */
+  async getArtifact(runId: string, artifactId: string): Promise<ArtifactContent | undefined> {
+    const row = (await this.db.query(
+      "SELECT run_id, artifact_id, kind, bytes, sha256, base_sha, created_at, content FROM run_artifacts WHERE run_id = $1 AND artifact_id = $2",
+      [runId, artifactId],
+    )).rows[0];
+    if (!row) return undefined;
+    return { ...this.mapArtifact(row), content: row.content === null || row.content === undefined ? null : String(row.content) };
+  }
+
+  /**
+   * AUD-16: persists the full artifact body. The per-run process is the only
+   * writer, so a plain upsert is enough; `content` is never truncated here (the
+   * route enforces a download cap separately).
+   */
+  async saveArtifact(input: SaveArtifactInput): Promise<ArtifactRecord> {
+    const createdAt = input.createdAt ?? new Date().toISOString();
+    const bytes = Buffer.byteLength(input.content, "utf8");
+    const hash = sha256(input.content);
+    await this.db.query(
+      `INSERT INTO run_artifacts (run_id, artifact_id, kind, bytes, sha256, base_sha, created_at, content)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (run_id, artifact_id) DO UPDATE SET
+         kind = $3, bytes = $4, sha256 = $5, base_sha = $6, created_at = $7, content = $8`,
+      [input.runId, input.artifactId, input.kind, bytes, hash, input.baseSha ?? null, createdAt, input.content],
+    );
+    return {
+      runId: input.runId,
+      artifactId: input.artifactId,
+      kind: input.kind,
+      bytes,
+      sha256: hash,
+      baseSha: input.baseSha ?? null,
+      createdAt,
+    };
+  }
+
+  private mapArtifact(row: Record<string, unknown>): ArtifactRecord {
+    return {
+      runId: String(row.run_id),
+      artifactId: String(row.artifact_id),
+      kind: String(row.kind),
+      bytes: Number(row.bytes),
+      sha256: row.sha256 === null || row.sha256 === undefined ? null : String(row.sha256),
+      baseSha: row.base_sha === null || row.base_sha === undefined ? null : String(row.base_sha),
+      createdAt: String(row.created_at),
+    };
+  }
+
   // ---------------------------------------------------------------- checkpoints
 
   async saveCheckpoint(input: { runId: string; stageKey: string; status: string; payload?: unknown; idempotencyKey?: string | null }) {
@@ -608,8 +677,8 @@ export class PostgresRunStore implements RunStoreLike {
     await tx.query("DELETE FROM run_checks WHERE run_id = $1", [run.id]);
     for (const check of run.checks ?? []) {
       await tx.query(
-        "INSERT INTO run_checks (run_id, check_id, name, command, status, duration_ms) VALUES ($1, $2, $3, $4, $5, $6)",
-        [run.id, check.id, check.name, check.command, check.status, check.durationMs ?? null],
+        "INSERT INTO run_checks (run_id, check_id, name, command, status, duration_ms, exit_code) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        [run.id, check.id, check.name, check.command, check.status, check.durationMs ?? null, check.exitCode ?? null],
       );
     }
     await tx.query("DELETE FROM run_findings WHERE run_id = $1", [run.id]);
@@ -662,12 +731,23 @@ export class PostgresRunStore implements RunStoreLike {
         ],
       );
     }
-    await tx.query("DELETE FROM run_artifacts WHERE run_id = $1", [run.id]);
+    // AUD-16: artifacts are NOT deleted/re-inserted on every projection anymore,
+    // so a full diff artifact body saved at terminal state survives later updates.
+    // A metadata-only row is created for a run that has a diff but no artifact yet.
     if (run.diff) {
-      await tx.query(
-        "INSERT INTO run_artifacts (run_id, artifact_id, kind, bytes, sha256, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
-        [run.id, "diff", "patch", Buffer.byteLength(run.diff, "utf8"), sha256(run.diff), run.updatedAt],
-      );
+      const existing = (await tx.query("SELECT artifact_id, content FROM run_artifacts WHERE run_id = $1 AND artifact_id = 'diff'", [run.id])).rows[0];
+      if (!existing) {
+        await tx.query(
+          "INSERT INTO run_artifacts (run_id, artifact_id, kind, bytes, sha256, base_sha, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+          [run.id, "diff", "patch", Buffer.byteLength(run.diff, "utf8"), sha256(run.diff), run.baseSha ?? null, run.updatedAt],
+        );
+      } else if (existing.content === null || existing.content === undefined) {
+        // Keep the metadata in step with the latest preview until a full body is saved.
+        await tx.query(
+          "UPDATE run_artifacts SET bytes = $2, sha256 = $3, base_sha = COALESCE($4, base_sha), created_at = $5 WHERE run_id = $1 AND artifact_id = 'diff'",
+          [run.id, Buffer.byteLength(run.diff, "utf8"), sha256(run.diff), run.baseSha ?? null, run.updatedAt],
+        );
+      }
     }
   }
 }

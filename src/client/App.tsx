@@ -24,6 +24,7 @@ import {
   Clock3,
   Code2,
   Cpu,
+  Download,
   FileCode2,
   FolderGit2,
   GitBranch,
@@ -48,12 +49,13 @@ import {
   Zap,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { ConfigStatus, CurrentUser, Finding, ModelCatalogResponse, Run, RunEvent, RunMode, RunState, Workspace } from "../shared/types";
+import type { ConfigStatus, CurrentUser, Finding, ModelCatalogResponse, Run, RunArtifact, RunEvent, RunMode, RunRoleUsage, RunState, Workspace } from "../shared/types";
 import { api } from "./api";
+import { MAX_BUFFERED_EVENTS, mergeRunEvents, shouldAcceptRun } from "./run-events";
 import { ModelsPage } from "./ModelsPage";
 import { WorkspacesPage } from "./WorkspacesPage";
 
-type Tab = "activity" | "agents" | "review" | "diff" | "checks";
+type Tab = "activity" | "agents" | "review" | "diff" | "checks" | "budget";
 type FlowNodeData = {
   label: string;
   caption: string;
@@ -433,12 +435,27 @@ function SubAgentsPanel({ run }: { run: Run }) {
   );
 }
 
-function DiffPanel({ diff }: { diff: string }) {
-  if (!diff) return <EmptyPanel icon={FileCode2} text="尚无代码变更" />;
+function DiffPanel({ run, artifacts }: { run: Run; artifacts: RunArtifact[] }) {
+  const diffArtifact = artifacts.find((artifact) => artifact.artifactId === "diff");
+  const downloadUrl = api.artifactDownloadUrl(run.id, "diff");
   return (
-    <pre className="diff-view">{diff.split("\n").map((line, index) => (
-      <span className={line.startsWith("+") ? "diff-add" : line.startsWith("-") ? "diff-remove" : line.startsWith("@@") ? "diff-hunk" : ""} key={`${index}-${line}`}>{line}{"\n"}</span>
-    ))}</pre>
+    <div className="diff-panel">
+      <div className="artifact-bar">
+        {diffArtifact || run.diff ? (
+          <a className="button secondary" href={downloadUrl} download>
+            <Download size={14} />下载完整 Diff (.patch)
+            {diffArtifact ? <em>{diffArtifact.bytes} bytes · {diffArtifact.sha256?.slice(0, 12)}</em> : null}
+          </a>
+        ) : null}
+        {diffArtifact?.baseSha ? <code className="artifact-base">base {diffArtifact.baseSha.slice(0, 10)}</code> : null}
+        <span className="artifact-hint">页面预览可能被截断；完整内容以制品下载为准。</span>
+      </div>
+      {run.diff ? (
+        <pre className="diff-view">{run.diff.split("\n").map((line, index) => (
+          <span className={line.startsWith("+") ? "diff-add" : line.startsWith("-") ? "diff-remove" : line.startsWith("@@") ? "diff-hunk" : ""} key={`${index}-${line}`}>{line}{"\n"}</span>
+        ))}</pre>
+      ) : <EmptyPanel icon={FileCode2} text="尚无代码变更" />}
+    </div>
   );
 }
 
@@ -451,9 +468,62 @@ function ChecksPanel({ run }: { run: Run }) {
             {check.status === "passed" ? <Check size={14} /> : check.status === "running" ? <LoaderCircle className="spin" size={14} /> : <CircleDot size={14} />}
           </span>
           <div><strong>{check.name}</strong><code>{check.command}</code></div>
+          <span className="check-exit" title="进程退出码">{check.exitCode === undefined ? "exit —" : `exit ${check.exitCode}`}</span>
           <span>{check.durationMs ? `${(check.durationMs / 1000).toFixed(1)}s` : "—"}</span>
         </div>
       ))}
+    </div>
+  );
+}
+
+/** GAP-04: per-run budget limits vs. current spend, remaining calls/cost. */
+function BudgetPanel({ run }: { run: Run }) {
+  const budget = run.budget;
+  const usedTokens = run.usage.totalTokens ?? run.usage.inputTokens + run.usage.outputTokens;
+  const usedCost = run.usage.estimatedCost;
+  const usedCalls = run.modelCalls ?? (run.usageRoles ?? []).reduce((total, entry) => total + entry.calls, 0);
+  const usedSeconds = Math.round(run.durationMs / 1000);
+  const remaining = (limit: number, used: number) => (limit > 0 ? Math.max(0, limit - used) : null);
+  const rows = [
+    { label: "Tokens", limit: budget?.maxTokens ?? 0, used: usedTokens, remaining: remaining(budget?.maxTokens ?? 0, usedTokens), unit: "" },
+    { label: "成本 (USD)", limit: budget?.maxCostUsd ?? 0, used: usedCost, remaining: remaining(budget?.maxCostUsd ?? 0, usedCost), unit: "$" },
+    { label: "模型调用次数", limit: budget?.maxModelCalls ?? 0, used: usedCalls, remaining: remaining(budget?.maxModelCalls ?? 0, usedCalls), unit: "" },
+    { label: "时长 (秒)", limit: budget?.maxDurationSeconds ?? 0, used: usedSeconds, remaining: remaining(budget?.maxDurationSeconds ?? 0, usedSeconds), unit: "" },
+  ];
+  const format = (value: number, unit: string) => `${unit}${unit === "$" ? value.toFixed(3) : compactNumber(value)}`;
+  const roles: RunRoleUsage[] = run.usageRoles ?? [];
+  const sessionFor = (role: string) => {
+    const base = run.id.replaceAll("_", "-");
+    if (role === "developer") return `${base}-developer`;
+    if (role === "integrator") return `${base}-integrator`;
+    if (role === "sub-agent") return `${base}-sub-<taskId>`;
+    return "无独立会话（--no-session）";
+  };
+  return (
+    <div className="budget-panel">
+      <div className="budget-grid">
+        {rows.map((row) => (
+          <div className="budget-row" key={row.label}>
+            <span>{row.label}</span>
+            <strong>{format(row.used, row.unit)}{row.limit > 0 ? <em> / {format(row.limit, row.unit)}</em> : <em> / 未设置上限</em>}</strong>
+            <small>{row.remaining === null ? "未设置上限" : `剩余 ${format(row.remaining, row.unit)}`}</small>
+          </div>
+        ))}
+      </div>
+      <div className="budget-roles">
+        <div className="budget-roles-head"><span>AGENT</span><span>MODEL</span><span>CALLS</span><span>TOKENS</span><span>COST</span></div>
+        {roles.length === 0 && <div className="budget-empty">尚无按 Agent 统计的用量（演示任务不产生真实用量）。</div>}
+        {roles.map((entry) => (
+          <div className="budget-roles-row" key={`${entry.role}-${entry.provider}-${entry.model}`}>
+            <span><strong>{entry.role}</strong><code>{sessionFor(entry.role)}</code></span>
+            <span>{entry.provider}/{entry.model}</span>
+            <span>{entry.calls}</span>
+            <span>{compactNumber(entry.inputTokens + entry.outputTokens)}</span>
+            <span>${entry.estimatedCost.toFixed(3)}</span>
+          </div>
+        ))}
+        {(run.usageUnknownCalls ?? 0) > 0 && <div className="budget-unknown">有 {run.usageUnknownCalls} 次调用的 provider 用量无法确认，未计入费用。</div>}
+      </div>
     </div>
   );
 }
@@ -464,19 +534,25 @@ function EmptyPanel({ icon: Icon, text }: { icon: typeof Activity; text: string 
 
 function HumanInterventionPanel({ run, onUpdated }: { run: Run; onUpdated: (run: Run) => void }) {
   const [instruction, setInstruction] = useState("");
-  const [busy, setBusy] = useState<"" | "resume" | "review" | "terminate">("");
+  const [busy, setBusy] = useState<"" | "resume" | "review" | "terminate" | "approve" | "reject">("");
   const [error, setError] = useState("");
   const unresolved = run.findings.filter((item) => !item.resolved).length;
 
-  const act = async (kind: "resume" | "review" | "terminate") => {
+  const act = async (kind: "resume" | "review" | "terminate" | "approve" | "reject") => {
     setError("");
     if (kind === "terminate" && !window.confirm(`终止任务「${run.title}」？\n\n任务会标记为已取消；代码与 worktree 全部保留，不会自动合并。`)) return;
+    if (kind === "approve" && !window.confirm(`确认通过任务「${run.title}」的交付？\n\n任务将标记为已通过；worktree 中的代码不会自动推送或合并。`)) return;
+    if (kind === "reject" && !window.confirm(`拒绝任务「${run.title}」的交付？\n\n任务将标记为已取消；代码与 worktree 全部保留。`)) return;
     setBusy(kind);
     try {
       if (kind === "resume") {
         onUpdated(await api.resumeRun(run.id, { instruction: instruction.trim() || undefined }));
       } else if (kind === "review") {
         onUpdated(await api.retryReviewRun(run.id));
+      } else if (kind === "approve") {
+        onUpdated(await api.approveRun(run.id, { note: instruction.trim() || undefined }));
+      } else if (kind === "reject") {
+        onUpdated(await api.rejectRun(run.id, { reason: instruction.trim() || undefined }));
       } else {
         onUpdated(await api.cancelRun(run.id));
       }
@@ -494,18 +570,24 @@ function HumanInterventionPanel({ run, onUpdated }: { run: Run; onUpdated: (run:
         <span className="human-reason">{run.summary}</span>
       </div>
       <p className="human-hint">
-        当前有 {unresolved} 条未解决意见，代码保留在服务器 worktree（未自动提交或合并）。你可以直接编辑 worktree 后「恢复下一轮」（会记录恢复点 HEAD 与人工指令），或「重试审核」让 Reviewer 复查当前代码；不再继续时「终止」。
+        当前有 {unresolved} 条未解决意见，代码保留在服务器 worktree（未自动提交或合并）。你可以「通过」确认交付，或直接编辑 worktree 后「恢复下一轮」（会记录恢复点 HEAD 与人工指令）、「重试审核」让 Reviewer 复查当前代码，或「拒绝」终止交付。
       </p>
-      <label>人工指令（可选，随恢复发送给修复 Agent）
+      <label>人工指令 / 审批备注（可选，随恢复或审批记录）
         <textarea rows={3} value={instruction} onChange={(event) => setInstruction(event.target.value)} placeholder="例如：优先修复凭据隔离问题；其余按审核意见逐条处理。" disabled={Boolean(busy)} />
       </label>
       {error && <div className="form-error">{error}</div>}
       <div className="human-actions">
-        <button type="button" className="button primary" disabled={Boolean(busy)} onClick={() => void act("resume")}>
+        <button type="button" className="button primary" disabled={Boolean(busy)} onClick={() => void act("approve")}>
+          {busy === "approve" ? <LoaderCircle className="spin" size={15} /> : <CheckCircle2 size={15} />}通过交付
+        </button>
+        <button type="button" className="button secondary" disabled={Boolean(busy)} onClick={() => void act("resume")}>
           {busy === "resume" ? <LoaderCircle className="spin" size={15} /> : <RotateCcw size={15} />}恢复下一轮
         </button>
         <button type="button" className="button secondary" disabled={Boolean(busy)} onClick={() => void act("review")}>
           {busy === "review" ? <LoaderCircle className="spin" size={15} /> : <ShieldCheck size={15} />}重试审核
+        </button>
+        <button type="button" className="button danger-text" disabled={Boolean(busy)} onClick={() => void act("reject")}>
+          {busy === "reject" ? <LoaderCircle className="spin" size={15} /> : <XCircle size={15} />}拒绝交付
         </button>
         <button type="button" className="button danger-text" disabled={Boolean(busy)} onClick={() => void act("terminate")}>
           {busy === "terminate" ? <LoaderCircle className="spin" size={15} /> : <Square size={14} />}终止
@@ -524,6 +606,7 @@ export function App() {
   const [selectedId, setSelectedId] = useState<string>();
   const [run, setRun] = useState<Run>();
   const [events, setEvents] = useState<RunEvent[]>([]);
+  const [artifacts, setArtifacts] = useState<RunArtifact[]>([]);
   const [config, setConfig] = useState<ConfigStatus>();
   const [user, setUser] = useState<CurrentUser>();
   const [tab, setTab] = useState<Tab>("activity");
@@ -538,29 +621,53 @@ export function App() {
     setSelectedId((current) => current || next[0]?.id);
   }, []);
 
+  /** AUD-17: accept a run snapshot only when it is not older than what is shown. */
+  const applyRun = useCallback((next: Run) => {
+    setRun((current) => (shouldAcceptRun(current, next) ? next : current));
+    setRuns((current) => current.map((item) => (item.id === next.id && shouldAcceptRun(item, next) ? next : item)));
+  }, []);
+
   useEffect(() => {
     void Promise.all([api.config().then(setConfig), api.me().then(setUser), refreshRuns()]).finally(() => setLoading(false));
   }, [refreshRuns]);
 
   useEffect(() => {
-    if (!selectedId) { setRun(undefined); setEvents([]); return; }
+    if (!selectedId) { setRun(undefined); setEvents([]); setArtifacts([]); return; }
     let active = true;
-    void Promise.all([api.run(selectedId), api.events(selectedId)]).then(([nextRun, nextEvents]) => {
+    // Reset for the newly selected run before any snapshot/stream data merges in,
+    // so seq numbers from different runs are never mixed.
+    setEvents([]);
+    setArtifacts([]);
+    void Promise.all([api.run(selectedId), api.events(selectedId), api.artifacts(selectedId)]).then(([nextRun, nextEvents, nextArtifacts]) => {
       if (!active) return;
-      setRun(nextRun);
-      setEvents(nextEvents);
-    });
+      applyRun(nextRun);
+      // Merge (not replace): the SSE stream may already have delivered newer events.
+      setEvents((current) => mergeRunEvents(current, nextEvents, MAX_BUFFERED_EVENTS));
+      setArtifacts(nextArtifacts.artifacts);
+    }).catch(() => undefined);
     const stream = new EventSource(`/api/runs/${selectedId}/stream`);
     stream.onmessage = (message) => {
+      if (!active) return;
       const event = JSON.parse(message.data) as RunEvent;
-      setEvents((current) => current.some((item) => item.seq === event.seq) ? current : [...current, event]);
+      // Dedupe by monotonic seq and cap the buffer so long runs stay bounded.
+      setEvents((current) => mergeRunEvents(current, [event], MAX_BUFFERED_EVENTS));
       void api.run(selectedId).then((nextRun) => {
-        setRun(nextRun);
-        setRuns((current) => current.map((item) => item.id === nextRun.id ? nextRun : item));
-      });
+        if (!active) return;
+        applyRun(nextRun);
+      }).catch(() => undefined);
     };
     return () => { active = false; stream.close(); };
-  }, [selectedId]);
+  }, [selectedId, applyRun]);
+
+  // GAP-04: the artifact list becomes meaningful at terminal state.
+  useEffect(() => {
+    if (!selectedId || !run || !terminalStates.includes(run.state)) return;
+    let active = true;
+    void api.artifacts(selectedId).then((response) => {
+      if (active) setArtifacts(response.artifacts);
+    }).catch(() => undefined);
+    return () => { active = false; };
+  }, [selectedId, run?.state]);
 
   const flow = useMemo(() => flowForRun(run), [run]);
   const running = runs.filter((item) => !terminalStates.includes(item.state)).length;
@@ -570,7 +677,19 @@ export function App() {
     setSelectedId(created.id);
     setRun(created);
     setEvents([]);
+    setArtifacts([]);
     setView("run");
+  };
+
+  const handleCleanup = async () => {
+    if (!window.confirm("清理 7 天前已结束（通过/失败/取消/需人工）的任务？\n\n任务记录、事件与制品会一并删除；worktree 保留在服务器。")) return;
+    try {
+      const result = await api.cleanupRuns({ olderThanDays: 7 });
+      await refreshRuns();
+      window.alert(`已清理 ${result.deleted ?? 0} 个已结束任务。`);
+    } catch (cause) {
+      window.alert(`清理失败：${(cause as Error).message}`);
+    }
   };
 
   const handleDelete = async (target: Run) => {
@@ -600,7 +719,7 @@ export function App() {
           <button type="button" className={view === "models" ? "active" : ""} onClick={() => setView("models")}><Cpu size={16} />模型与凭据</button>
           <a href="#system"><Activity size={16} />运行状态</a>
         </nav>
-        <div className="sidebar-section-head"><span>最近任务</span><Search size={14} /></div>
+        <div className="sidebar-section-head"><span>最近任务</span><span className="sidebar-head-actions"><Search size={14} /><button className="sidebar-cleanup" type="button" title="清理 7 天前已结束的任务" onClick={() => void handleCleanup()}><Trash2 size={13} /></button></span></div>
         <div className="run-list">
           {runs.map((item) => (
             <div className={`run-item ${selectedId === item.id ? "selected" : ""}`} key={item.id}>
@@ -703,6 +822,7 @@ export function App() {
                     ["review", `审核 ${run.findings.length || ""}`, ShieldCheck],
                     ["diff", "Diff", FileCode2],
                     ["checks", "检查", ListChecks],
+                    ["budget", "预算与用量", Braces],
                   ] as const).map(([key, label, Icon]) => (
                     <button className={tab === key ? "active" : ""} key={key} onClick={() => setTab(key)}><Icon size={14} />{label}</button>
                   ))}
@@ -711,8 +831,9 @@ export function App() {
                   {tab === "activity" && <ActivityPanel events={events} />}
                   {tab === "agents" && <SubAgentsPanel run={run} />}
                   {tab === "review" && <ReviewPanel findings={run.findings} />}
-                  {tab === "diff" && <DiffPanel diff={run.diff} />}
+                  {tab === "diff" && <DiffPanel run={run} artifacts={artifacts} />}
                   {tab === "checks" && <ChecksPanel run={run} />}
+                  {tab === "budget" && <BudgetPanel run={run} />}
                 </div>
               </section>
             </div>

@@ -278,4 +278,39 @@ describe("PostgresRunStore", () => {
     expect(broken.getRun(run.id)?.summary).not.toBe("should not stick");
   });
 
+  it("stores the full diff artifact body and keeps it across later run updates (AUD-16)", async () => {
+    const db = await createTestDb();
+    const store = new PostgresRunStore(db);
+    await store.init();
+    const run = makeRun({ diff: "diff --git a/f b/f\n+first preview\n" });
+    await store.createRun(run, event(run.id, "run.created"));
+    // createRun projects metadata only (no body yet).
+    expect(await store.getArtifact(run.id, "diff")).toMatchObject({ bytes: Buffer.byteLength(run.diff), content: null });
+
+    const full = "diff --git a/f b/f\n+full body\n+".concat("x".repeat(50_000), "\n");
+    await store.saveArtifact({ runId: run.id, artifactId: "diff", kind: "patch", content: full, baseSha: "abc123" });
+    // A later update with a (possibly truncated) preview must not wipe the body.
+    await store.updateRun(run.id, { diff: "diff --git a/f b/f\n+truncated\n" });
+
+    const artifacts = await store.listArtifacts(run.id);
+    expect(artifacts.length).toBe(1);
+    expect(artifacts[0]).toMatchObject({ artifactId: "diff", kind: "patch", bytes: Buffer.byteLength(full), baseSha: "abc123" });
+    const stored = await store.getArtifact(run.id, "diff");
+    expect(stored?.content).toBe(full);
+    const row = (await db.query("SELECT content, base_sha FROM run_artifacts WHERE run_id = $1 AND artifact_id = 'diff'", [run.id])).rows[0];
+    expect(String(row.content)).toBe(full);
+    expect(String(row.base_sha)).toBe("abc123");
+  });
+
+  it("stores check exit codes for check records (GAP-04)", async () => {
+    const db = await createTestDb();
+    const store = new PostgresRunStore(db);
+    await store.init();
+    const run = makeRun({ checks: [{ id: "c1", name: "tests", command: "npm test", status: "failed", exitCode: 2, durationMs: 12 }] });
+    await store.createRun(run, event(run.id, "run.created"));
+    const row = (await db.query("SELECT exit_code, status FROM run_checks WHERE run_id = $1 AND check_id = 'c1'", [run.id])).rows[0];
+    expect(Number(row.exit_code)).toBe(2);
+    expect(String(row.status)).toBe("failed");
+  });
+
 });

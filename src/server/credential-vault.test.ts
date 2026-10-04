@@ -162,4 +162,36 @@ describe("CredentialVault", () => {
     expect(vault.get("owner-a", "deepseek")).toBe("second-dev-secret");
     expect(vault.get("owner-a", "openai-proxy")).toBe("review-secret");
   });
+
+  it("lists only unverified credentials for the startup pass, across users (AUD-08 cutover)", async () => {
+    const file = await vaultFile();
+    const vault = new CredentialVault(file, secretFor(31));
+    await vault.init();
+    await vault.set("owner-a", { provider: "deepseek", apiKey: "dev-secret-value" });
+    await vault.set("owner-a", { provider: "openai-proxy", apiKey: "review-secret-value" });
+    await vault.set("owner-b", { provider: "anthropic", apiKey: "claude-secret-value" });
+    await vault.markVerified("owner-a", "deepseek", ["deepseek-chat"]);
+
+    const pending = vault.pendingVerifications();
+    expect(pending.sort((a, b) => a.provider.localeCompare(b.provider))).toEqual([
+      { userId: "owner-b", provider: "anthropic" },
+      { userId: "owner-a", provider: "openai-proxy" },
+    ]);
+    // The listing never carries key material.
+    expect(JSON.stringify(pending)).not.toContain("secret-value");
+  });
+
+  it("marks a credential verified for all models when the probe is disabled (AUD-08 cutover)", async () => {
+    const file = await vaultFile();
+    const vault = new CredentialVault(file, secretFor(37));
+    await vault.init();
+    await vault.set("owner-a", { provider: "openai-proxy", apiKey: "review-secret-value" });
+
+    await vault.markVerified("owner-a", "openai-proxy", null);
+    const availability = vault.providerAvailability("owner-a")[0];
+    expect(availability.verifiedAt).not.toBeNull();
+    // null = "no per-model restriction" for the operator-asserted path.
+    expect(availability.verifiedModels).toBeNull();
+    expect(vault.pendingVerifications()).toEqual([]);
+  });
 });

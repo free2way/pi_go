@@ -1,10 +1,15 @@
+import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { Run, RunEvent } from "../shared/types.js";
+import type { Run, RunArtifact, RunEvent } from "../shared/types.js";
 
 interface DatabaseShape {
   runs: Run[];
   events: Record<string, RunEvent[]>;
+}
+
+function artifactSha(content: string) {
+  return createHash("sha256").update(content).digest("hex");
 }
 
 export type EventListener = (event: RunEvent) => void;
@@ -12,6 +17,22 @@ export type EventListener = (event: RunEvent) => void;
 export interface AppendEventOptions {
   /** Idempotency key for at-least-once delivery (AT-REL-004). */
   deliveryId?: string;
+}
+
+/** GAP-04: run artifact metadata; `content` is only returned by `getArtifact`. */
+export type ArtifactRecord = RunArtifact;
+
+export interface ArtifactContent extends ArtifactRecord {
+  content: string | null;
+}
+
+export interface SaveArtifactInput {
+  runId: string;
+  artifactId: string;
+  kind: string;
+  content: string;
+  baseSha?: string | null;
+  createdAt?: string;
 }
 
 /** Storage contract shared by the JSON (dev/test) and PostgreSQL (REL-001) stores. */
@@ -25,10 +46,17 @@ export interface RunStoreLike {
   getEvents(runId: string, after?: number, limit?: number): Promise<RunEvent[]>;
   subscribe(runId: string, listener: EventListener): () => void;
   deleteRun(id: string): Promise<void>;
+  /** GAP-04: artifact metadata, newest first (content is never returned here). */
+  listArtifacts(runId: string): Promise<ArtifactRecord[]>;
+  /** GAP-04/AUD-16: one artifact including its stored content, when present. */
+  getArtifact(runId: string, artifactId: string): Promise<ArtifactContent | undefined>;
+  /** AUD-16: persists the full artifact content (overwrites a metadata-only row). */
+  saveArtifact(input: SaveArtifactInput): Promise<ArtifactRecord>;
 }
 
 export class RunStore implements RunStoreLike {
   private data: DatabaseShape = { runs: [], events: {} };
+  private artifacts = new Map<string, ArtifactContent>();
   private listeners = new Map<string, Set<EventListener>>();
   private deliveryIds = new Map<string, Map<string, number>>();
   private writeQueue: Promise<void> = Promise.resolve();
@@ -58,6 +86,7 @@ export class RunStore implements RunStoreLike {
   async createRun(run: Run, event: Omit<RunEvent, "seq">) {
     this.data.runs.push(run);
     this.data.events[run.id] = [];
+    this.projectArtifact(run);
     await this.appendEvent(event);
     return run;
   }
@@ -66,6 +95,7 @@ export class RunStore implements RunStoreLike {
     const run = this.getRun(id);
     if (!run) throw new Error(`Run not found: ${id}`);
     Object.assign(run, patch, { updatedAt: new Date().toISOString() });
+    this.projectArtifact(run);
     await this.persist();
     return run;
   }
@@ -119,7 +149,55 @@ export class RunStore implements RunStoreLike {
     delete this.data.events[id];
     this.deliveryIds.delete(id);
     this.listeners.delete(id);
+    for (const key of [...this.artifacts.keys()]) {
+      if (this.artifacts.get(key)?.runId === id) this.artifacts.delete(key);
+    }
     await this.persist();
+  }
+
+  // ------------------------------------------------------------------ artifacts (GAP-04 / AUD-16)
+
+  async listArtifacts(runId: string): Promise<ArtifactRecord[]> {
+    return [...this.artifacts.values()]
+      .filter((artifact) => artifact.runId === runId)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  async getArtifact(runId: string, artifactId: string): Promise<ArtifactContent | undefined> {
+    return this.artifacts.get(`${runId}|${artifactId}`);
+  }
+
+  async saveArtifact(input: SaveArtifactInput): Promise<ArtifactRecord> {
+    const record: ArtifactContent = {
+      runId: input.runId,
+      artifactId: input.artifactId,
+      kind: input.kind,
+      bytes: Buffer.byteLength(input.content, "utf8"),
+      sha256: artifactSha(input.content),
+      baseSha: input.baseSha ?? null,
+      createdAt: input.createdAt ?? new Date().toISOString(),
+      content: input.content,
+    };
+    this.artifacts.set(`${input.runId}|${input.artifactId}`, record);
+    return record;
+  }
+
+  /** Metadata-only diff artifact so a run created with a diff is always listed. */
+  private projectArtifact(run: Run) {
+    if (!run.diff) return;
+    const key = `${run.id}|diff`;
+    const existing = this.artifacts.get(key);
+    if (existing?.content) return;
+    this.artifacts.set(key, {
+      runId: run.id,
+      artifactId: "diff",
+      kind: "patch",
+      bytes: Buffer.byteLength(run.diff, "utf8"),
+      sha256: artifactSha(run.diff),
+      baseSha: run.baseSha ?? null,
+      createdAt: run.updatedAt,
+      content: existing?.content ?? null,
+    });
   }
 
   private persist() {

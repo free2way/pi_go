@@ -102,4 +102,26 @@ describe("RunStore", () => {
     expect(persisted.runs).toHaveLength(0);
     expect(persisted.events[run.id]).toBeUndefined();
   });
+
+  it("lists and stores run artifacts including the diff body (GAP-04/AUD-16)", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "pigo-store-"));
+    const store = new RunStore(path.join(directory, "runs.json"));
+    await store.init();
+    const run = baseDemoRun({ title: "Artifact run", task: "A sufficiently long test task", repository: "test/repo" }, "owner-a");
+    run.diff = "diff --git a/a b/a\n+preview\n";
+    await store.createRun(run, { runId: run.id, round: 1, source: "system", type: "run.created", message: "created", at: new Date().toISOString() });
+
+    const metadata = await store.listArtifacts(run.id);
+    expect(metadata).toHaveLength(1);
+    expect(metadata[0]).toMatchObject({ artifactId: "diff", kind: "patch" });
+    expect((await store.getArtifact(run.id, "diff"))?.content).toBeNull();
+
+    const full = run.diff.concat("+more\n".repeat(100));
+    await store.saveArtifact({ runId: run.id, artifactId: "diff", kind: "patch", content: full, baseSha: "sha1" });
+    expect((await store.getArtifact(run.id, "diff"))?.content).toBe(full);
+    expect((await store.listArtifacts(run.id))[0].baseSha).toBe("sha1");
+
+    await store.deleteRun(run.id);
+    expect(await store.listArtifacts(run.id)).toEqual([]);
+  });
 });

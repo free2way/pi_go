@@ -146,19 +146,36 @@ export class CredentialVault {
 
   /**
    * AUD-08 / AT-MODEL-004: records a successful live probe. `models` is the
-   * provider-reported model id list; an empty list means "the credential works
-   * but the provider did not enumerate models", so no per-model restriction is
-   * applied.
+   * provider-reported model id list; `null` (or an empty list) means "the
+   * credential is valid but no per-model restriction applies", so every model on
+   * the provider may be used. This is the explicit operator assertion path for
+   * `PI_MODEL_PROBE_MODE=off` deployments without a reachable /models endpoint.
    */
-  async markVerified(userId: string, provider: string, models: string[]) {
+  async markVerified(userId: string, provider: string, models: string[] | null) {
     const record = this.data.users[userId]?.providers?.[provider];
     if (!record) return this.status(userId);
     const now = new Date().toISOString();
     record.verifiedAt = now;
-    record.verifiedModels = Array.isArray(models) ? models.slice(0, 500) : null;
+    record.verifiedModels = models === null ? null : models.slice(0, 500);
     this.data.users[userId].updatedAt = now;
     await this.persist();
     return this.status(userId);
+  }
+
+  /**
+   * AUD-08 cutover safety: every stored provider credential that has never been
+   * verified (`verifiedAt === null`). Used by the bounded startup pass so keys
+   * written before live verification existed do not block every real run. Only
+   * ids/providers are returned; key material stays inside the vault.
+   */
+  pendingVerifications(): Array<{ userId: string; provider: string }> {
+    const pending: Array<{ userId: string; provider: string }> = [];
+    for (const [userId, record] of Object.entries(this.data.users)) {
+      for (const [provider, value] of Object.entries(record.providers ?? {})) {
+        if (value.verifiedAt === null) pending.push({ userId, provider });
+      }
+    }
+    return pending;
   }
 
   /** Records a failed/incomplete probe so the credential is shown as unverified. */

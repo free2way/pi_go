@@ -22,6 +22,8 @@ export interface SandboxRequest {
   stateMount?: "volume" | "bind";
   /** Absolute host path backing the state directory when using a bind mount. */
   hostStateDir?: string;
+  /** GAP-02: allowlisted Pi plugins, mounted read-only into the sandbox. */
+  pluginMounts?: Array<{ hostPath: string; containerPath: string }>;
   env: Record<string, string>;
   argv: string[];
   user?: string;
@@ -52,6 +54,11 @@ export function buildContainerSpec(request: SandboxRequest): ContainerCreateSpec
   }
   if (request.stateMount === "bind" && request.hostStateDir) {
     binds.push(`${request.hostStateDir}:${request.stateDir}:rw`);
+  }
+  for (const plugin of request.pluginMounts ?? []) {
+    // GAP-02: only explicitly allowlisted resources are exposed, and read-only
+    // so a task can never tamper with an approved plugin.
+    binds.push(`${plugin.hostPath}:${plugin.containerPath}:ro`);
   }
 
   const env = Object.entries(request.env).map(([key, value]) => `${key}=${value}`);

@@ -403,3 +403,31 @@ button { color: inherit; }
 .model-credential-form .button { height: 34px; padding: 0 12px; font-size: 10px; }
 .model-credential-form .danger-text { height: 34px; border-radius: 8px; padding: 0 12px; font-size: 10px; font-weight: 650; cursor: pointer; }
 @media (max-width: 760px) { .model-grid { grid-template-columns: 1fr; } .model-credential-form { flex-wrap: wrap; } }
+
+/* ---------- GAP-04: artifacts, checks exit code, budget & per-agent usage ---------- */
+.sidebar-head-actions { display: flex; align-items: center; gap: 8px; }
+.sidebar-cleanup { display: inline-flex; align-items: center; justify-content: center; border: 1px solid #262d34; background: #12161b; color: #7b858f; border-radius: 6px; width: 22px; height: 22px; cursor: pointer; }
+.sidebar-cleanup:hover { color: #e07a72; border-color: rgba(224,122,114,.4); }
+
+.artifact-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+.artifact-bar .button { height: 32px; padding: 0 12px; font-size: 10px; text-decoration: none; }
+.artifact-bar .button em { font-style: normal; color: #6d7782; font: 8px "DM Mono", monospace; margin-left: 4px; }
+.artifact-base { color: #6d7782; font: 9px "DM Mono", monospace; }
+.artifact-hint { color: #8a7f6c; font-size: 9px; }
+.check-exit { color: #7b858f; font: 9px "DM Mono", monospace; }
+
+.budget-panel { display: flex; flex-direction: column; gap: 14px; }
+.budget-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 8px; }
+.budget-row { border: 1px solid #1f252c; background: #0f1317; border-radius: 8px; padding: 10px 12px; }
+.budget-row > span { color: #6d7782; font-size: 9px; letter-spacing: .08em; text-transform: uppercase; }
+.budget-row strong { display: block; margin-top: 6px; font-size: 15px; color: #e6ebef; }
+.budget-row strong em { font-style: normal; color: #7b858f; font-size: 10px; font-weight: 500; }
+.budget-row small { display: block; margin-top: 4px; color: #83ccaa; font-size: 9px; }
+.budget-roles { border: 1px solid #1f252c; border-radius: 8px; overflow: hidden; }
+.budget-roles-head, .budget-roles-row { display: grid; grid-template-columns: 1.4fr 1.4fr .6fr .8fr .7fr; gap: 8px; padding: 8px 12px; align-items: center; }
+.budget-roles-head { background: #12161b; color: #5f6974; font: 8px "DM Mono", monospace; letter-spacing: .09em; }
+.budget-roles-row { border-top: 1px solid #1a1f25; font-size: 10px; color: #c3cad1; }
+.budget-roles-row strong { display: block; color: #e6ebef; }
+.budget-roles-row code { display: block; margin-top: 3px; color: #6d7782; font: 8px "DM Mono", monospace; word-break: break-all; }
+.budget-empty { padding: 12px; color: #7b858f; font-size: 10px; }
+.budget-unknown { padding: 8px 12px; border-top: 1px solid #1a1f25; color: #d9a06c; font-size: 9px; }

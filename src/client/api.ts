@@ -1,4 +1,4 @@
-import type { ConfigStatus, CredentialStatus, CurrentUser, ModelCatalogResponse, ModelSelection, Run, RunEvent, Workspace } from "../shared/types";
+import type { ConfigStatus, CredentialStatus, CurrentUser, ModelCatalogResponse, ModelSelection, Run, RunArtifact, RunEvent, Workspace } from "../shared/types";
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -40,9 +40,17 @@ export const api = {
   runs: () => request<Run[]>("/api/runs"),
   run: (id: string) => request<Run>(`/api/runs/${id}`),
   events: (id: string) => request<RunEvent[]>(`/api/runs/${id}/events`),
+  artifacts: (id: string) => request<{ artifacts: RunArtifact[] }>(`/api/runs/${id}/artifacts`),
+  artifactDownloadUrl: (id: string, artifactId: string) => `/api/runs/${id}/artifacts/${encodeURIComponent(artifactId)}/download`,
   createRun: (body: { title: string; task: string; repository?: string; workspaceId?: string; mode: "demo" | "real"; checks?: string[]; developerModel?: ModelSelection; reviewerModel?: ModelSelection }) =>
     request<Run>("/api/runs", { method: "POST", body: JSON.stringify(body) }),
   cancelRun: (id: string) => request<Run>(`/api/runs/${id}/cancel`, { method: "POST" }),
+  approveRun: (id: string, body: { note?: string } = {}) =>
+    request<Run>(`/api/runs/${id}/approve`, { method: "POST", body: JSON.stringify(body) }),
+  rejectRun: (id: string, body: { reason?: string } = {}) =>
+    request<Run>(`/api/runs/${id}/reject`, { method: "POST", body: JSON.stringify(body) }),
+  cleanupRuns: (body: { runIds?: string[]; states?: Run["state"][]; olderThanDays?: number; scope?: "own" | "all"; dryRun?: boolean } = {}) =>
+    request<{ dryRun: boolean; deleted?: number; runIds: string[]; matched: number }>("/api/runs/cleanup", { method: "POST", body: JSON.stringify(body) }),
   resumeRun: (id: string, body: { instruction?: string }) =>
     request<Run>(`/api/runs/${id}/resume`, { method: "POST", body: JSON.stringify(body) }),
   retryReviewRun: (id: string) => request<Run>(`/api/runs/${id}/retry-review`, { method: "POST" }),
