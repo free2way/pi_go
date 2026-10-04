@@ -1,5 +1,6 @@
 export type ProviderErrorKind =
   | "credential"
+  | "storage"
   | "rate_limit"
   | "timeout"
   | "unsupported"
@@ -8,6 +9,9 @@ export type ProviderErrorKind =
   | "unknown";
 
 const patterns: Array<[ProviderErrorKind, RegExp]> = [
+  // AT-REL-007: persistence failures must be reported as storage problems, never
+  // as a successful run.
+  ["storage", /storage_unavailable|no space left on device|enospc|disk (space|full)|econnrefused|connection terminated|terminating connection|callback failed|数据库不可用|存储不可用/i],
   ["credential", /\b(401|403)\b|unauthorized|invalid[_\s-]*api[_\s-]*key|authentication|permission denied|api key.*(invalid|not valid)|invalid_request_error.*\bkey\b/i],
   ["rate_limit", /\b429\b|rate[_\s-]?limit|too many requests|insufficient_quota|no available (accounts|capacity)|model_rate_limited|quota/i],
   ["timeout", /timeout|timed out|etimedout|econnreset|socket hang up|\baborted\b|temporarily unavailable/i],
@@ -26,6 +30,7 @@ export function classifyProviderError(message: string): ProviderErrorKind {
 
 export const providerErrorHints: Record<ProviderErrorKind, string> = {
   credential: "凭据问题：请在「模型与凭据」页检查或轮换该 provider 的 Key。",
+  storage: "存储错误：数据库或磁盘写入失败，任务未完成；恢复存储后可从「需要人工处理」入口继续。",
   rate_limit: "限流或额度不足：稍后重试，或更换模型/账号额度。",
   timeout: "调用超时：确认网络与代理稳定后重试（任务可人工恢复）。",
   unsupported: "该账号或代理不支持所选模型：改用允许目录内的其他模型。",

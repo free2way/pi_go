@@ -7,6 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import type { ConfigStatus, CurrentUser, ModelCatalogResponse, Run, RunEvent, Workspace } from "../shared/types.js";
+import { AlertManager, createAlertSink } from "./alerts.js";
 import { Authenticator } from "./auth.js";
 import { CredentialVault } from "./credential-vault.js";
 import { createDb, createPool, newId, runMigrations } from "./db.js";
@@ -74,6 +75,10 @@ if (store instanceof PostgresRunStore && existsSync(dataFile)) {
     app.log.warn({ error: (error as Error).message }, "legacy runs.json import skipped");
   }
 }
+const alerts = new AlertManager(createAlertSink({
+  log: (level, payload, message) => app.log[level](payload, message),
+  webhookUrl: process.env.PI_ALERT_WEBHOOK,
+}));
 const identities = new IdentityService(db);
 const workspacesEnabled = process.env.PI_WORKSPACES_ENABLED !== "false";
 const workspaces = new WorkspaceService(db, workerRequest);
@@ -261,10 +266,71 @@ function vaultKeyFor(request: FastifyRequest) {
 app.get("/api/health", async (_request, reply) => {
   try {
     await db.query("SELECT 1");
-    return { status: "ok", service: "pigo-web", version: "0.11.0", db: "ok" };
-  } catch {
-    return reply.code(503).send({ status: "error", service: "pigo-web", version: "0.11.0", db: "unavailable" });
+    alerts.clear("database_unavailable");
+    return { status: "ok", service: "pigo-web", version: "0.12.0", db: "ok" };
+  } catch (error) {
+    // AT-REL-005: fail loudly instead of pretending the service is healthy.
+    alerts.raise({
+      key: "database_unavailable",
+      severity: "critical",
+      message: "数据库不可用，Web 已降级：运行/事件读写暂停",
+      details: { error: (error as Error).message.slice(0, 200) },
+    });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.12.0", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
   }
+});
+
+interface StorageStatus {
+  state: "ok" | "low" | "critical";
+  freeBytes: number;
+  totalBytes: number;
+  freePercent: number;
+}
+
+/** REL-006: one place to inspect database, queue, worker and disk health. */
+app.get("/api/health/detail", async (request, reply) => {
+  const internal = safeTokenMatch(request.headers.authorization);
+  if (!internal && !auth.user(request)) return reply.code(401).send({ error: "Unauthorized" });
+  const health: Record<string, unknown> = { version: "0.12.0", at: new Date().toISOString() };
+  try {
+    await db.query("SELECT 1");
+    health.database = { status: "ok" };
+    alerts.clear("database_unavailable");
+  } catch (error) {
+    health.database = { status: "unavailable", error: (error as Error).message.slice(0, 200) };
+    alerts.raise({ key: "database_unavailable", severity: "critical", message: "数据库不可用", details: {} });
+  }
+  if (jobQueue) {
+    try {
+      const jobs = await jobQueue.listPendingJobs({ staleAfterMs: JOB_STALE_MS, limit: 50 });
+      const stale = jobs.filter((job) => job.state === "claimed").length;
+      health.queue = { pending: jobs.length, reclaimedFromDeadWorker: stale };
+      if (jobs.length > 0 && stale > 0) {
+        alerts.raise({ key: "queue_stale", severity: "warning", message: "存在因 Worker 中断而未完成的任务，正在等待重领", details: { count: stale } });
+      }
+    } catch (error) {
+      health.queue = { status: "unavailable", error: (error as Error).message.slice(0, 200) };
+    }
+  }
+  const worker = await workerRequest<{ activeJobs: number }>("/health").then((value) => value).catch(() => undefined);
+  if (worker) {
+    alerts.clear("worker_unreachable");
+    const storage = await workerRequest<StorageStatus>("/health/storage").catch(() => undefined);
+    health.worker = { status: "ok", activeJobs: worker.activeJobs, storage: storage ?? null };
+    if (storage && storage.state !== "ok") {
+      alerts.raise({
+        key: `disk_${storage.state}`,
+        severity: storage.state === "critical" ? "critical" : "warning",
+        message: storage.state === "critical" ? "工作区磁盘空间严重不足，已停止接收新任务" : "工作区磁盘空间偏低",
+        details: { freeBytes: storage.freeBytes, freePercent: storage.freePercent },
+      });
+    }
+  } else {
+    health.worker = { status: "unreachable" };
+    alerts.raise({ key: "worker_unreachable", severity: "critical", message: "无法连接 Worker，任务执行暂停", details: { workerUrl } });
+  }
+  health.alerts = alerts.activeKeys;
+  return health;
 });
 app.get("/api/me", async (request) => auth.user(request));
 app.get("/api/credentials/status", async (request) => vault.status(vaultKeyFor(request)));
@@ -468,6 +534,29 @@ app.post("/api/runs", async (request, reply) => {
     }
     if (!realRunsEnabled || !internalToken) return reply.code(503).send({ error: "Real agent execution is disabled", code: "REAL_RUNNER_NOT_AVAILABLE" });
 
+    // AT-REL-010: stop accepting new work when the workspace disk is critical.
+    const storage = await workerRequest<StorageStatus>("/health/storage").catch(() => undefined);
+    if (storage && storage.state === "critical") {
+      alerts.raise({
+        key: "disk_critical",
+        severity: "critical",
+        message: "工作区磁盘空间严重不足，已停止接收新任务",
+        details: { freeBytes: storage.freeBytes, freePercent: storage.freePercent },
+      });
+      return reply.code(507).send({
+        error: `磁盘空间不足（剩余 ${Math.round(storage.freeBytes / 1024 / 1024)} MB），已停止接收新任务`,
+        code: "DISK_FULL",
+      });
+    }
+    if (storage && storage.state === "low") {
+      alerts.raise({
+        key: "disk_low",
+        severity: "warning",
+        message: "工作区磁盘空间偏低，请清理后继续",
+        details: { freeBytes: storage.freeBytes, freePercent: storage.freePercent },
+      });
+    }
+
     // MODEL-007/008: resolve the exact models and preflight them before queueing.
     const configured = new Set(vault.configuredProviders(vaultKeyFor(request)));
     const developerSelection = parsed.data.developerModel ?? modelDefaults.developer;
@@ -598,7 +687,15 @@ async function requeueStaleJobs() {
   if (!jobQueue) return;
   try {
     const requeued = await jobQueue.requeueStaleJobs(JOB_STALE_MS);
-    if (requeued.length > 0) app.log.warn({ requeued }, "re-queued stale jobs after worker heartbeat loss");
+    if (requeued.length > 0) {
+      app.log.warn({ requeued }, "re-queued stale jobs after worker heartbeat loss");
+      alerts.raise({
+        key: "jobs_requeued",
+        severity: "warning",
+        message: "Worker 心跳超时，未完成任务已重新入队等待领取",
+        details: { count: requeued.length, jobs: requeued.slice(0, 10) },
+      });
+    }
   } catch (error) {
     app.log.error({ error: (error as Error).message }, "stale job requeue failed");
   }
@@ -803,6 +900,20 @@ for (const signal of ["SIGTERM", "SIGINT"] as const) {
     void pool.end().finally(() => process.exit(0));
   });
 }
+
+// AT-REL-007 / AT-REL-005: storage failures are surfaced as explicit 503s
+// instead of generic 500s, and raise an alert.
+app.setErrorHandler((error, _request, reply) => {
+  const message = String((error as Error).message || "");
+  const storageFailure = /ECONNREFUSED|Connection terminated|connection is closed|ETIMEDOUT|terminating connection|57P0|STORAGE_UNAVAILABLE|no space left on device|ENOSPC/i.test(message);
+  if (storageFailure) {
+    alerts.raise({ key: "storage_failure", severity: "critical", message: "存储写入失败，任务未完成", details: { error: message.slice(0, 200) } });
+    return reply.code(503).send({ error: `存储不可用：${message.slice(0, 200)}`, code: "STORAGE_UNAVAILABLE" });
+  }
+  const status = (error as { statusCode?: number }).statusCode ?? 500;
+  if (status >= 500) app.log.error({ error: message }, "request failed");
+  return reply.code(status).send({ error: status >= 500 ? "Internal error" : message });
+});
 
 // REL-002: jobs left unfinished by a stopped worker are re-queued and (when the
 // worker is back) pushed again, so a run never stalls silently.

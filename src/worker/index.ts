@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
 import { timingSafeEqual } from "node:crypto";
-import { mkdir, readdir, realpath, rm, stat } from "node:fs/promises";
+import { mkdir, readdir, realpath, rm, stat, statfs } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
 import type { CheckResult, DevelopmentPlan, Finding, ProjectInfo, Run, RunEvent, RunState, SubAgentTask, WorkspaceVerifyResult } from "../shared/types.js";
@@ -9,6 +9,7 @@ import { CheckpointTracker, memoryCheckpointClient, stages, type Checkpoint, typ
 import { conflictFreeBatches, executionWaves, fallbackPlan, parseDevelopmentPlan } from "./orchestrator.js";
 import { UsageTracker, addUsage, assistantErrorFromEvent, assistantTextFromEvent, emptyUsage, toRunUsage, toolNameFromEvent, type UsageTotals } from "./pi-events.js";
 import { apiKeyEnvName, classifyProviderError, providerErrorSummary } from "./provider-errors.js";
+import { sleep, withProviderRetry } from "./provider-retry.js";
 import { parseReview, type ReviewResult } from "./review-protocol.js";
 import { mergeFindings, unresolvedFeedback } from "./review-findings.js";
 import { WorkspacePathError, resolveInsideRoot, sanitizeRelativePath, sanitizeWorkspaceName, validateCloneUrl } from "./workspace-paths.js";
@@ -26,6 +27,34 @@ const maxSubagents = Number.isInteger(configuredMaxSubagents) ? Math.min(4, Math
 const configuredMaxActiveJobs = Number(process.env.PI_MAX_ACTIVE_JOBS || 1);
 const maxActiveJobs = Number.isInteger(configuredMaxActiveJobs) ? Math.min(4, Math.max(1, configuredMaxActiveJobs)) : 1;
 const active = new Map<string, AbortController>();
+const minFreeDiskMb = Math.max(64, Number(process.env.PI_MIN_FREE_DISK_MB || 2048));
+const criticalFreeDiskMb = Math.max(32, Math.min(minFreeDiskMb, Number(process.env.PI_CRITICAL_FREE_DISK_MB || 512)));
+
+export type StorageStatus = {
+  state: "ok" | "low" | "critical";
+  freeBytes: number;
+  totalBytes: number;
+  freePercent: number;
+  path: string;
+};
+
+/**
+ * AT-REL-010: reports workspace disk headroom so new work stops before the
+ * source repositories or their worktrees are damaged by a full disk.
+ */
+async function storageStatus(): Promise<StorageStatus> {
+  try {
+    const stats = await statfs(workspaceRoot);
+    const freeBytes = Number(stats.bavail) * Number(stats.bsize);
+    const totalBytes = Number(stats.blocks) * Number(stats.bsize);
+    const freeMb = freeBytes / 1024 / 1024;
+    const state = freeMb <= criticalFreeDiskMb ? "critical" : freeMb <= minFreeDiskMb ? "low" : "ok";
+    return { state, freeBytes, totalBytes, freePercent: totalBytes ? Number(((freeBytes / totalBytes) * 100).toFixed(2)) : 0, path: workspaceRoot };
+  } catch (error) {
+    console.warn(`[storage] statfs failed: ${(error as Error).message}`);
+    return { state: "ok", freeBytes: -1, totalBytes: -1, freePercent: -1, path: workspaceRoot };
+  }
+}
 let worktreeMutationQueue: Promise<void> = Promise.resolve();
 
 function serializeWorktreeMutation<T>(operation: () => Promise<T>) {
@@ -162,16 +191,25 @@ async function postUpdate(runId: string, input: {
   patch?: Partial<Run>;
   event?: Omit<RunEvent, "seq" | "runId" | "at">;
 }) {
-  const response = await fetch(`${callbackBase}/api/internal/runs/${runId}/update`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${internalToken}`,
-      "Content-Type": "application/json",
-    },
-    body: encodeCallbackBody(input),
-    signal: AbortSignal.timeout(15_000),
-  });
-  if (!response.ok) throw new Error(`Callback failed: ${response.status}`);
+  let response: Response;
+  try {
+    response = await fetch(`${callbackBase}/api/internal/runs/${runId}/update`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${internalToken}`,
+        "Content-Type": "application/json",
+      },
+      body: encodeCallbackBody(input),
+      signal: AbortSignal.timeout(15_000),
+    });
+  } catch (error) {
+    // AT-REL-007: an unreachable store is a storage failure, never a success.
+    throw new Error(`Callback failed: ${(error as Error).message || "store unreachable"}`);
+  }
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(`Callback failed: ${response.status} ${body.slice(0, 200)}`);
+  }
 }
 
 async function update(run: Run, state: RunState, source: RunEvent["source"], type: string, message: string, patch: Partial<Run> = {}) {
@@ -376,6 +414,29 @@ async function collectDiff(worktree: string, signal: AbortSignal, baseRef?: stri
   return (await git(worktree, args, signal)).slice(0, 120_000);
 }
 
+/**
+ * REL-005 / AT-REL-006: wraps one Pi invocation with bounded backoff so a burst
+ * of 429/5xx errors retries a few times before the run is parked for a human.
+ */
+async function runPiWithRetry(
+  input: Parameters<typeof runPi>[0],
+  context: { runId: string; round: number; label: string },
+) {
+  return withProviderRetry(() => runPi(input), {
+    signal: input.signal,
+    onRetry: async ({ attempt, delayMs, kind, message }) => {
+      await postUpdate(context.runId, {
+        event: {
+          round: context.round,
+          source: "system",
+          type: "provider.retry",
+          message: `${context.label} 调用遇到${kind}错误，约 ${Math.max(1, Math.round(delayMs / 1000))} 秒后重试（第 ${attempt} 次）：${message.slice(0, 200)}`,
+        },
+      }).catch(() => undefined);
+    },
+  });
+}
+
 async function planDevelopment(run: Run, worktree: string, credentials: JobInput["credentials"], signal: AbortSignal, usage: UsageTotals) {
   const prompt = [
     "You are the lead engineering planner. Inspect the current repository read-only and size the requested implementation.",
@@ -387,7 +448,7 @@ async function planDevelopment(run: Run, worktree: string, credentials: JobInput
     '{"complexity":"small|medium|large","rationale":"...","tasks":[{"id":"kebab-id","title":"...","description":"...","files":["relative/path"],"dependsOn":[]}]}',
   ].join("\n\n");
   try {
-    const result = await runPi({
+    const result = await runPiWithRetry({
       cwd: worktree,
       provider: run.developer.provider,
       model: run.developer.model,
@@ -397,7 +458,7 @@ async function planDevelopment(run: Run, worktree: string, credentials: JobInput
       apiKeyEnvironmentName: apiKeyEnvName(run.developer.provider),
       signal,
       onActivity: (message) => postUpdate(run.id, { event: { round: run.round, source: "developer", type: "planner.activity", message: `主 Agent：${message}` } }),
-    });
+    }, { runId: run.id, round: run.round, label: "主 Agent 规划" });
     addUsage(usage, result.usage);
     return parseDevelopmentPlan(redactJobSecrets(result.text, credentials), maxSubagents);
   } catch (error) {
@@ -417,7 +478,7 @@ async function runDeveloperAgent(input: {
   activityPrefix?: string;
   usage: UsageTotals;
 }) {
-  const result = await runPi({
+  const result = await runPiWithRetry({
     cwd: input.worktree,
     provider: input.run.developer.provider,
     model: input.run.developer.model,
@@ -434,7 +495,7 @@ async function runDeveloperAgent(input: {
         message: input.activityPrefix ? `${input.activityPrefix}：${message}` : message,
       },
     }),
-  });
+  }, { runId: input.run.id, round: input.run.round, label: input.activityPrefix ?? "开发 Agent" });
   addUsage(input.usage, result.usage);
   return result.text;
 }
@@ -665,7 +726,7 @@ async function performReview(input: {
   ].join("\n\n");
   let firstReview: { text: string; usage: UsageTotals };
   try {
-    firstReview = await runPi({
+    firstReview = await runPiWithRetry({
       cwd: input.worktree,
       provider: input.run.reviewer.provider,
       model: input.run.reviewer.model,
@@ -675,7 +736,7 @@ async function performReview(input: {
       apiKeyEnvironmentName: apiKeyEnvName(input.run.reviewer.provider),
       signal: input.signal,
       onActivity: (message) => postUpdate(input.run.id, { event: { round: input.round, source: "reviewer", type: "agent.activity", message } }),
-    });
+    }, { runId: input.run.id, round: input.round, label: "审核 Agent" });
   } catch (providerError) {
     const reason = redactJobSecrets((providerError as Error).message, input.credentials).slice(0, 500);
     const kind = classifyProviderError(reason);
@@ -694,7 +755,7 @@ async function performReview(input: {
     await postUpdate(input.run.id, { event: { round: input.round, source: "reviewer", type: "review.retry", message: `审核输出无法解析（${reason}），已要求 Reviewer 重新输出` } });
     let retryReview: { text: string; usage: UsageTotals };
     try {
-      retryReview = await runPi({
+      retryReview = await runPiWithRetry({
         cwd: input.worktree,
         provider: input.run.reviewer.provider,
         model: input.run.reviewer.model,
@@ -704,7 +765,7 @@ async function performReview(input: {
         apiKeyEnvironmentName: apiKeyEnvName(input.run.reviewer.provider),
         signal: input.signal,
         onActivity: (message) => postUpdate(input.run.id, { event: { round: input.round, source: "reviewer", type: "agent.activity", message } }),
-      });
+      }, { runId: input.run.id, round: input.round, label: "审核 Agent（协议重试）" });
     } catch (providerError) {
       const providerReason = redactJobSecrets((providerError as Error).message, input.credentials).slice(0, 500);
       const kind = classifyProviderError(providerReason);
@@ -784,6 +845,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
   const recovering = Boolean(!input.resume && !input.retryReview && (input.recovery || tracker.size > 0));
   const stopHeartbeat = startJobHeartbeat(input.jobId);
   let outcomeState: "done" | "failed" | "cancelled" = "done";
+  let terminalRecorded = true;
   try {
     const project = await resolveProject(run.repository);
     const dirty = await git(project, ["status", "--porcelain"], controller.signal);
@@ -965,21 +1027,44 @@ async function executeJob(input: JobInput, controller: AbortController) {
     outcomeState = cancelled ? "cancelled" : "failed";
     const safeMessage = redactJobSecrets((error as Error).message, input.credentials).slice(0, 2_000);
     const followup = Boolean(input.resume || input.retryReview);
-    const state: RunState = cancelled ? "cancelled" : followup || recovering ? "needs_human" : "failed";
-    const type = cancelled ? "run.cancelled" : followup ? "run.resume_failed" : recovering ? "run.recovery_failed" : "run.failed";
     const kind = cancelled ? undefined : classifyProviderError(safeMessage);
+    // AT-REL-006/007: classified provider and storage failures are parked for a
+    // human (bounded retries already happened above); only unclassified errors
+    // mark the run permanently failed.
+    const parked = followup || recovering || (kind !== undefined && kind !== "unknown");
+    const state: RunState = cancelled ? "cancelled" : parked ? "needs_human" : "failed";
+    const type = cancelled ? "run.cancelled" : followup ? "run.resume_failed" : recovering ? "run.recovery_failed" : kind === "storage" ? "run.storage_error" : "run.failed";
     const message = cancelled
       ? "任务已取消"
-      : `${followup ? "恢复执行失败，保持人工处理" : recovering ? "Worker 恢复执行失败，保持人工处理" : "真实运行失败"}（${kind}）：${safeMessage}`;
-    await update(run, state, "system", type, message, {
-      summary: cancelled ? "已取消" : providerErrorSummary(kind ?? "unknown", safeMessage).slice(0, 800),
-      usage: toRunUsage(usage),
-      durationMs: Date.now() - started,
-    }).catch(() => undefined);
+      : kind === "storage"
+        ? `存储错误，任务未完成，保持人工处理（${kind}）：${safeMessage}`
+        : `${followup ? "恢复执行失败，保持人工处理" : recovering ? "Worker 恢复执行失败，保持人工处理" : "真实运行失败"}（${kind}）：${safeMessage}`;
+    // AT-REL-007: retry the terminal write so a short store outage cannot leave
+    // the run silently mid-flight; if it still fails the job stays claimed and a
+    // later reclaim repeats this stage (never marking a false completion).
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        await update(run, state, "system", type, message, {
+          summary: cancelled ? "已取消" : providerErrorSummary(kind ?? "unknown", safeMessage).slice(0, 800),
+          usage: toRunUsage(usage),
+          durationMs: Date.now() - started,
+        });
+        terminalRecorded = true;
+        break;
+      } catch (writeError) {
+        console.warn(`[store] terminal update failed (attempt ${attempt}): ${(writeError as Error).message}`);
+        if (attempt < 3) await sleep(1_000 * 2 ** (attempt - 1));
+      }
+    }
+    if (!terminalRecorded) {
+      console.error(`[store] could not record the terminal state for ${run.id}; leaving the job for reclaim`);
+    }
   } finally {
     stopHeartbeat();
-    if (input.jobId) {
+    if (input.jobId && terminalRecorded) {
       await jobApi.finish(input.jobId, outcomeState).catch((error) => console.warn(`[jobs] finish failed: ${(error as Error).message}`));
+    } else if (input.jobId) {
+      console.warn(`[jobs] keeping ${input.jobId} claimed so it can be retried after the store recovers`);
     }
     input.credentials.developer = "";
     input.credentials.reviewer = "";
@@ -990,6 +1075,10 @@ async function executeJob(input: JobInput, controller: AbortController) {
 /** Picks up jobs that were never delivered or whose worker died mid-run (REL-002). */
 async function reclaimPendingJobs() {
   if (active.size >= maxActiveJobs) return 0;
+  if ((await storageStatus()).state === "critical") {
+    console.warn("[jobs] disk space critically low; skipping reclaim until cleaned up");
+    return 0;
+  }
   let jobs: PendingJob[] = [];
   try {
     jobs = await jobApi.pending();
@@ -1017,7 +1106,11 @@ async function reclaimPendingJobs() {
 const server = createServer(async (request, response) => {
   try {
     const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
-    if (request.method === "GET" && url.pathname === "/health") return json(response, 200, { status: "ok", service: "pigo-worker", activeJobs: active.size });
+    if (request.method === "GET" && url.pathname === "/health") {
+      const storage = await storageStatus();
+      return json(response, 200, { status: "ok", service: "pigo-worker", activeJobs: active.size, storage: storage.state });
+    }
+    if (request.method === "GET" && url.pathname === "/health/storage") return json(response, 200, await storageStatus());
     if (!authorized(request)) return json(response, 401, { error: "Unauthorized" });
     if (request.method === "GET" && (url.pathname === "/projects" || url.pathname === "/workspaces")) return json(response, 200, await listProjects());
     if (request.method === "POST" && url.pathname === "/workspaces/verify") {
@@ -1041,6 +1134,10 @@ const server = createServer(async (request, response) => {
       // Dispatch is at-least-once: a run already executing locally is not an error.
       if (active.has(body.run.id)) return json(response, 202, { accepted: true, runId: body.run.id, note: "already running" });
       if (active.size >= maxActiveJobs) return json(response, 429, { error: "Worker capacity reached; retry after an active job finishes" });
+      const storage = await storageStatus();
+      if (storage.state === "critical") {
+        return json(response, 507, { error: `Disk space critically low (${Math.round(storage.freeBytes / 1024 / 1024)} MB free); refusing new jobs` });
+      }
       const controller = new AbortController();
       active.set(body.run.id, controller);
       void executeJob(body, controller);
