@@ -2,6 +2,7 @@ import {
   AlertTriangle,
   Check,
   FolderGit2,
+  FolderPlus,
   GitBranch,
   LoaderCircle,
   Plus,
@@ -16,11 +17,16 @@ import { api } from "./api";
 
 const namePattern = /^[A-Za-z0-9._-]{1,80}$/;
 
+/** Same rules as the server/worker `isValidWorkspaceName`. */
+function isValidName(value: string): boolean {
+  return namePattern.test(value) && value !== "." && value !== "..";
+}
+
 function describeError(cause: unknown): string {
   const code = (cause as { code?: string }).code;
   switch (code) {
     case "WORKSPACE_EXISTS":
-      return "同名工作区已存在。可以刷新列表查看，或换一个名称。";
+      return "同名工作区或目录已存在。若目录中已有其他内容，PiGO 不会覆盖；请换一个名称，或用「注册已有目录」登记它。";
     case "WORKSPACE_NOT_FOUND":
       return "工作区不存在，可能已被解除注册。";
     case "WORKSPACE_OUTSIDE_ROOT":
@@ -59,10 +65,11 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
-  const [panel, setPanel] = useState<"none" | "register" | "clone">("none");
+  const [panel, setPanel] = useState<"none" | "register" | "clone" | "create">("none");
   const [relativePath, setRelativePath] = useState("");
   const [cloneUrl, setCloneUrl] = useState("");
   const [cloneName, setCloneName] = useState("");
+  const [createName, setCreateName] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState("");
   const [pendingId, setPendingId] = useState("");
@@ -107,7 +114,7 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
   const submitClone = async (event: React.FormEvent) => {
     event.preventDefault();
     const name = cloneName.trim();
-    if (!namePattern.test(name)) {
+    if (!isValidName(name)) {
       setFormError("名称只能包含字母、数字、点、连字符与下划线（1–80 个字符）。");
       return;
     }
@@ -117,6 +124,27 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
       await api.cloneWorkspace({ url: cloneUrl.trim(), name });
       setCloneUrl("");
       setCloneName("");
+      setPanel("none");
+      await load();
+    } catch (cause) {
+      setFormError(describeError(cause));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const submitCreate = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const name = createName.trim();
+    if (!isValidName(name)) {
+      setFormError("名称只能包含字母、数字、点、连字符与下划线（1–80 个字符）。");
+      return;
+    }
+    setSubmitting(true);
+    setFormError("");
+    try {
+      await api.createWorkspace({ name });
+      setCreateName("");
       setPanel("none");
       await load();
     } catch (cause) {
@@ -181,9 +209,10 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
         <div>
           <span className="eyebrow">SERVER WORKSPACES</span>
           <h1>工作区</h1>
-          <p>注册受控根目录中已有的 Git 仓库，或从 Git URL 克隆到服务器。真实任务将在隔离的 worktree 中执行，不会改动源目录。</p>
+          <p>在 Worker 主机的受控根目录中新建工作区目录、注册已有 Git 仓库，或从 Git URL 克隆到服务器。真实任务将在隔离的 worktree 中执行，不会改动源目录。</p>
         </div>
         <div className="ws-heading-actions">
+          <button className="button secondary" onClick={() => { setPanel(panel === "create" ? "none" : "create"); setFormError(""); }}><FolderPlus size={15} />新建工作区目录</button>
           <button className="button secondary" onClick={() => { setPanel(panel === "register" ? "none" : "register"); setFormError(""); }}><Plus size={15} />注册已有目录</button>
           <button className="button secondary" onClick={() => { setPanel(panel === "clone" ? "none" : "clone"); setFormError(""); }}><GitBranch size={15} />从 Git 克隆</button>
         </div>
@@ -200,6 +229,27 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
 
       {panel !== "none" && (
         <div className="ws-forms">
+          {panel === "create" && (
+            <form className="ws-form" onSubmit={submitCreate}>
+              <div className="ws-form-head">
+                <div><span className="eyebrow">NEW WORKSPACE DIRECTORY</span><h3>新建工作区目录</h3></div>
+                <button className="icon-button" type="button" onClick={() => setPanel("none")}><X size={16} /></button>
+              </div>
+              <p className="ws-form-help">
+                在 Worker 主机的受控项目根目录（<code>PI_WORKSPACE_ROOT/projects</code>，容器内默认为 <code>/workspace/projects</code>）下创建目录并初始化为空的 Git 仓库，然后自动注册为工作区。<strong>目录建在 Worker 主机上，不是你本机的目录。</strong>同名目录已存在且含其他内容时会报错，不会覆盖。新建的是空仓库，需先推入或提交至少一次代码后才能用于真实任务。
+              </p>
+              <label>工作区名称
+                <input value={createName} onChange={(event) => setCreateName(event.target.value)} placeholder="my-new-repo" autoFocus />
+              </label>
+              {formError && <div className="form-error">{formError}</div>}
+              <div className="ws-form-actions">
+                <button type="button" className="button secondary" onClick={() => setPanel("none")}>取消</button>
+                <button type="submit" className="button primary" disabled={submitting || !createName.trim()}>
+                  {submitting ? <LoaderCircle className="spin" size={15} /> : <FolderPlus size={15} />}创建并注册
+                </button>
+              </div>
+            </form>
+          )}
           {panel === "register" && (
             <form className="ws-form" onSubmit={submitRegister}>
               <div className="ws-form-head">
@@ -252,7 +302,7 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
         <div className="ws-empty">
           <FolderGit2 size={26} />
           <strong>还没有注册工作区</strong>
-          <span>注册受控根目录中的已有仓库，或从 Git URL 克隆一个新的。</span>
+          <span>在 Worker 主机上新建一个工作区目录，或注册已有仓库 / 从 Git URL 克隆。</span>
         </div>
       ) : (
         <div className="ws-grid">

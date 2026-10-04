@@ -217,6 +217,7 @@ button { color: inherit; }
 .check-row code { display: block; margin-top: 3px; color: #5f6974; font: 8px "DM Mono", monospace; }
 .check-row > span:last-child { color: #66717b; font: 8px "DM Mono", monospace; }
 .empty-panel { height: 100%; min-height: 260px; display: grid; place-content: center; justify-items: center; gap: 9px; color: #4c5660; font-size: 10px; }
+.run-loading { min-height: calc(100vh - 57px); display: grid; place-content: center; justify-items: center; gap: 10px; color: #5f6973; font-size: 11px; }
 .chat-panel { margin-top: 12px; }
 .chat-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 14px 17px; border-bottom: 1px solid var(--line-soft); flex-wrap: wrap; }
 .chat-title { display: flex; flex-direction: column; gap: 3px; }
@@ -247,7 +248,13 @@ button { color: inherit; }
 .tag-developer { color: #a8c3ff; border-color: rgba(109,156,247,.3); }
 .tag-reviewer { color: #9ee0bc; border-color: rgba(115,214,162,.3); }
 .chat-round { font-style: normal; padding: 1px 6px; border-radius: 999px; background: #171c21; color: #8b96a0; font-size: 8px; }
-.chat-bubble p { margin: 8px 0 0; color: #aab3bc; font-size: 11px; line-height: 1.7; white-space: pre-wrap; word-break: break-word; }
+.chat-text { margin: 8px 0 0; color: #aab3bc; font-size: 11px; line-height: 1.7; white-space: pre-wrap; word-break: break-word; }
+.chat-mono { max-height: 320px; overflow: auto; padding: 9px 10px; border: 1px solid #22282f; border-radius: 7px; background: #0a0d10; color: #9fb4c4; font: 10px/1.65 "DM Mono", monospace; white-space: pre-wrap; scrollbar-width: thin; scrollbar-color: #303740 transparent; }
+.chat-copy { display: inline-flex; align-items: center; gap: 4px; height: 20px; padding: 0 7px; border: 1px solid #2b323a; border-radius: 999px; background: #151a1f; color: #8b96a0; font: 8px "DM Mono", monospace; cursor: pointer; }
+.chat-copy:hover { color: #c8cfd6; border-color: #353d46; }
+.chat-toggle { display: inline-flex; align-items: center; gap: 5px; margin-top: 8px; border: 0; background: none; color: #9fae6a; font-size: 9px; cursor: pointer; padding: 0; }
+.chat-toggle:hover { color: #dbe69b; }
+.chat-toggle-open { transform: rotate(180deg); }
 .welcome-state { min-height: calc(100vh - 57px); display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 30px; }
 .welcome-state h1 { margin: 14px 0 11px; font-size: clamp(34px, 5vw, 61px); letter-spacing: -.065em; line-height: .98; }
 .welcome-state p { max-width: 510px; color: #76818c; line-height: 1.7; font-size: 12px; margin: 0 0 25px; }
@@ -329,7 +336,7 @@ button { color: inherit; }
 .ws-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; flex-wrap: wrap; }
 .ws-heading h1 { margin: 10px 0 7px; font-size: clamp(22px, 2.1vw, 31px); letter-spacing: -.045em; }
 .ws-heading p { margin: 0; color: #757f89; font-size: 11px; line-height: 1.65; max-width: 520px; }
-.ws-heading-actions { display: flex; gap: 8px; }
+.ws-heading-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .ws-strip { display: flex; align-items: center; gap: 10px; margin-top: 18px; padding: 10px 12px; border: 1px solid rgba(243,166,90,.18); background: rgba(243,166,90,.055); border-radius: 9px; color: #cf9c69; }
 .ws-strip.is-ready { border-color: rgba(115,214,162,.16); background: rgba(115,214,162,.055); color: #83ccaa; }
 .ws-strip > svg { flex: 0 0 auto; }
@@ -343,6 +350,8 @@ button { color: inherit; }
 .ws-form-head { display: flex; justify-content: space-between; align-items: flex-start; }
 .ws-form-head h3 { margin: 4px 0 0; font-size: 13px; }
 .ws-form-help { color: #5f6973; font-size: 9px; line-height: 1.6; margin: 9px 0 2px; }
+.ws-form-help code { color: #8b96a0; font: 8px "DM Mono", monospace; }
+.ws-form-help strong { color: #8a936a; font-weight: 600; }
 .ws-form label { display: block; color: #747f89; font-size: 9px; margin-top: 11px; }
 .ws-form input { width: 100%; margin-top: 6px; border: 1px solid #293039; background: #0a0d10; color: #dfe3e7; border-radius: 8px; padding: 10px 11px; outline: none; font-size: 11px; }
 .ws-form input:focus { border-color: #59652c; box-shadow: 0 0 0 2px rgba(223,248,84,.04); }

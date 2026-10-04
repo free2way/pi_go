@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { baseDemoRun } from "../server/demo-runner.js";
 import type { Run, RunEvent } from "../shared/types";
-import { createRunSelectionGuard, eventsForRun } from "./run-selection.js";
+import { createRunSelectionGuard, eventsForRun, isRunSelected, pickSelectedRun } from "./run-selection.js";
 
 const makeRun = (id: string): Run => ({
   ...baseDemoRun({ title: "Selection race", task: "A sufficiently long task", repository: "test/repo" }),
@@ -59,5 +59,28 @@ describe("eventsForRun", () => {
 
   it("returns an empty list without a selection", () => {
     expect(eventsForRun([runEvent("run_a", 1)], undefined)).toEqual([]);
+  });
+});
+
+describe("pickSelectedRun / isRunSelected", () => {
+  const runA = makeRun("run_a");
+  const runB = makeRun("run_b");
+
+  it("returns the list entry for the selected id so the header can render immediately", () => {
+    expect(pickSelectedRun([runA, runB], "run_b")).toBe(runB);
+  });
+
+  it("returns undefined when nothing is selected or the id is not in the list", () => {
+    expect(pickSelectedRun([runA, runB], undefined)).toBeUndefined();
+    expect(pickSelectedRun([runA, runB], "run_missing")).toBeUndefined();
+  });
+
+  it("rejects a snapshot whose id no longer matches the selection", () => {
+    // Regression: after switching run_a -> run_b, the stale run_a snapshot must
+    // never back the header (this was what left the big title stuck).
+    expect(isRunSelected(runA, "run_b")).toBe(false);
+    expect(isRunSelected(runB, "run_b")).toBe(true);
+    expect(isRunSelected(runA, undefined)).toBe(false);
+    expect(isRunSelected(undefined, "run_b")).toBe(false);
   });
 });

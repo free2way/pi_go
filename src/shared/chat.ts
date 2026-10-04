@@ -97,6 +97,97 @@ export function filterChatMessages(messages: ChatMessage[], tab: ChatTab): ChatM
   return tab === "all" ? messages : messages.filter((message) => message.channel === tab);
 }
 
+/** UTF-8 byte length without depending on Node's Buffer (isomorphic). */
+export function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).length;
+}
+
+/**
+ * Hard per-message cap on persisted chat content. A cap keeps storage bounded,
+ * but it must never truncate silently: the caller appends `chatTruncationMarker`
+ * so the reader can see that content was dropped and how much.
+ */
+export const CHAT_CONTENT_MAX = 12_000;
+
+export interface ClippedChatContent {
+  /** Content to persist (already carries the marker when truncated). */
+  content: string;
+  truncated: boolean;
+  originalBytes: number;
+  retainedBytes: number;
+}
+
+/** Explicit, human-readable marker appended to a truncated chat message. */
+export function chatTruncationMarker(originalBytes: number, retainedBytes: number): string {
+  return `\n\n…（内容已截断：完整内容约 ${originalBytes} 字节，此处保留前 ${retainedBytes} 字节；完整输出请查看制品或服务器日志）`;
+}
+
+/**
+ * Bounds one chat message to `max` characters and, when it clipped anything,
+ * appends an explicit marker with the original/retained byte counts. Never
+ * returns truncated content without the marker.
+ */
+export function clipChatContent(content: string, max = CHAT_CONTENT_MAX): ClippedChatContent {
+  const originalBytes = utf8Bytes(content);
+  if (content.length <= max) {
+    return { content, truncated: false, originalBytes, retainedBytes: originalBytes };
+  }
+  const head = content.slice(0, max);
+  const retainedBytes = utf8Bytes(head);
+  return { content: `${head}${chatTruncationMarker(originalBytes, retainedBytes)}`, truncated: true, originalBytes, retainedBytes };
+}
+
+/** Long messages are collapsed by default; short ones render inline. */
+export const CHAT_COLLAPSE_BYTES = 700;
+export const CHAT_COLLAPSE_LINES = 12;
+
+export interface ChatMessageView {
+  /** Text to render right now (preview when collapsed, full when expanded). */
+  text: string;
+  /** Full persisted content — the copy target, never a slice. */
+  full: string;
+  collapsible: boolean;
+  expanded: boolean;
+  /** Prompts, tool output and fenced code render as a monospace block. */
+  monospace: boolean;
+  bytes: number;
+  /** Bytes hidden by the collapsed preview (0 when expanded/not collapsible). */
+  hiddenBytes: number;
+}
+
+function looksLikeCode(message: ChatMessage): boolean {
+  if (message.role === "prompt" || message.role === "tool") return true;
+  if (message.content.includes("```")) return true;
+  return message.content.split("\n").some((line) => /^\s{2,}\S/.test(line));
+}
+
+/**
+ * Pure shaping for one chat entry: decides whether it is collapsible, whether
+ * it should render monospace, and returns the exact text for the current
+ * expand/collapse state. Collapsing only shortens what is displayed — the full
+ * `content` is always available via `full` (copy) and the expanded state.
+ */
+export function chatMessageView(message: ChatMessage, expanded: boolean): ChatMessageView {
+  const full = message.content;
+  const bytes = utf8Bytes(full);
+  const lines = full.split("\n").length;
+  const collapsible = bytes > CHAT_COLLAPSE_BYTES || lines > CHAT_COLLAPSE_LINES;
+  if (!collapsible || expanded) {
+    return { text: full, full, collapsible, expanded, monospace: looksLikeCode(message), bytes, hiddenBytes: 0 };
+  }
+  const preview = full.slice(0, CHAT_COLLAPSE_BYTES);
+  const hiddenBytes = Math.max(0, bytes - utf8Bytes(preview));
+  return {
+    text: `${preview.trimEnd()}\n…（已折叠约 ${hiddenBytes} 字节，展开查看完整内容）`,
+    full,
+    collapsible,
+    expanded,
+    monospace: looksLikeCode(message),
+    bytes,
+    hiddenBytes,
+  };
+}
+
 export function chatCounts(messages: ChatMessage[]): Record<ChatTab, number> {
   const counts = { all: messages.length } as Record<ChatTab, number>;
   for (const tab of chatTabs) {

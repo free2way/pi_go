@@ -31,6 +31,8 @@ export const api = {
   workspaces: () => request<{ workspaces: Workspace[] }>("/api/workspaces"),
   registerWorkspace: (body: { relativePath: string }) =>
     request<Workspace>("/api/workspaces/register", { method: "POST", body: JSON.stringify(body) }),
+  createWorkspace: (body: { name: string }) =>
+    request<Workspace>("/api/workspaces/create", { method: "POST", body: JSON.stringify(body) }),
   cloneWorkspace: (body: { url: string; name: string }) =>
     request<Workspace>("/api/workspaces/clone", { method: "POST", body: JSON.stringify(body) }),
   refreshWorkspace: (id: string) => request<Workspace>(`/api/workspaces/${id}/refresh`, { method: "POST" }),

@@ -5,6 +5,7 @@ import { mkdir, readFile, readdir, realpath, rm, stat, statfs } from "node:fs/pr
 import path from "node:path";
 import readline from "node:readline";
 import type { ChatChannel, ChatParticipant, ChatRole, DevelopmentPlan, Finding, ProjectInfo, Run, RunEvent, RunRoleUsage, RunState, SubAgentTask, WorkspaceVerifyResult } from "../shared/types.js";
+import { clipChatContent } from "../shared/chat.js";
 import { runChecks as runCheckSuite, throwIfCancelled, type CommandResult } from "./checks.js";
 import { CheckpointTracker, isCheckpointCurrent, memoryCheckpointClient, stages, type Checkpoint, type CheckpointClient, type StoredChecks, type StoredReview } from "./checkpoints.js";
 import { conflictFreeBatches, executionWaves, fallbackPlan, parseDevelopmentPlan } from "./orchestrator.js";
@@ -28,7 +29,7 @@ import {
   reviewSnapshotDirectory,
   type MaterializedReviewSnapshot,
 } from "./review-snapshot.js";
-import { WorkspacePathError, resolveInsideRoot, sanitizeRelativePath, sanitizeWorkspaceName, validateCloneUrl } from "./workspace-paths.js";
+import { WorkspacePathError, prepareWorkspaceDirectory, resolveInsideRoot, sanitizeRelativePath, sanitizeWorkspaceName, validateCloneUrl } from "./workspace-paths.js";
 import { RunCleanupPathError, removeRunDirectory } from "./run-cleanup.js";
 import { WorkspaceLockManager, workspaceKeyFor } from "./workspace-lock.js";
 import { PiRunError, failureOutputForEvent } from "./agent-failure.js";
@@ -588,7 +589,9 @@ async function chat(
   signal?: AbortSignal,
 ) {
   throwIfCancelled(signal);
-  const clipped = content.length > 6_000 ? `${content.slice(0, 6_000)}\n\n…（内容已截断）` : content;
+  // Bounded per message, but never silent: `clipChatContent` appends an explicit
+  // marker with the original/retained byte counts when it had to truncate.
+  const clipped = clipChatContent(content).content;
   if (!clipped.trim()) return;
   await postUpdate(run.id, {
     event: {
@@ -779,6 +782,33 @@ async function cloneWorkspace(url: string, name: string): Promise<WorkspaceVerif
     return { ok: false, code: "CLONE_FAILED", error: reason || "git clone failed" };
   }
   return verifyWorkspace(cleanName);
+}
+
+/**
+ * Creates a new workspace directory under the projects root and initializes it
+ * as an empty Git repository so it is immediately registrable (real runs clone
+ * a repository; a bare directory would fail verification). Idempotent for an
+ * already-created empty workspace; an existing non-empty directory is reported
+ * as WORKSPACE_EXISTS instead of being claimed or overwritten.
+ */
+async function createWorkspace(name: string): Promise<WorkspaceVerifyResult> {
+  const cleanName = sanitizeWorkspaceName(name);
+  if (!cleanName) return { ok: false, code: "WORKSPACE_INVALID", error: "Invalid workspace name" };
+  let prepared;
+  try {
+    prepared = await prepareWorkspaceDirectory(projectsRoot, cleanName);
+  } catch (error) {
+    if (error instanceof WorkspacePathError) return { ok: false, code: error.code, error: error.message };
+    throw error;
+  }
+  try {
+    const isGit = await git(prepared.canonicalPath, ["rev-parse", "--is-inside-work-tree"]).then((value) => value === "true").catch(() => false);
+    if (!isGit) await git(prepared.canonicalPath, ["init", "--quiet"]);
+  } catch (error) {
+    if (prepared.created) await rm(prepared.canonicalPath, { recursive: true, force: true }).catch(() => undefined);
+    return { ok: false, code: "WORKSPACE_INVALID", error: `Failed to initialize workspace repository: ${(error as Error).message}` };
+  }
+  return verifyWorkspace(prepared.relativePath);
 }
 
 function parsePiLine(line: string) {
@@ -2070,6 +2100,10 @@ const server = createServer(async (request, response) => {
     if (request.method === "POST" && url.pathname === "/workspaces/clone") {
       const body = await readJson(request) as { url?: unknown; name?: unknown };
       return json(response, 200, await cloneWorkspace(String(body.url ?? ""), String(body.name ?? "")));
+    }
+    if (request.method === "POST" && url.pathname === "/workspaces/create") {
+      const body = await readJson(request) as { name?: unknown };
+      return json(response, 200, await createWorkspace(String(body.name ?? "")));
     }
     if (request.method === "POST" && url.pathname === "/jobs") {
       const body = await readJson(request) as unknown as JobInput;

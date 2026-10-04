@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { RunEvent } from "./types";
-import { checkChatMessage, chatCounts, chatMessagesFromEvents, filterChatMessages, reworkBranchRounds, reworkRounds, type ChatPayload } from "./chat";
+import type { ChatMessage, RunEvent } from "./types";
+import { checkChatMessage, chatCounts, chatMessageView, chatMessagesFromEvents, clipChatContent, filterChatMessages, reworkBranchRounds, reworkRounds, type ChatPayload } from "./chat";
 
 const baseEvent = (overrides: Partial<RunEvent>): RunEvent => ({
   seq: 1,
@@ -141,5 +141,94 @@ describe("reworkBranchRounds", () => {
     ];
 
     expect(reworkBranchRounds(events)).toEqual([]);
+  });
+});
+
+const chatMessage = (overrides: Partial<ChatMessage> = {}): ChatMessage => ({
+  id: "run_test-1",
+  seq: 1,
+  runId: "run_test",
+  round: 1,
+  channel: "developer",
+  from: "developer",
+  to: "orchestrator",
+  role: "response",
+  content: "hello",
+  at: "2026-10-04T10:00:00.000Z",
+  ...overrides,
+});
+
+describe("clipChatContent", () => {
+  it("returns short content unchanged without any marker", () => {
+    const result = clipChatContent("hello");
+
+    expect(result.truncated).toBe(false);
+    expect(result.content).toBe("hello");
+    expect(result.originalBytes).toBe(5);
+    expect(result.retainedBytes).toBe(5);
+    expect(result.content).not.toContain("截断");
+  });
+
+  it("truncates long content with an explicit original/retained byte marker", () => {
+    const result = clipChatContent("x".repeat(50), 10);
+
+    expect(result.truncated).toBe(true);
+    expect(result.originalBytes).toBe(50);
+    expect(result.retainedBytes).toBe(10);
+    expect(result.content.startsWith("x".repeat(10))).toBe(true);
+    expect(result.content).toContain("已截断");
+    expect(result.content).toContain("50 字节");
+    expect(result.content).toContain("10 字节");
+  });
+
+  it("reports real UTF-8 bytes for multibyte content", () => {
+    // 30 CJK characters = 90 UTF-8 bytes.
+    const result = clipChatContent("中".repeat(30), 5);
+
+    expect(result.truncated).toBe(true);
+    expect(result.originalBytes).toBe(90);
+    expect(result.content).toContain("90 字节");
+  });
+
+  it("keeps a large real-run style message bounded yet marked", () => {
+    const result = clipChatContent("y".repeat(100_000));
+
+    expect(result.truncated).toBe(true);
+    expect(result.content.length).toBeLessThan(100_000);
+    expect(result.content).toContain("100000 字节");
+  });
+});
+
+describe("chatMessageView", () => {
+  it("keeps short messages inline and renders them as prose", () => {
+    const view = chatMessageView(chatMessage({ content: "done", role: "response" }), false);
+
+    expect(view.collapsible).toBe(false);
+    expect(view.text).toBe("done");
+    expect(view.full).toBe("done");
+    expect(view.monospace).toBe(false);
+    expect(view.hiddenBytes).toBe(0);
+  });
+
+  it("collapses long messages but always exposes the full copy target", () => {
+    const content = "a".repeat(2_000);
+    const collapsed = chatMessageView(chatMessage({ content, role: "response" }), false);
+
+    expect(collapsed.collapsible).toBe(true);
+    expect(collapsed.text.length).toBeLessThan(content.length);
+    expect(collapsed.text).toContain("已折叠");
+    expect(collapsed.full).toBe(content);
+    expect(collapsed.hiddenBytes).toBeGreaterThan(0);
+
+    const expanded = chatMessageView(chatMessage({ content, role: "response" }), true);
+    expect(expanded.text).toBe(content);
+    expect(expanded.hiddenBytes).toBe(0);
+  });
+
+  it("marks prompts, tool output and fenced code as monospace", () => {
+    expect(chatMessageView(chatMessage({ role: "prompt", content: "implement X" }), false).monospace).toBe(true);
+    expect(chatMessageView(chatMessage({ role: "tool", content: "ls -la" }), false).monospace).toBe(true);
+    expect(chatMessageView(chatMessage({ role: "response", content: "```ts\nconst a = 1;\n```" }), false).monospace).toBe(true);
+    expect(chatMessageView(chatMessage({ role: "response", content: "all good" }), false).monospace).toBe(false);
   });
 });

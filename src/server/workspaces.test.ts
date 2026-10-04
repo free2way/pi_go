@@ -87,6 +87,40 @@ describe("workspace service", () => {
     expect(called).toBe(0);
   });
 
+  it("validates create names before calling the worker", async () => {
+    let called = 0;
+    const { service } = await createService(async () => {
+      called += 1;
+      return verifyOk();
+    });
+    await expect(service.create("owner-a", "../evil")).rejects.toMatchObject({ code: "WORKSPACE_INVALID", status: 422 });
+    expect(called).toBe(0);
+  });
+
+  it("creates the directory on the worker and registers it for the caller", async () => {
+    const calls: Array<{ pathName: string; body: unknown }> = [];
+    const { service } = await createService(async (pathName, init) => {
+      calls.push({ pathName, body: JSON.parse(String(init?.body)) });
+      return verifyOk({ name: "new-repo", relativePath: "new-repo", canonicalPath: "/workspace/projects/new-repo" });
+    });
+
+    const workspace = await service.create("owner-a", "new-repo");
+
+    expect(calls).toEqual([{ pathName: "/workspaces/create", body: { name: "new-repo" } }]);
+    expect(workspace).toMatchObject({ name: "new-repo", status: "active", rootPath: "new-repo" });
+    expect((await service.list(["owner-a"])).map((item) => item.name)).toEqual(["new-repo"]);
+  });
+
+  it("surfaces a clear error when the worker refuses an existing directory", async () => {
+    const { service } = await createService(async () => ({
+      ok: false,
+      code: "WORKSPACE_EXISTS",
+      error: "Workspace directory already exists with different content: taken",
+    }));
+
+    await expect(service.create("owner-a", "taken")).rejects.toMatchObject({ code: "WORKSPACE_EXISTS", status: 409 });
+  });
+
   it("redacts credentials embedded in git urls", () => {
     expect(redactGitUrl("https://user:token@example.com/repo.git")).toBe("https://***@example.com/repo.git");
     expect(redactGitUrl("https://example.com/repo.git")).toBe("https://example.com/repo.git");

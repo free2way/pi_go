@@ -135,6 +135,23 @@ export class WorkspaceService {
     return this.persist(ownerId, result, redactGitUrl(url));
   }
 
+  /**
+   * Creates a new workspace directory on the worker host (under its projects
+   * root) and registers it for the caller. The worker validates the name with
+   * the same rules as `isValidWorkspaceName` before touching the filesystem.
+   */
+  async create(ownerId: string, name: string): Promise<Workspace> {
+    if (!isValidWorkspaceName(name)) {
+      throw new WorkspaceError("WORKSPACE_INVALID", "Workspace name may only contain letters, digits, dot, dash and underscore", 422);
+    }
+    const result = await this.callWorker<WorkspaceVerifyResult>("/workspaces/create", {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    });
+    if (!result.ok) throw this.verifyError(result);
+    return this.persist(ownerId, result, null);
+  }
+
   async refresh(ownerKeys: string[], id: string): Promise<Workspace> {
     const row = await this.findRow(ownerKeys, id);
     if (!row) throw new WorkspaceError("WORKSPACE_NOT_FOUND", "Workspace not found", 404);

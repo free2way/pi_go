@@ -24,10 +24,12 @@ import {
   Braces,
   Check,
   CheckCircle2,
+  ChevronDown,
   ChevronRight,
   CircleDot,
   Clock3,
   Code2,
+  Copy,
   CornerDownLeft,
   Cpu,
   Download,
@@ -57,13 +59,13 @@ import {
   Zap,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { chatChannelLabels, chatCounts, chatParticipantLabels, chatMessagesFromEvents, chatTabs, filterChatMessages, reworkBranchRounds, type ChatTab } from "../shared/chat";
+import { chatChannelLabels, chatCounts, chatMessageView, chatMessagesFromEvents, chatParticipantLabels, chatTabs, filterChatMessages, reworkBranchRounds, type ChatTab } from "../shared/chat";
 import type { ChatMessage, ConfigStatus, CurrentUser, Finding, ModelCatalogResponse, Run, RunArtifact, RunEvent, RunMode, RunRoleUsage, RunState, Workspace } from "../shared/types";
 import { api } from "./api";
 import { HistoryPage } from "./HistoryPage";
 import { runStateLabels, requirementSummary } from "./requirement-history";
 import { MAX_BUFFERED_EVENTS, mergeRunEvents, shouldAcceptRun } from "./run-events";
-import { createRunSelectionGuard, eventsForRun } from "./run-selection";
+import { createRunSelectionGuard, eventsForRun, isRunSelected, pickSelectedRun } from "./run-selection";
 import { ModelsPage } from "./ModelsPage";
 import { WorkspacesPage } from "./WorkspacesPage";
 
@@ -605,6 +607,54 @@ function participantInitials(participant: ChatMessage["from"]) {
   return "USR";
 }
 
+function ChatMessageItem({ message, run, expanded, onToggle }: {
+  message: ChatMessage;
+  run: Run;
+  expanded: boolean;
+  onToggle: (id: string) => void;
+}) {
+  const [copied, setCopied] = useState(false);
+  const view = useMemo(() => chatMessageView(message, expanded), [message, expanded]);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(view.full);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1_500);
+    } catch {
+      // Clipboard API can be unavailable (insecure origin / denied): keep the
+      // message readable instead of surfacing a failure.
+      setCopied(false);
+    }
+  };
+  return (
+    <article className={`chat-message chat-${message.channel} role-${message.role}`}>
+      <span className="chat-avatar">{participantInitials(message.from)}</span>
+      <div className="chat-bubble">
+        <div className="chat-meta">
+          <strong>{participantName(message.from, run)}</strong>
+          <ArrowRight size={11} />
+          <span>{participantName(message.to, run)}</span>
+          <em className={`chat-channel-tag tag-${message.channel}`}>{chatChannelLabels[message.channel]}</em>
+          <em className="chat-round">R{message.round}</em>
+          <time>{formatClock(message.at)}</time>
+          <button type="button" className="chat-copy" title="复制这条消息的完整内容" onClick={() => void copy()}>
+            {copied ? <Check size={11} /> : <Copy size={11} />}{copied ? "已复制" : "复制"}
+          </button>
+        </div>
+        {view.monospace
+          ? <pre className="chat-text chat-mono">{view.text}</pre>
+          : <p className="chat-text">{view.text}</p>}
+        {view.collapsible && (
+          <button type="button" className="chat-toggle" aria-expanded={view.expanded} onClick={() => onToggle(message.id)}>
+            <ChevronDown size={12} className={view.expanded ? "chat-toggle-open" : ""} />
+            {view.expanded ? "收起" : `展开完整内容（${(view.bytes / 1024).toFixed(1)} KB）`}
+          </button>
+        )}
+      </div>
+    </article>
+  );
+}
+
 function ChatLog({ messages, run, activeTab, onTabChange }: {
   messages: ChatMessage[];
   run: Run;
@@ -613,6 +663,15 @@ function ChatLog({ messages, run, activeTab, onTabChange }: {
 }) {
   const counts = useMemo(() => chatCounts(messages), [messages]);
   const visible = useMemo(() => filterChatMessages(messages, activeTab), [messages, activeTab]);
+  const [expandedIds, setExpandedIds] = useState<ReadonlySet<string>>(() => new Set<string>());
+  const toggle = (id: string) => {
+    setExpandedIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
   return (
     <section className="panel chat-panel">
       <div className="chat-head">
@@ -642,20 +701,13 @@ function ChatLog({ messages, run, activeTab, onTabChange }: {
         ) : (
           <div className="chat-stream">
             {visible.map((message) => (
-              <article className={`chat-message chat-${message.channel} role-${message.role}`} key={message.id}>
-                <span className="chat-avatar">{participantInitials(message.from)}</span>
-                <div className="chat-bubble">
-                  <div className="chat-meta">
-                    <strong>{participantName(message.from, run)}</strong>
-                    <ArrowRight size={11} />
-                    <span>{participantName(message.to, run)}</span>
-                    <em className={`chat-channel-tag tag-${message.channel}`}>{chatChannelLabels[message.channel]}</em>
-                    <em className="chat-round">R{message.round}</em>
-                    <time>{formatClock(message.at)}</time>
-                  </div>
-                  <p>{message.content}</p>
-                </div>
-              </article>
+              <ChatMessageItem
+                key={message.id}
+                message={message}
+                run={run}
+                expanded={expandedIds.has(message.id)}
+                onToggle={toggle}
+              />
             ))}
           </div>
         )}
@@ -778,6 +830,17 @@ export function App() {
     setRuns((current) => current.map((item) => (item.id === next.id && shouldAcceptRun(item, next) ? next : item)));
   }, []);
 
+  // Every run-scoped panel (header, meta, checks, diff, budget, topology, chat)
+  // reads `activeRun`, never `run` directly. While the snapshot for a newly
+  // selected run is in flight, `run` still holds the previous run, so rendering
+  // it is exactly what made the big title stick on the old task. Falling back to
+  // the (complete) list entry makes the selection visible immediately and makes a
+  // stale snapshot structurally unable to render.
+  const activeRun = useMemo(
+    () => (isRunSelected(run, selectedId) ? run : pickSelectedRun(runs, selectedId)),
+    [run, selectedId, runs],
+  );
+
   useEffect(() => {
     // 失败也要收敛：无 catch 的 Promise.all 在 500 时会抛出未处理拒绝
     // （e2e 曾捕获到 pageerror "Internal Server Error"），这里降级为保持外壳可用。
@@ -796,9 +859,16 @@ export function App() {
     // selected run is invalidated here, so a late api.run/SSE event cannot
     // overwrite the newly selected run.
     const guard = createRunSelectionGuard(selectedId);
-    void Promise.all([api.run(selectedId), api.events(selectedId), api.artifacts(selectedId)]).then(([nextRun, nextEvents, nextArtifacts]) => {
+    // The run snapshot is fetched on its own: the header/meta/topology must never
+    // depend on the events/artifacts request succeeding (a single rejected member
+    // of Promise.all silently dropped the whole snapshot and left the previous
+    // run's title on screen forever).
+    void api.run(selectedId).then((nextRun) => {
       if (!guard.acceptRun(nextRun)) return;
       applyRun(nextRun);
+    }).catch(() => undefined);
+    void Promise.all([api.events(selectedId), api.artifacts(selectedId)]).then(([nextEvents, nextArtifacts]) => {
+      if (!guard.isActive()) return;
       // Merge (not replace): the SSE stream may already have delivered newer events.
       // Keep only events of this run so a draining previous stream cannot collide.
       setEvents((current) => mergeRunEvents(eventsForRun(current, guard.runId), nextEvents.filter((event) => guard.acceptEvent(event)), MAX_BUFFERED_EVENTS));
@@ -820,15 +890,15 @@ export function App() {
 
   // GAP-04: the artifact list becomes meaningful at terminal state.
   useEffect(() => {
-    if (!selectedId || !run || !terminalStates.includes(run.state)) return;
+    if (!selectedId || !activeRun || !terminalStates.includes(activeRun.state)) return;
     let active = true;
     void api.artifacts(selectedId).then((response) => {
       if (active) setArtifacts(response.artifacts);
     }).catch(() => undefined);
     return () => { active = false; };
-  }, [selectedId, run?.state]);
+  }, [selectedId, activeRun?.state]);
 
-  const flow = useMemo(() => flowForRun(run, events), [run, events]);
+  const flow = useMemo(() => flowForRun(activeRun, events), [activeRun, events]);
   const chatMessages = useMemo(() => chatMessagesFromEvents(events), [events]);
   const running = runs.filter((item) => !terminalStates.includes(item.state)).length;
 
@@ -916,11 +986,11 @@ export function App() {
                 ? <><span>MODELS</span><ChevronRight size={13} /><strong>模型与凭据</strong></>
                 : view === "history"
                   ? <><span>HISTORY</span><ChevronRight size={13} /><strong>需求历史</strong></>
-                  : <><span>WORKFLOWS</span><ChevronRight size={13} /><strong>{run?.id.slice(0, 12) || "OVERVIEW"}</strong></>}
+                  : <><span>WORKFLOWS</span><ChevronRight size={13} /><strong>{activeRun?.id.slice(0, 12) || "OVERVIEW"}</strong></>}
           </div>
           <div className="topbar-actions">
-            {view === "run" && (run?.mode === "demo" ? <span className="demo-chip"><Sparkles size={13} />演示数据</span> : run && <span className="demo-chip real-chip"><Code2 size={13} />真实工作区</span>)}
-            {view === "run" && run && !terminalStates.includes(run.state) && <button className="button danger-small" onClick={() => void api.cancelRun(run.id)}><Square size={12} />停止</button>}
+            {view === "run" && (activeRun?.mode === "demo" ? <span className="demo-chip"><Sparkles size={13} />演示数据</span> : activeRun && <span className="demo-chip real-chip"><Code2 size={13} />真实工作区</span>)}
+            {view === "run" && activeRun && !terminalStates.includes(activeRun.state) && <button className="button danger-small" onClick={() => void api.cancelRun(activeRun.id)}><Square size={12} />停止</button>}
             <button className="icon-button"><PanelRightClose size={17} /></button>
           </div>
         </header>
@@ -931,28 +1001,35 @@ export function App() {
           <WorkspacesPage config={config} runs={runs} onOpenCredentials={() => setView("models")} />
         ) : view === "history" ? (
           <HistoryPage runs={runs} onOpenRun={(id) => { setSelectedId(id); setView("run"); setSidebarOpen(false); }} />
-        ) : !run ? (
-          <section className="welcome-state">
-            <div className="welcome-orbit"><div><Bot size={32} /></div><i /><i /><i /></div>
-            <span className="eyebrow">MULTI-MODEL ENGINEERING</span>
-            <h1>让开发与审核<br />形成可靠闭环</h1>
-            <p>DeepSeek 编写代码，OpenAI 独立审核。每次退回、检查与复审都有迹可循。</p>
-            <button className="button primary large" onClick={() => setCreateOpen(true)}><Play size={17} />创建开发工作流</button>
-          </section>
+        ) : !activeRun ? (
+          selectedId ? (
+            <section className="run-loading">
+              <LoaderCircle className="spin" size={22} />
+              <span>正在加载任务详情…</span>
+            </section>
+          ) : (
+            <section className="welcome-state">
+              <div className="welcome-orbit"><div><Bot size={32} /></div><i /><i /><i /></div>
+              <span className="eyebrow">MULTI-MODEL ENGINEERING</span>
+              <h1>让开发与审核<br />形成可靠闭环</h1>
+              <p>DeepSeek 编写代码，OpenAI 独立审核。每次退回、检查与复审都有迹可循。</p>
+              <button className="button primary large" onClick={() => setCreateOpen(true)}><Play size={17} />创建开发工作流</button>
+            </section>
+          )
         ) : (
           <div className="dashboard" id="workflow">
             <section className="run-heading">
               <div>
-                <div className="heading-meta"><StatusPill state={run.state} /><span>{run.repository}</span><span><GitBranch size={12} />{run.branch}</span></div>
-                <h1>{run.title}</h1>
-                <p>{run.summary}</p>
+                <div className="heading-meta"><StatusPill state={activeRun.state} /><span>{activeRun.repository}</span><span><GitBranch size={12} />{activeRun.branch}</span></div>
+                <h1>{activeRun.title}</h1>
+                <p>{activeRun.summary}</p>
               </div>
-              <div className="run-round"><span>REVIEW ROUND</span><strong>{run.round}<em>/ {run.maxRounds}</em></strong></div>
+              <div className="run-round"><span>REVIEW ROUND</span><strong>{activeRun.round}<em>/ {activeRun.maxRounds}</em></strong></div>
             </section>
 
-            {run.state === "needs_human" && (
+            {activeRun.state === "needs_human" && (
               <HumanInterventionPanel
-                run={run}
+                run={activeRun}
                 onUpdated={(next) => {
                   setRun(next);
                   setRuns((current) => current.map((item) => (item.id === next.id ? next : item)));
@@ -961,17 +1038,21 @@ export function App() {
             )}
 
             <section className="metrics-grid">
-              <div className="metric"><span><Activity size={14} />状态</span><strong>{runStateLabels[run.state]}</strong><small>{running} 个任务运行中</small></div>
-              <div className="metric"><span><Clock3 size={14} />耗时</span><strong>{formatDuration(run.durationMs)}</strong><small>端到端执行时间</small></div>
-              <div className="metric"><span><Braces size={14} />Tokens</span><strong>{compactNumber(run.usage.inputTokens + run.usage.outputTokens)}</strong><small>输入 {compactNumber(run.usage.inputTokens)} · 输出 {compactNumber(run.usage.outputTokens)}</small></div>
-              <div className="metric"><span><Zap size={14} />估算成本</span><strong>${run.usage.estimatedCost.toFixed(3)}</strong><small>{run.mode === "demo" ? "演示估算值" : "当前统计值"}</small></div>
+              <div className="metric"><span><Activity size={14} />状态</span><strong>{runStateLabels[activeRun.state]}</strong><small>{running} 个任务运行中</small></div>
+              <div className="metric"><span><Clock3 size={14} />耗时</span><strong>{formatDuration(activeRun.durationMs)}</strong><small>端到端执行时间</small></div>
+              <div className="metric"><span><Braces size={14} />Tokens</span><strong>{compactNumber(activeRun.usage.inputTokens + activeRun.usage.outputTokens)}</strong><small>输入 {compactNumber(activeRun.usage.inputTokens)} · 输出 {compactNumber(activeRun.usage.outputTokens)}</small></div>
+              <div className="metric"><span><Zap size={14} />估算成本</span><strong>${activeRun.usage.estimatedCost.toFixed(3)}</strong><small>{activeRun.mode === "demo" ? "演示估算值" : "当前统计值"}</small></div>
             </section>
 
             <div className="content-grid">
               <section className="panel flow-panel">
                 <div className="panel-head"><div><span className="eyebrow">LIVE ORCHESTRATION</span><h3>工作流拓扑</h3></div><div className="live-indicator"><i />LIVE</div></div>
                 <div className="flow-wrap">
-                  <ReactFlow nodes={flow.nodes} edges={flow.edges} nodeTypes={nodeTypes} edgeTypes={edgeTypes} fitView minZoom={0.6} maxZoom={1.4} nodesDraggable={false} nodesConnectable={false} elementsSelectable={false} proOptions={{ hideAttribution: true }}>
+                  {/* Keyed by run id so each run mounts a fresh React Flow
+                      instance: `fitView` only runs on mount, so reusing the
+                      instance across a run switch could leave the new topology
+                      panned/zoomed off-screen (a blank canvas). */}
+                  <ReactFlow key={activeRun.id} nodes={flow.nodes} edges={flow.edges} nodeTypes={nodeTypes} edgeTypes={edgeTypes} fitView minZoom={0.6} maxZoom={1.4} nodesDraggable={false} nodesConnectable={false} elementsSelectable={false} proOptions={{ hideAttribution: true }}>
                     <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#252a31" />
                     <Controls showInteractive={false} />
                     <MiniMap pannable={false} zoomable={false} nodeColor={(node) => node.data.status === "active" ? "#e6ff62" : "#353b44"} maskColor="rgba(8,10,13,.76)" />
@@ -983,8 +1064,8 @@ export function App() {
                 <div className="detail-tabs">
                   {([
                     ["activity", "活动", Activity],
-                    ["agents", `Agents ${run.plan?.tasks.length || ""}`, Bot],
-                    ["review", `审核 ${run.findings.length || ""}`, ShieldCheck],
+                    ["agents", `Agents ${activeRun.plan?.tasks.length || ""}`, Bot],
+                    ["review", `审核 ${activeRun.findings.length || ""}`, ShieldCheck],
                     ["diff", "Diff", FileCode2],
                     ["checks", "检查", ListChecks],
                     ["budget", "预算与用量", Braces],
@@ -994,16 +1075,16 @@ export function App() {
                 </div>
                 <div className="detail-body">
                   {tab === "activity" && <ActivityPanel events={events} />}
-                  {tab === "agents" && <SubAgentsPanel run={run} />}
-                  {tab === "review" && <ReviewPanel findings={run.findings} />}
-                  {tab === "diff" && <DiffPanel run={run} artifacts={artifacts} />}
-                  {tab === "checks" && <ChecksPanel run={run} />}
-                  {tab === "budget" && <BudgetPanel run={run} />}
+                  {tab === "agents" && <SubAgentsPanel run={activeRun} />}
+                  {tab === "review" && <ReviewPanel findings={activeRun.findings} />}
+                  {tab === "diff" && <DiffPanel run={activeRun} artifacts={artifacts} />}
+                  {tab === "checks" && <ChecksPanel run={activeRun} />}
+                  {tab === "budget" && <BudgetPanel run={activeRun} />}
                 </div>
               </section>
             </div>
 
-            <ChatLog messages={chatMessages} run={run} activeTab={chatTab} onTabChange={setChatTab} />
+            <ChatLog messages={chatMessages} run={activeRun} activeTab={chatTab} onTabChange={setChatTab} />
           </div>
         )}
       </main>
