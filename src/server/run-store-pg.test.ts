@@ -313,4 +313,21 @@ describe("PostgresRunStore", () => {
     expect(String(row.status)).toBe("failed");
   });
 
+
+  it("hydrates a run written by another process instead of reporting it missing", async () => {
+    const db = await createTestDb();
+    const store = new PostgresRunStore(db);
+    await store.init();
+    const run = { id: "run_other_process", ownerId: "owner-1", state: "running", mode: "real", round: 1, title: "外部进程创建", task: "t", checks: [], events: [], artifacts: [], createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" };
+    await db.query(
+      "INSERT INTO runs (id, owner_id, state, mode, last_seq, document_json, updated_at, created_at) VALUES ($1, $2, $3, 'real', 3, $4, $5, $6)",
+      [run.id, run.ownerId, run.state, JSON.stringify(run), run.createdAt, run.createdAt],
+    );
+    expect(store.getRun(run.id)).toBeUndefined();
+    const hydrated = await store.hydrate(run.id);
+    expect(hydrated?.id).toBe(run.id);
+    expect(hydrated?.lastSeq).toBe(3);
+    expect(store.getRun(run.id)?.title).toBe("外部进程创建");
+  });
+
 });

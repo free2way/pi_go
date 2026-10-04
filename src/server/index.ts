@@ -1166,6 +1166,17 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/retry-review", async (reques
   return dispatchFollowupJob(request, reply, { kind: "retry-review" });
 });
 
+// Multi-process safety (rolling deploys / ops tooling): hydrate a run written by
+// another web instance on first touch instead of answering 404.
+app.addHook("preHandler", async (request) => {
+  const url = request.url.split("?")[0];
+  if (!url.startsWith("/api/runs/") && !url.startsWith("/api/internal/runs/")) return;
+  const id = (request.params as { id?: string } | undefined)?.id;
+  if (!id || !(store instanceof PostgresRunStore)) return;
+  if (store.getRun(id)) return;
+  await store.hydrate(id).catch(() => undefined);
+});
+
 app.post<{ Params: { id: string } }>("/api/internal/runs/:id/update", { bodyLimit: 4 * 1024 * 1024 }, async (request, reply) => {
   if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
   const parsed = internalUpdateSchema.safeParse(request.body);

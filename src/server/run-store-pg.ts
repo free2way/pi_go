@@ -127,6 +127,23 @@ export class PostgresRunStore implements RunStoreLike {
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
+  /**
+   * Multi-process safety: load a run created by another web instance (rolling
+   * deploy, ops tooling) instead of treating it as missing. A newer cached
+   * snapshot is never replaced by an older database row.
+   */
+  async hydrate(id: string): Promise<Run | undefined> {
+    const row = (await this.db.query("SELECT id, owner_id, last_seq, document_json FROM runs WHERE id = $1", [id])).rows[0] as unknown as RunRow | undefined;
+    if (!row) return undefined;
+    const fromDb = JSON.parse(row.document_json) as Run;
+    fromDb.lastSeq = Number(row.last_seq);
+    const cached = this.cache.get(row.id);
+    if (!cached || String(cached.updatedAt ?? "") < String(fromDb.updatedAt ?? "")) {
+      this.cache.set(row.id, fromDb);
+    }
+    return this.cache.get(row.id);
+  }
+
   getRun(id: string, owner?: string | string[]) {
     const run = this.cache.get(id);
     if (!run) return undefined;
