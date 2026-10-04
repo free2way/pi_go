@@ -144,7 +144,11 @@ async function runInSandbox(input: SandboxRunInput): Promise<CommandResult> {
   // Kept next to (never inside) the worktree so sandbox state cannot leak into
   // the diff or the committed tree.
   const runStateDir = `${input.worktree}.state`;
-  await mkdir(runStateDir, { recursive: true });
+  // The state directory (and its agent subdirectory) must exist and be owned by
+  // the container user before the container starts: the bind for the read-only
+  // model definition would otherwise create it as root and Pi could not write
+  // its session/credential store.
+  await mkdir(path.join(runStateDir, "agent"), { recursive: true });
   const spec = buildContainerSpec({
     image: imageForSandbox,
     worktree: input.worktree,
