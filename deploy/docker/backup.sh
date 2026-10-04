@@ -44,8 +44,20 @@ fi
 # non-sensitive keys, and URL userinfo is stripped, so no password can leak into
 # the "sanitized" diagnostics copy.
 SANITIZER="$(cd "$(dirname "$0")" && pwd)/env-sanitize.mjs"
-docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$WEB_CONTAINER" | node "$SANITIZER" > "$TARGET/web.env.sanitized"
-docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "${PI_WORKER_CONTAINER:-pi-agent-worker-1}" | node "$SANITIZER" > "$TARGET/worker.env.sanitized"
+# 宿主机可能没有 node（生产主机即如此）：退化为在 web 容器内执行同一净化器。
+# 容器内路径固定为 /tmp/env-sanitize.mjs；容器不可用时明确报错而不是静默跳过。
+run_sanitizer() {
+  local env_dump="$1" target_file="$2"
+  if command -v node >/dev/null 2>&1; then
+    printf '%s' "$env_dump" | node "$SANITIZER" > "$target_file"
+  else
+    # 容器根文件系统只读，不能 docker cp 写入；把脚本经 argv 传给容器内 node，
+    # stdin 仍留给环境变量数据流。
+    printf '%s' "$env_dump" | docker exec -i "$WEB_CONTAINER" node --input-type=module -e "$(cat "$SANITIZER")" > "$target_file"
+  fi
+}
+run_sanitizer "$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$WEB_CONTAINER")" "$TARGET/web.env.sanitized"
+run_sanitizer "$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "${PI_WORKER_CONTAINER:-pi-agent-worker-1}")" "$TARGET/worker.env.sanitized"
 chmod 600 "$TARGET/web.env.sanitized" "$TARGET/worker.env.sanitized"
 
 # ---------------------------------------------------------------- manifest
