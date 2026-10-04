@@ -383,3 +383,23 @@ button { color: inherit; }
 .human-actions { display: flex; gap: 8px; margin-top: 13px; }
 .human-actions .danger-text { height: 38px; border-radius: 8px; padding: 0 15px; font-size: 11px; font-weight: 650; display: inline-flex; align-items: center; justify-content: center; gap: 8px; cursor: pointer; }
 .human-actions .danger-text:disabled { opacity: .55; cursor: wait; }
+
+/* ---------- models & credentials ---------- */
+.model-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 12px; margin-top: 14px; }
+.model-card { display: flex; flex-direction: column; }
+.model-credential { font: 500 9px "DM Mono", monospace; color: #b9885b; background: rgba(243,166,90,.07); border: 1px solid rgba(243,166,90,.18); border-radius: 6px; padding: 4px 8px; }
+.model-credential.is-set { color: #83ccaa; background: rgba(115,214,162,.07); border-color: rgba(115,214,162,.16); }
+.model-list { padding: 10px 14px; display: grid; gap: 6px; }
+.model-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; border: 1px solid #1d232a; background: #0f1317; border-radius: 8px; padding: 8px 10px; }
+.model-name strong { display: block; font-size: 11px; }
+.model-name code { display: block; margin-top: 3px; color: #5f6974; font: 8px "DM Mono", monospace; }
+.model-tags { display: flex; gap: 5px; flex-wrap: wrap; justify-content: flex-end; }
+.model-tags span { border: 1px solid #262d34; background: #101419; border-radius: 5px; padding: 2px 6px; color: #98a2ac; font: 8px "DM Mono", monospace; }
+.model-tags span.ok { color: #83ccaa; border-color: rgba(115,214,162,.2); }
+.model-tags span.warn { color: #d9a06c; border-color: rgba(243,166,90,.22); }
+.model-credential-form { display: flex; gap: 7px; padding: 0 14px 14px; }
+.model-credential-form input { flex: 1; min-width: 0; border: 1px solid #293039; background: #0a0d10; color: #dfe3e7; border-radius: 8px; padding: 9px 10px; outline: none; font-size: 10px; }
+.model-credential-form input:focus { border-color: #59652c; }
+.model-credential-form .button { height: 34px; padding: 0 12px; font-size: 10px; }
+.model-credential-form .danger-text { height: 34px; border-radius: 8px; padding: 0 12px; font-size: 10px; font-weight: 650; cursor: pointer; }
+@media (max-width: 760px) { .model-grid { grid-template-columns: 1fr; } .model-credential-form { flex-wrap: wrap; } }

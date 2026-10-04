@@ -18,11 +18,11 @@ export function baseRealRun(input: CreateRunInput, ownerId: string): Run {
     maxRounds: Number(process.env.PI_MAX_REVIEW_ROUNDS || 3),
     createdAt: now,
     updatedAt: now,
-    developer: {
+    developer: input.developerModel ?? {
       provider: process.env.PI_DEVELOPER_PROVIDER || "deepseek",
       model: process.env.PI_DEVELOPER_MODEL || "deepseek-flash",
     },
-    reviewer: {
+    reviewer: input.reviewerModel ?? {
       provider: process.env.PI_REVIEWER_PROVIDER || "openai-proxy",
       model: process.env.PI_REVIEWER_MODEL || "gpt-5.6-sol",
     },

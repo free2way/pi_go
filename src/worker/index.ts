@@ -7,6 +7,7 @@ import readline from "node:readline";
 import type { CheckResult, DevelopmentPlan, Finding, ProjectInfo, Run, RunEvent, RunState, SubAgentTask, WorkspaceVerifyResult } from "../shared/types.js";
 import { conflictFreeBatches, executionWaves, fallbackPlan, parseDevelopmentPlan } from "./orchestrator.js";
 import { UsageTracker, addUsage, assistantErrorFromEvent, assistantTextFromEvent, emptyUsage, toRunUsage, toolNameFromEvent, type UsageTotals } from "./pi-events.js";
+import { apiKeyEnvName, classifyProviderError, providerErrorSummary } from "./provider-errors.js";
 import { parseReview, type ReviewResult } from "./review-protocol.js";
 import { mergeFindings, unresolvedFeedback } from "./review-findings.js";
 import { WorkspacePathError, resolveInsideRoot, sanitizeRelativePath, sanitizeWorkspaceName, validateCloneUrl } from "./workspace-paths.js";
@@ -254,7 +255,7 @@ async function runPi(input: {
   sessionId?: string;
   readOnly?: boolean;
   apiKey: string;
-  apiKeyEnvironmentName: "DEEPSEEK_API_KEY" | "OPENAI_API_KEY";
+  apiKeyEnvironmentName: string;
   signal: AbortSignal;
   onActivity: (message: string) => Promise<void>;
 }) {
@@ -330,7 +331,7 @@ async function planDevelopment(run: Run, worktree: string, credentials: JobInput
       prompt,
       readOnly: true,
       apiKey: credentials.developer,
-      apiKeyEnvironmentName: "DEEPSEEK_API_KEY",
+      apiKeyEnvironmentName: apiKeyEnvName(run.developer.provider),
       signal,
       onActivity: (message) => postUpdate(run.id, { event: { round: run.round, source: "developer", type: "planner.activity", message: `主 Agent：${message}` } }),
     });
@@ -360,7 +361,7 @@ async function runDeveloperAgent(input: {
     prompt: input.prompt,
     sessionId: `${input.run.id.replaceAll("_", "-")}-${input.sessionSuffix}`,
     apiKey: input.credentials.developer,
-    apiKeyEnvironmentName: "DEEPSEEK_API_KEY",
+    apiKeyEnvironmentName: apiKeyEnvName(input.run.developer.provider),
     signal: input.signal,
     onActivity: (message) => postUpdate(input.run.id, {
       event: {
@@ -574,16 +575,17 @@ async function performReview(input: {
       prompt: reviewPrompt,
       readOnly: true,
       apiKey: input.credentials.reviewer,
-      apiKeyEnvironmentName: "OPENAI_API_KEY",
+      apiKeyEnvironmentName: apiKeyEnvName(input.run.reviewer.provider),
       signal: input.signal,
       onActivity: (message) => postUpdate(input.run.id, { event: { round: input.round, source: "reviewer", type: "agent.activity", message } }),
     });
   } catch (providerError) {
     const reason = redactJobSecrets((providerError as Error).message, input.credentials).slice(0, 500);
-    await update(input.run, "needs_human", "reviewer", "review.provider_error", `审核模型调用失败：${reason}`, {
+    const kind = classifyProviderError(reason);
+    await update(input.run, "needs_human", "reviewer", "review.provider_error", `审核模型调用失败（${kind}）：${reason}`, {
       usage: toRunUsage(input.usage),
       durationMs: Date.now() - input.started,
-      summary: `审核模型暂时不可用：${reason}`,
+      summary: providerErrorSummary(kind, reason).slice(0, 500),
     });
     return { stopped: true };
   }
@@ -602,16 +604,17 @@ async function performReview(input: {
         prompt: `${reviewPrompt}\n\n上一次回复被拒绝：不是合法的协议 JSON。只输出 JSON 对象本身，不要 markdown 代码块，不要任何解释。`,
         readOnly: true,
         apiKey: input.credentials.reviewer,
-        apiKeyEnvironmentName: "OPENAI_API_KEY",
+        apiKeyEnvironmentName: apiKeyEnvName(input.run.reviewer.provider),
         signal: input.signal,
         onActivity: (message) => postUpdate(input.run.id, { event: { round: input.round, source: "reviewer", type: "agent.activity", message } }),
       });
     } catch (providerError) {
       const providerReason = redactJobSecrets((providerError as Error).message, input.credentials).slice(0, 500);
-      await update(input.run, "needs_human", "reviewer", "review.provider_error", `审核模型调用失败：${providerReason}`, {
+      const kind = classifyProviderError(providerReason);
+      await update(input.run, "needs_human", "reviewer", "review.provider_error", `审核模型调用失败（${kind}）：${providerReason}`, {
         usage: toRunUsage(input.usage),
         durationMs: Date.now() - input.started,
-        summary: `审核模型暂时不可用：${providerReason}`,
+        summary: providerErrorSummary(kind, providerReason).slice(0, 500),
       });
       return { stopped: true };
     }
@@ -619,10 +622,10 @@ async function performReview(input: {
     try {
       return { stopped: false, review: parseReview(redactJobSecrets(retryReview.text, input.credentials), input.round) };
     } catch (retryError) {
-      await update(input.run, "needs_human", "reviewer", "review.invalid_protocol", "Reviewer 两次输出均无法解析为审核协议，转人工处理", {
+      await update(input.run, "needs_human", "reviewer", "review.invalid_protocol", "Reviewer 两次输出均无法解析为审核协议（protocol），转人工处理", {
         usage: toRunUsage(input.usage),
         durationMs: Date.now() - input.started,
-        summary: `审核输出无法解析：${redactJobSecrets((retryError as Error).message, input.credentials).slice(0, 500)}`,
+        summary: providerErrorSummary("protocol", `审核输出无法解析：${redactJobSecrets((retryError as Error).message, input.credentials).slice(0, 300)}`).slice(0, 500),
       });
       return { stopped: true };
     }
@@ -815,9 +818,12 @@ async function executeJob(input: JobInput, controller: AbortController) {
     const followup = Boolean(input.resume || input.retryReview);
     const state: RunState = cancelled ? "cancelled" : followup ? "needs_human" : "failed";
     const type = cancelled ? "run.cancelled" : followup ? "run.resume_failed" : "run.failed";
-    const message = cancelled ? "任务已取消" : followup ? `恢复执行失败，保持人工处理：${safeMessage}` : `真实运行失败：${safeMessage}`;
+    const kind = cancelled ? undefined : classifyProviderError(safeMessage);
+    const message = cancelled
+      ? "任务已取消"
+      : `${followup ? "恢复执行失败，保持人工处理" : "真实运行失败"}（${kind}）：${safeMessage}`;
     await update(run, state, "system", type, message, {
-      summary: cancelled ? "已取消" : safeMessage,
+      summary: cancelled ? "已取消" : providerErrorSummary(kind ?? "unknown", safeMessage).slice(0, 800),
       usage: toRunUsage(usage),
       durationMs: Date.now() - started,
     }).catch(() => undefined);

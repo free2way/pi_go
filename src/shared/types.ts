@@ -112,6 +112,8 @@ export interface CreateRunInput {
   workspaceId?: string;
   mode: RunMode;
   checks?: string[];
+  developerModel?: ModelSelection;
+  reviewerModel?: ModelSelection;
 }
 
 export interface ConfigStatus {
@@ -132,6 +134,42 @@ export interface CredentialStatus {
   developerConfigured: boolean;
   reviewerConfigured: boolean;
   updatedAt: string | null;
+  providers: Array<{
+    provider: string;
+    configured: boolean;
+    masked: string | null;
+    updatedAt: string | null;
+  }>;
+}
+
+export type ModelRole = "developer" | "reviewer";
+
+export interface ModelCatalogEntry {
+  id: string;
+  provider: string;
+  model: string;
+  label: string;
+  contextWindow?: number;
+  toolCalling: boolean;
+  reasoning: boolean;
+  roles: ModelRole[];
+  status: "available" | "preview" | "deprecated";
+}
+
+export interface ModelInfo extends ModelCatalogEntry {
+  available: boolean;
+  unavailableReason: "credential_missing" | "role_restricted" | null;
+}
+
+export interface ModelSelection {
+  provider: string;
+  model: string;
+}
+
+export interface ModelCatalogResponse {
+  models: ModelInfo[];
+  defaultDeveloper: ModelSelection;
+  defaultReviewer: ModelSelection;
 }
 
 export type WorkspaceStatus = "active" | "unregistered" | "invalid";

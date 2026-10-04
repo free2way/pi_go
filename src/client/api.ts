@@ -1,4 +1,4 @@
-import type { ConfigStatus, CredentialStatus, CurrentUser, Run, RunEvent, Workspace } from "../shared/types";
+import type { ConfigStatus, CredentialStatus, CurrentUser, ModelCatalogResponse, ModelSelection, Run, RunEvent, Workspace } from "../shared/types";
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -23,9 +23,11 @@ export const api = {
   config: () => request<ConfigStatus>("/api/config/status"),
   me: () => request<CurrentUser>("/api/me"),
   credentialStatus: () => request<CredentialStatus>("/api/credentials/status"),
-  saveCredentials: (body: { developerApiKey?: string; reviewerApiKey?: string }) =>
+  models: () => request<ModelCatalogResponse>("/api/models"),
+  saveCredentials: (body: { provider: string; apiKey: string } | { developerApiKey?: string; reviewerApiKey?: string }) =>
     request<CredentialStatus>("/api/credentials", { method: "PUT", body: JSON.stringify(body) }),
-  deleteCredentials: () => request<void>("/api/credentials", { method: "DELETE" }),
+  deleteCredentials: (provider?: string) =>
+    request<void>(`/api/credentials${provider ? `?provider=${encodeURIComponent(provider)}` : ""}`, { method: "DELETE" }),
   workspaces: () => request<{ workspaces: Workspace[] }>("/api/workspaces"),
   registerWorkspace: (body: { relativePath: string }) =>
     request<Workspace>("/api/workspaces/register", { method: "POST", body: JSON.stringify(body) }),
@@ -38,7 +40,7 @@ export const api = {
   runs: () => request<Run[]>("/api/runs"),
   run: (id: string) => request<Run>(`/api/runs/${id}`),
   events: (id: string) => request<RunEvent[]>(`/api/runs/${id}/events`),
-  createRun: (body: { title: string; task: string; repository?: string; workspaceId?: string; mode: "demo" | "real"; checks?: string[] }) =>
+  createRun: (body: { title: string; task: string; repository?: string; workspaceId?: string; mode: "demo" | "real"; checks?: string[]; developerModel?: ModelSelection; reviewerModel?: ModelSelection }) =>
     request<Run>("/api/runs", { method: "POST", body: JSON.stringify(body) }),
   cancelRun: (id: string) => request<Run>(`/api/runs/${id}/cancel`, { method: "POST" }),
   resumeRun: (id: string, body: { instruction?: string }) =>

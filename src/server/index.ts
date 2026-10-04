@@ -5,12 +5,13 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import type { ConfigStatus, CurrentUser, Run, Workspace } from "../shared/types.js";
+import type { ConfigStatus, CurrentUser, ModelCatalogResponse, Run, Workspace } from "../shared/types.js";
 import { Authenticator } from "./auth.js";
 import { CredentialVault } from "./credential-vault.js";
 import { createDb, createPool, runMigrations } from "./db.js";
 import { baseDemoRun, runDemo } from "./demo-runner.js";
 import { IdentityService } from "./identity.js";
+import { availableModels, defaultSelections, loadModelCatalog, validateModelSelection } from "./model-catalog.js";
 import { baseRealRun } from "./real-run.js";
 import { RunStore } from "./store.js";
 import { WorkspaceError, WorkspaceService } from "./workspaces.js";
@@ -37,8 +38,13 @@ const vaultSecret = process.env.PI_VAULT_SECRET;
 if (!vaultSecret) throw new Error("PI_VAULT_SECRET is required");
 if (process.env.PI_AUTH_MODE === "cloudflare" && !publicOrigin) throw new Error("PI_PUBLIC_ORIGIN is required with Cloudflare authentication");
 
+const modelCatalog = loadModelCatalog();
+const modelDefaults = defaultSelections();
 const store = new RunStore(dataFile);
-const vault = new CredentialVault(vaultFile, vaultSecret);
+const vault = new CredentialVault(vaultFile, vaultSecret, {
+  developer: modelDefaults.developer.provider,
+  reviewer: modelDefaults.reviewer.provider,
+});
 const auth = new Authenticator();
 await Promise.all([store.init(), vault.init()]);
 
@@ -59,6 +65,8 @@ const createRunSchema = z.object({
   workspaceId: z.string().trim().min(1).max(80).optional(),
   mode: z.enum(["demo", "real"]).default("demo"),
   checks: z.array(z.string().trim().min(1).max(500)).max(8).default([]),
+  developerModel: z.object({ provider: z.string().trim().min(1).max(80), model: z.string().trim().min(1).max(120) }).optional(),
+  reviewerModel: z.object({ provider: z.string().trim().min(1).max(80), model: z.string().trim().min(1).max(120) }).optional(),
 }).superRefine((value, context) => {
   if (value.mode === "real" && value.checks.length === 0) {
     context.addIssue({ code: "custom", path: ["checks"], message: "Real runs require at least one check command" });
@@ -69,9 +77,12 @@ const createRunSchema = z.object({
 });
 
 const credentialSchema = z.object({
+  provider: z.string().trim().min(1).max(80).optional(),
+  apiKey: z.string().trim().min(12).max(512).optional(),
   developerApiKey: z.string().trim().min(12).max(512).optional(),
   reviewerApiKey: z.string().trim().min(12).max(512).optional(),
-}).refine((value) => value.developerApiKey || value.reviewerApiKey, "At least one credential is required");
+}).refine((value) => (value.provider && value.apiKey) || value.developerApiKey || value.reviewerApiKey, "At least one credential is required")
+  .refine((value) => !value.provider || Boolean(value.apiKey), "apiKey is required when provider is set");
 
 const runStateSchema = z.enum(["queued", "preparing", "developing", "checking", "reviewing", "completed", "needs_human", "failed", "cancelled"]);
 const findingSchema = z.object({
@@ -214,9 +225,9 @@ function vaultKeyFor(request: FastifyRequest) {
 app.get("/api/health", async (_request, reply) => {
   try {
     await db.query("SELECT 1");
-    return { status: "ok", service: "pigo-web", version: "0.9.0", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.10.0", db: "ok" };
   } catch {
-    return reply.code(503).send({ status: "error", service: "pigo-web", version: "0.9.0", db: "unavailable" });
+    return reply.code(503).send({ status: "error", service: "pigo-web", version: "0.10.0", db: "unavailable" });
   }
 });
 app.get("/api/me", async (request) => auth.user(request));
@@ -227,24 +238,45 @@ app.put("/api/credentials", async (request, reply) => {
   if (!credentialWriteAllowed(user.id)) return reply.code(429).send({ error: "Too many credential updates" });
   const parsed = credentialSchema.safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: "Invalid credential request" });
-  return vault.set(vaultKeyFor(request), { developer: parsed.data.developerApiKey, reviewer: parsed.data.reviewerApiKey });
+  const userId = vaultKeyFor(request);
+  const writes: Array<{ provider: string; apiKey: string }> = [];
+  if (parsed.data.provider && parsed.data.apiKey) {
+    writes.push({ provider: parsed.data.provider, apiKey: parsed.data.apiKey });
+  } else {
+    // Legacy role-based payloads map onto the configured role providers.
+    if (parsed.data.developerApiKey) writes.push({ provider: modelDefaults.developer.provider, apiKey: parsed.data.developerApiKey });
+    if (parsed.data.reviewerApiKey) writes.push({ provider: modelDefaults.reviewer.provider, apiKey: parsed.data.reviewerApiKey });
+  }
+  let status = vault.status(userId);
+  for (const write of writes) status = await vault.set(userId, write);
+  return status;
 });
 
-app.delete("/api/credentials", async (request, reply) => {
+app.delete<{ Querystring: { provider?: string } }>("/api/credentials", async (request, reply) => {
   const user = auth.user(request);
   if (!credentialWriteAllowed(user.id)) return reply.code(429).send({ error: "Too many credential updates" });
-  await vault.delete(vaultKeyFor(request));
+  await vault.delete(vaultKeyFor(request), request.query?.provider || undefined);
   return reply.code(204).send();
+});
+
+app.get("/api/models", async (request): Promise<ModelCatalogResponse> => {
+  const configured = new Set(vault.configuredProviders(vaultKeyFor(request)));
+  return {
+    models: availableModels(modelCatalog, configured),
+    defaultDeveloper: modelDefaults.developer,
+    defaultReviewer: modelDefaults.reviewer,
+  };
 });
 
 app.get("/api/config/status", async (request): Promise<ConfigStatus> => {
   const credentials = vault.status(vaultKeyFor(request));
+  const configured = new Set(credentials.providers.map((item) => item.provider));
   return {
     demoMode,
     piVersion: process.env.PI_VERSION || "1.0.0",
-    developer: { provider: "deepseek", model: process.env.PI_DEVELOPER_MODEL || "deepseek-flash", credentialConfigured: credentials.developerConfigured },
-    reviewer: { provider: process.env.PI_REVIEWER_PROVIDER || "openai-proxy", model: process.env.PI_REVIEWER_MODEL || "gpt-5.6-sol", credentialConfigured: credentials.reviewerConfigured },
-    realRunsAvailable: realRunsEnabled && Boolean(internalToken) && credentials.developerConfigured && credentials.reviewerConfigured,
+    developer: { provider: modelDefaults.developer.provider, model: modelDefaults.developer.model, credentialConfigured: configured.has(modelDefaults.developer.provider) },
+    reviewer: { provider: modelDefaults.reviewer.provider, model: modelDefaults.reviewer.model, credentialConfigured: configured.has(modelDefaults.reviewer.provider) },
+    realRunsAvailable: realRunsEnabled && Boolean(internalToken) && configured.has(modelDefaults.developer.provider) && configured.has(modelDefaults.reviewer.provider),
   };
 });
 
@@ -384,9 +416,30 @@ app.post("/api/runs", async (request, reply) => {
       });
     }
     if (!realRunsEnabled || !internalToken) return reply.code(503).send({ error: "Real agent execution is disabled", code: "REAL_RUNNER_NOT_AVAILABLE" });
-    const credentials = vault.get(vaultKeyFor(request));
-    if (!credentials) return reply.code(403).send({ error: "Configure both personal model keys before starting a real run", code: "PERSONAL_CREDENTIALS_REQUIRED" });
-    const run = baseRealRun({ ...parsed.data, repository: workspace.rootPath, workspaceId: workspace.id }, user.id);
+
+    // MODEL-007/008: resolve the exact models and preflight them before queueing.
+    const configured = new Set(vault.configuredProviders(vaultKeyFor(request)));
+    const developerSelection = parsed.data.developerModel ?? modelDefaults.developer;
+    const reviewerSelection = parsed.data.reviewerModel ?? modelDefaults.reviewer;
+    const developerCheck = validateModelSelection(modelCatalog, "developer", developerSelection, configured);
+    if (!developerCheck.ok) return reply.code(422).send({ error: developerCheck.message, code: developerCheck.code });
+    const reviewerCheck = validateModelSelection(modelCatalog, "reviewer", reviewerSelection, configured);
+    if (!reviewerCheck.ok) return reply.code(422).send({ error: reviewerCheck.message, code: reviewerCheck.code });
+
+    const credentials = {
+      developer: vault.get(vaultKeyFor(request), developerCheck.entry.provider),
+      reviewer: vault.get(vaultKeyFor(request), reviewerCheck.entry.provider),
+    };
+    if (!credentials.developer || !credentials.reviewer) {
+      return reply.code(403).send({ error: "所选模型的 provider 凭据不完整，请在「模型与凭据」页配置", code: "PERSONAL_CREDENTIALS_REQUIRED" });
+    }
+    const run = baseRealRun({
+      ...parsed.data,
+      repository: workspace.rootPath,
+      workspaceId: workspace.id,
+      developerModel: { provider: developerCheck.entry.provider, model: developerCheck.entry.model },
+      reviewerModel: { provider: reviewerCheck.entry.provider, model: reviewerCheck.entry.model },
+    }, user.id);
     await store.createRun(run, { runId: run.id, round: 1, source: "system", type: "run.created", message: "真实任务已创建，正在交给隔离 Pi Worker", at: new Date().toISOString() });
     try {
       await workerRequest("/jobs", { method: "POST", body: JSON.stringify({ run, checks: parsed.data.checks, credentials }) });
@@ -443,8 +496,12 @@ async function dispatchFollowupJob(
   if (run.mode !== "real") return reply.code(409).send({ error: "只有真实任务支持人工恢复", code: "RUN_NOT_RESUMABLE" });
   if (run.state !== "needs_human") return reply.code(409).send({ error: "仅「需要人工处理」的任务可以执行该操作", code: "RUN_NOT_RESUMABLE" });
   if (!realRunsEnabled || !internalToken) return reply.code(503).send({ error: "Real agent execution is disabled", code: "REAL_RUNNER_NOT_AVAILABLE" });
-  const credentials = vault.get(vaultKeyFor(request));
-  if (!credentials) return reply.code(403).send({ error: "请先配置个人模型 Key 再继续真实任务", code: "PERSONAL_CREDENTIALS_REQUIRED" });
+  const developerKey = vault.get(vaultKeyFor(request), run.developer.provider);
+  const reviewerKey = vault.get(vaultKeyFor(request), run.reviewer.provider);
+  if (!developerKey || !reviewerKey) {
+    return reply.code(403).send({ error: "该任务所用模型的 provider 凭据缺失，请在「模型与凭据」页配置", code: "PERSONAL_CREDENTIALS_REQUIRED" });
+  }
+  const credentials = { developer: developerKey, reviewer: reviewerKey };
 
   const instruction = options.kind === "resume" ? options.instruction?.trim() : undefined;
   const round = options.kind === "resume" ? run.round + 1 : run.round;

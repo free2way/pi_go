@@ -48,8 +48,9 @@ import {
   Zap,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { ConfigStatus, CurrentUser, Finding, Run, RunEvent, RunMode, RunState, Workspace } from "../shared/types";
+import type { ConfigStatus, CurrentUser, Finding, ModelCatalogResponse, Run, RunEvent, RunMode, RunState, Workspace } from "../shared/types";
 import { api } from "./api";
+import { ModelsPage } from "./ModelsPage";
 import { WorkspacesPage } from "./WorkspacesPage";
 
 type Tab = "activity" | "agents" | "review" | "diff" | "checks";
@@ -244,19 +245,30 @@ function CreateRunDialog({ open, onClose, onCreated, config, onGoWorkspaces }: {
   const [checks, setChecks] = useState("npm test");
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [workspaceId, setWorkspaceId] = useState("");
+  const [models, setModels] = useState<ModelCatalogResponse>();
+  const [developerModelId, setDeveloperModelId] = useState("");
+  const [reviewerModelId, setReviewerModelId] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
     if (!open || !config?.realRunsAvailable) return;
-    void api.workspaces().then(({ workspaces: items }) => {
-      const active = items.filter((item) => item.status === "active");
+    void Promise.all([api.workspaces(), api.models()]).then(([workspaceResult, modelResult]) => {
+      const active = workspaceResult.workspaces.filter((item) => item.status === "active");
       setWorkspaces(active);
+      setModels(modelResult);
       const preferred = active.find((item) => !item.git?.dirty) ?? active[0];
       if (preferred) {
         setWorkspaceId(preferred.id);
         if (preferred.defaultChecks.length > 0) setChecks(preferred.defaultChecks.join("\n"));
       }
+      const pick = (selection: { provider: string; model: string }, role: "developer" | "reviewer") => {
+        const exact = modelResult.models.find((entry) => entry.provider === selection.provider && entry.model === selection.model);
+        if (exact) return exact.id;
+        return modelResult.models.find((entry) => entry.roles.includes(role) && entry.available)?.id ?? "";
+      };
+      setDeveloperModelId(pick(modelResult.defaultDeveloper, "developer"));
+      setReviewerModelId(pick(modelResult.defaultReviewer, "reviewer"));
     }).catch((cause) => setError((cause as Error).message));
   }, [open, config?.realRunsAvailable]);
 
@@ -273,12 +285,19 @@ function CreateRunDialog({ open, onClose, onCreated, config, onGoWorkspaces }: {
     setSubmitting(true);
     setError("");
     try {
+      const developer = models?.models.find((entry) => entry.id === developerModelId);
+      const reviewer = models?.models.find((entry) => entry.id === reviewerModelId);
       const run = await api.createRun({
         title,
         task,
         mode,
         ...(mode === "real"
-          ? { workspaceId, checks: checks.split("\n").map((item) => item.trim()).filter(Boolean) }
+          ? {
+              workspaceId,
+              checks: checks.split("\n").map((item) => item.trim()).filter(Boolean),
+              developerModel: developer ? { provider: developer.provider, model: developer.model } : undefined,
+              reviewerModel: reviewer ? { provider: reviewer.provider, model: reviewer.model } : undefined,
+            }
           : { repository, checks: [] }),
       });
       onCreated(run);
@@ -320,6 +339,16 @@ function CreateRunDialog({ open, onClose, onCreated, config, onGoWorkspaces }: {
                   </option>
                 ))}
               </select></label>
+              <label>开发模型<select value={developerModelId} onChange={(event) => setDeveloperModelId(event.target.value)}>
+                {(models?.models ?? []).filter((entry) => entry.roles.includes("developer")).map((entry) => (
+                  <option value={entry.id} key={entry.id} disabled={!entry.available}>{entry.label} · {entry.model}{entry.available ? "" : "（缺凭据）"}</option>
+                ))}
+              </select></label>
+              <label>审核模型<select value={reviewerModelId} onChange={(event) => setReviewerModelId(event.target.value)}>
+                {(models?.models ?? []).filter((entry) => entry.roles.includes("reviewer")).map((entry) => (
+                  <option value={entry.id} key={entry.id} disabled={!entry.available}>{entry.label} · {entry.model}{entry.available ? "" : "（缺凭据）"}</option>
+                ))}
+              </select></label>
               {selectedDirty && (
                 <div className="dirty-warning">
                   <AlertTriangle size={15} />
@@ -338,81 +367,9 @@ function CreateRunDialog({ open, onClose, onCreated, config, onGoWorkspaces }: {
         {error && <div className="form-error">{error}</div>}
         <div className="modal-actions">
           <button type="button" className="button secondary" onClick={onClose}>取消</button>
-          <button type="submit" className="button primary" disabled={submitting || (mode === "real" && (!workspaceId || selectedDirty))}>
+          <button type="submit" className="button primary" disabled={submitting || (mode === "real" && (!workspaceId || selectedDirty || !developerModelId || !reviewerModelId))}>
             {submitting ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}{mode === "real" ? "开始真实开发" : "运行演示"}
           </button>
-        </div>
-      </form>
-    </div>
-  );
-}
-
-function CredentialsDialog({ open, onClose, config, onChanged }: {
-  open: boolean;
-  onClose: () => void;
-  config?: ConfigStatus;
-  onChanged: (config: ConfigStatus) => void;
-}) {
-  const [developerApiKey, setDeveloperApiKey] = useState("");
-  const [reviewerApiKey, setReviewerApiKey] = useState("");
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState("");
-
-  if (!open) return null;
-  const submit = async (event: React.FormEvent) => {
-    event.preventDefault();
-    setSubmitting(true);
-    setError("");
-    try {
-      await api.saveCredentials({
-        developerApiKey: developerApiKey || undefined,
-        reviewerApiKey: reviewerApiKey || undefined,
-      });
-      setDeveloperApiKey("");
-      setReviewerApiKey("");
-      onChanged(await api.config());
-      onClose();
-    } catch (cause) {
-      setError((cause as Error).message);
-    } finally {
-      setSubmitting(false);
-    }
-  };
-  const remove = async () => {
-    if (!window.confirm("删除当前账户保存的全部模型 Key？删除后真实开发将不可用。")) return;
-    setSubmitting(true);
-    setError("");
-    try {
-      await api.deleteCredentials();
-      onChanged(await api.config());
-      onClose();
-    } catch (cause) {
-      setError((cause as Error).message);
-    } finally {
-      setSubmitting(false);
-    }
-  };
-  return (
-    <div className="modal-backdrop" onMouseDown={onClose}>
-      <form className="modal credential-modal" onSubmit={submit} onMouseDown={(event) => event.stopPropagation()}>
-        <div className="modal-head">
-          <div><span className="eyebrow">PERSONAL MODEL VAULT</span><h2>个人模型 Key</h2></div>
-          <button className="icon-button" type="button" onClick={onClose}><X size={18} /></button>
-        </div>
-        <div className="security-notice"><ShieldCheck size={18} /><div><strong>仅当前账户可用</strong><span>Key 经 AES-256-GCM 加密后保存，界面和 API 永不回显明文。留空可保留原 Key。</span></div></div>
-        <label>DeepSeek 开发模型 Key
-          <input type="password" autoComplete="new-password" value={developerApiKey} onChange={(event) => setDeveloperApiKey(event.target.value)} placeholder={config?.developer.credentialConfigured ? "已配置 · 输入新值可轮换" : "输入个人 Key"} />
-        </label>
-        <label>OpenAI 审核模型 Key
-          <input type="password" autoComplete="new-password" value={reviewerApiKey} onChange={(event) => setReviewerApiKey(event.target.value)} placeholder={config?.reviewer.credentialConfigured ? "已配置 · 输入新值可轮换" : "输入个人 Key"} />
-        </label>
-        <p className="credential-help">真实任务只在对应 Agent 进程运行期间把 Key 注入内存；不会写入任务、日志、Diff 或 Git 仓库。</p>
-        {error && <div className="form-error">{error}</div>}
-        <div className="modal-actions split-actions">
-          <button type="button" className="button danger-text" disabled={submitting || (!config?.developer.credentialConfigured && !config?.reviewer.credentialConfigured)} onClick={() => void remove()}>删除全部 Key</button>
-          <span />
-          <button type="button" className="button secondary" onClick={onClose}>取消</button>
-          <button type="submit" className="button primary" disabled={submitting || (!developerApiKey && !reviewerApiKey)}>{submitting ? <LoaderCircle className="spin" size={16} /> : <KeyRound size={16} />}安全保存</button>
         </div>
       </form>
     </div>
@@ -566,9 +523,8 @@ export function App() {
   const [config, setConfig] = useState<ConfigStatus>();
   const [user, setUser] = useState<CurrentUser>();
   const [tab, setTab] = useState<Tab>("activity");
-  const [view, setView] = useState<"run" | "workspaces">("run");
+  const [view, setView] = useState<"run" | "workspaces" | "models">("run");
   const [createOpen, setCreateOpen] = useState(false);
-  const [credentialsOpen, setCredentialsOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [loading, setLoading] = useState(true);
 
@@ -637,7 +593,7 @@ export function App() {
         <nav className="primary-nav">
           <button type="button" className={view === "run" ? "active" : ""} onClick={() => setView("run")}><GitBranch size={16} />工作流</button>
           <button type="button" className={view === "workspaces" ? "active" : ""} onClick={() => setView("workspaces")}><FolderGit2 size={16} />工作区</button>
-          <button type="button" onClick={() => setCredentialsOpen(true)}><KeyRound size={16} />个人模型 Key<span className="nav-badge">BYOK</span></button>
+          <button type="button" className={view === "models" ? "active" : ""} onClick={() => setView("models")}><Cpu size={16} />模型与凭据</button>
           <a href="#system"><Activity size={16} />运行状态</a>
         </nav>
         <div className="sidebar-section-head"><span>最近任务</span><Search size={14} /></div>
@@ -660,7 +616,7 @@ export function App() {
           <div className="providers-title"><span>AGENT ROUTING</span><Zap size={13} /></div>
           <ProviderStatus label="开发" provider={config.developer.provider} model={config.developer.model} ready={config.developer.credentialConfigured} icon={Code2} />
           <ProviderStatus label="审核" provider={config.reviewer.provider} model={config.reviewer.model} ready={config.reviewer.credentialConfigured} icon={ShieldCheck} />
-          <button className="manage-credentials" type="button" onClick={() => setCredentialsOpen(true)}><KeyRound size={13} />配置或轮换个人 Key</button>
+          <button className="manage-credentials" type="button" onClick={() => setView("models")}><KeyRound size={13} />配置或轮换个人 Key</button>
           <div className={`credential-warning ${config.realRunsAvailable ? "runner-ready" : ""}`}><AlertTriangle size={13} />{config.realRunsAvailable ? "真实执行已启用" : "真实执行尚未启用"}</div>
         </div>}
         <div className="account-footer"><div><span className="system-dot" /><strong>{user?.email || "正在验证账户"}</strong><small>Pi {config?.piVersion || "—"}</small></div><a href="/cdn-cgi/access/logout" title="退出登录"><LogOut size={15} /></a></div>
@@ -672,7 +628,9 @@ export function App() {
           <div className="breadcrumb">
             {view === "workspaces"
               ? <><span>WORKSPACES</span><ChevronRight size={13} /><strong>工作区</strong></>
-              : <><span>WORKFLOWS</span><ChevronRight size={13} /><strong>{run?.id.slice(0, 12) || "OVERVIEW"}</strong></>}
+              : view === "models"
+                ? <><span>MODELS</span><ChevronRight size={13} /><strong>模型与凭据</strong></>
+                : <><span>WORKFLOWS</span><ChevronRight size={13} /><strong>{run?.id.slice(0, 12) || "OVERVIEW"}</strong></>}
           </div>
           <div className="topbar-actions">
             {view === "run" && (run?.mode === "demo" ? <span className="demo-chip"><Sparkles size={13} />演示数据</span> : run && <span className="demo-chip real-chip"><Code2 size={13} />真实工作区</span>)}
@@ -681,8 +639,10 @@ export function App() {
           </div>
         </header>
 
-        {view === "workspaces" ? (
-          <WorkspacesPage config={config} runs={runs} onOpenCredentials={() => setCredentialsOpen(true)} />
+        {view === "models" ? (
+          <ModelsPage config={config} onChanged={() => { void api.config().then(setConfig); }} />
+        ) : view === "workspaces" ? (
+          <WorkspacesPage config={config} runs={runs} onOpenCredentials={() => setView("models")} />
         ) : !run ? (
           <section className="welcome-state">
             <div className="welcome-orbit"><div><Bot size={32} /></div><i /><i /><i /></div>
@@ -756,7 +716,6 @@ export function App() {
         )}
       </main>
       <CreateRunDialog open={createOpen} onClose={() => setCreateOpen(false)} onCreated={handleCreated} config={config} onGoWorkspaces={() => { setCreateOpen(false); setView("workspaces"); }} />
-      <CredentialsDialog open={credentialsOpen} onClose={() => setCredentialsOpen(false)} config={config} onChanged={setConfig} />
     </div>
   );
 }
