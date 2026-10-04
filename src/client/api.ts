@@ -41,5 +41,8 @@ export const api = {
   createRun: (body: { title: string; task: string; repository?: string; workspaceId?: string; mode: "demo" | "real"; checks?: string[] }) =>
     request<Run>("/api/runs", { method: "POST", body: JSON.stringify(body) }),
   cancelRun: (id: string) => request<Run>(`/api/runs/${id}/cancel`, { method: "POST" }),
+  resumeRun: (id: string, body: { instruction?: string }) =>
+    request<Run>(`/api/runs/${id}/resume`, { method: "POST", body: JSON.stringify(body) }),
+  retryReviewRun: (id: string) => request<Run>(`/api/runs/${id}/retry-review`, { method: "POST" }),
   deleteRun: (id: string) => request<void>(`/api/runs/${id}`, { method: "DELETE" }),
 };

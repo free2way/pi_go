@@ -214,9 +214,9 @@ function vaultKeyFor(request: FastifyRequest) {
 app.get("/api/health", async (_request, reply) => {
   try {
     await db.query("SELECT 1");
-    return { status: "ok", service: "pigo-web", version: "0.7.0", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.8.0", db: "ok" };
   } catch {
-    return reply.code(503).send({ status: "error", service: "pigo-web", version: "0.7.0", db: "unavailable" });
+    return reply.code(503).send({ status: "error", service: "pigo-web", version: "0.8.0", db: "unavailable" });
   }
 });
 app.get("/api/me", async (request) => auth.user(request));
@@ -426,6 +426,82 @@ app.delete<{ Params: { id: string } }>("/api/runs/:id", async (request, reply) =
   }
   await store.deleteRun(run.id);
   return reply.code(204).send();
+});
+
+const resumeSchema = z.object({
+  instruction: z.string().trim().max(2_000).optional(),
+});
+
+/** RUN-006: human-in-the-loop actions for runs stopped at needs_human. */
+async function dispatchFollowupJob(
+  request: FastifyRequest<{ Params: { id: string } }>,
+  reply: FastifyReply,
+  options: { kind: "resume"; instruction?: string } | { kind: "retry-review" },
+) {
+  const run = store.getRun(request.params.id, ownerKeysFor(request));
+  if (!run) return reply.code(404).send({ error: "Run not found" });
+  if (run.mode !== "real") return reply.code(409).send({ error: "只有真实任务支持人工恢复", code: "RUN_NOT_RESUMABLE" });
+  if (run.state !== "needs_human") return reply.code(409).send({ error: "仅「需要人工处理」的任务可以执行该操作", code: "RUN_NOT_RESUMABLE" });
+  if (!realRunsEnabled || !internalToken) return reply.code(503).send({ error: "Real agent execution is disabled", code: "REAL_RUNNER_NOT_AVAILABLE" });
+  const credentials = vault.get(vaultKeyFor(request));
+  if (!credentials) return reply.code(403).send({ error: "请先配置个人模型 Key 再继续真实任务", code: "PERSONAL_CREDENTIALS_REQUIRED" });
+
+  const instruction = options.kind === "resume" ? options.instruction?.trim() : undefined;
+  const round = options.kind === "resume" ? run.round + 1 : run.round;
+  const updated = await store.updateRun(run.id, options.kind === "resume"
+    ? { state: "queued", round, maxRounds: Math.max(run.maxRounds, round), summary: "人工恢复：等待 Worker 接收" }
+    : { state: "reviewing", summary: "人工触发：重新审核中" });
+  await store.appendEvent({
+    runId: run.id,
+    round,
+    source: "system",
+    type: options.kind === "resume" ? "run.resumed" : "run.review_retry",
+    message: options.kind === "resume"
+      ? `工作区所有者恢复执行（第 ${round} 轮）`
+      : "工作区所有者触发重新审核",
+    at: new Date().toISOString(),
+  });
+  if (instruction) {
+    await store.appendEvent({ runId: run.id, round, source: "system", type: "run.resume_instruction", message: `人工指令：${instruction.slice(0, 500)}`, at: new Date().toISOString() });
+  }
+
+  try {
+    await workerRequest("/jobs", {
+      method: "POST",
+      body: JSON.stringify({
+        run: updated,
+        checks: run.checks.map((check) => check.command),
+        credentials,
+        ...(options.kind === "resume" ? { resume: { instruction } } : { retryReview: true }),
+      }),
+    });
+    credentials.developer = "";
+    credentials.reviewer = "";
+    return reply.code(201).send(store.getRun(run.id, ownerKeysFor(request)));
+  } catch (error) {
+    credentials.developer = "";
+    credentials.reviewer = "";
+    await store.updateRun(run.id, { state: "needs_human", summary: "Worker 拒绝任务，保持人工处理" });
+    await store.appendEvent({
+      runId: run.id,
+      round,
+      source: "system",
+      type: options.kind === "resume" ? "run.resume_failed" : "run.review_retry_failed",
+      message: `Worker 拒绝任务：${(error as Error).message}`,
+      at: new Date().toISOString(),
+    });
+    return reply.code(503).send({ error: (error as Error).message });
+  }
+}
+
+app.post<{ Params: { id: string } }>("/api/runs/:id/resume", async (request, reply) => {
+  const parsed = resumeSchema.safeParse(request.body ?? {});
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
+  return dispatchFollowupJob(request, reply, { kind: "resume", instruction: parsed.data.instruction });
+});
+
+app.post<{ Params: { id: string } }>("/api/runs/:id/retry-review", async (request, reply) => {
+  return dispatchFollowupJob(request, reply, { kind: "retry-review" });
 });
 
 app.post<{ Params: { id: string } }>("/api/internal/runs/:id/update", { bodyLimit: 4 * 1024 * 1024 }, async (request, reply) => {

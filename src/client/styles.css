@@ -370,3 +370,16 @@ button { color: inherit; }
 .dirty-warning strong { display: block; font-size: 10px; color: #e2b483; }
 .dirty-warning span { display: block; margin-top: 3px; color: #98836e; font-size: 9px; line-height: 1.5; }
 .dirty-warning code { display: block; margin-top: 5px; color: #a8927a; font: 8px "DM Mono", monospace; word-break: break-all; }
+
+/* ---------- human intervention ---------- */
+.human-panel { margin-top: 16px; border: 1px solid rgba(243,166,90,.22); background: rgba(243,166,90,.045); border-radius: 11px; padding: 15px 16px; }
+.human-panel-head { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; }
+.human-panel-head h3 { margin: 4px 0 0; font-size: 14px; }
+.human-reason { color: #c08f5c; font-size: 9px; max-width: 56%; text-align: right; line-height: 1.5; }
+.human-hint { margin: 9px 0 0; color: #97826c; font-size: 10px; line-height: 1.65; }
+.human-panel label { display: block; color: #747f89; font-size: 9px; margin-top: 11px; }
+.human-panel textarea { width: 100%; margin-top: 6px; border: 1px solid #293039; background: #0a0d10; color: #dfe3e7; border-radius: 8px; padding: 10px 11px; outline: none; font-size: 11px; resize: vertical; font-family: inherit; }
+.human-panel textarea:focus { border-color: #59652c; box-shadow: 0 0 0 2px rgba(223,248,84,.04); }
+.human-actions { display: flex; gap: 8px; margin-top: 13px; }
+.human-actions .danger-text { height: 38px; border-radius: 8px; padding: 0 15px; font-size: 11px; font-weight: 650; display: inline-flex; align-items: center; justify-content: center; gap: 8px; cursor: pointer; }
+.human-actions .danger-text:disabled { opacity: .55; cursor: wait; }

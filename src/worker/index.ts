@@ -8,6 +8,7 @@ import type { CheckResult, DevelopmentPlan, Finding, ProjectInfo, Run, RunEvent,
 import { executionWaves, fallbackPlan, parseDevelopmentPlan } from "./orchestrator.js";
 import { UsageTracker, addUsage, assistantErrorFromEvent, assistantTextFromEvent, emptyUsage, toRunUsage, toolNameFromEvent, type UsageTotals } from "./pi-events.js";
 import { parseReview, type ReviewResult } from "./review-protocol.js";
+import { mergeFindings, unresolvedFeedback } from "./review-findings.js";
 import { WorkspacePathError, resolveInsideRoot, sanitizeRelativePath, sanitizeWorkspaceName, validateCloneUrl } from "./workspace-paths.js";
 
 const port = Number(process.env.PORT || 3200);
@@ -38,6 +39,10 @@ type JobInput = {
     developer: string;
     reviewer: string;
   };
+  /** Human-in-the-loop resume: reuse the existing worktree and continue with the next round. */
+  resume?: { instruction?: string };
+  /** Human-in-the-loop: re-run only the reviewer against the current worktree. */
+  retryReview?: boolean;
 };
 
 function redactJobSecrets(message: string, credentials: JobInput["credentials"]) {
@@ -516,6 +521,136 @@ async function runChecks(run: Run, worktree: string, commands: string[], signal:
   return { passed: true, results };
 }
 
+type ReviewOutcome = { stopped: true } | { stopped: false; review: ReviewResult };
+
+async function performReview(input: {
+  run: Run;
+  worktree: string;
+  credentials: JobInput["credentials"];
+  round: number;
+  diff: string;
+  signal: AbortSignal;
+  usage: UsageTotals;
+  started: number;
+}): Promise<ReviewOutcome> {
+  const reviewPrompt = [
+    "You are an independent read-only code reviewer. Do not modify files.",
+    `Original task: ${input.run.task}`,
+    "Review the current repository and the diff below for correctness, missing requirements, security, regressions, and test quality.",
+    "Return JSON only with this exact shape:",
+    '{"verdict":"approved|changes_requested","summary":"...","findings":[{"id":"...","severity":"critical|high|medium|low","file":null,"line":null,"title":"...","evidence":"...","requiredChange":"..."}]}',
+    "Use changes_requested only for actionable defects. approved must not contain critical/high/medium findings.",
+    `Diff:\n${input.diff.slice(0, 90_000)}`,
+  ].join("\n\n");
+  let firstReview: { text: string; usage: UsageTotals };
+  try {
+    firstReview = await runPi({
+      cwd: input.worktree,
+      provider: input.run.reviewer.provider,
+      model: input.run.reviewer.model,
+      prompt: reviewPrompt,
+      readOnly: true,
+      apiKey: input.credentials.reviewer,
+      apiKeyEnvironmentName: "OPENAI_API_KEY",
+      signal: input.signal,
+      onActivity: (message) => postUpdate(input.run.id, { event: { round: input.round, source: "reviewer", type: "agent.activity", message } }),
+    });
+  } catch (providerError) {
+    const reason = redactJobSecrets((providerError as Error).message, input.credentials).slice(0, 500);
+    await update(input.run, "needs_human", "reviewer", "review.provider_error", `审核模型调用失败：${reason}`, {
+      usage: toRunUsage(input.usage),
+      durationMs: Date.now() - input.started,
+      summary: `审核模型暂时不可用：${reason}`,
+    });
+    return { stopped: true };
+  }
+  addUsage(input.usage, firstReview.usage);
+  try {
+    return { stopped: false, review: parseReview(redactJobSecrets(firstReview.text, input.credentials), input.round) };
+  } catch (protocolError) {
+    const reason = redactJobSecrets((protocolError as Error).message, input.credentials).slice(0, 200);
+    await postUpdate(input.run.id, { event: { round: input.round, source: "reviewer", type: "review.retry", message: `审核输出无法解析（${reason}），已要求 Reviewer 重新输出` } });
+    let retryReview: { text: string; usage: UsageTotals };
+    try {
+      retryReview = await runPi({
+        cwd: input.worktree,
+        provider: input.run.reviewer.provider,
+        model: input.run.reviewer.model,
+        prompt: `${reviewPrompt}\n\n上一次回复被拒绝：不是合法的协议 JSON。只输出 JSON 对象本身，不要 markdown 代码块，不要任何解释。`,
+        readOnly: true,
+        apiKey: input.credentials.reviewer,
+        apiKeyEnvironmentName: "OPENAI_API_KEY",
+        signal: input.signal,
+        onActivity: (message) => postUpdate(input.run.id, { event: { round: input.round, source: "reviewer", type: "agent.activity", message } }),
+      });
+    } catch (providerError) {
+      const providerReason = redactJobSecrets((providerError as Error).message, input.credentials).slice(0, 500);
+      await update(input.run, "needs_human", "reviewer", "review.provider_error", `审核模型调用失败：${providerReason}`, {
+        usage: toRunUsage(input.usage),
+        durationMs: Date.now() - input.started,
+        summary: `审核模型暂时不可用：${providerReason}`,
+      });
+      return { stopped: true };
+    }
+    addUsage(input.usage, retryReview.usage);
+    try {
+      return { stopped: false, review: parseReview(redactJobSecrets(retryReview.text, input.credentials), input.round) };
+    } catch (retryError) {
+      await update(input.run, "needs_human", "reviewer", "review.invalid_protocol", "Reviewer 两次输出均无法解析为审核协议，转人工处理", {
+        usage: toRunUsage(input.usage),
+        durationMs: Date.now() - input.started,
+        summary: `审核输出无法解析：${redactJobSecrets((retryError as Error).message, input.credentials).slice(0, 500)}`,
+      });
+      return { stopped: true };
+    }
+  }
+}
+
+/** Human-triggered re-review: no development happens, the reviewer checks the current worktree again. */
+async function executeRetryReview(input: {
+  run: Run;
+  worktree: string;
+  baseCommit: string;
+  credentials: JobInput["credentials"];
+  controller: AbortController;
+  usage: UsageTotals;
+  started: number;
+}) {
+  const { run } = input;
+  await update(run, "reviewing", "reviewer", "review.started", `${run.reviewer.model} 重新审核（人工触发）`, { summary: "Reviewer Agent 正在重新审核" });
+  const diff = await collectDiff(input.worktree, input.controller.signal, input.baseCommit);
+  const outcome = await performReview({
+    run,
+    worktree: input.worktree,
+    credentials: input.credentials,
+    round: run.round,
+    diff,
+    signal: input.controller.signal,
+    usage: input.usage,
+    started: input.started,
+  });
+  if (outcome.stopped) return;
+  const review = outcome.review;
+  const findings = mergeFindings(run.findings ?? [], review.findings);
+  if (review.verdict === "approved") {
+    await update(run, "completed", "reviewer", "review.approved", "独立审核通过，代码保留在任务 worktree", {
+      findings,
+      diff,
+      summary: review.summary,
+      usage: toRunUsage(input.usage),
+      durationMs: Date.now() - input.started,
+    });
+    return;
+  }
+  await update(run, "needs_human", "reviewer", "review.changes_requested", `重试审核仍发现 ${review.findings.length} 个问题，继续人工处理`, {
+    findings,
+    diff,
+    summary: review.summary,
+    usage: toRunUsage(input.usage),
+    durationMs: Date.now() - input.started,
+  });
+}
+
 async function executeJob(input: JobInput, controller: AbortController) {
   const run = input.run;
   const started = Date.now();
@@ -524,18 +659,50 @@ async function executeJob(input: JobInput, controller: AbortController) {
     const project = await resolveProject(run.repository);
     const dirty = await git(project, ["status", "--porcelain"], controller.signal);
     if (dirty) throw new Error("Source repository has uncommitted changes; clean it before starting a real run");
-    const baseCommit = await git(project, ["rev-parse", "HEAD"], controller.signal);
+    const projectHead = await git(project, ["rev-parse", "HEAD"], controller.signal);
     if (!/^[a-f0-9]{64}$/.test(run.ownerId)) throw new Error("Invalid run owner");
     const worktree = path.join(runsRoot, run.ownerId, run.id);
-    await mkdir(path.dirname(worktree), { recursive: true });
-    await update(run, "preparing", "system", "workspace.preparing", "正在创建隔离 Git worktree", { worktree: path.relative(workspaceRoot, worktree) });
-    await git(project, ["worktree", "add", "-b", run.branch, worktree, "HEAD"], controller.signal);
+    const reuseWorktree = Boolean(input.resume || input.retryReview);
+    const humanInstruction = input.resume?.instruction?.trim() || "";
+
+    let baseCommit = projectHead;
+    if (reuseWorktree) {
+      const exists = await stat(worktree).then(() => true).catch(() => false);
+      if (!exists) throw new Error("无法恢复：任务 worktree 不存在（可能已被清理）");
+      const branch = await git(worktree, ["branch", "--show-current"], controller.signal);
+      if (branch !== run.branch) throw new Error(`无法恢复：worktree 当前分支为 ${branch || "detached"}，期望 ${run.branch}`);
+      const head = await git(worktree, ["rev-parse", "HEAD"], controller.signal);
+      const pending = await git(worktree, ["status", "--porcelain"], controller.signal);
+      baseCommit = await git(project, ["merge-base", projectHead, run.branch], controller.signal).catch(() => projectHead);
+      await update(run,
+        input.retryReview ? "reviewing" : "preparing",
+        "system",
+        input.retryReview ? "review.retry_started" : "run.resume_detected",
+        input.retryReview
+          ? `重试审核：复用现有 worktree（HEAD ${head.slice(0, 7)}）`
+          : `人工恢复：复用已有 worktree（HEAD ${head.slice(0, 7)}${pending ? "，包含未提交的人工修改" : ""}）`,
+        { worktree: path.relative(workspaceRoot, worktree), summary: input.retryReview ? "Reviewer Agent 正在重新审核" : "人工恢复：正在准备继续执行" });
+      if (humanInstruction) {
+        await postUpdate(run.id, { event: { round: run.round, source: "system", type: "run.resume_instruction", message: `人工指令：${humanInstruction.slice(0, 500)}` } });
+      }
+    } else {
+      await mkdir(path.dirname(worktree), { recursive: true });
+      await update(run, "preparing", "system", "workspace.preparing", "正在创建隔离 Git worktree", { worktree: path.relative(workspaceRoot, worktree) });
+      await git(project, ["worktree", "add", "-b", run.branch, worktree, "HEAD"], controller.signal);
+    }
+
+    if (input.retryReview) {
+      await executeRetryReview({ run, worktree, baseCommit, credentials: input.credentials, controller, usage, started });
+      return;
+    }
+
     await update(run, "developing", "developer", "agent.started", `${run.developer.model} 主 Agent 开始评估工作量`, { summary: "主 Agent 正在分析任务并决定是否拆分 Sub Agent" });
 
-    let feedback = "";
-    let findings: Finding[] = [];
+    let feedback = input.resume ? unresolvedFeedback(run.findings) : "";
+    let findings: Finding[] = input.resume ? [...(run.findings ?? [])] : [];
     let plan: DevelopmentPlan | undefined;
-    for (let round = 1; round <= run.maxRounds; round += 1) {
+    const firstRound = input.resume ? Math.max(2, run.round) : 1;
+    for (let round = firstRound; round <= run.maxRounds; round += 1) {
       run.round = round;
       await postUpdate(run.id, { patch: { round }, event: { round, source: "system", type: "round.started", message: `开始第 ${round} 轮开发` } });
       if (round === 1) {
@@ -579,14 +746,16 @@ async function executeJob(input: JobInput, controller: AbortController) {
           await postUpdate(run.id, { patch: { plan }, event: { round, source: "developer", type: "developer.completed", message: "单 Agent 实现完成" } });
         }
       } else {
-        const repairPrompt = [
+        const repairSections = [
           "You are the repair developer agent. Work only in the current Git worktree.",
           `Original task: ${run.task}`,
           `Required fixes from checks or review:\n${feedback}`,
-          "Inspect the existing combined implementation, make the required fixes, and update tests.",
-          "Do not push, deploy, delete the repository, or read credentials.",
-        ].join("\n\n");
-        await runDeveloperAgent({ run, worktree, credentials: input.credentials, signal: controller.signal, prompt: repairPrompt, sessionSuffix: `repair-${round}`, activityPrefix: "修复 Agent", usage });
+        ];
+        if (round === firstRound && humanInstruction) {
+          repairSections.push(`人工指令（来自工作区所有者，最高优先级，必须满足）：\n${humanInstruction}`);
+        }
+        repairSections.push("Inspect the existing combined implementation, make the required fixes, and update tests.", "Do not push, deploy, delete the repository, or read credentials.");
+        await runDeveloperAgent({ run, worktree, credentials: input.credentials, signal: controller.signal, prompt: repairSections.join("\n\n"), sessionSuffix: `repair-${round}`, activityPrefix: "修复 Agent", usage });
       }
       const diff = await collectDiff(worktree, controller.signal, baseCommit);
       await update(run, "checking", "checks", "checks.started", "Developer 完成，开始确定性检查", { diff, summary: "正在运行项目检查", usage: toRunUsage(usage) });
@@ -599,80 +768,10 @@ async function executeJob(input: JobInput, controller: AbortController) {
 
       const latestDiff = await collectDiff(worktree, controller.signal, baseCommit);
       await update(run, "reviewing", "reviewer", "review.started", `${run.reviewer.model} 开始独立只读审核`, { diff: latestDiff, summary: "Reviewer Agent 正在审核" });
-      const reviewPrompt = [
-        "You are an independent read-only code reviewer. Do not modify files.",
-        `Original task: ${run.task}`,
-        "Review the current repository and the diff below for correctness, missing requirements, security, regressions, and test quality.",
-        "Return JSON only with this exact shape:",
-        '{"verdict":"approved|changes_requested","summary":"...","findings":[{"id":"...","severity":"critical|high|medium|low","file":null,"line":null,"title":"...","evidence":"...","requiredChange":"..."}]}',
-        "Use changes_requested only for actionable defects. approved must not contain critical/high/medium findings.",
-        `Diff:\n${latestDiff.slice(0, 90_000)}`,
-      ].join("\n\n");
-      let firstReview: { text: string; usage: UsageTotals };
-      try {
-        firstReview = await runPi({
-          cwd: worktree,
-          provider: run.reviewer.provider,
-          model: run.reviewer.model,
-          prompt: reviewPrompt,
-          readOnly: true,
-          apiKey: input.credentials.reviewer,
-          apiKeyEnvironmentName: "OPENAI_API_KEY",
-          signal: controller.signal,
-          onActivity: (message) => postUpdate(run.id, { event: { round, source: "reviewer", type: "agent.activity", message } }),
-        });
-      } catch (providerError) {
-        const reason = redactJobSecrets((providerError as Error).message, input.credentials).slice(0, 500);
-        await update(run, "needs_human", "reviewer", "review.provider_error", `审核模型调用失败：${reason}`, {
-          usage: toRunUsage(usage),
-          durationMs: Date.now() - started,
-          summary: `审核模型暂时不可用：${reason}`,
-        });
-        return;
-      }
-      addUsage(usage, firstReview.usage);
-      let review: ReviewResult;
-      try {
-        review = parseReview(redactJobSecrets(firstReview.text, input.credentials), round);
-      } catch (protocolError) {
-        const reason = redactJobSecrets((protocolError as Error).message, input.credentials).slice(0, 200);
-        await postUpdate(run.id, { event: { round, source: "reviewer", type: "review.retry", message: `审核输出无法解析（${reason}），已要求 Reviewer 重新输出` } });
-        let retryReview: { text: string; usage: UsageTotals };
-        try {
-          retryReview = await runPi({
-            cwd: worktree,
-            provider: run.reviewer.provider,
-            model: run.reviewer.model,
-            prompt: `${reviewPrompt}\n\n上一次回复被拒绝：不是合法的协议 JSON。只输出 JSON 对象本身，不要 markdown 代码块，不要任何解释。`,
-            readOnly: true,
-            apiKey: input.credentials.reviewer,
-            apiKeyEnvironmentName: "OPENAI_API_KEY",
-            signal: controller.signal,
-            onActivity: (message) => postUpdate(run.id, { event: { round, source: "reviewer", type: "agent.activity", message } }),
-          });
-        } catch (providerError) {
-          const providerReason = redactJobSecrets((providerError as Error).message, input.credentials).slice(0, 500);
-          await update(run, "needs_human", "reviewer", "review.provider_error", `审核模型调用失败：${providerReason}`, {
-            usage: toRunUsage(usage),
-            durationMs: Date.now() - started,
-            summary: `审核模型暂时不可用：${providerReason}`,
-          });
-          return;
-        }
-        addUsage(usage, retryReview.usage);
-        try {
-          review = parseReview(redactJobSecrets(retryReview.text, input.credentials), round);
-        } catch (retryError) {
-          await update(run, "needs_human", "reviewer", "review.invalid_protocol", "Reviewer 两次输出均无法解析为审核协议，转人工处理", {
-            usage: toRunUsage(usage),
-            durationMs: Date.now() - started,
-            summary: `审核输出无法解析：${redactJobSecrets((retryError as Error).message, input.credentials).slice(0, 500)}`,
-          });
-          return;
-        }
-      }
-      const currentFindings = review.findings.map((item) => ({ ...item, resolved: false }));
-      findings = [...findings.map((item) => ({ ...item, resolved: true })), ...currentFindings];
+      const outcome = await performReview({ run, worktree, credentials: input.credentials, round, diff: latestDiff, signal: controller.signal, usage, started });
+      if (outcome.stopped) return;
+      const review = outcome.review;
+      findings = mergeFindings(findings, review.findings);
       if (review.verdict === "approved") {
         await update(run, "completed", "reviewer", "review.approved", "独立审核通过，代码保留在任务 worktree", {
           findings,
@@ -690,7 +789,11 @@ async function executeJob(input: JobInput, controller: AbortController) {
   } catch (error) {
     const cancelled = controller.signal.aborted;
     const safeMessage = redactJobSecrets((error as Error).message, input.credentials).slice(0, 2_000);
-    await update(run, cancelled ? "cancelled" : "failed", "system", cancelled ? "run.cancelled" : "run.failed", cancelled ? "任务已取消" : `真实运行失败：${safeMessage}`, {
+    const followup = Boolean(input.resume || input.retryReview);
+    const state: RunState = cancelled ? "cancelled" : followup ? "needs_human" : "failed";
+    const type = cancelled ? "run.cancelled" : followup ? "run.resume_failed" : "run.failed";
+    const message = cancelled ? "任务已取消" : followup ? `恢复执行失败，保持人工处理：${safeMessage}` : `真实运行失败：${safeMessage}`;
+    await update(run, state, "system", type, message, {
       summary: cancelled ? "已取消" : safeMessage,
       usage: toRunUsage(usage),
       durationMs: Date.now() - started,

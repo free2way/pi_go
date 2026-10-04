@@ -501,6 +501,59 @@ function EmptyPanel({ icon: Icon, text }: { icon: typeof Activity; text: string 
   return <div className="empty-panel"><Icon size={22} /><span>{text}</span></div>;
 }
 
+function HumanInterventionPanel({ run, onUpdated }: { run: Run; onUpdated: (run: Run) => void }) {
+  const [instruction, setInstruction] = useState("");
+  const [busy, setBusy] = useState<"" | "resume" | "review" | "terminate">("");
+  const [error, setError] = useState("");
+  const unresolved = run.findings.filter((item) => !item.resolved).length;
+
+  const act = async (kind: "resume" | "review" | "terminate") => {
+    setError("");
+    if (kind === "terminate" && !window.confirm(`终止任务「${run.title}」？\n\n任务会标记为已取消；代码与 worktree 全部保留，不会自动合并。`)) return;
+    setBusy(kind);
+    try {
+      if (kind === "resume") {
+        onUpdated(await api.resumeRun(run.id, { instruction: instruction.trim() || undefined }));
+      } else if (kind === "review") {
+        onUpdated(await api.retryReviewRun(run.id));
+      } else {
+        onUpdated(await api.cancelRun(run.id));
+      }
+    } catch (cause) {
+      setError((cause as Error).message);
+    } finally {
+      setBusy("");
+    }
+  };
+
+  return (
+    <section className="human-panel">
+      <div className="human-panel-head">
+        <div><span className="eyebrow">HUMAN IN THE LOOP</span><h3>需要人工处理</h3></div>
+        <span className="human-reason">{run.summary}</span>
+      </div>
+      <p className="human-hint">
+        当前有 {unresolved} 条未解决意见，代码保留在服务器 worktree（未自动提交或合并）。你可以直接编辑 worktree 后「恢复下一轮」（会记录恢复点 HEAD 与人工指令），或「重试审核」让 Reviewer 复查当前代码；不再继续时「终止」。
+      </p>
+      <label>人工指令（可选，随恢复发送给修复 Agent）
+        <textarea rows={3} value={instruction} onChange={(event) => setInstruction(event.target.value)} placeholder="例如：优先修复凭据隔离问题；其余按审核意见逐条处理。" disabled={Boolean(busy)} />
+      </label>
+      {error && <div className="form-error">{error}</div>}
+      <div className="human-actions">
+        <button type="button" className="button primary" disabled={Boolean(busy)} onClick={() => void act("resume")}>
+          {busy === "resume" ? <LoaderCircle className="spin" size={15} /> : <RotateCcw size={15} />}恢复下一轮
+        </button>
+        <button type="button" className="button secondary" disabled={Boolean(busy)} onClick={() => void act("review")}>
+          {busy === "review" ? <LoaderCircle className="spin" size={15} /> : <ShieldCheck size={15} />}重试审核
+        </button>
+        <button type="button" className="button danger-text" disabled={Boolean(busy)} onClick={() => void act("terminate")}>
+          {busy === "terminate" ? <LoaderCircle className="spin" size={15} /> : <Square size={14} />}终止
+        </button>
+      </div>
+    </section>
+  );
+}
+
 const formatClock = (date: string) => new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(new Date(date));
 const formatDuration = (ms: number) => ms ? `${Math.floor(ms / 60_000)}m ${Math.floor((ms % 60_000) / 1000)}s` : "—";
 const compactNumber = (value: number) => value > 999 ? `${(value / 1000).toFixed(1)}k` : String(value);
@@ -648,6 +701,16 @@ export function App() {
               </div>
               <div className="run-round"><span>REVIEW ROUND</span><strong>{run.round}<em>/ {run.maxRounds}</em></strong></div>
             </section>
+
+            {run.state === "needs_human" && (
+              <HumanInterventionPanel
+                run={run}
+                onUpdated={(next) => {
+                  setRun(next);
+                  setRuns((current) => current.map((item) => (item.id === next.id ? next : item)));
+                }}
+              />
+            )}
 
             <section className="metrics-grid">
               <div className="metric"><span><Activity size={14} />状态</span><strong>{stateLabels[run.state]}</strong><small>{running} 个任务运行中</small></div>
