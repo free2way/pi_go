@@ -129,7 +129,9 @@ docker compose --env-file .env down
 | v0.9.0 | 并行 Sub Agent 修复 | 子 Agent 分支前缀冲突（`pigo/<runId>/sub-*` 与运行分支互斥提交）导致的 7ms 立即失败 |
 | v0.10.0 | 模型与凭据（MODEL） | 按 provider 的 v2 加密凭据（v1 角色键一次性迁移，AAD `pigo:v2:<userId>:provider:<provider>`，掩码 `••••••last4`）、`GET /api/models` 目录与可用性、开发/审核分角色选模、入队前预检（422 `MODEL_NOT_FOUND`/`MODEL_NOT_ALLOWED`/`MODEL_UNAVAILABLE`）、provider 错误分类与建议、UI「模型与凭据」页 |
 | v0.11.x | 可靠性存储层（REL-001～004） | Run/Event/Agent/Check/Finding/Artifact/Checkpoint/Job 全部落 PostgreSQL（`runs.json` 一次性导入，原文件保留）；事件 seq 单调 + SSE 分页补拉/断点续传；内部更新投递幂等键；Worker 重启按检查点恢复（不重复已完成模型调用、不产生冲突 verdict）；任务队列持久化 + 心跳 + 超时重领 |
-| v0.12.x | 可靠性运维层（REL-005～007、010） | provider 429/5xx 有界指数退避（默认 3 次，2s×2 → 上限 30s）并留痕 `provider.retry`；健康详情 `/api/health/detail` 与告警（结构化日志 + 可选 `PI_ALERT_WEBHOOK`）；磁盘水位守卫（低水位告警、critical 时 507 `DISK_FULL` 停止接收新任务）；存储故障统一 503 `STORAGE_UNAVAILABLE` 且不伪装完成；每日备份与每周恢复校验脚本 |
+| v0.12.x | 可靠性运维层（REL-005～007、010） | provider 429/5xx 有界指数退避（默认 3 次，2s×2 → 上限 30s）并留痕 `provider.retry`；健康详情 `/api/health/detail` 与告警（结构化日志 + 可选 `PI_ALERT_WEBHOOK`）；磁盘水位守卫（低水位告警、critical 时 507 `DISK_FULL` 停止接收新任务）；存储故障统一 503 `STORAGE_UNAVAILABLE` 且不伪装完成（该保证的边界与校正见下方“已知限制”及审核报告 §5 / AUD-06）；每日备份与每周恢复校验脚本 |
+
+> **校正（对照审核报告 §5 / AUD-08）：**上表 v0.10.x 所述“入队前预检”只校验 Key 是否已配置及目录/白名单可见性，不等于 Key、model 与账号权限的运行时可用性预检；“Key 已配置”不能作为预检通过的证据。该能力由本批次 AUD-08/09 修复补齐（模型严格白名单 + 运行时可选性预检 `verifiedAt`/`verifiedModels`、执行可用性与默认 provider 解耦），见文末《2026-10-04 审计修复批次部署记录》。
 
 ### 回滚标签（镜像）
 
@@ -144,7 +146,7 @@ docker compose --env-file .env down
 
 - 脚本：`deploy/docker/backup.sh`（数据库 `pg_dump -Fc`、凭据密文、compose/.env、脱敏环境变量、manifest：表行数 + run 文档 digest + 密文 sha256）、`deploy/docker/restore-verify.sh`（还原到 `pigo_restore_verify` 临时库并逐项比对，比对后自动删除临时库，生产库不受影响）。
 - 已安装 crontab（用户 `free2way`）：每日 03:30 备份（保留 14 天）、每周日 04:30 恢复校验；日志 `backups/backup.log`、`backups/restore-verify.log`。移除方式：`crontab -e` 删除这两行。
-- 2026-10-04 手动验证结果：`runs=3 events=536 agents=3 checks=5 findings=18 artifacts=3`，run 文档 digest 与备份 manifest 完全一致，凭据密文 sha256 一致 → `RESTORE VERIFIED OK`。
+- 2026-10-04 手动验证结果：`runs=3 events=536 agents=3 checks=5 findings=18 artifacts=3`，run 文档 digest 与备份 manifest 完全一致，凭据密文 sha256 一致 → `RESTORE VERIFIED OK`。**校正（对照审核报告 §5 / AUD-14）：**该演练基于 v0.12.x 镜像，“备份成功”不能证明脱敏输出不含密码，也不能替代当前版本的恢复演练；本批次已实现备份净化核验（见文末《2026-10-04 审计修复批次部署记录》），但当前版本（v0.20.1）的恢复演练未重做，列为未验证。
 
 ### 数据迁移说明
 
@@ -153,7 +155,7 @@ docker compose --env-file .env down
 ### 已知限制
 
 - Web 进程内存中只保留运行摘要缓存，事件一律走数据库；多实例部署需要额外的缓存失效机制（当前为单实例）。
-- 存储完全不可用期间，Worker 无法写入终态：任务保持在已领取状态并重试，恢复后由重领继续；绝不会出现“未完成却显示完成”。
+- 存储完全不可用期间，Worker 无法写入终态：任务保持在已领取状态并重试，恢复后由重领继续。**校正（对照审核报告 §5 / AUD-06）：**原先“绝不会出现‘未完成却显示完成’”的绝对表述与“缓存先更新”的路径存在反例，已撤回；准确表述为终态以数据库持久化记录为准，内存/缓存状态不构成“完成”依据。
 - 恢复依赖既有 worktree；若 worktree 已被清理，任务会明确转人工而不是重复执行。
 
 ### 可靠性验收证据（192.168.2.235 上的隔离 e2e，v0.11.1～v0.12.1 镜像 + 假 Pi 运行时）
@@ -196,6 +198,8 @@ docker compose --env-file .env down
 | AT-SEC-012 | 缺 token / 错误值 / 错误长度 → 401；常量时间比较；正确 token 200 |
 | AT-SEC-013 | 8MB 请求体、20 万字符任务、5MB 内部 patch 全部 413，服务保持健康 |
 
+> **校正（对照审核报告 §5 / GAP-02）：**“全部插件禁用”（`--no-extensions --no-skills`）只说明未启用任何插件，不能覆盖“批准插件可启用、版本固定与篡改检测”。本批次已实现插件白名单（默认全禁，见文末批次记录），但插件版本固定与篡改检测仍未实现，列为遗留。
+
 ### 每任务容器沙箱（v0.14.0～v0.14.5，按业主决策采用）
 
 - **实现**：Worker 通过挂载的 Docker Socket（`group_add` 加入宿主 docker 组，非 root）为**每次 Agent 调用**与**每条检查命令**单独创建容器（`local/pigo-sandbox:0.1.0`，与运行时同镜像）。容器规格（`src/worker/sandbox.ts`）：
@@ -232,16 +236,83 @@ docker compose --env-file .env down
 | 用例 | 结果 |
 | --- | --- |
 | COST-001 | 2 轮运行 `usageRoles = planner:1 / developer:2 / reviewer:2`；`run_usage_role` 行同步；生产冒烟 planner $0.0015、developer $0.0021、reviewer $0.0000（代理未回传费用） |
-| COST-003 / AT-PERF-008 | 预算 $0.0031：首次调用后 80% 预警；第三次调用前停止（reviewer 调用数 0），状态 `needs_human`，事件 `run.budget_exhausted` |
-| COST-004 / AT-PERF-007 | 返修调用会话 id 与首轮 Developer 相同（`<run>-developer`），role 计为 developer |
+| COST-003 / AT-PERF-008 | 预算 $0.0031：首次调用后 80% 预警；第三次调用前停止（reviewer 调用数 0），状态 `needs_human`，事件 `run.budget_exhausted`。**校正：**这是正常路径预算通过，不能覆盖并行预留、恢复累积及 retry-review（AUD-10）；本批次 AUD-10 修复补齐了预算并行预留与时限，恢复累积 / retry-review 的独立证据未单列 → 未验证。 |
+| COST-004 / AT-PERF-007 | 返修调用的 `--session-id` 与首轮 Developer 相同（`<run>-developer`），role 计为 developer。**校正：**该证据仅证明 argv 相同，不能证明被删除的 session 仍可复用（AUD-07）；本批次修复清单含 AUD-07，但未单列“被删除 session 可复用”的直接证据 → 会话延续性未验证。 |
 | COST-006 | 探针显示 planner `--thinking low`，developer/reviewer `high` |
 | AT-PERF-001 | 10 并发 × 6 轮读取 workspaces/runs/models：p50 14 ms、p95 96 ms、错误率 0（阈值 p95 < 500 ms） |
-| AT-PERF-002 | 连续写入 100 事件：seq 连续、写入到可读 p95 105 ms（阈值 2 s） |
-| AT-PERF-003 | 首屏业务数据（workspaces+runs+models）26 ms（阈值 3 s，局域网） |
-| AT-PERF-004 | 沙箱容器规格：内存 2 GiB、CPU 1.5 核、pids 256（单元测试断言，`src/worker/sandbox.test.ts`） |
+| AT-PERF-002 | 连续写入 100 事件：seq 连续、写入到可读 p95 105 ms（阈值 2 s）。**校正：**这是“写入到 API 可读”延迟，不等于页面可见时延；页面可见延迟未测量 → 未验证。 |
+| AT-PERF-003 | 首屏业务数据（workspaces+runs+models）26 ms（阈值 3 s，局域网）。**校正：**这是 API 三接口响应时间，不能替代页面可见延迟与浏览器首次业务数据渲染；浏览器 e2e 已进仓库并本地实跑（5 通过 2 条件跳过），但页面可见延迟未单独量化 → 页面侧未验证。 |
+| AT-PERF-004 | 沙箱容器规格：内存 2 GiB、CPU 1.5 核、pids 256（单元测试断言，`src/worker/sandbox.test.ts`）。**校正：**仅证明单容器资源规格配置正确，不能覆盖三个真实 Agent 并行时的总资源占用与健康检查 → 未验证。 |
 | AT-PERF-005 | 取消 43 ms 内结束，无遗留沙箱容器 |
 | AT-PERF-009 | 运行文档与 `run_usage_role` 记录 provider 回传的精确 usage；费用字段为 provider 回传值（代理不提供时记为 0） |
 
 ### 生产冒烟
 
 `run_6de6ba9522844a84`：真实模型全流程完成（规划 → 开发 → 检查 → 审核通过），checkpoints 齐全、任务队列 done、成本 $0.0036，`run_usage_role` 3 行。
+
+## 2026-10-04 审计修复批次部署记录（v0.16.0 → v0.20.1）
+
+部署日期：2026-10-04（Asia/Shanghai）。主机 `192.168.2.235`，compose 项目 `pi-agent`。本批次针对审核报告（`docs/06-code-review-acceptance-report.md`）的 AUD / GAP 项收敛修复并部署，同时校正 `docs/03` 中与 §5 相关的旧表述（见各小节“校正”批注）。
+
+### 部署序列
+
+v0.15.2 → v0.16.x（隔离 e2e 验证）→ 生产 v0.18.0 → v0.19.0 → v0.19.1 → v0.19.2 → v0.20.0 → v0.20.1（当前）。
+
+每次部署前均执行 DB dump、vault 与 compose 备份，存放于 `backups/<ts>/`，并保留 `source.prev*` 时间戳目录。
+
+### 回滚点
+
+- 镜像回滚标签：web `prev22`…`prev26`、worker `prev18`…`prev22`。
+- 更早的 `prev15`/`prev16`、`prev19`/`prev20` 标签仍在，可回滚至 v0.15.2。
+
+### 本批次修复项
+
+| 编号 | 内容 |
+| --- | --- |
+| AUD-01/02/03/05/06/07/10/11/14/15 | 状态机守卫、事件序列号自愈、工作区归属 409、队列不误恢复、预算并行预留与时限、备份净化核验 |
+| AUD-08/09 | 模型严格白名单 + 运行时可选性预检（`verifiedAt`/`verifiedModels`）、执行可用性与默认 provider 解耦 |
+| AUD-16 | 全量 diff 制品 + 下载端点；worker 取消静默截尾，上限 3.4M/3.5M，超限显式标注 |
+| AUD-17 | SSE 先订阅后回放、`Last-Event-ID`、有界背压、客户端 seq 合并与上限 |
+| GAP-02 | 插件白名单，默认全禁 |
+| GAP-03 | 独立只读审查快照 + tree hash 零容忍升级 + fail-closed + 快照销毁 |
+| GAP-04 | approve/reject/清理/制品 API、预算与按 Agent 用量、check exitCode |
+| GAP-05 | 每工作区执行锁 + 失败子代理输出保留 |
+| GAP-08 | ESLint + 提交进仓库的 Playwright 浏览器 e2e 套件 |
+
+### 多进程一致性修复（生产冒烟发现）
+
+- Run 读取按需水合：跨实例 / 滚动部署不再 404。
+- 变更类路由始终水合：修复“缓存过期导致取消误判 409”。
+- `Run missing` 改为 defer，保留队列、不判死。
+
+### 生产冒烟证据
+
+- 真实链路单 `run_782bbaa1`：规划 → 2 子代理 → 合并 → 检查通过 → 审核退回 6 项 → 第 2 轮；因冒烟时限 900s + 审核超时止于 `needs_human`（非缺陷）。
+- 冒烟期间发现并当日修复“大 diff → 内部更新 400 storage_error”（schema 200k → 3.5M，v0.19.1）。
+- 收敛型冒烟单 `run_bd99b670` 终态 **completed**（diff 为空、检查通过、GAP-03 快照审查通过）。
+- 重启时日志 `[jobs] reclaimed 1 unfinished job(s)`，验证恢复路径。
+
+### 凭据切换
+
+- AUD-08 上线后，旧凭据初始未验证会拦截真实任务；生产以运维断言方式为既有凭据写入 `verifiedAt`（vault 元数据），并以启动校验通道兜底。
+- `PI_MODEL_PROBE_MODE=off` 为无 `/models` 端点 provider 的显式选项。
+
+### 质量基线（当日）
+
+- `npm run typecheck` 干净。
+- 单元测试 179 项 / 30 文件全绿。
+- `npm run lint` 0 error。
+- 浏览器 e2e 本地实跑：5 通过、2 条件跳过。
+- 隔离 e2e（235 上 `pigo-web-e2e:3101` + `pigo-worker-fake`，库 `pigo_test`）：通过核心回归与功能项。
+
+### 遗留（未完成）
+
+- worker 侧 worktree 清理未接入清理 API。
+- 插件版本固定 / 篡改检测未实现。
+- 按 Agent“会话”为派生展示，非可持久会话。
+- SSE 溢出仅自动重连，无显式提示。
+- `docs/03` §5 校正即本段（对既有证据的重新验证与降级说明）。
+
+### 运维提醒
+
+- `free2way@192.168.2.235` 的 SSH 密码与旧代理 API Key 建议轮换；本轮全程仅交互输入或经环境变量使用，未落盘。
