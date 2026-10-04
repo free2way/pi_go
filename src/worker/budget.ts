@@ -19,12 +19,19 @@ export interface BudgetStatus {
   reason?: string;
 }
 
+/**
+ * COST-002/003: reads the run-level hard budgets. Product semantics (docs/03
+ * deployment record) are that a value of 0 means UNLIMITED (`生产默认全部为 0
+ * （不限制）`); `evaluateBudget` already skips any limit `<= 0`. When nothing is
+ * configured at all the duration budget is unlimited (0) rather than an eager
+ * default, so an unconfigured worker does not terminate runs with a timeout.
+ */
 export function readBudgetLimits(env: NodeJS.ProcessEnv = process.env): BudgetLimits {
   return {
     maxTokens: Number(env.PI_RUN_MAX_TOKENS || 0),
     maxCostUsd: Number(env.PI_RUN_MAX_COST_USD || 0),
     maxModelCalls: Number(env.PI_RUN_MAX_MODEL_CALLS || 0),
-    maxDurationSeconds: Number(env.PI_RUN_MAX_DURATION_SECONDS || env.PI_RUN_TIMEOUT_SECONDS || 1800),
+    maxDurationSeconds: Number(env.PI_RUN_MAX_DURATION_SECONDS || env.PI_RUN_TIMEOUT_SECONDS || 0),
   };
 }
 

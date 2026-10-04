@@ -162,3 +162,66 @@ export async function hardenedGitConfigArgs(cwd: string): Promise<string[]> {
   }
   return args;
 }
+
+export interface HardenedGitResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+
+export interface HardenedGitOptions {
+  cwd: string;
+  /** Command-specific args appended after the hardened flags/config overrides. */
+  args: string[];
+  /** Extra environment layered on top of the scrubbed hardened environment. */
+  env?: Record<string, string>;
+  signal?: AbortSignal;
+  /** Process timeout in ms; 0/undefined means no limit (unlimited). */
+  timeoutMs?: number;
+  /** Bounded stdout/stderr capture (defaults to 4 MiB). */
+  maxOutput?: number;
+}
+
+/**
+ * NEW-01 / AUD-01: the single hardened entry point for every platform Git
+ * invocation. It mirrors `git()`/`defaultGitExec` so no call site can spawn git
+ * with raw args or the Worker environment:
+ *   - `hardenedGitFlags` disables hooks, credential helpers, fsmonitor and the
+ *     file transport;
+ *   - `hardenedGitConfigArgs(cwd)` overrides every execution-relevant key of the
+ *     repository-local config (which no env var can neutralize);
+ *   - `hardenedGitEnvironment` scrubs Worker secrets and points global/system
+ *     config at an empty file.
+ * A timeout of 0 (or absent) means unlimited, matching the run-budget semantics.
+ */
+export const defaultGitMaxOutput = 4_000_000;
+
+export async function runHardenedGit(options: HardenedGitOptions): Promise<HardenedGitResult> {
+  const configArgs = await hardenedGitConfigArgs(options.cwd);
+  const argv = [...hardenedGitFlags, ...configArgs, ...options.args];
+  const env = { ...hardenedGitEnvironment(options.env), ...(options.env ?? {}) };
+  const captureLimit = options.maxOutput ?? defaultGitMaxOutput;
+  return new Promise((resolve, reject) => {
+    const child = spawn("git", argv, {
+      cwd: options.cwd,
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+      ...(options.signal ? { signal: options.signal } : {}),
+    });
+    let stdout = "";
+    let stderr = "";
+    const timeoutMs = Number(options.timeoutMs);
+    const timer = timeoutMs > 0 ? setTimeout(() => child.kill("SIGTERM"), timeoutMs) : undefined;
+    child.stdout.on("data", (chunk) => { stdout = `${stdout}${String(chunk)}`.slice(-captureLimit); });
+    child.stderr.on("data", (chunk) => { stderr = `${stderr}${String(chunk)}`.slice(-captureLimit); });
+    child.on("error", (error) => {
+      if (timer) clearTimeout(timer);
+      if ((error as Error).name === "AbortError") resolve({ code: 130, stdout, stderr: stderr || "aborted" });
+      else reject(error);
+    });
+    child.on("close", (code) => {
+      if (timer) clearTimeout(timer);
+      resolve({ code: code ?? 1, stdout, stderr });
+    });
+  });
+}

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -171,6 +171,77 @@ describe("plugin content pinning (AT-PI-007 / AT-SEC-014)", () => {
     const verified = await verifyPluginPins([{ kind: "extension", path: "/opt/pigo/missing.ts", pin: { sha256: "c".repeat(64) } }]);
     expect(verified.enabled).toEqual([]);
     expect(verified.denials[0].reason).toContain("could not be verified");
+  });
+});
+
+describe("plugin symlink identity (AT-PI-007 / AT-SEC-014)", () => {
+  async function bundleDir(): Promise<string> {
+    return mkdtemp(path.join(tmpdir(), "pigo-symlink-"));
+  }
+
+  it("hashes content reached through an in-root symlink deterministically", async () => {
+    const bundle = await bundleDir();
+    await writeFile(path.join(bundle, "real.ts"), "export const x = 1;\n", "utf8");
+    await symlink("real.ts", path.join(bundle, "link.ts"));
+    const first = await hashPluginPath(bundle);
+    const second = await hashPluginPath(bundle);
+    expect(first).toBe(second);
+    // The link is part of the identity: the same bytes reachable through a link
+    // must not hash the same as a bundle that has no link at all.
+    const plain = await bundleDir();
+    await writeFile(path.join(plain, "real.ts"), "export const x = 1;\n", "utf8");
+    expect(await hashPluginPath(plain)).not.toBe(first);
+  });
+
+  it("changes the hash when a symlink is repointed at different content", async () => {
+    const bundle = await bundleDir();
+    await writeFile(path.join(bundle, "a.ts"), "content-a", "utf8");
+    await writeFile(path.join(bundle, "b.ts"), "content-b", "utf8");
+    const link = path.join(bundle, "current.ts");
+    await symlink("a.ts", link);
+    const first = await hashPluginPath(bundle);
+    await rm(link);
+    await symlink("b.ts", link);
+    const second = await hashPluginPath(bundle);
+    expect(second).not.toBe(first);
+  });
+
+  it("changes the hash when the content behind an in-root link changes", async () => {
+    const bundle = await bundleDir();
+    await writeFile(path.join(bundle, "real.ts"), "v1", "utf8");
+    await symlink("real.ts", path.join(bundle, "link.ts"));
+    const first = await hashPluginPath(bundle);
+    await writeFile(path.join(bundle, "real.ts"), "v2", "utf8");
+    const second = await hashPluginPath(bundle);
+    expect(second).not.toBe(first);
+  });
+
+  it("denies a symlink that escapes the plugin root", async () => {
+    const bundle = await bundleDir();
+    const outside = await mkdtemp(path.join(tmpdir(), "pigo-outside-"));
+    await writeFile(path.join(outside, "secret.ts"), "secret", "utf8");
+    await symlink(path.join(outside, "secret.ts"), path.join(bundle, "leak.ts"));
+    await expect(hashPluginPath(bundle)).rejects.toThrow(/escapes plugin root/);
+
+    // The same escape must surface as an explicit pin denial, never load.
+    const verified = await verifyPluginPins([
+      { kind: "skill", path: bundle, pin: { sha256: "a".repeat(64) } },
+    ]);
+    expect(verified.enabled).toEqual([]);
+    expect(verified.denials).toHaveLength(1);
+    expect(verified.denials[0].reason).toContain("escapes plugin root");
+  });
+
+  it("denies a symlink loop without hanging", async () => {
+    const dirLoop = await bundleDir();
+    await mkdir(path.join(dirLoop, "sub"), { recursive: true });
+    // sub/loop -> plugin root: recursing would never terminate.
+    await symlink("..", path.join(dirLoop, "sub", "loop"));
+    await expect(hashPluginPath(dirLoop)).rejects.toThrow(/loop/);
+
+    const selfLoop = await bundleDir();
+    await symlink("self", path.join(selfLoop, "self"));
+    await expect(hashPluginPath(selfLoop)).rejects.toThrow(/cannot be resolved/);
   });
 });
 

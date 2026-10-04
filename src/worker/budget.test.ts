@@ -53,6 +53,13 @@ describe("readBudgetLimits", () => {
     const limits = readBudgetLimits({ PI_RUN_MAX_TOKENS: "5000", PI_RUN_MAX_COST_USD: "2.5", PI_RUN_TIMEOUT_SECONDS: "900" } as NodeJS.ProcessEnv);
     expect(limits).toEqual({ maxTokens: 5000, maxCostUsd: 2.5, maxModelCalls: 0, maxDurationSeconds: 900 });
   });
+
+  it("treats an absent duration budget as unlimited (0), not an eager default", () => {
+    expect(readBudgetLimits({} as NodeJS.ProcessEnv).maxDurationSeconds).toBe(0);
+    expect(readBudgetLimits({ PI_RUN_MAX_DURATION_SECONDS: "0" } as NodeJS.ProcessEnv).maxDurationSeconds).toBe(0);
+    // An explicit 0 duration wins over the run-timeout fallback (0 = unlimited).
+    expect(readBudgetLimits({ PI_RUN_MAX_DURATION_SECONDS: "0", PI_RUN_TIMEOUT_SECONDS: "900" } as NodeJS.ProcessEnv).maxDurationSeconds).toBe(0);
+  });
 });
 
 describe("mergeRoleUsage", () => {

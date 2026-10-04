@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFile, readdir, stat } from "node:fs/promises";
+import { lstat, readFile, readdir, readlink, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 
 /**
@@ -182,36 +182,142 @@ export function selectPlugins(policy: PluginPolicy, role: string): { enabled: Pl
   return { enabled, denials };
 }
 
-/** Sorted relative file paths of a directory (skill bundle) for stable hashing. */
-async function listBundleFiles(root: string, prefix = ""): Promise<string[]> {
-  const entries = await readdir(root, { withFileTypes: true });
-  const files: string[] = [];
-  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-    const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
-    if (entry.isDirectory()) files.push(...await listBundleFiles(path.join(root, entry.name), relative));
-    else if (entry.isFile()) files.push(relative);
+/**
+ * Thrown when a plugin's on-disk identity cannot be established safely (a
+ * symlink escapes the plugin root, a symlink loop, or a special file). Surfaced
+ * by `verifyPluginPins` as an explicit denial instead of silently following the
+ * link.
+ */
+export class PluginContentError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PluginContentError";
   }
-  return files;
+}
+
+function assertInsideRoot(rootReal: string, resolved: string, relative: string, linkTarget: string) {
+  if (resolved !== rootReal && !resolved.startsWith(`${rootReal}${path.sep}`)) {
+    throw new PluginContentError(
+      `symlink escapes plugin root: ${relative} -> ${linkTarget} (resolves to ${resolved})`,
+    );
+  }
 }
 
 /**
- * AT-PI-007: content identity of a plugin. A single file hashes to the sha256 of
- * its bytes (matching `sha256sum`); a directory (skill bundle) hashes the sorted
- * relative paths and each file's bytes so renames/additions/edits all change it.
+ * Hashes one bundle entry into the digest. A symlink is represented by its
+ * `path -> link target` relation *and* by the content reached through the link
+ * when the resolved path stays inside the plugin root. Escaping links, links
+ * that resolve to a special file, and unresolvable links (e.g. a loop) are
+ * rejected instead of followed.
+ */
+async function hashBundleEntry(
+  hash: ReturnType<typeof createHash>,
+  absolute: string,
+  relative: string,
+  rootReal: string,
+  stack: Set<string>,
+): Promise<void> {
+  const info = await lstat(absolute);
+  if (info.isSymbolicLink()) {
+    const linkTarget = await readlink(absolute).catch(() => "");
+    const resolved = await realpath(absolute).catch((error: NodeJS.ErrnoException) => {
+      throw new PluginContentError(
+        `symlink ${relative} -> ${linkTarget} cannot be resolved (${error.code ?? "unknown"})`,
+      );
+    });
+    assertInsideRoot(rootReal, resolved, relative, linkTarget);
+    hash.update(`symlink:${relative}\u0000target:${linkTarget}\u0000`);
+    const resolvedInfo = await stat(resolved);
+    if (resolvedInfo.isDirectory()) {
+      await walkBundle(hash, resolved, relative, rootReal, stack);
+    } else if (resolvedInfo.isFile()) {
+      hash.update(await readFile(resolved));
+      hash.update("\u0000");
+    } else {
+      throw new PluginContentError(`symlink ${relative} -> ${linkTarget} resolves to an unsafe special file`);
+    }
+    return;
+  }
+  if (info.isFile()) {
+    hash.update(`path:${relative}\u0000`);
+    hash.update(await readFile(absolute));
+    hash.update("\u0000");
+    return;
+  }
+  if (info.isDirectory()) {
+    await walkBundle(hash, absolute, relative, rootReal, stack);
+    return;
+  }
+  throw new PluginContentError(`unsafe plugin entry (not a file, directory or symlink): ${relative}`);
+}
+
+/** Recursively hashes a bundle directory, rejecting symlink cycles without hanging. */
+async function walkBundle(
+  hash: ReturnType<typeof createHash>,
+  absoluteDir: string,
+  relativeDir: string,
+  rootReal: string,
+  stack: Set<string>,
+): Promise<void> {
+  const realDir = await realpath(absoluteDir).catch((error: NodeJS.ErrnoException) => {
+    throw new PluginContentError(`plugin directory ${relativeDir || "."} cannot be resolved (${error.code ?? "unknown"})`);
+  });
+  // A real path already on the current walk stack means a symlink points back at
+  // an ancestor; recursing would never terminate.
+  if (stack.has(realDir)) {
+    throw new PluginContentError(`symlink loop detected at ${relativeDir || "."}`);
+  }
+  stack.add(realDir);
+  try {
+    const entries = await readdir(absoluteDir, { withFileTypes: true });
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      const absolute = path.join(absoluteDir, entry.name);
+      const relative = relativeDir ? `${relativeDir}/${entry.name}` : entry.name;
+      await hashBundleEntry(hash, absolute, relative, rootReal, stack);
+    }
+  } finally {
+    stack.delete(realDir);
+  }
+}
+
+/**
+ * AT-PI-007: content identity of a plugin. A single (regular) file hashes to the
+ * sha256 of its bytes (matching `sha256sum`); a directory (skill bundle) hashes
+ * the sorted relative paths, each file's bytes and every symlink's
+ * `path -> link target` relation plus the in-root content it reaches, so
+ * renames, additions, edits and repointed symlinks all change the identity.
+ * Throws `PluginContentError` when a symlink escapes the plugin root, resolves
+ * to a special file, or forms a loop.
  */
 export async function hashPluginPath(target: string): Promise<string> {
-  const info = await stat(target);
+  const info = await lstat(target);
   const hash = createHash("sha256");
-  if (info.isDirectory()) {
-    for (const relative of await listBundleFiles(target)) {
-      hash.update(`path:${relative}\u0000`);
-      hash.update(await readFile(path.join(target, relative)));
-      hash.update("\u0000");
-    }
-  } else {
-    hash.update(await readFile(target));
+  if (info.isSymbolicLink()) {
+    // The plugin root for a symlinked top-level target is the directory that
+    // contains the link, so a link may not escape it.
+    const rootReal = await realpath(path.dirname(target));
+    const linkTarget = await readlink(target).catch(() => "");
+    const resolved = await realpath(target).catch((error: NodeJS.ErrnoException) => {
+      throw new PluginContentError(`symlink ${target} -> ${linkTarget} cannot be resolved (${error.code ?? "unknown"})`);
+    });
+    assertInsideRoot(rootReal, resolved, path.basename(target), linkTarget);
+    hash.update(`symlink:${path.basename(target)}\u0000target:${linkTarget}\u0000`);
+    const resolvedInfo = await stat(resolved);
+    if (resolvedInfo.isDirectory()) await walkBundle(hash, resolved, "", rootReal, new Set());
+    else if (resolvedInfo.isFile()) { hash.update(await readFile(resolved)); hash.update("\u0000"); }
+    else throw new PluginContentError(`symlink ${target} resolves to an unsafe special file`);
+    return hash.digest("hex");
   }
-  return hash.digest("hex");
+  if (info.isDirectory()) {
+    const rootReal = await realpath(target);
+    await walkBundle(hash, target, "", rootReal, new Set());
+    return hash.digest("hex");
+  }
+  if (info.isFile()) {
+    hash.update(await readFile(target));
+    return hash.digest("hex");
+  }
+  throw new PluginContentError(`unsafe plugin entry (not a file, directory or symlink): ${target}`);
 }
 
 export interface VerifyPluginPinsOptions {

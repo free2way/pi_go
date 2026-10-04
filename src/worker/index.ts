@@ -13,7 +13,7 @@ import { readBudgetLimits } from "./budget.js";
 import { BudgetExceededError, createRunBudget, type RunBudgetContext } from "./run-budget.js";
 import { runProviderOperation } from "./provider-attempts.js";
 import { scrubEnvironment } from "./pi-env.js";
-import { hardenedGitConfigArgs, hardenedGitEnvironment, hardenedGitFlags } from "./git-hardening.js";
+import { runHardenedGit } from "./git-hardening.js";
 import { apiKeyEnvName, classifyProviderError, providerErrorSummary } from "./provider-errors.js";
 import { sleep } from "./provider-retry.js";
 import { blockingSeverities, parseReview, type ReviewResult } from "./review-protocol.js";
@@ -36,6 +36,7 @@ import { recoveryResumePhase, recoveryUpdateState } from "./run-recovery.js";
 import { callbackBodyExceedsInlineLimit, encodeCallbackBody, persistDiffArtifact, type DiffArtifactRef } from "./diff-artifacts.js";
 import { uploadRunArtifact } from "./artifact-upload.js";
 import { captureSnapshotHash } from "./snapshot-hash.js";
+import { startRunDeadline } from "./run-deadline.js";
 import { detectProjectPlugins, parsePluginPolicy, pluginArguments, pluginMounts, selectPlugins, verifyPluginPins, type PluginDenial } from "./plugin-policy.js";
 
 const port = Number(process.env.PORT || 3200);
@@ -274,7 +275,8 @@ async function runInSandbox(input: SandboxRunInput): Promise<CommandResult> {
   const containerId = await docker.createContainer(name, spec);
   let stdout = "";
   let stderr = "";
-  const timer = setTimeout(() => { void docker.killContainer(containerId).catch(() => undefined); }, input.timeoutMs);
+  // A container timeout of 0/absent means no limit; only a positive value kills it.
+  const timer = input.timeoutMs > 0 ? setTimeout(() => { void docker.killContainer(containerId).catch(() => undefined); }, input.timeoutMs) : undefined;
   const onAbort = () => { void docker.killContainer(containerId).catch(() => undefined); };
   try {
     input.signal.addEventListener("abort", onAbort, { once: true });
@@ -294,7 +296,7 @@ async function runInSandbox(input: SandboxRunInput): Promise<CommandResult> {
     await logs;
     return { code: StatusCode, stdout, stderr };
   } finally {
-    clearTimeout(timer);
+    if (timer) clearTimeout(timer);
     input.signal.removeEventListener("abort", onAbort);
     await docker.removeContainer(containerId).catch(() => undefined);
     // AUD-07: the per-run Pi state directory is intentionally kept so the next
@@ -589,7 +591,11 @@ function command(commandName: string, args: string[], options: {
     });
     let stdout = "";
     let stderr = "";
-    const timer = setTimeout(() => child.kill("SIGTERM"), options.timeoutMs || 1_800_000);
+    // A timeout of 0/undefined means no limit; only a positive value arms the
+    // timer. (Previously `options.timeoutMs || 1_800_000` silently turned an
+    // explicit 0 into the 30 minute default instead of "unlimited".)
+    const timeoutMs = options.timeoutMs === undefined ? 1_800_000 : options.timeoutMs;
+    const timer = timeoutMs > 0 ? setTimeout(() => child.kill("SIGTERM"), timeoutMs) : undefined;
     const lines = readline.createInterface({ input: child.stdout });
     lines.on("line", (line) => {
       stdout = `${stdout}${line}\n`.slice(-captureLimit);
@@ -597,12 +603,12 @@ function command(commandName: string, args: string[], options: {
     });
     child.stderr.on("data", (chunk) => { stderr = `${stderr}${String(chunk)}`.slice(-captureLimit); });
     child.on("error", (error) => {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       if (error.name === "AbortError") resolve({ code: 130, stdout, stderr: "aborted" });
       else reject(error);
     });
     child.on("close", (code) => {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       resolve({ code: code ?? 1, stdout, stderr });
     });
   });
@@ -612,17 +618,17 @@ function command(commandName: string, args: string[], options: {
  * AUD-01 / NEW-01: every platform Git invocation runs with hooks, credential
  * helpers, repository-local filters/diff/merge drivers and fsmonitor disabled,
  * and with a scrubbed environment. Untrusted code from a task can therefore
- * never execute inside the Worker through Git.
+ * never execute inside the Worker through Git. Delegates to the single hardened
+ * runner (`runHardenedGit`) shared by every git call site.
  */
 async function git(cwd: string, args: string[], signal?: AbortSignal, options: { maxOutput?: number; env?: Record<string, string> } = {}) {
-  const configArgs = await hardenedGitConfigArgs(cwd);
-  const hardened = [...hardenedGitFlags, ...configArgs, ...args];
-  const result = await command("git", hardened, {
+  const result = await runHardenedGit({
     cwd,
+    args,
     signal,
     timeoutMs: 120_000,
-    maxOutput: options.maxOutput,
-    env: { ...hardenedGitEnvironment(), ...(options.env ?? {}) },
+    maxOutput: options.maxOutput ?? maxOutput,
+    env: options.env,
   });
   if (result.code !== 0) throw new Error(result.stderr.trim() || `git ${args[0]} failed`);
   return result.stdout.trim();
@@ -738,7 +744,7 @@ async function cloneWorkspace(url: string, name: string): Promise<WorkspaceVerif
   }
   const exists = await stat(target).then(() => true).catch(() => false);
   if (exists) return { ok: false, code: "WORKSPACE_EXISTS", error: `Directory already exists: ${cleanName}` };
-  const result = await command("git", ["clone", "--quiet", url, target], { cwd: root, timeoutMs: 600_000 });
+  const result = await runHardenedGit({ cwd: root, args: ["clone", "--quiet", url, target], timeoutMs: 600_000 });
   if (result.code !== 0) {
     await rm(target, { recursive: true, force: true }).catch(() => undefined);
     const reason = redactCredentials(`${result.stderr}\n${result.stdout}`.trim()).slice(0, 500);
@@ -1074,7 +1080,7 @@ async function captureFailedSubAgentArtifact(run: Run, mainWorktree: string, wor
     taskId: task.id,
     // Deliberately independent of the run's abort signal: retention must still
     // work when the sub-agent failed because the run was cancelled/timed out.
-    exec: (args) => command("git", args, { cwd: worktree, timeoutMs: 30_000 }),
+    exec: (args) => runHardenedGit({ cwd: worktree, args, timeoutMs: 30_000 }),
   });
   if (result.ok) {
     const artifact = result.artifact;
@@ -1192,9 +1198,9 @@ async function orchestrateSubAgents(input: {
             continue;
           }
           if (result.commit) {
-            const merged = await command("git", ["-c", "user.name=PiGO Integration", "-c", "user.email=agent@pigo.local", "cherry-pick", result.commit], { cwd: input.worktree, signal: input.signal, timeoutMs: 120_000 });
+            const merged = await runHardenedGit({ cwd: input.worktree, args: ["-c", "user.name=PiGO Integration", "-c", "user.email=agent@pigo.local", "cherry-pick", result.commit], signal: input.signal, timeoutMs: 120_000 });
             if (merged.code !== 0) {
-              await command("git", ["cherry-pick", "--abort"], { cwd: input.worktree, timeoutMs: 120_000 }).catch(() => undefined);
+              await runHardenedGit({ cwd: input.worktree, args: ["cherry-pick", "--abort"], timeoutMs: 120_000 }).catch(() => undefined);
               result.task.status = "failed";
               result.task.summary = `Merge conflict from ${result.branch}`;
               integrationNotes.push(`${result.task.title}: merge ${result.branch} manually (${(merged.stderr || merged.stdout).trim().slice(0, 160)})`);
@@ -1551,12 +1557,16 @@ async function executeJob(input: JobInput, controller: AbortController) {
   let outcomeState: "done" | "failed" | "cancelled" = "done";
   let terminalRecorded = true;
   // AUD-10: one Run level deadline covers model calls, checks and container work.
+  // COST-002: a duration budget of 0/absent means unlimited, so no timer is armed.
   let deadlineExceeded = false;
-  const deadlineAt = Math.max(started, new Date(run.createdAt).getTime() + runLimits.maxDurationSeconds * 1000);
-  const deadlineTimer = setTimeout(() => {
+  const deadline = startRunDeadline({
+    startedAt: started,
+    createdAt: new Date(run.createdAt).getTime(),
+    maxDurationSeconds: runLimits.maxDurationSeconds,
+  }, () => {
     deadlineExceeded = true;
     controller.abort();
-  }, Math.max(0, deadlineAt - Date.now()));
+  });
   try {
     const project = await resolveProject(run.repository);
     const dirty = await git(project, ["status", "--porcelain"], controller.signal);
@@ -1943,7 +1953,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
       console.error(`[store] could not record the terminal state for ${run.id}; leaving the job for reclaim`);
     }
   } finally {
-    clearTimeout(deadlineTimer);
+    deadline.cancel();
     stopHeartbeat();
     if (input.jobId && terminalRecorded) {
       await jobApi.finish(input.jobId, outcomeState).catch((error) => console.warn(`[jobs] finish failed: ${(error as Error).message}`));

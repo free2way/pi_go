@@ -1,4 +1,4 @@
-import { appendFile, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -93,5 +93,29 @@ describe.skipIf(!gitAvailable)("hardenedGitConfigArgs (NEW-01)", () => {
     await defaultGitExec(repo, ["diff", "--no-ext-diff", "--no-textconv", "--", "."]);
 
     expect(await stat(marker).then(() => true).catch(() => false)).toBe(false);
+  });
+});
+
+describe("no raw git invocation bypasses the hardening (AUD-01 / NEW-01)", () => {
+  // Only the central runner (and the real-git test helper that probes for the
+  // binary) may spawn git directly. Everything else must use `runHardenedGit`
+  // or `defaultGitExec`, both of which apply `hardenedGitFlags`, the repo-local
+  // config overrides and the scrubbed environment.
+  const allowedFiles = new Set(["git-hardening.ts", "git-test-helpers.ts"]);
+  const rawGitInvocation = /(?:spawn|spawnSync|exec|execFile|execFileSync|execSync|execa|command)\s*\(\s*["']git["']/;
+
+  it("routes every worker git call through the shared hardened runner", async () => {
+    const dir = path.dirname(new URL(import.meta.url).pathname);
+    const files = (await readdir(dir)).filter(
+      (file) => file.endsWith(".ts") && !file.endsWith(".test.ts") && !allowedFiles.has(file),
+    );
+    const offenders: string[] = [];
+    for (const file of files) {
+      const lines = (await readFile(path.join(dir, file), "utf8")).split("\n");
+      lines.forEach((line, index) => {
+        if (rawGitInvocation.test(line)) offenders.push(`${file}:${index + 1}: ${line.trim()}`);
+      });
+    }
+    expect(offenders).toEqual([]);
   });
 });

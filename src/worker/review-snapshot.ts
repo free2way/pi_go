@@ -1,9 +1,8 @@
-import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFile, lstat, mkdir, readFile, readdir, readlink, rm, symlink } from "node:fs/promises";
 import path from "node:path";
 import type { Finding } from "../shared/types.js";
-import { hardenedGitConfigArgs, hardenedGitEnvironment, hardenedGitFlags } from "./git-hardening.js";
+import { runHardenedGit } from "./git-hardening.js";
 
 /**
  * GAP-03 / AT-REVIEW-012 / AT-GIT-005 / AT-SEC-009:
@@ -48,27 +47,19 @@ const maxCapturedOutput = 4_000_000;
 
 /**
  * AUD-01 / NEW-01: hooks, credential helpers, repository-local filters and the
- * full Worker environment stay out of every snapshot Git command.
+ * full Worker environment stay out of every snapshot Git command. Delegates to
+ * the single hardened runner so no git call site can bypass the hardening.
  */
 export const defaultGitExec: GitExec = async (cwd, args, options = {}) => {
-  const configArgs = await hardenedGitConfigArgs(cwd);
-  return new Promise((resolve, reject) => {
-    const child = spawn("git", [...hardenedGitFlags, ...configArgs, ...args], {
-      cwd,
-      env: { ...hardenedGitEnvironment(options.env), ...(options.env ?? {}) },
-      stdio: ["ignore", "pipe", "pipe"],
-      ...(options.signal ? { signal: options.signal } : {}),
-    });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => { stdout = `${stdout}${String(chunk)}`.slice(-maxCapturedOutput); });
-    child.stderr.on("data", (chunk) => { stderr = `${stderr}${String(chunk)}`.slice(-maxCapturedOutput); });
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if (code === 0) resolve(stdout.trim());
-      else reject(new Error(stderr.trim() || `git ${args[0]} exited with ${code}`));
-    });
+  const result = await runHardenedGit({
+    cwd,
+    args,
+    env: options.env,
+    signal: options.signal,
+    maxOutput: maxCapturedOutput,
   });
+  if (result.code === 0) return result.stdout.trim();
+  throw new Error(result.stderr.trim() || `git ${args[0]} exited with ${result.code}`);
 };
 
 // ---------------------------------------------------------------- manifest
