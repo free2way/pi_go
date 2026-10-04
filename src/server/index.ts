@@ -1,6 +1,6 @@
 import fastifyStatic from "@fastify/static";
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
@@ -95,6 +95,8 @@ const createRunSchema = z.object({
   workspaceId: z.string().trim().min(1).max(80).optional(),
   mode: z.enum(["demo", "real"]).default("demo"),
   checks: z.array(z.string().trim().min(1).max(500)).max(8).default([]),
+  acceptanceCriteria: z.string().trim().max(4_000).optional(),
+  idempotencyKey: z.string().trim().min(8).max(120).optional(),
   developerModel: z.object({ provider: z.string().trim().min(1).max(80), model: z.string().trim().min(1).max(120) }).optional(),
   reviewerModel: z.object({ provider: z.string().trim().min(1).max(80), model: z.string().trim().min(1).max(120) }).optional(),
 }).superRefine((value, context) => {
@@ -218,6 +220,25 @@ const internalUpdateSchema = z.object({
 const credentialWrites = new RateLimiter(10);
 const runCreations = new RateLimiter(Number(process.env.PI_RUN_CREATE_PER_MINUTE || 20));
 const runActions = new RateLimiter(Number(process.env.PI_RUN_ACTIONS_PER_MINUTE || 30));
+
+/** GAP-01: the budget that applied when the run was created (also shown in the UI). */
+function readRunBudget() {
+  return {
+    maxTokens: Number(process.env.PI_RUN_MAX_TOKENS || 0),
+    maxCostUsd: Number(process.env.PI_RUN_MAX_COST_USD || 0),
+    maxModelCalls: Number(process.env.PI_RUN_MAX_MODEL_CALLS || 0),
+    maxDurationSeconds: Number(process.env.PI_RUN_MAX_DURATION_SECONDS || process.env.PI_RUN_TIMEOUT_SECONDS || 1800),
+  };
+}
+
+/** GAP-01: credential version marker (never the credential itself). */
+function credentialFingerprint(apiKey: string | undefined) {
+  if (!apiKey) return undefined;
+  return createHash("sha256").update(apiKey).digest("hex").slice(0, 16);
+}
+
+/** GAP-01: workflow/prompt/plugin policy snapshot. */
+const PIPELINE_VERSION = process.env.PI_PIPELINE_VERSION || "pigo-pipeline-1";
 
 function tooManyRequests(reply: FastifyReply, retryAfterMs: number) {
   reply.header("Retry-After", String(Math.max(1, Math.ceil(retryAfterMs / 1000))));
@@ -633,6 +654,12 @@ app.post("/api/runs", async (request, reply) => {
     if (!credentials) {
       return reply.code(403).send({ error: "所选模型的 provider 凭据不完整，请在「模型与凭据」页配置", code: "PERSONAL_CREDENTIALS_REQUIRED" });
     }
+    // GAP-01 / AT-RUN-010: an idempotency key returns the existing run instead of
+    // creating a duplicate.
+    if (parsed.data.idempotencyKey) {
+      const existing = store.listRuns(ownerKeysFor(request)).find((item) => item.idempotencyKey === parsed.data.idempotencyKey);
+      if (existing) return reply.code(200).send(existing);
+    }
     const run = baseRealRun({
       ...parsed.data,
       repository: workspace.rootPath,
@@ -640,6 +667,14 @@ app.post("/api/runs", async (request, reply) => {
       developerModel: { provider: developerCheck.entry.provider, model: developerCheck.entry.model },
       reviewerModel: { provider: reviewerCheck.entry.provider, model: reviewerCheck.entry.model },
     }, user.id);
+    // GAP-01: freeze the reproducible inputs with the run.
+    run.baseSha = workspace.git?.head ?? undefined;
+    run.budget = readRunBudget();
+    run.pipelineVersion = PIPELINE_VERSION;
+    run.credentialVersions = {
+      developer: credentialFingerprint(vault.get(vaultKeyFor(request), developerCheck.entry.provider)),
+      reviewer: credentialFingerprint(vault.get(vaultKeyFor(request), reviewerCheck.entry.provider)),
+    };
     await store.createRun(run, { runId: run.id, round: 1, source: "system", type: "run.created", message: "真实任务已创建，正在交给隔离 Pi Worker", at: new Date().toISOString() });
     try {
       await dispatchJob(run, parsed.data.checks, {}, credentials);
@@ -727,8 +762,9 @@ async function dispatchJob(
   } catch (error) {
     const message = (error as Error).message;
     if (/capacity/i.test(message)) {
-      // REL-002: stay queued instead of failing the run; the worker claims it
-      // as soon as capacity frees up (or after a restart).
+      // REL-002 / AUD-05: stay queued instead of failing the run, and release the
+      // reservation right away so the job can be claimed as soon as a slot frees.
+      await jobQueue.releaseReservation(jobId, "worker capacity reached");
       await store.appendEvent({
         runId: run.id,
         round: run.round,
@@ -913,12 +949,18 @@ app.get<{ Querystring: { workerId?: string } }>("/api/internal/jobs/pending", as
       continue;
     }
     const payload = (job.payload ?? {}) as Record<string, unknown>;
+    // AUD-05: the durable job payload decides what the worker executes: a job
+    // that never started must create the run directory, only a started one is a
+    // recovery; human resume/retry intent survives a queue wait or a crash.
     payloads.push({
       jobId: job.id,
       kind: job.kind,
       run,
       checks: Array.isArray(payload.checks) ? payload.checks : [],
       credentials,
+      wasStarted: job.startedAt !== null,
+      ...(payload.resume ? { resume: payload.resume } : {}),
+      ...(payload.retryReview ? { retryReview: true } : {}),
     });
   }
   return { jobs: payloads };

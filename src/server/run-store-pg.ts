@@ -53,6 +53,8 @@ export interface JobRecord {
   workerId: string | null;
   claimedAt: string | null;
   heartbeatAt: string | null;
+  /** AUD-05: set only when a worker actually started executing the job. */
+  startedAt: string | null;
   attempts: number;
   lastError: string | null;
   createdAt: string;
@@ -407,7 +409,7 @@ export class PostgresRunStore implements RunStoreLike {
 
   async getJob(id: string): Promise<JobRecord | undefined> {
     const rows = await this.db.query(
-      "SELECT id, run_id, kind, state, payload_json, worker_id, claimed_at, heartbeat_at, attempts, last_error, created_at, updated_at FROM jobs WHERE id = $1",
+      "SELECT id, run_id, kind, state, payload_json, worker_id, claimed_at, heartbeat_at, started_at, attempts, last_error, created_at, updated_at FROM jobs WHERE id = $1",
       [id],
     );
     return rows.rows[0] ? this.mapJob(rows.rows[0]) : undefined;
@@ -416,7 +418,8 @@ export class PostgresRunStore implements RunStoreLike {
   /**
    * Marks a job as dispatched by the web process. The row is already handed to
    * the worker over HTTP, so it must not also be picked up by the periodic
-   * reclaim sweep before the worker claims it (REL-002).
+   * reclaim sweep before the worker claims it (REL-002). `started_at` stays NULL:
+   * a reserved job has not begun executing (AUD-05).
    */
   async reserveJob(id: string) {
     const now = new Date().toISOString();
@@ -426,10 +429,20 @@ export class PostgresRunStore implements RunStoreLike {
     );
   }
 
+  /** AUD-05: releases a reservation so a queued job can be claimed again immediately. */
+  async releaseReservation(id: string, reason?: string) {
+    const now = new Date().toISOString();
+    await this.db.query(
+      "UPDATE jobs SET state = 'queued', worker_id = NULL, claimed_at = NULL, heartbeat_at = NULL, last_error = COALESCE($2, last_error), updated_at = $3 WHERE id = $1 AND state IN ('queued','claimed')",
+      [id, reason ?? null, now],
+    );
+  }
+
   async claimJob(id: string, workerId: string) {
     const now = new Date().toISOString();
     const result = await this.db.query(
-      `UPDATE jobs SET state = 'claimed', worker_id = $2, claimed_at = $3, heartbeat_at = $3, attempts = attempts + 1, updated_at = $3
+      `UPDATE jobs SET state = 'claimed', worker_id = $2, claimed_at = $3, heartbeat_at = $3, started_at = COALESCE(started_at, $3),
+         attempts = attempts + 1, updated_at = $3
        WHERE id = $1 AND state IN ('queued', 'claimed') RETURNING id`,
       [id, workerId, now],
     );
@@ -454,7 +467,7 @@ export class PostgresRunStore implements RunStoreLike {
   async listPendingJobs(input: { staleAfterMs: number; kinds?: string[]; limit?: number }) {
     const cutoff = new Date(Date.now() - input.staleAfterMs).toISOString();
     const result = await this.db.query(
-      `SELECT id, run_id, kind, state, payload_json, worker_id, claimed_at, heartbeat_at, attempts, last_error, created_at, updated_at
+      `SELECT id, run_id, kind, state, payload_json, worker_id, claimed_at, heartbeat_at, started_at, attempts, last_error, created_at, updated_at
        FROM jobs
        WHERE (state = 'queued' AND attempts < 5)
           OR (state = 'claimed' AND (heartbeat_at IS NULL OR heartbeat_at < $1) AND attempts < 5)
@@ -564,6 +577,7 @@ export class PostgresRunStore implements RunStoreLike {
       workerId: row.worker_id === null ? null : String(row.worker_id),
       claimedAt: row.claimed_at === null ? null : String(row.claimed_at),
       heartbeatAt: row.heartbeat_at === null ? null : String(row.heartbeat_at),
+      startedAt: row.started_at === null || row.started_at === undefined ? null : String(row.started_at),
       attempts: Number(row.attempts),
       lastError: row.last_error === null ? null : String(row.last_error),
       createdAt: String(row.created_at),

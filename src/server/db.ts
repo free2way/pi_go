@@ -241,6 +241,8 @@ export const databaseMigrations: Migration[] = [
       ALTER TABLE run_findings ADD COLUMN observations INTEGER NOT NULL DEFAULT 1;
       ALTER TABLE run_findings ADD COLUMN consecutive_rounds INTEGER NOT NULL DEFAULT 0;
 
+      ALTER TABLE jobs ADD COLUMN started_at TEXT;
+
       CREATE TABLE run_deliveries (
         run_id TEXT NOT NULL,
         delivery_id TEXT NOT NULL,

@@ -247,6 +247,10 @@ type PendingJob = {
   run: Run;
   checks: string[];
   credentials: { developer: string; reviewer: string };
+  /** AUD-05: false means the job never started, so it must create the run directory. */
+  wasStarted: boolean;
+  resume?: { instruction?: string };
+  retryReview?: boolean;
 };
 
 /** Keeps a claimed job's heartbeat fresh so only a truly dead worker is reclaimed. */
@@ -392,10 +396,62 @@ function command(commandName: string, args: string[], options: {
   });
 }
 
+/**
+ * AUD-01: every platform Git invocation runs with hooks, credential helpers and
+ * repository-local config disabled, and with a scrubbed environment. Untrusted
+ * code from a task can therefore never execute inside the Worker through Git.
+ */
 async function git(cwd: string, args: string[], signal?: AbortSignal) {
-  const result = await command("git", args, { cwd, signal, timeoutMs: 120_000 });
+  const hardened = [
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "credential.helper=",
+    "-c", "core.fsmonitor=false",
+    "-c", "protocol.file.allow=never",
+    "-c", "gc.auto=0",
+    "-c", "advice.detachedHead=false",
+    ...args,
+  ];
+  const result = await command("git", hardened, {
+    cwd,
+    signal,
+    timeoutMs: 120_000,
+    env: scrubEnvironment(process.env),
+  });
   if (result.code !== 0) throw new Error(result.stderr.trim() || `git ${args[0]} failed`);
   return result.stdout.trim();
+}
+
+/**
+ * AUD-01 / AT-GIT-001: prepares the run directory as a standalone clone of the
+ * source repository. No shared, writable Git metadata is exposed to agents; the
+ * clone is the only repository the sandbox can see.
+ */
+async function prepareRunDirectory(input: {
+  project: string;
+  runDir: string;
+  branch: string;
+  baseSha?: string;
+  reuse: boolean;
+  signal: AbortSignal;
+}): Promise<{ baseSha: string }> {
+  const { project, runDir, branch, signal } = input;
+  const exists = await stat(runDir).then(() => true).catch(() => false);
+  if (input.reuse) {
+    if (!exists) throw new Error("无法恢复：任务运行目录不存在（可能已被清理）");
+    const current = await git(runDir, ["branch", "--show-current"], signal);
+    if (current !== branch) throw new Error(`无法恢复：运行目录当前分支为 ${current || "detached"}，期望 ${branch}`);
+    const baseSha = input.baseSha ?? await git(runDir, ["rev-parse", "HEAD"], signal);
+    return { baseSha };
+  }
+  await mkdir(path.dirname(runDir), { recursive: true });
+  if (exists) await rm(runDir, { recursive: true, force: true });
+  await serializeWorktreeMutation(() => git(project, ["clone", "--local", "--no-hardlinks", "--quiet", project, runDir], signal));
+  await git(runDir, ["config", "core.hooksPath", "/dev/null"], signal);
+  await git(runDir, ["config", "credential.helper", ""], signal);
+  await git(runDir, ["config", "gc.auto", "0"], signal);
+  const head = input.baseSha ?? await git(project, ["rev-parse", "HEAD"], signal);
+  await git(runDir, ["checkout", "-b", branch, head], signal);
+  return { baseSha: head };
 }
 
 async function resolveProject(relative: string) {
@@ -574,8 +630,10 @@ async function runPiWithRetry(
   context: { runId: string; round: number; label: string; role: RunRoleUsage["role"]; budget?: RunBudgetContext },
 ) {
   const budget = context.budget;
-  budget?.assertAvailable(context.role);
-  const result = await withProviderRetry(() => runPi(input), {
+  budget?.reserve(context.role);
+  let result: Awaited<ReturnType<typeof runPi>>;
+  try {
+    result = await withProviderRetry(() => runPi(input), {
     signal: input.signal,
     onRetry: async ({ attempt, delayMs, kind, message }) => {
       await postUpdate(context.runId, {
@@ -588,13 +646,24 @@ async function runPiWithRetry(
       }).catch(() => undefined);
     },
   });
+  } catch (error) {
+    // AUD-10: a failed call may still have consumed tokens; count it as unknown
+    // instead of silently treating it as free.
+    budget?.recordUnknown();
+    throw error;
+  }
   if (budget) await budget.record(context.role, input, result.usage);
   return result;
 }
 
 /** COST-002/003: per-run budget guard shared by every model call. */
 interface RunBudgetContext {
-  assertAvailable(role: RunRoleUsage["role"]): void;
+  /** AUD-10: atomically reserves one model call slot before the call starts. */
+  reserve(role: RunRoleUsage["role"]): void;
+  /** Releases a reservation that never produced usage. */
+  release(): void;
+  /** AUD-10: records a call whose provider usage could not be determined. */
+  recordUnknown(): void;
   record(role: RunRoleUsage["role"], input: { provider: string; model: string }, usage: UsageTotals): Promise<void>;
 }
 
@@ -614,6 +683,9 @@ function createBudgetContext(
   onWarning?: (message: string) => Promise<void>,
 ): RunBudgetContext {
   const warned = new Set<string>();
+  // AUD-10: reservations make parallel sub-agents account for each other, so a
+  // limit of N can never be exceeded by N+1 concurrent calls.
+  let pendingCalls = 0;
   const currentUsage = () => {
     const live = usageProvider();
     return {
@@ -626,11 +698,26 @@ function createBudgetContext(
     };
   };
   return {
-    assertAvailable() {
-      const status = evaluateBudget({ usage: currentUsage(), modelCalls: run.modelCalls ?? 0, elapsedMs: Date.now() - startedAt, limits });
+    reserve() {
+      const status = evaluateBudget({
+        usage: currentUsage(),
+        modelCalls: (run.modelCalls ?? 0) + pendingCalls,
+        elapsedMs: Date.now() - startedAt,
+        limits,
+      });
       if (status.state === "exhausted") throw new BudgetExceededError(status.reason ?? "运行预算已用尽");
+      pendingCalls += 1;
+    },
+    release() {
+      pendingCalls = Math.max(0, pendingCalls - 1);
+    },
+    recordUnknown() {
+      pendingCalls = Math.max(0, pendingCalls - 1);
+      run.usageUnknownCalls = (run.usageUnknownCalls ?? 0) + 1;
+      void postUpdate(run.id, { patch: { usageUnknownCalls: run.usageUnknownCalls } }).catch(() => undefined);
     },
     async record(role, input, usageTotals) {
+      pendingCalls = Math.max(0, pendingCalls - 1);
       const usage: RunUsage = {
         inputTokens: Math.round(usageTotals.input),
         outputTokens: Math.round(usageTotals.output),
@@ -640,7 +727,7 @@ function createBudgetContext(
         estimatedCost: usageTotals.cost,
       };
       mergeRoleUsage(run, { role, provider: input.provider, model: input.model, usage });
-      await postUpdate(run.id, { patch: { usageRoles: run.usageRoles, modelCalls: run.modelCalls } }).catch(() => undefined);
+      await postUpdate(run.id, { patch: { usageRoles: run.usageRoles, modelCalls: run.modelCalls, usageUnknownCalls: run.usageUnknownCalls } }).catch(() => undefined);
       const status = evaluateBudget({ usage: currentUsage(), modelCalls: run.modelCalls ?? 0, elapsedMs: Date.now() - startedAt, limits });
       if (status.state !== "ok" && status.dimension && !warned.has(status.dimension)) {
         warned.add(status.dimension);
@@ -738,7 +825,7 @@ async function runSubAgent(input: {
 }): Promise<SubAgentResult> {
   const startedAt = Date.now();
   const branch = `${input.mainBranch}-sub-${input.task.id}`;
-  const worktree = path.join(runsRoot, input.run.ownerId, `${input.run.id}-subagents`, input.task.id);
+  const worktree = path.join(input.project, "subagents", input.task.id);
   input.task.status = "running";
   input.task.branch = branch;
   await mkdir(path.dirname(worktree), { recursive: true });
@@ -1117,14 +1204,28 @@ async function executeRetryReview(input: {
   });
 }
 
+function usageFromRun(documentUsage: Run["usage"] | undefined): UsageTotals {
+  return {
+    input: documentUsage?.inputTokens ?? 0,
+    output: documentUsage?.outputTokens ?? 0,
+    cacheRead: documentUsage?.cacheReadTokens ?? 0,
+    cacheWrite: documentUsage?.cacheWriteTokens ?? 0,
+    totalTokens: documentUsage?.totalTokens ?? 0,
+    cost: documentUsage?.estimatedCost ?? 0,
+  };
+}
+
 async function executeJob(input: JobInput, controller: AbortController) {
   const run = input.run;
   const started = Date.now();
-  const usage: UsageTotals = emptyUsage();
+  // AUD-10: resumes, worker restarts and human continuations accumulate into the
+  // persisted usage instead of resetting it.
+  const usage: UsageTotals = usageFromRun(run.usage);
   const tracker = await loadTracker(run.id);
   // COST-002/003: budgets are evaluated before every model call and after each
   // one, with a single 80% warning per dimension.
-  const budget = createBudgetContext(run, started, readBudgetLimits(), () => toRunUsage(usage), async (message) => {
+  const runLimits = run.budget ?? readBudgetLimits();
+  const budget = createBudgetContext(run, started, runLimits, () => toRunUsage(usage), async (message) => {
     await postUpdate(run.id, {
       patch: { usageRoles: run.usageRoles, modelCalls: run.modelCalls },
       event: { round: run.round, source: "system", type: "run.budget_warning", message },
@@ -1136,12 +1237,20 @@ async function executeJob(input: JobInput, controller: AbortController) {
   const stopHeartbeat = startJobHeartbeat(input.jobId);
   let outcomeState: "done" | "failed" | "cancelled" = "done";
   let terminalRecorded = true;
+  // AUD-10: one Run level deadline covers model calls, checks and container work.
+  let deadlineExceeded = false;
+  const deadlineAt = Math.max(started, new Date(run.createdAt).getTime() + runLimits.maxDurationSeconds * 1000);
+  const deadlineTimer = setTimeout(() => {
+    deadlineExceeded = true;
+    controller.abort();
+  }, Math.max(0, deadlineAt - Date.now()));
   try {
     const project = await resolveProject(run.repository);
     const dirty = await git(project, ["status", "--porcelain"], controller.signal);
     if (dirty) throw new Error("Source repository has uncommitted changes; clean it before starting a real run");
-    const projectHead = await git(project, ["rev-parse", "HEAD"], controller.signal);
     if (!/^[a-f0-9]{64}$/.test(run.ownerId)) throw new Error("Invalid run owner");
+    // AUD-01: the run directory is a standalone clone; source repositories are
+    // never mounted into agent containers and their Git metadata is never shared.
     const worktree = path.join(runsRoot, run.ownerId, run.id);
     const reuseWorktree = Boolean(input.resume || input.retryReview || recovering);
     const humanInstruction = input.resume?.instruction?.trim() || "";
@@ -1151,20 +1260,22 @@ async function executeJob(input: JobInput, controller: AbortController) {
       });
     }
 
-    let baseCommit = projectHead;
+    let baseCommit = run.baseSha ?? await git(project, ["rev-parse", "HEAD"], controller.signal);
     if (reuseWorktree) {
       const exists = await stat(worktree).then(() => true).catch(() => false);
-      if (!exists) throw new Error("无法恢复：任务 worktree 不存在（可能已被清理）");
+      if (!exists) throw new Error("无法恢复：任务运行目录不存在（可能已被清理）");
       const branch = await git(worktree, ["branch", "--show-current"], controller.signal);
-      if (branch !== run.branch) throw new Error(`无法恢复：worktree 当前分支为 ${branch || "detached"}，期望 ${run.branch}`);
+      if (branch !== run.branch) throw new Error(`无法恢复：运行目录当前分支为 ${branch || "detached"}，期望 ${run.branch}`);
       const head = await git(worktree, ["rev-parse", "HEAD"], controller.signal);
       const pending = await git(worktree, ["status", "--porcelain"], controller.signal);
-      baseCommit = await git(project, ["merge-base", projectHead, run.branch], controller.signal).catch(() => projectHead);
+      // AT-GIT-001: the pinned base SHA keeps diffs and recovery stable even if
+      // the source branch moved on while the task was queued.
+      baseCommit = run.baseSha ?? baseCommit;
       const recoveryLabel = input.retryReview
-        ? `重试审核：复用现有 worktree（HEAD ${head.slice(0, 7)}）`
+        ? `重试审核：复用现有运行目录（HEAD ${head.slice(0, 7)}）`
         : input.resume
-          ? `人工恢复：复用已有 worktree（HEAD ${head.slice(0, 7)}${pending ? "，包含未提交的人工修改" : ""}）`
-          : `Worker 恢复：复用已有 worktree（HEAD ${head.slice(0, 7)}${pending ? "，包含未提交的修改" : ""}）`;
+          ? `人工恢复：复用已有运行目录（HEAD ${head.slice(0, 7)}${pending ? "，包含未提交的人工修改" : ""}）`
+          : `Worker 恢复：复用已有运行目录（HEAD ${head.slice(0, 7)}${pending ? "，包含未提交的修改" : ""}）`;
       await update(run,
         input.retryReview ? "reviewing" : "preparing",
         "system",
@@ -1178,9 +1289,20 @@ async function executeJob(input: JobInput, controller: AbortController) {
         await postUpdate(run.id, { event: { round: run.round, source: "system", type: "run.resume_instruction", message: `人工指令：${humanInstruction.slice(0, 500)}` } });
       }
     } else {
-      await mkdir(path.dirname(worktree), { recursive: true });
-      await update(run, "preparing", "system", "workspace.preparing", "正在创建隔离 Git worktree", { worktree: path.relative(workspaceRoot, worktree) });
-      await git(project, ["worktree", "add", "-b", run.branch, worktree, "HEAD"], controller.signal);
+      await update(run, "preparing", "system", "workspace.preparing", "正在创建独立运行目录（克隆）", { worktree: path.relative(workspaceRoot, worktree) });
+      const prepared = await prepareRunDirectory({
+        project,
+        runDir: worktree,
+        branch: run.branch,
+        baseSha: run.baseSha,
+        reuse: false,
+        signal: controller.signal,
+      });
+      baseCommit = prepared.baseSha;
+      if (!run.baseSha) {
+        run.baseSha = prepared.baseSha;
+        await postUpdate(run.id, { patch: { baseSha: prepared.baseSha } });
+      }
     }
 
     if (input.retryReview) {
@@ -1229,7 +1351,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
           await tracker.complete(stages.planning, plan);
         }
         if (plan.tasks.length > 1) {
-          const integrationNotes = await orchestrateSubAgents({ run, project, worktree, plan, credentials: input.credentials, signal: controller.signal, usage, tracker, budget });
+          const integrationNotes = await orchestrateSubAgents({ run, project: worktree, worktree, plan, credentials: input.credentials, signal: controller.signal, usage, tracker, budget });
           const integrationPrompt = [
             "You are the lead integration agent. Work only in the current Git worktree.",
             `Original task: ${run.task}`,
@@ -1339,6 +1461,27 @@ async function executeJob(input: JobInput, controller: AbortController) {
     }
     await update(run, "needs_human", "system", "run.needs_human", "达到最大审核轮次，需要人工处理", { findings, usage: toRunUsage(usage), usageRoles: run.usageRoles, modelCalls: run.modelCalls, durationMs: Date.now() - started });
   } catch (error) {
+    if (deadlineExceeded) {
+      terminalRecorded = false;
+      const message = `运行超过时限预算（${runLimits.maxDurationSeconds}s），已终止本次执行并转人工处理`;
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        try {
+          await update(run, "needs_human", "system", "run.deadline_exceeded", message, {
+            usage: toRunUsage(usage),
+            usageRoles: run.usageRoles,
+            modelCalls: run.modelCalls,
+            durationMs: Date.now() - started,
+            summary: message,
+          });
+          terminalRecorded = true;
+          break;
+        } catch (writeError) {
+          console.warn(`[store] deadline terminal update failed (attempt ${attempt}): ${(writeError as Error).message}`);
+          if (attempt < 3) await sleep(1_000 * 2 ** (attempt - 1));
+        }
+      }
+      return;
+    }
     const cancelled = controller.signal.aborted;
     outcomeState = cancelled ? "cancelled" : "failed";
     // AUD-06: nothing is recorded yet; the finally block may only finish the job
@@ -1411,6 +1554,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
       console.error(`[store] could not record the terminal state for ${run.id}; leaving the job for reclaim`);
     }
   } finally {
+    clearTimeout(deadlineTimer);
     stopHeartbeat();
     if (input.jobId && terminalRecorded) {
       await jobApi.finish(input.jobId, outcomeState).catch((error) => console.warn(`[jobs] finish failed: ${(error as Error).message}`));
@@ -1448,7 +1592,17 @@ async function reclaimPendingJobs() {
     const controller = new AbortController();
     active.set(job.run.id, controller);
     started += 1;
-    void executeJob({ run: job.run, checks: job.checks, credentials: job.credentials, jobId: job.jobId, recovery: true }, controller);
+    // AUD-05: only a job that actually started is a recovery; a queued job that
+    // never ran begins normally (and creates its clone).
+    void executeJob({
+      run: job.run,
+      checks: job.checks,
+      credentials: job.credentials,
+      jobId: job.jobId,
+      recovery: job.wasStarted,
+      ...(job.resume ? { resume: job.resume } : {}),
+      ...(job.retryReview ? { retryReview: true } : {}),
+    }, controller);
   }
   if (started > 0) console.warn(`[jobs] reclaimed ${started} unfinished job(s) after restart`);
   return started;
