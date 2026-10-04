@@ -156,8 +156,8 @@ export class PostgresRunStore implements RunStoreLike {
     }
     await this.db.withTransaction(async (tx) => {
       await tx.query(
-        `UPDATE runs SET state = $2, updated_at = $3, last_seq = $4, document_json = $5 WHERE id = $1`,
-        [next.id, next.state, next.updatedAt, next.lastSeq ?? 0, JSON.stringify(next)],
+        `UPDATE runs SET state = $2, updated_at = $3, document_json = $4 WHERE id = $1`,
+        [next.id, next.state, next.updatedAt, JSON.stringify(next)],
       );
       await this.project(tx, next);
     });
@@ -206,10 +206,7 @@ export class PostgresRunStore implements RunStoreLike {
         await this.project(tx, next);
       }
       if (input.event) {
-        const bumped = (await tx.query(
-          "UPDATE runs SET last_seq = last_seq + 1, updated_at = $2 WHERE id = $1 RETURNING last_seq",
-          [input.runId, input.event.at],
-        )).rows[0];
+        const bumped = await this.nextSequence(tx, input.runId, input.event.at);
         if (!bumped) throw new Error(`Run not found: ${input.runId}`);
         seq = Number(bumped.last_seq);
         await tx.query(
@@ -266,10 +263,7 @@ export class PostgresRunStore implements RunStoreLike {
       }
     }
     const seq = await this.db.withTransaction(async (tx) => {
-      const next = (await tx.query(
-        `UPDATE runs SET last_seq = last_seq + 1, updated_at = $2 WHERE id = $1 RETURNING last_seq`,
-        [event.runId, event.at],
-      )).rows[0];
+      const next = await this.nextSequence(tx, event.runId, event.at);
       if (!next) throw new Error(`Run not found: ${event.runId}`);
       const value = Number(next.last_seq);
       await tx.query(
@@ -565,6 +559,23 @@ export class PostgresRunStore implements RunStoreLike {
       importedRuns += 1;
     }
     return { importedRuns, importedEvents, skippedRuns };
+  }
+
+  /**
+   * Allocates the next per-run sequence. A conditional heal first repairs a
+   * counter that a legacy/partial write left behind the event log, then the
+   * atomic bump serialises concurrent callbacks through the row lock.
+   */
+  private async nextSequence(tx: Db, runId: string, at: string) {
+    const maxRow = (await tx.query("SELECT COALESCE(MAX(seq), 0) AS max_seq FROM run_events WHERE run_id = $1", [runId])).rows[0];
+    const maxSeq = Number(maxRow?.max_seq ?? 0);
+    if (maxSeq > 0) {
+      await tx.query("UPDATE runs SET last_seq = $2 WHERE id = $1 AND last_seq < $2", [runId, maxSeq]);
+    }
+    return (await tx.query(
+      "UPDATE runs SET last_seq = last_seq + 1, updated_at = $2 WHERE id = $1 RETURNING last_seq",
+      [runId, at],
+    )).rows[0] as { last_seq: number } | undefined;
   }
 
   private mapJob(row: Record<string, unknown>): JobRecord {
