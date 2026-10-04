@@ -25,6 +25,7 @@ import {
   type MaterializedReviewSnapshot,
 } from "./review-snapshot.js";
 import { WorkspacePathError, resolveInsideRoot, sanitizeRelativePath, sanitizeWorkspaceName, validateCloneUrl } from "./workspace-paths.js";
+import { RunCleanupPathError, removeRunDirectory } from "./run-cleanup.js";
 import { WorkspaceLockManager, workspaceKeyFor } from "./workspace-lock.js";
 import { PiRunError, failureOutputForEvent } from "./agent-failure.js";
 import { detectProjectPlugins, parsePluginPolicy, pluginArguments, pluginMounts, selectPlugins, type PluginDenial } from "./plugin-policy.js";
@@ -1982,6 +1983,26 @@ const server = createServer(async (request, response) => {
       if (!controller) return json(response, 404, { error: "Active job not found" });
       controller.abort();
       return json(response, 202, { cancelled: true });
+    }
+    // GAP-04: owner-scoped removal of a finished run's on-disk directory tree.
+    const cleanupMatch = url.pathname.match(/^\/runs\/([^/]+)\/cleanup$/);
+    if (request.method === "POST" && cleanupMatch) {
+      const runId = decodeURIComponent(cleanupMatch[1]);
+      // Never delete the working directory of a job this worker is running.
+      if (active.has(runId)) return json(response, 409, { error: "Run is still active on this worker", code: "RUN_ACTIVE" });
+      const body = await readJson(request) as { ownerId?: unknown; dryRun?: unknown };
+      try {
+        const result = await removeRunDirectory({
+          runsRoot,
+          ownerId: String(body.ownerId ?? ""),
+          runId,
+          dryRun: body.dryRun === true,
+        });
+        return json(response, 200, result);
+      } catch (error) {
+        if (error instanceof RunCleanupPathError) return json(response, 400, { error: error.message, code: error.code });
+        throw error;
+      }
     }
     return json(response, 404, { error: "Not found" });
   } catch (error) {

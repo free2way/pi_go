@@ -15,6 +15,7 @@ import { baseDemoRun, runDemo } from "./demo-runner.js";
 import { IdentityService } from "./identity.js";
 import { availableModels, defaultSelections, loadModelCatalog, preflightRunModels, type RuntimeCapability } from "./model-catalog.js";
 import { RunEventStream } from "./event-stream.js";
+import { cleanupRunDirectory, keptRunStorageOutcome, type RunDirectoryCleaner } from "./run-cleanup.js";
 import { baseRealRun } from "./real-run.js";
 import { createProviderProbe, providerProbeDisabled } from "./provider-probe.js";
 import { verifyPendingCredentials } from "./credential-verification.js";
@@ -338,6 +339,18 @@ async function workerRequest<T>(pathName: string, init?: RequestInit): Promise<T
   return body as T;
 }
 
+/**
+ * GAP-04 storage follow-up: asks the worker to remove a finished run's on-disk
+ * directory tree (standalone clone, sub-agent worktrees, reviewer snapshots and
+ * the per-run Pi state directories). Best-effort by design: the caller shapes a
+ * `kept` outcome instead of failing the cleanup request.
+ */
+const runDirectoryCleaner: RunDirectoryCleaner = ({ runId, ownerId, dryRun }) =>
+  workerRequest(`/runs/${encodeURIComponent(runId)}/cleanup`, {
+    method: "POST",
+    body: JSON.stringify({ ownerId, dryRun }),
+  });
+
 app.addHook("onSend", async (_request, reply, payload) => {
   reply.header("X-Content-Type-Options", "nosniff");
   reply.header("Referrer-Policy", "same-origin");
@@ -408,7 +421,7 @@ app.get("/api/health", async (_request, reply) => {
   try {
     await pingDatabase();
     alerts.clear("database_unavailable");
-    return { status: "ok", service: "pigo-web", version: "0.20.1", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.20.2", db: "ok" };
   } catch (error) {
     // AT-REL-005: fail loudly instead of pretending the service is healthy.
     alerts.raise({
@@ -417,7 +430,7 @@ app.get("/api/health", async (_request, reply) => {
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
       details: { error: (error as Error).message.slice(0, 200) },
     });
-    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.20.1", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.20.2", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
   }
 });
 
@@ -432,7 +445,7 @@ interface StorageStatus {
 app.get("/api/health/detail", async (request, reply) => {
   const internal = safeTokenMatch(request.headers.authorization);
   if (!internal && !auth.user(request)) return reply.code(401).send({ error: "Unauthorized" });
-  const health: Record<string, unknown> = { version: "0.20.1", at: new Date().toISOString() };
+  const health: Record<string, unknown> = { version: "0.20.2", at: new Date().toISOString() };
   try {
     await pingDatabase();
     health.database = { status: "ok" };
@@ -993,19 +1006,28 @@ app.post("/api/runs/cleanup", async (request, reply) => {
     return true;
   });
   if (parsed.data.dryRun) {
-    return { dryRun: true, matched: matched.length, runIds: matched.map((run) => run.id) };
+    const storage = await Promise.all(
+      matched.map((run) => cleanupRunDirectory(run, { dryRun: true, cleaner: runDirectoryCleaner })),
+    );
+    return { dryRun: true, matched: matched.length, runIds: matched.map((run) => run.id), storage };
   }
   const deleted: string[] = [];
+  const storage: Awaited<ReturnType<typeof cleanupRunDirectory>>[] = [];
   for (const run of matched) {
     try {
       await store.deleteRun(run.id);
       deleted.push(run.id);
     } catch (error) {
       app.log.warn({ runId: run.id, error: (error as Error).message }, "cleanup: failed to delete run");
+      storage.push(keptRunStorageOutcome(run.id, `database deletion failed: ${(error as Error).message}`));
+      continue;
     }
+    // Best-effort on-disk cleanup after the records are gone: a worker that is
+    // unreachable (or refuses an unsafe path) only marks the run as kept.
+    storage.push(await cleanupRunDirectory(run, { dryRun: false, cleaner: runDirectoryCleaner }));
   }
   if (deleted.length > 0) app.log.info({ actor: user.id, deleted }, "cleaned up finished runs");
-  return { dryRun: false, deleted: deleted.length, runIds: deleted, matched: matched.length };
+  return { dryRun: false, deleted: deleted.length, runIds: deleted, matched: matched.length, storage };
 });
 
 // ---------------------------------------------------------------- job queue (REL-002)
