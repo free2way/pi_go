@@ -10,6 +10,11 @@ export interface SandboxRequest {
   worktree: string;
   /** Host path backing `worktree` (the Docker daemon resolves bind sources on the host). */
   hostWorktreePath: string;
+  /**
+   * GAP-03: mount the worktree read-only and skip the repository metadata bind.
+   * Used for the reviewer's one-shot snapshot so a review cannot write back.
+   */
+  readOnly?: boolean;
   /** Host path of the repository the worktree belongs to (git metadata must stay writable). */
   hostRepositoryPath?: string;
   /** Container path that receives git metadata access (worktree `.git` link target). */
@@ -42,8 +47,11 @@ export interface SandboxRequest {
  * socket are never exposed. Check commands run with `network: "none"`.
  */
 export function buildContainerSpec(request: SandboxRequest): ContainerCreateSpec {
-  const binds = [`${request.hostWorktreePath}:${request.worktree}:rw`];
-  if (request.hostRepositoryPath && request.repositoryPath) {
+  // GAP-03 / AT-SEC-009: the reviewer snapshot is mounted read-only, and the
+  // repository metadata bind is skipped entirely (a snapshot has no `.git`, and
+  // the reviewer must never see the developer repository's mutable metadata).
+  const binds = [`${request.hostWorktreePath}:${request.worktree}:${request.readOnly ? "ro" : "rw"}`];
+  if (!request.readOnly && request.hostRepositoryPath && request.repositoryPath) {
     // `.git` is shared so the worktree can commit; working trees of other
     // projects are still invisible because only this repository's metadata is
     // mounted.

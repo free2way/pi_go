@@ -43,6 +43,13 @@ describe("buildContainerSpec", () => {
     expect(spec.HostConfig.Binds).toContain("/opt/pigo/review.ts:/opt/pigo/plugins/0-review.ts:ro");
   });
 
+  it("mounts the reviewer snapshot read-only and hides repository metadata (GAP-03 / AT-SEC-009)", () => {
+    const spec = buildContainerSpec({ ...base, readOnly: true });
+    expect(spec.HostConfig.Binds).toContain("/host/workspace/runs/owner/run_1:/workspace/runs/owner/run_1:ro");
+    expect(spec.HostConfig.Binds.some((bind) => bind.includes("/.git:"))).toBe(false);
+    expect(spec.HostConfig.Binds.some((bind) => bind.includes(":rw") && bind.includes("runs/owner/run_1:"))).toBe(false);
+  });
+
   it("applies the container security baseline (SEC-005)", () => {
     const spec = buildContainerSpec(base);
     expect(spec.User).toBe("node");

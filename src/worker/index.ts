@@ -16,6 +16,14 @@ import { sleep, withProviderRetry } from "./provider-retry.js";
 import { blockingSeverities, parseReview, type ReviewResult } from "./review-protocol.js";
 import { buildContainerSpec, hostPathFor, resolveSandboxMode } from "./sandbox.js";
 import { mergeFindings, unresolvedFeedback } from "./review-findings.js";
+import {
+  buildSnapshotDivergenceFinding,
+  createGitReviewSnapshotMaterializer,
+  destroyReviewSnapshot,
+  evaluateSnapshotDivergence,
+  reviewSnapshotDirectory,
+  type MaterializedReviewSnapshot,
+} from "./review-snapshot.js";
 import { WorkspacePathError, resolveInsideRoot, sanitizeRelativePath, sanitizeWorkspaceName, validateCloneUrl } from "./workspace-paths.js";
 import { WorkspaceLockManager, workspaceKeyFor } from "./workspace-lock.js";
 import { PiRunError, failureOutputForEvent } from "./agent-failure.js";
@@ -118,6 +126,12 @@ const sandboxExtraBinds = (process.env.PI_SANDBOX_EXTRA_BINDS || "").split(",").
 const sandboxExtraEnv = (process.env.PI_SANDBOX_EXTRA_ENV || "").split(",").map((item) => item.trim()).filter(Boolean);
 
 /**
+ * GAP-03: creates the reviewer's immutable one-shot snapshot. Injectable so the
+ * decision logic can be exercised without shelling out to git.
+ */
+const materializeReviewSnapshot = createGitReviewSnapshotMaterializer();
+
+/**
  * GAP-02: Pi plugins are default-off. Only resources in the operator allowlist
  * are re-enabled through explicit `--extension/--skill/--prompt-template`
  * flags; anything requested but not allowlisted produces a `plugin.denied`
@@ -210,6 +224,8 @@ interface SandboxRunInput {
   onStdoutLine?: (line: string) => void;
   label: string;
   pluginMounts?: Array<{ hostPath: string; containerPath: string }>;
+  /** GAP-03: mount the worktree read-only (reviewer snapshot). */
+  readOnly?: boolean;
 }
 
 /** Runs one invocation inside its own container and always cleans it up. */
@@ -226,6 +242,7 @@ async function runInSandbox(input: SandboxRunInput): Promise<CommandResult> {
     image: imageForSandbox,
     worktree: input.worktree,
     hostWorktreePath: hostPathFor(input.worktree, workspaceRoot, hostWorkspaceRoot),
+    readOnly: input.readOnly,
     repositoryPath: input.repository,
     hostRepositoryPath: input.repository ? hostPathFor(input.repository, workspaceRoot, hostWorkspaceRoot) : undefined,
     modelsFile: "/home/node/.pi/agent/models.json",
@@ -760,7 +777,10 @@ async function runPi(input: {
     ? await runInSandbox({
         argv: ["pi", ...args],
         worktree: input.cwd,
-        repository: await repositoryForWorktree(input.cwd),
+        // GAP-03: the reviewer reads its own snapshot, which has no git metadata
+        // to share, and the mount is read-only.
+        repository: input.readOnly ? undefined : await repositoryForWorktree(input.cwd),
+        readOnly: input.readOnly,
         env: sandboxEnvironment({ [input.apiKeyEnvironmentName]: input.apiKey, ...(input.readOnly ? { PIGO_SANDBOX_READONLY: "1" } : {}) }),
         network: agentNetwork,
         timeoutMs: runTimeoutMs,
@@ -1236,9 +1256,68 @@ async function runChecks(run: Run, worktree: string, commands: string[], signal:
 
 type ReviewOutcome = { stopped: true } | { stopped: false; review: ReviewResult };
 
-async function performReview(input: {
+/**
+ * GAP-03: materialize and verify the reviewer's immutable snapshot before the
+ * review phase. Returns the snapshot directory to review, or `undefined` when
+ * the run was escalated (snapshot creation failed, or the developer tree moved
+ * under the snapshot). The live worktree is never handed to the reviewer.
+ */
+async function prepareReviewSnapshot(input: {
   run: Run;
   worktree: string;
+  round: number;
+  signal: AbortSignal;
+}): Promise<string | undefined> {
+  const { run, round } = input;
+  const directory = reviewSnapshotDirectory(input.worktree, round);
+  let materialized: MaterializedReviewSnapshot;
+  try {
+    materialized = await materializeReviewSnapshot({ worktree: input.worktree, snapshotDir: directory, signal: input.signal });
+  } catch (error) {
+    await destroyReviewSnapshot(directory);
+    await update(run, "needs_human", "reviewer", "review.snapshot_failed", `无法创建审核只读快照，已停止审核（绝不回退到可写 worktree）：${(error as Error).message.slice(0, 300)}`, {
+      summary: "审核快照创建失败，已转人工",
+    });
+    return undefined;
+  }
+  const decision = evaluateSnapshotDivergence(materialized);
+  const evidence = {
+    round,
+    developerTree: materialized.developerTreeHash,
+    developerTreeAfter: materialized.developerTreeHashAfter,
+    snapshotTree: materialized.snapshotTreeHash,
+    commit: materialized.commit,
+    directory: path.relative(workspaceRoot, directory),
+    diverged: decision.divergent,
+    at: new Date().toISOString(),
+  };
+  await postUpdate(run.id, {
+    event: {
+      round,
+      source: "reviewer",
+      type: "review.snapshot_created",
+      message: `已创建第 ${round} 轮审核只读快照（tree ${materialized.snapshotTreeHash.slice(0, 12)}）${decision.divergent ? "：与开发 worktree 不一致" : ""}`,
+      meta: evidence,
+    },
+  });
+  if (decision.divergent) {
+    // GAP-03: reviewing a different tree is never allowed, so this is a
+    // blocking escalation rather than a warning.
+    const findings = mergeFindings(run.findings ?? [], [buildSnapshotDivergenceFinding(round, decision.reasons)]);
+    await destroyReviewSnapshot(directory);
+    await update(run, "needs_human", "reviewer", "review.snapshot_diverged", `审核快照与开发 worktree 的 tree hash 不一致，已阻断审核：${decision.reasons.join("；")}`, {
+      findings,
+      summary: "审核快照与开发 worktree 不一致，已转人工",
+    });
+    return undefined;
+  }
+  return directory;
+}
+
+async function performReview(input: {
+  run: Run;
+  /** GAP-03: immutable snapshot directory the reviewer reads (never the live worktree). */
+  snapshotPath: string;
   credentials: JobInput["credentials"];
   round: number;
   diff: string;
@@ -1259,7 +1338,7 @@ async function performReview(input: {
   let firstReview: { text: string; usage: UsageTotals };
   try {
     firstReview = await runPiWithRetry({
-      cwd: input.worktree,
+      cwd: input.snapshotPath,
       provider: input.run.reviewer.provider,
       model: input.run.reviewer.model,
       prompt: reviewPrompt,
@@ -1289,7 +1368,7 @@ async function performReview(input: {
     let retryReview: { text: string; usage: UsageTotals };
     try {
       retryReview = await runPiWithRetry({
-        cwd: input.worktree,
+        cwd: input.snapshotPath,
         provider: input.run.reviewer.provider,
         model: input.run.reviewer.model,
         prompt: `${reviewPrompt}\n\n上一次回复被拒绝：不是合法的协议 JSON。只输出 JSON 对象本身，不要 markdown 代码块，不要任何解释。`,
@@ -1353,20 +1432,30 @@ async function executeRetryReview(input: {
     });
     return;
   }
-  await update(run, "reviewing", "reviewer", "review.started", `${run.reviewer.model} 重新审核（人工触发）`, { summary: "Reviewer Agent 正在重新审核" });
   const diff = await collectDiff(input.worktree, input.controller.signal, input.baseCommit);
   const reviewSnapshot = await snapshotHash(input.worktree, input.controller.signal);
-  const outcome = await performReview({
-    run,
-    worktree: input.worktree,
-    credentials: input.credentials,
-    round: run.round,
-    diff,
-    signal: input.controller.signal,
-    usage: input.usage,
-    started: input.started,
-    budget: input.budget,
-  });
+  // GAP-03: the reviewer reads an immutable snapshot, never the live worktree.
+  const snapshotPath = await prepareReviewSnapshot({ run, worktree: input.worktree, round: run.round, signal: input.controller.signal });
+  if (!snapshotPath) return;
+  await update(run, "reviewing", "reviewer", "review.started", `${run.reviewer.model} 重新审核（人工触发）`, { summary: "Reviewer Agent 正在重新审核" });
+  let outcome: ReviewOutcome;
+  try {
+    outcome = await performReview({
+      run,
+      snapshotPath,
+      credentials: input.credentials,
+      round: run.round,
+      diff,
+      signal: input.controller.signal,
+      usage: input.usage,
+      started: input.started,
+      budget: input.budget,
+    });
+  } finally {
+    // AT-REVIEW-012: the one-shot snapshot (and its Pi state) is discarded after
+    // the review, so the reviewer can never leave files behind.
+    await destroyReviewSnapshot(snapshotPath);
+  }
   if (outcome.stopped) return;
   const review = outcome.review;
   const findings = mergeFindings(run.findings ?? [], review.findings, { approved: review.verdict === "approved" });
@@ -1626,17 +1715,28 @@ async function executeJob(input: JobInput, controller: AbortController) {
 
       const latestDiff = await collectDiff(worktree, controller.signal, baseCommit);
       const reviewSnapshot = await snapshotHash(worktree, controller.signal);
-      await update(run, "reviewing", "reviewer", "review.started", `${run.reviewer.model} 开始独立只读审核`, { diff: latestDiff, checkSnapshot, reviewSnapshot, checkPassed: true, checks: checked.results, summary: "Reviewer Agent 正在审核" });
       // AT-REL-003: a review that already produced a verdict is reused, so a
       // restarted worker can never emit two conflicting verdicts for one round.
       let review: ReviewResult;
       const storedReview = tracker.isCompleted(stages.review(round)) ? tracker.payload<StoredReview>(stages.review(round)) : undefined;
       if (storedReview) {
+        await update(run, "reviewing", "reviewer", "review.started", `${run.reviewer.model} 开始独立只读审核`, { diff: latestDiff, checkSnapshot, reviewSnapshot, checkPassed: true, checks: checked.results, summary: "Reviewer Agent 正在审核" });
         review = storedReview;
         await postUpdate(run.id, { event: { round, source: "system", type: "review.checkpoint_restored", message: "从检查点恢复本轮审核结论，跳过重复的审核模型调用" } });
       } else {
+        // GAP-03: materialize the reviewer's immutable snapshot before announcing
+        // the review, so the reviewer never reads the developer's live worktree.
+        const snapshotPath = await prepareReviewSnapshot({ run, worktree, round, signal: controller.signal });
+        if (!snapshotPath) return;
+        await update(run, "reviewing", "reviewer", "review.started", `${run.reviewer.model} 开始独立只读审核`, { diff: latestDiff, checkSnapshot, reviewSnapshot, checkPassed: true, checks: checked.results, summary: "Reviewer Agent 正在审核" });
         await tracker.start(stages.review(round));
-        const outcome = await performReview({ run, worktree, credentials: input.credentials, round, diff: latestDiff, signal: controller.signal, usage, started, budget });
+        let outcome: ReviewOutcome;
+        try {
+          outcome = await performReview({ run, snapshotPath, credentials: input.credentials, round, diff: latestDiff, signal: controller.signal, usage, started, budget });
+        } finally {
+          // AT-REVIEW-012: snapshot and its state are destroyed after one use.
+          await destroyReviewSnapshot(snapshotPath);
+        }
         if (outcome.stopped) return;
         review = outcome.review;
         await tracker.complete(stages.review(round), review);
