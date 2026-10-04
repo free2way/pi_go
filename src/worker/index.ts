@@ -791,7 +791,7 @@ async function runPi(input: {
 
 /** AUD-16: cap is high enough for realistic diffs; when it is hit the artifact
  * says so explicitly instead of silently clipping. */
-const maxDiffOutput = 3_500_000;
+const maxDiffOutput = 3_400_000;
 
 async function collectDiff(worktree: string, signal: AbortSignal, baseRef?: string) {
   await git(worktree, ["add", "-N", "."], signal);

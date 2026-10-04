@@ -232,7 +232,9 @@ const runPatchSchema = z.object({
   state: runStateSchema,
   round: z.number().int().min(1).max(99),
   summary: z.string().max(8_000),
-  diff: z.string().max(200_000),
+  // AUD-16: the worker reports the full run diff (bounded at 3.4M chars); the
+  // JSON body limit is 4 MiB, so the schema must allow the same magnitude.
+  diff: z.string().max(3_500_000),
   findings: z.array(findingSchema).max(100),
   checks: z.array(checkResultSchema).max(16),
   plan: developmentPlanSchema,
@@ -406,7 +408,7 @@ app.get("/api/health", async (_request, reply) => {
   try {
     await pingDatabase();
     alerts.clear("database_unavailable");
-    return { status: "ok", service: "pigo-web", version: "0.19.0", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.19.1", db: "ok" };
   } catch (error) {
     // AT-REL-005: fail loudly instead of pretending the service is healthy.
     alerts.raise({
@@ -415,7 +417,7 @@ app.get("/api/health", async (_request, reply) => {
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
       details: { error: (error as Error).message.slice(0, 200) },
     });
-    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.19.0", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.19.1", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
   }
 });
 
@@ -430,7 +432,7 @@ interface StorageStatus {
 app.get("/api/health/detail", async (request, reply) => {
   const internal = safeTokenMatch(request.headers.authorization);
   if (!internal && !auth.user(request)) return reply.code(401).send({ error: "Unauthorized" });
-  const health: Record<string, unknown> = { version: "0.19.0", at: new Date().toISOString() };
+  const health: Record<string, unknown> = { version: "0.19.1", at: new Date().toISOString() };
   try {
     await pingDatabase();
     health.database = { status: "ok" };
