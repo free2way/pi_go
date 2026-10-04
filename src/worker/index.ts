@@ -587,11 +587,28 @@ class BudgetExceededError extends Error {
 }
 
 /** Wires budget limits, per-role usage and 80% warnings into a running job. */
-function createBudgetContext(run: Run, startedAt: number, limits = readBudgetLimits(), onWarning?: (message: string) => Promise<void>): RunBudgetContext {
-  let warned = new Set<string>();
+function createBudgetContext(
+  run: Run,
+  startedAt: number,
+  limits = readBudgetLimits(),
+  usageProvider: () => RunUsage = () => run.usage ?? emptyUsage(),
+  onWarning?: (message: string) => Promise<void>,
+): RunBudgetContext {
+  const warned = new Set<string>();
+  const currentUsage = () => {
+    const live = usageProvider();
+    return {
+      inputTokens: live.inputTokens,
+      outputTokens: live.outputTokens,
+      cacheReadTokens: live.cacheReadTokens ?? 0,
+      cacheWriteTokens: live.cacheWriteTokens ?? 0,
+      totalTokens: live.totalTokens ?? (live.inputTokens + live.outputTokens + (live.cacheReadTokens ?? 0) + (live.cacheWriteTokens ?? 0)),
+      estimatedCost: live.estimatedCost,
+    };
+  };
   return {
     assertAvailable() {
-      const status = evaluateBudget({ usage: run.usage ?? emptyUsage(), modelCalls: run.modelCalls ?? 0, elapsedMs: Date.now() - startedAt, limits });
+      const status = evaluateBudget({ usage: currentUsage(), modelCalls: run.modelCalls ?? 0, elapsedMs: Date.now() - startedAt, limits });
       if (status.state === "exhausted") throw new BudgetExceededError(status.reason ?? "运行预算已用尽");
     },
     async record(role, input, usageTotals) {
@@ -605,7 +622,7 @@ function createBudgetContext(run: Run, startedAt: number, limits = readBudgetLim
       };
       mergeRoleUsage(run, { role, provider: input.provider, model: input.model, usage });
       await postUpdate(run.id, { patch: { usageRoles: run.usageRoles, modelCalls: run.modelCalls } }).catch(() => undefined);
-      const status = evaluateBudget({ usage: run.usage ?? emptyUsage(), modelCalls: run.modelCalls ?? 0, elapsedMs: Date.now() - startedAt, limits });
+      const status = evaluateBudget({ usage: currentUsage(), modelCalls: run.modelCalls ?? 0, elapsedMs: Date.now() - startedAt, limits });
       if (status.state !== "ok" && status.dimension && !warned.has(status.dimension)) {
         warned.add(status.dimension);
         await onWarning?.(budgetWarningMessage(status));
@@ -1047,7 +1064,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
   const tracker = await loadTracker(run.id);
   // COST-002/003: budgets are evaluated before every model call and after each
   // one, with a single 80% warning per dimension.
-  const budget = createBudgetContext(run, started, readBudgetLimits(), async (message) => {
+  const budget = createBudgetContext(run, started, readBudgetLimits(), () => toRunUsage(usage), async (message) => {
     await postUpdate(run.id, {
       patch: { usageRoles: run.usageRoles, modelCalls: run.modelCalls },
       event: { round: run.round, source: "system", type: "run.budget_warning", message },
