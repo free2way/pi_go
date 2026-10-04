@@ -154,7 +154,7 @@ describe("PostgresRunStore", () => {
       { ...event(run.id, "run.state"), seq: 2 },
     ];
     const first = await store.importLegacy({ runs: [{ ...run, lastSeq: 2 }], events: { [run.id]: legacyEvents } });
-    expect(first).toEqual({ importedRuns: 1, importedEvents: 2 });
+    expect(first).toEqual({ importedRuns: 1, importedEvents: 2, skippedRuns: 0 });
     expect(store.getRun(run.id)?.lastSeq).toBe(2);
 
     const second = await store.importLegacy({ runs: [{ ...run, lastSeq: 2 }], events: { [run.id]: legacyEvents } });
@@ -163,6 +163,22 @@ describe("PostgresRunStore", () => {
 
     const next = await store.appendEvent(event(run.id, "run.after_import"));
     expect(next.seq).toBe(3);
+  });
+
+  it("imports ownerless legacy runs under the pre-migration owner key", async () => {
+    const db = await createTestDb();
+    const store = new PostgresRunStore(db);
+    await store.init();
+    const run = makeRun();
+    const ownerless = { ...run, ownerId: "" } as unknown as Run;
+    const result = await store.importLegacy({ runs: [ownerless], events: {} }, { defaultOwnerId: "legacy_owner_1" });
+    expect(result).toEqual({ importedRuns: 1, importedEvents: 0, skippedRuns: 0 });
+    expect(store.getRun(run.id)?.ownerId).toBe("legacy_owner_1");
+    expect(store.listRuns(["legacy_owner_1"]).length).toBe(1);
+
+    // Runs without an id (or without any owner fallback) are skipped, not fatal.
+    const skipped = await store.importLegacy({ runs: [{ ...run, id: "" } as unknown as Run], events: {} });
+    expect(skipped.skippedRuns).toBe(1);
   });
 
   it("deletes a run together with its derived rows", async () => {

@@ -369,14 +369,35 @@ export class PostgresRunStore implements RunStoreLike {
    * One-time import of a legacy `runs.json` document (REL-001 migration).
    * Existing rows are never overwritten, so a restart cannot regress state.
    */
-  async importLegacy(data: { runs: Run[]; events: Record<string, RunEvent[]> }) {
+  async importLegacy(
+    data: { runs: Run[]; events: Record<string, RunEvent[]> },
+    options: { defaultOwnerId?: string } = {},
+  ) {
     let importedRuns = 0;
     let importedEvents = 0;
+    let skippedRuns = 0;
+    const now = new Date().toISOString();
     for (const run of data.runs ?? []) {
-      if (this.cache.has(run.id)) continue;
+      if (!run?.id || this.cache.has(run.id)) {
+        if (!run?.id) skippedRuns += 1;
+        continue;
+      }
+      // Runs created before owner scoping have no ownerId; they belong to the
+      // single pre-migration owner recorded in users.legacy_owner_id.
+      const ownerId = run.ownerId || options.defaultOwnerId;
+      if (!ownerId) {
+        skippedRuns += 1;
+        continue;
+      }
       const events = (data.events?.[run.id] ?? []).slice().sort((a, b) => a.seq - b.seq);
       const lastSeq = events.at(-1)?.seq ?? run.lastSeq ?? 0;
-      const record: Run = { ...run, lastSeq };
+      const record: Run = {
+        ...run,
+        ownerId,
+        createdAt: run.createdAt || run.updatedAt || now,
+        updatedAt: run.updatedAt || run.createdAt || now,
+        lastSeq,
+      };
       this.cache.set(record.id, record);
       await this.db.withTransaction(async (tx) => {
         await tx.query(
@@ -396,7 +417,7 @@ export class PostgresRunStore implements RunStoreLike {
       });
       importedRuns += 1;
     }
-    return { importedRuns, importedEvents };
+    return { importedRuns, importedEvents, skippedRuns };
   }
 
   private mapJob(row: Record<string, unknown>): JobRecord {

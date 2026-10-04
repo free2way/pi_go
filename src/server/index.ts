@@ -67,8 +67,11 @@ if (store instanceof PostgresRunStore && existsSync(dataFile)) {
     if ((legacy.runs ?? []).length > 0) {
       const before = await store.statistics();
       if (before.counts.runs === 0) {
-        const result = await store.importLegacy({ runs: legacy.runs ?? [], events: legacy.events ?? {} });
-        app.log.info({ ...result }, "imported legacy runs.json into PostgreSQL");
+        // Pre-owner-scoping runs (no ownerId) belong to the single legacy owner.
+        const owners = (await db.query("SELECT id, legacy_owner_id FROM users")).rows;
+        const defaultOwnerId = owners.length === 1 ? String(owners[0].legacy_owner_id ?? owners[0].id) : undefined;
+        const result = await store.importLegacy({ runs: legacy.runs ?? [], events: legacy.events ?? {} }, { defaultOwnerId });
+        app.log.info({ ...result, defaultOwnerId: Boolean(defaultOwnerId) }, "imported legacy runs.json into PostgreSQL");
       }
     }
   } catch (error) {
@@ -283,7 +286,7 @@ app.get("/api/health", async (_request, reply) => {
   try {
     await pingDatabase();
     alerts.clear("database_unavailable");
-    return { status: "ok", service: "pigo-web", version: "0.12.1", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.12.2", db: "ok" };
   } catch (error) {
     // AT-REL-005: fail loudly instead of pretending the service is healthy.
     alerts.raise({
@@ -292,7 +295,7 @@ app.get("/api/health", async (_request, reply) => {
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
       details: { error: (error as Error).message.slice(0, 200) },
     });
-    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.12.1", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.12.2", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
   }
 });
 
@@ -307,7 +310,7 @@ interface StorageStatus {
 app.get("/api/health/detail", async (request, reply) => {
   const internal = safeTokenMatch(request.headers.authorization);
   if (!internal && !auth.user(request)) return reply.code(401).send({ error: "Unauthorized" });
-  const health: Record<string, unknown> = { version: "0.12.1", at: new Date().toISOString() };
+  const health: Record<string, unknown> = { version: "0.12.2", at: new Date().toISOString() };
   try {
     await pingDatabase();
     health.database = { status: "ok" };
