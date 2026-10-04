@@ -28,7 +28,9 @@ const configuredMaxActiveJobs = Number(process.env.PI_MAX_ACTIVE_JOBS || 1);
 const maxActiveJobs = Number.isInteger(configuredMaxActiveJobs) ? Math.min(4, Math.max(1, configuredMaxActiveJobs)) : 1;
 const active = new Map<string, AbortController>();
 const minFreeDiskMb = Math.max(64, Number(process.env.PI_MIN_FREE_DISK_MB || 2048));
-const criticalFreeDiskMb = Math.max(32, Math.min(minFreeDiskMb, Number(process.env.PI_CRITICAL_FREE_DISK_MB || 512)));
+// Critical is a quarter of the configured minimum (2048 MB -> 512 MB by default),
+// so raising PI_MIN_FREE_DISK_MB also scales the hard stop threshold.
+const criticalFreeDiskMb = Math.max(32, Number(process.env.PI_CRITICAL_FREE_DISK_MB || Math.round(minFreeDiskMb / 4)));
 
 export type StorageStatus = {
   state: "ok" | "low" | "critical";
@@ -1033,7 +1035,17 @@ async function executeJob(input: JobInput, controller: AbortController) {
     // mark the run permanently failed.
     const parked = followup || recovering || (kind !== undefined && kind !== "unknown");
     const state: RunState = cancelled ? "cancelled" : parked ? "needs_human" : "failed";
-    const type = cancelled ? "run.cancelled" : followup ? "run.resume_failed" : recovering ? "run.recovery_failed" : kind === "storage" ? "run.storage_error" : "run.failed";
+    const type = cancelled
+      ? "run.cancelled"
+      : kind === "storage"
+        ? "run.storage_error"
+        : parked
+          ? "run.provider_error"
+          : followup
+            ? "run.resume_failed"
+            : recovering
+              ? "run.recovery_failed"
+              : "run.failed";
     const message = cancelled
       ? "任务已取消"
       : kind === "storage"

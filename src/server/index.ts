@@ -263,11 +263,27 @@ function vaultKeyFor(request: FastifyRequest) {
   return user.legacyOwnerId ?? user.id;
 }
 
+/** Bounded liveness ping: a frozen database must not hang the health probe. */
+async function pingDatabase(timeoutMs = 2_500) {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      db.query("SELECT 1"),
+      new Promise((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("database ping timeout")), timeoutMs);
+      }),
+    ]);
+    return true;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 app.get("/api/health", async (_request, reply) => {
   try {
-    await db.query("SELECT 1");
+    await pingDatabase();
     alerts.clear("database_unavailable");
-    return { status: "ok", service: "pigo-web", version: "0.12.0", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.12.1", db: "ok" };
   } catch (error) {
     // AT-REL-005: fail loudly instead of pretending the service is healthy.
     alerts.raise({
@@ -276,7 +292,7 @@ app.get("/api/health", async (_request, reply) => {
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
       details: { error: (error as Error).message.slice(0, 200) },
     });
-    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.12.0", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.12.1", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
   }
 });
 
@@ -291,9 +307,9 @@ interface StorageStatus {
 app.get("/api/health/detail", async (request, reply) => {
   const internal = safeTokenMatch(request.headers.authorization);
   if (!internal && !auth.user(request)) return reply.code(401).send({ error: "Unauthorized" });
-  const health: Record<string, unknown> = { version: "0.12.0", at: new Date().toISOString() };
+  const health: Record<string, unknown> = { version: "0.12.1", at: new Date().toISOString() };
   try {
-    await db.query("SELECT 1");
+    await pingDatabase();
     health.database = { status: "ok" };
     alerts.clear("database_unavailable");
   } catch (error) {
@@ -402,9 +418,20 @@ function workspacesDisabled(reply: FastifyReply) {
   return reply.code(503).send({ error: "Workspaces are disabled", code: "WORKSPACES_DISABLED" });
 }
 
+function isStorageFailure(message: string) {
+  return /ECONNREFUSED|Connection terminated|connection is closed|connection timeout|ETIMEDOUT|terminating connection|57P0|no space left on device|ENOSPC|STORAGE_UNAVAILABLE/i.test(message);
+}
+
 function workspaceErrorReply(reply: FastifyReply, error: unknown) {
   if (error instanceof WorkspaceError) return reply.code(error.status).send({ error: error.message, code: error.code });
-  return reply.code(503).send({ error: `Workspace operation failed: ${(error as Error).message}` });
+  const message = (error as Error)?.message ?? String(error);
+  // AT-REL-005: a database outage is reported as storage degradation, not as a
+  // confusing workspace error.
+  if (isStorageFailure(message)) {
+    alerts.raise({ key: "storage_failure", severity: "critical", message: "存储不可用：工作区操作无法完成", details: { error: message.slice(0, 200) } });
+    return reply.code(503).send({ error: `存储不可用：${message.slice(0, 200)}`, code: "STORAGE_UNAVAILABLE" });
+  }
+  return reply.code(503).send({ error: `Workspace operation failed: ${message}` });
 }
 
 app.get("/api/workspaces", async (request, reply) => {
