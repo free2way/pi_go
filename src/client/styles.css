@@ -389,6 +389,10 @@ button { color: inherit; }
 .model-card { display: flex; flex-direction: column; }
 .model-credential { font: 500 9px "DM Mono", monospace; color: #b9885b; background: rgba(243,166,90,.07); border: 1px solid rgba(243,166,90,.18); border-radius: 6px; padding: 4px 8px; }
 .model-credential.is-set { color: #83ccaa; background: rgba(115,214,162,.07); border-color: rgba(115,214,162,.16); }
+.model-head-tags { display: flex; align-items: center; gap: 6px; }
+.model-verify { font: 500 9px "DM Mono", monospace; border-radius: 6px; padding: 4px 8px; border: 1px solid #262d34; background: #101419; color: #98a2ac; }
+.model-verify.ok { color: #83ccaa; border-color: rgba(115,214,162,.2); background: rgba(115,214,162,.06); }
+.model-verify.warn { color: #d9a06c; border-color: rgba(243,166,90,.22); background: rgba(243,166,90,.06); }
 .model-list { padding: 10px 14px; display: grid; gap: 6px; }
 .model-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; border: 1px solid #1d232a; background: #0f1317; border-radius: 8px; padding: 8px 10px; }
 .model-name strong { display: block; font-size: 11px; }

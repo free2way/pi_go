@@ -2,6 +2,7 @@ import { AlertTriangle, KeyRound, LoaderCircle, ShieldCheck } from "lucide-react
 import { useCallback, useEffect, useState } from "react";
 import type { ConfigStatus, CredentialStatus, ModelCatalogResponse } from "../shared/types";
 import { api } from "./api";
+import { availabilityLabel, modelCapabilityHint, verificationBadge } from "./model-verification";
 
 const roleLabel = { developer: "开发", reviewer: "审核" } as const;
 
@@ -95,26 +96,34 @@ export function ModelsPage({ config, onChanged }: { config?: ConfigStatus; onCha
         {providers.map((provider) => {
           const credential = credentialFor(provider);
           const entries = (catalog?.models ?? []).filter((entry) => entry.provider === provider);
+          const providerBadge = credential ? verificationBadge(credential) : undefined;
           return (
             <article className="panel model-card" key={provider}>
               <div className="panel-head">
                 <div><span className="eyebrow">{provider.toUpperCase()}</span><h3>{provider}</h3></div>
-                <span className={`model-credential ${credential ? "is-set" : ""}`}>{credential ? `${credential.masked}` : "未配置 Key"}</span>
+                <div className="model-head-tags">
+                  {providerBadge && <span className={`model-verify ${providerBadge.tone}`} title={providerBadge.title}>{providerBadge.label}</span>}
+                  <span className={`model-credential ${credential ? "is-set" : ""}`}>{credential ? `${credential.masked}` : "未配置 Key"}</span>
+                </div>
               </div>
               <div className="model-list">
-                {entries.map((entry) => (
-                  <div className="model-row" key={entry.id}>
-                    <div className="model-name"><strong>{entry.label}</strong><code>{entry.provider}/{entry.model}</code></div>
-                    <div className="model-tags">
-                      {entry.roles.map((role) => <span key={role}>{roleLabel[role]}</span>)}
-                      {entry.reasoning && <span>推理</span>}
-                      {/* AUD-08: distinguish configured-but-unverified from missing. */}
-                      <span className={entry.available ? "ok" : "warn"}>
-                        {entry.available ? (entry.verified ? "已校验可用" : "可用") : entry.unavailableReason === "credential_missing" ? "缺凭据" : "待校验"}
-                      </span>
+                {entries.map((entry) => {
+                  const badge = verificationBadge(entry);
+                  const capability = modelCapabilityHint(entry);
+                  return (
+                    <div className="model-row" key={entry.id}>
+                      <div className="model-name"><strong>{entry.label}</strong><code>{entry.provider}/{entry.model}</code></div>
+                      <div className="model-tags">
+                        {entry.roles.map((role) => <span key={role}>{roleLabel[role]}</span>)}
+                        {entry.reasoning && <span>推理</span>}
+                        {/* AUD-08: availability and credential verification are distinct signals. */}
+                        <span className={entry.available ? "ok" : "warn"}>{availabilityLabel(entry)}</span>
+                        <span className={badge.tone} title={badge.title}>{badge.label}</span>
+                        {capability && <span className={capability.runtimeVerified ? "ok" : "warn"} title={capability.title}>{capability.label}</span>}
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
               <div className="model-credential-form">
                 <input

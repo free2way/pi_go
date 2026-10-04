@@ -1,6 +1,6 @@
 {
   "name": "pigo-web",
-  "version": "0.21.1",
+  "version": "0.21.2",
   "private": true,
   "type": "module",
   "engines": {
@@ -10,11 +10,12 @@
     "dev": "concurrently -k -n api,web -c blue,magenta \"npm:dev:server\" \"npm:dev:client\"",
     "dev:server": "tsx watch src/server/index.ts",
     "dev:client": "vite",
-    "build": "vite build && tsup src/server/index.ts --format esm --platform node --out-dir dist/server --clean",
+    "build": "vite build && tsup src/server/index.ts src/server/run-store-pg.ts --format esm --platform node --out-dir dist/server --clean",
     "start": "node dist/server/index.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "validate:compose": "node deploy/docker/validate-compose.mjs",
+    "test:pg:concurrency": "node scripts/pg-concurrency-check.mjs",
     "lint": "eslint .",
     "e2e:browser": "playwright test"
   },
