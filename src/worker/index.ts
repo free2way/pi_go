@@ -658,6 +658,7 @@ async function planDevelopment(run: Run, worktree: string, credentials: JobInput
     addUsage(usage, result.usage);
     return parseDevelopmentPlan(redactJobSecrets(result.text, credentials), maxSubagents);
   } catch (error) {
+    if (error instanceof BudgetExceededError) throw error;
     const safeMessage = redactJobSecrets((error as Error).message, credentials);
     await postUpdate(run.id, { event: { round: run.round, source: "system", type: "planner.fallback", message: `任务拆分失败，安全回退到单 Agent：${safeMessage}` } });
     return fallbackPlan(run.task);
@@ -960,6 +961,7 @@ async function performReview(input: {
       onActivity: (message) => postUpdate(input.run.id, { event: { round: input.round, source: "reviewer", type: "agent.activity", message } }),
     }, { runId: input.run.id, round: input.round, label: "审核 Agent", role: "reviewer", budget: input.budget });
   } catch (providerError) {
+    if (providerError instanceof BudgetExceededError) throw providerError;
     const reason = redactJobSecrets((providerError as Error).message, input.credentials).slice(0, 500);
     const kind = classifyProviderError(reason);
     await update(input.run, "needs_human", "reviewer", "review.provider_error", `审核模型调用失败（${kind}）：${reason}`, {
@@ -989,6 +991,7 @@ async function performReview(input: {
         onActivity: (message) => postUpdate(input.run.id, { event: { round: input.round, source: "reviewer", type: "agent.activity", message } }),
       }, { runId: input.run.id, round: input.round, label: "审核 Agent（协议重试）", role: "reviewer", budget: input.budget });
     } catch (providerError) {
+      if (providerError instanceof BudgetExceededError) throw providerError;
       const providerReason = redactJobSecrets((providerError as Error).message, input.credentials).slice(0, 500);
       const kind = classifyProviderError(providerReason);
       await update(input.run, "needs_human", "reviewer", "review.provider_error", `审核模型调用失败（${kind}）：${providerReason}`, {
