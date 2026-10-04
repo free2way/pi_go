@@ -213,3 +213,35 @@ docker compose --env-file .env down
 - Agent 调用容器仍需出网（调用 provider），未做目的地 allowlist；如需严格限制，需在宿主侧加 egress 代理或防火墙策略。
 - Worker 持有 Docker Socket 即具备创建容器的能力：请勿在同机运行不可信工作负载；共享主机场景建议改用 socket proxy。
 - 检查命令在沙箱内无网络，若某项目检查确实需要联网（如 `npm install`），需临时调整 `PI_SANDBOX_MODE=process` 或改用离线缓存方案。
+
+## v0.15.x 升级记录：成本与性能组（COST / AT-PERF）
+
+升级日期：2026-10-04（Asia/Shanghai）。生产 `pi-agent-web-1` / `pi-agent-worker-1` 已重建（v0.15.2，沙箱模式 container）。回滚标签：web `prev19`、worker `prev15`；源码留档 `source.prev28-*`。
+
+### 本次变更（代码）
+
+- **COST-001**：按角色（planner / developer / sub-agent / integrator / reviewer）记录 input/output/cache token 与费用，写入运行文档 `usageRoles`/`modelCalls` 并投影到 PostgreSQL 表 `run_usage_role`（迁移 4）。
+- **COST-002/003（AT-PERF-008）**：Run 级硬预算 `PI_RUN_MAX_TOKENS` / `PI_RUN_MAX_COST_USD` / `PI_RUN_MAX_MODEL_CALLS` / `PI_RUN_MAX_DURATION_SECONDS`；每次模型调用前判定、调用后累计，任一维度达 80% 记 `run.budget_warning` 一次，达 100% 抛预算异常：不再发起新调用，运行转 `needs_human` 并记 `run.budget_exhausted`。生产默认全部为 0（不限制），按需开启。
+- **COST-004（AT-PERF-007）**：返修复用 Developer 会话（`--session-id <run>-developer`），只注入新增 finding / 检查失败输出与必要上下文，不再新建 repair 会话。
+- **COST-006**：Planner 默认低推理（`PI_PLANNER_THINKING=low`，可覆盖）。
+- **AT-PERF-005**：任务取消时同步终止沙箱容器（实测取消耗时 29～43 ms，无遗留容器）。
+- **AT-PERF-006**：Worker 容量不足时任务保持持久排队（REL 队列），不丢任务。
+
+### 验收证据（隔离 e2e v0.15.2 + 假运行时；生产 v0.15.2 冒烟）
+
+| 用例 | 结果 |
+| --- | --- |
+| COST-001 | 2 轮运行 `usageRoles = planner:1 / developer:2 / reviewer:2`；`run_usage_role` 行同步；生产冒烟 planner $0.0015、developer $0.0021、reviewer $0.0000（代理未回传费用） |
+| COST-003 / AT-PERF-008 | 预算 $0.0031：首次调用后 80% 预警；第三次调用前停止（reviewer 调用数 0），状态 `needs_human`，事件 `run.budget_exhausted` |
+| COST-004 / AT-PERF-007 | 返修调用会话 id 与首轮 Developer 相同（`<run>-developer`），role 计为 developer |
+| COST-006 | 探针显示 planner `--thinking low`，developer/reviewer `high` |
+| AT-PERF-001 | 10 并发 × 6 轮读取 workspaces/runs/models：p50 14 ms、p95 96 ms、错误率 0（阈值 p95 < 500 ms） |
+| AT-PERF-002 | 连续写入 100 事件：seq 连续、写入到可读 p95 105 ms（阈值 2 s） |
+| AT-PERF-003 | 首屏业务数据（workspaces+runs+models）26 ms（阈值 3 s，局域网） |
+| AT-PERF-004 | 沙箱容器规格：内存 2 GiB、CPU 1.5 核、pids 256（单元测试断言，`src/worker/sandbox.test.ts`） |
+| AT-PERF-005 | 取消 43 ms 内结束，无遗留沙箱容器 |
+| AT-PERF-009 | 运行文档与 `run_usage_role` 记录 provider 回传的精确 usage；费用字段为 provider 回传值（代理不提供时记为 0） |
+
+### 生产冒烟
+
+`run_6de6ba9522844a84`：真实模型全流程完成（规划 → 开发 → 检查 → 审核通过），checkpoints 齐全、任务队列 done、成本 $0.0036，`run_usage_role` 3 行。
