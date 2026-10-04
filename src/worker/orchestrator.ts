@@ -33,12 +33,34 @@ export function parseDevelopmentPlan(text: string, maxSubagents: number): Develo
     while (ids.has(task.id)) task.id = `${task.id}-${index + 1}`.slice(0, 32);
     ids.add(task.id);
   }
-  for (const task of tasks) task.dependsOn = task.dependsOn.filter((id) => ids.has(id) && id !== task.id);
+
+  // Invalid dependency declarations are rejected loudly: silently dropping them
+  // could let dependent tasks run before their prerequisites (unsafe parallelism).
+  const invalidDependencies: string[] = [];
+  for (const task of tasks) {
+    const kept: string[] = [];
+    for (const id of task.dependsOn) {
+      if (id === task.id) invalidDependencies.push(`${task.id} -> itself`);
+      else if (!ids.has(id)) invalidDependencies.push(`${task.id} -> unknown task "${id}"`);
+      else kept.push(id);
+    }
+    task.dependsOn = kept;
+  }
+  if (invalidDependencies.length > 0) {
+    throw new Error(`Planner returned invalid dependencies: ${invalidDependencies.slice(0, 8).join("; ")}`);
+  }
+
+  // Reject cyclic dependency graphs before any worktree or model call happens.
+  executionWaves(tasks);
 
   const complexity = complexityValues.has(parsed.complexity as WorkloadSize) ? parsed.complexity as WorkloadSize : tasks.length === 1 ? "small" : "medium";
+  const truncation = rawTasks.length > tasks.length
+    ? `计划原含 ${rawTasks.length} 个任务，已按并发上限合并/截取为前 ${tasks.length} 个。`
+    : "";
+  const rationale = [String(parsed.rationale || "Planner did not provide a rationale.").slice(0, 1_000), truncation].filter(Boolean).join(" ");
   return {
     complexity,
-    rationale: String(parsed.rationale || "Planner did not provide a rationale.").slice(0, 1_000),
+    rationale,
     strategy: tasks.length === 1 ? "single" : "parallel",
     tasks,
   };
@@ -58,6 +80,31 @@ export function executionWaves(tasks: SubAgentTask[]) {
     }
   }
   return waves;
+}
+
+function normalizeFile(file: string) {
+  return file.replace(/^\.\/+/, "").replace(/\/+$/, "").toLowerCase();
+}
+
+/** Two declared paths conflict when they are equal or one contains the other. */
+export function filesOverlap(left: string[], right: string[]) {
+  const normalizedLeft = left.map(normalizeFile).filter(Boolean);
+  const normalizedRight = right.map(normalizeFile).filter(Boolean);
+  return normalizedLeft.some((a) => normalizedRight.some((b) => a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`)));
+}
+
+/**
+ * Partitions a dependency wave into sequentially executed batches so that no two
+ * tasks in the same batch declare overlapping files (AT-AGENT-006).
+ */
+export function conflictFreeBatches(tasks: SubAgentTask[]): SubAgentTask[][] {
+  const batches: SubAgentTask[][] = [];
+  for (const task of tasks) {
+    const target = batches.find((batch) => batch.every((member) => !filesOverlap(member.files, task.files)));
+    if (target) target.push(task);
+    else batches.push([task]);
+  }
+  return batches;
 }
 
 export function fallbackPlan(task: string): DevelopmentPlan {

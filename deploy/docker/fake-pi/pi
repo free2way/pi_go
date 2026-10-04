@@ -1,0 +1,120 @@
+#!/usr/bin/env node
+// Deterministic Fake Pi Runtime for PiGO acceptance testing.
+// Speaks the Pi JSON stdout protocol (see docs/json.md) and is driven by
+// scenario JSON files so parallel sub-agents, review loops and failure paths can
+// be exercised without real model calls.
+//
+// FAKE_PI_SCENARIO may point at a single JSON file or a directory of scenarios.
+// For a directory, the first file whose "match" string appears in the prompt is
+// used; otherwise "default.json" / an empty scenario. Review counters are keyed
+// per run (derived from the worktree path) so runs stay independent.
+//
+// Scenario shape (all optional):
+// {
+//   "match": "keyword that selects this scenario",
+//   "plannerError": "message",
+//   "plan": { complexity, rationale, tasks: [...] },
+//   "reviewVerdicts": ["changes_requested", "approved"],
+//   "reviewFinding": {...},
+//   "reviewError": "message",
+//   "developer": { "error": "message", "noChanges": true, "file": "x-{tag}.txt", "summary": "..." }
+// }
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import path from "node:path";
+
+const args = process.argv.slice(2);
+const prompt = args[args.indexOf("--") + 1] || "";
+
+const scenarioTarget = process.env.FAKE_PI_SCENARIO || "/fake-pi/scenarios";
+let scenario = {};
+let scenarioName = "default";
+try {
+  if (statSync(scenarioTarget).isDirectory()) {
+    for (const file of readdirSync(scenarioTarget).filter((name) => name.endsWith(".json")).sort()) {
+      const candidate = JSON.parse(readFileSync(path.join(scenarioTarget, file), "utf8"));
+      if (candidate.match && prompt.includes(candidate.match)) {
+        scenario = candidate;
+        scenarioName = file.replace(/\.json$/, "");
+        break;
+      }
+    }
+  } else {
+    scenario = JSON.parse(readFileSync(scenarioTarget, "utf8"));
+  }
+} catch {
+  scenario = {};
+}
+
+const stateDir = process.env.FAKE_PI_STATE_DIR || "/tmp/fake-pi-state";
+mkdirSync(stateDir, { recursive: true });
+const runId = (path.basename(process.cwd()).match(/run_[a-z0-9]+/) || ["run_unknown"])[0];
+
+const emit = (event) => process.stdout.write(`${JSON.stringify(event)}\n`);
+const usage = { input: 1200, output: 300, cacheRead: 0, cacheWrite: 0, totalTokens: 1500, cost: { total: 0.003 } };
+const finish = (text, error) => {
+  emit({
+    type: "message_end",
+    message: error
+      ? { role: "assistant", stopReason: "error", errorMessage: error }
+      : { role: "assistant", content: [{ type: "text", text }], usage },
+  });
+  process.exit(0);
+};
+const activity = (toolName) => emit({ type: "tool_execution_start", toolName });
+const bump = (key) => {
+  const file = path.join(stateDir, key);
+  const next = (existsSync(file) ? Number(readFileSync(file, "utf8")) : 0) + 1;
+  writeFileSync(file, String(next));
+  return next;
+};
+
+const isPlanner = prompt.includes("You are the lead engineering planner");
+const isReviewer = prompt.includes("You are an independent read-only code reviewer");
+const isDeveloper = prompt.includes("developer agent") || prompt.includes("implementation sub-agent") || prompt.includes("integration agent");
+
+if (isPlanner) {
+  activity("read");
+  if (scenario.plannerError) finish("", scenario.plannerError);
+  const plan = scenario.plan || {
+    complexity: "small",
+    rationale: "Fake planner: single implementation task",
+    tasks: [{ id: "implementation", title: "Implementation", description: "Apply the requested change", files: [], dependsOn: [] }],
+  };
+  finish(JSON.stringify(plan));
+} else if (isReviewer) {
+  activity("read");
+  activity("grep");
+  if (scenario.reviewError) finish("", scenario.reviewError);
+  const verdicts = scenario.reviewVerdicts?.length ? scenario.reviewVerdicts : ["approved"];
+  const call = bump(`review-count-${runId}-${scenarioName}`);
+  const verdict = verdicts[Math.min(call - 1, verdicts.length - 1)];
+  const finding = scenario.reviewFinding || {
+    id: "fake-finding-1",
+    severity: "high",
+    file: "README.md",
+    line: 1,
+    title: "Fake review finding",
+    evidence: "Deterministic fake reviewer evidence",
+    requiredChange: "Apply the deterministic fake fix",
+  };
+  finish(JSON.stringify(verdict === "approved"
+    ? { verdict: "approved", summary: "Fake reviewer approved the change set", findings: [] }
+    : { verdict: "changes_requested", summary: "Fake reviewer requested changes", findings: [finding] }));
+} else if (isDeveloper) {
+  activity("bash");
+  activity("read");
+  const mode = scenario.developer || {};
+  if (mode.error) finish("", mode.error);
+  if (mode.noChanges !== true) {
+    const tag = createHash("sha256").update(prompt).digest("hex").slice(0, 8);
+    const relative = (mode.file || `fake-agent-${tag}.txt`).replace("{tag}", tag);
+    const target = path.join(process.cwd(), relative);
+    mkdirSync(path.dirname(target), { recursive: true });
+    appendFileSync(target, `deterministic change from ${tag}\n`);
+  }
+  finish(mode.summary || `Fake developer finished the assigned work (${mode.noChanges ? "no changes" : "updated files"}).`);
+} else {
+  activity("read");
+  finish("Fake pi completed an unrecognized prompt.");
+}

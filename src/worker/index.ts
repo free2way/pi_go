@@ -5,7 +5,7 @@ import { mkdir, readdir, realpath, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
 import type { CheckResult, DevelopmentPlan, Finding, ProjectInfo, Run, RunEvent, RunState, SubAgentTask, WorkspaceVerifyResult } from "../shared/types.js";
-import { executionWaves, fallbackPlan, parseDevelopmentPlan } from "./orchestrator.js";
+import { conflictFreeBatches, executionWaves, fallbackPlan, parseDevelopmentPlan } from "./orchestrator.js";
 import { UsageTracker, addUsage, assistantErrorFromEvent, assistantTextFromEvent, emptyUsage, toRunUsage, toolNameFromEvent, type UsageTotals } from "./pi-events.js";
 import { parseReview, type ReviewResult } from "./review-protocol.js";
 import { mergeFindings, unresolvedFeedback } from "./review-findings.js";
@@ -393,7 +393,7 @@ async function runSubAgent(input: {
   usage: UsageTotals;
 }): Promise<SubAgentResult> {
   const startedAt = Date.now();
-  const branch = `${input.mainBranch}/sub-${input.task.id}`;
+  const branch = `${input.mainBranch}-sub-${input.task.id}`;
   const worktree = path.join(runsRoot, input.run.ownerId, `${input.run.id}-subagents`, input.task.id);
   input.task.status = "running";
   input.task.branch = branch;
@@ -436,13 +436,17 @@ async function runSubAgent(input: {
     input.task.status = "failed";
     input.task.summary = safeMessage.slice(0, 1_000);
     input.task.durationMs = Date.now() - startedAt;
-    await postUpdate(input.run.id, { event: { round: input.run.round, source: "developer", type: "subagent.failed", message: `Sub Agent「${input.task.title}」失败，将由集成 Agent 接管` } });
+    await postUpdate(input.run.id, { event: { round: input.run.round, source: "developer", type: "subagent.failed", message: `Sub Agent「${input.task.title}」失败，将由集成 Agent 接管：${safeMessage.slice(0, 200)}` } });
     return { task: input.task, branch, worktree, error: safeMessage };
   }
 }
 
 async function removeSubAgentWorktree(project: string, worktree: string) {
   await serializeWorktreeMutation(() => git(project, ["worktree", "remove", "--force", worktree])).catch(() => undefined);
+}
+
+async function deleteSubAgentBranch(project: string, branch: string) {
+  await serializeWorktreeMutation(() => git(project, ["branch", "-D", branch])).catch(() => undefined);
 }
 
 async function orchestrateSubAgents(input: {
@@ -462,38 +466,57 @@ async function orchestrateSubAgents(input: {
       task.summary = "A dependency failed to merge";
       integrationNotes.push(`${task.title}: skipped because a dependency failed`);
     }
-    if (runnable.length === 0) continue;
+    if (runnable.length === 0) {
+      if (wave.length > 0) await postUpdate(input.run.id, { patch: { plan: input.plan } });
+      continue;
+    }
     for (const task of runnable) task.status = "running";
-    await postUpdate(input.run.id, { patch: { plan: input.plan }, event: { round: input.run.round, source: "system", type: "subagents.wave_started", message: `并行启动 ${runnable.length} 个 Sub Agent` } });
-    const results = await Promise.all(runnable.map((task) => runSubAgent({
-      run: input.run,
-      project: input.project,
-      mainBranch: input.run.branch,
-      task,
-      credentials: input.credentials,
-      signal: input.signal,
-      usage: input.usage,
-    })));
-    for (const result of results) {
-      try {
-        if (result.error) {
-          integrationNotes.push(`${result.task.title}: ${result.error}`);
-          continue;
-        }
-        if (result.commit) {
-          const merged = await command("git", ["cherry-pick", result.commit], { cwd: input.worktree, signal: input.signal, timeoutMs: 120_000 });
-          if (merged.code !== 0) {
-            await command("git", ["cherry-pick", "--abort"], { cwd: input.worktree, timeoutMs: 120_000 }).catch(() => undefined);
-            result.task.status = "failed";
-            result.task.summary = `Merge conflict from ${result.branch}`;
-            integrationNotes.push(`${result.task.title}: merge ${result.branch} manually`);
+    const batches = conflictFreeBatches(runnable);
+    await postUpdate(input.run.id, {
+      patch: { plan: input.plan },
+      event: {
+        round: input.run.round,
+        source: "system",
+        type: "subagents.wave_started",
+        message: batches.length > 1
+          ? `并行启动 ${runnable.length} 个 Sub Agent（检测到声明的文件范围重叠，分 ${batches.length} 批串行化执行）`
+          : `并行启动 ${runnable.length} 个 Sub Agent`,
+      },
+    });
+    for (const batch of batches) {
+      const results = await Promise.all(batch.map((task) => runSubAgent({
+        run: input.run,
+        project: input.project,
+        mainBranch: input.run.branch,
+        task,
+        credentials: input.credentials,
+        signal: input.signal,
+        usage: input.usage,
+      })));
+      for (const result of results) {
+        let keepBranch = false;
+        try {
+          if (result.error) {
+            integrationNotes.push(`${result.task.title}: ${result.error}`);
             continue;
           }
+          if (result.commit) {
+            const merged = await command("git", ["-c", "user.name=PiGO Integration", "-c", "user.email=agent@pigo.local", "cherry-pick", result.commit], { cwd: input.worktree, signal: input.signal, timeoutMs: 120_000 });
+            if (merged.code !== 0) {
+              await command("git", ["cherry-pick", "--abort"], { cwd: input.worktree, timeoutMs: 120_000 }).catch(() => undefined);
+              result.task.status = "failed";
+              result.task.summary = `Merge conflict from ${result.branch}`;
+              integrationNotes.push(`${result.task.title}: merge ${result.branch} manually (${(merged.stderr || merged.stdout).trim().slice(0, 160)})`);
+              keepBranch = true;
+              continue;
+            }
+          }
+          result.task.status = "merged";
+          await postUpdate(input.run.id, { event: { round: input.run.round, source: "developer", type: "subagent.merged", message: `Sub Agent「${result.task.title}」已合并` } });
+        } finally {
+          await removeSubAgentWorktree(input.project, result.worktree);
+          if (!keepBranch) await deleteSubAgentBranch(input.project, result.branch);
         }
-        result.task.status = "merged";
-        await postUpdate(input.run.id, { event: { round: input.run.round, source: "developer", type: "subagent.merged", message: `Sub Agent「${result.task.title}」已合并` } });
-      } finally {
-        await removeSubAgentWorktree(input.project, result.worktree);
       }
     }
     await postUpdate(input.run.id, { patch: { plan: input.plan }, event: { round: input.run.round, source: "system", type: "subagents.wave_completed", message: "本批 Sub Agent 执行完成，主 Agent 正在整合" } });
