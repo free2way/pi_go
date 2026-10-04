@@ -45,6 +45,20 @@ export function assertTransition(from: string, to: string) {
   if (!allowed.includes(to)) throw new InvalidStateTransitionError(from, to);
 }
 
+/**
+ * NEW-05: raised when a compare-and-swap write loses a race against another
+ * committed writer (the row revision moved between the locked read and the
+ * conditional update). Callers can retry against the freshly-read state or
+ * surface a conflict instead of silently clobbering newer data.
+ */
+export class RunConflictError extends Error {
+  readonly code = "RUN_CONFLICT";
+  constructor(readonly runId: string, message: string) {
+    super(message);
+    this.name = "RunConflictError";
+  }
+}
+
 /** Creates the delivery table used to make internal updates idempotent. */
 export async function recordDelivery(db: Db, runId: string, deliveryId: string, seq?: number) {
   await db.query(
@@ -158,7 +172,7 @@ export class PostgresRunStore implements RunStoreLike {
       await tx.query(
         `INSERT INTO runs (id, owner_id, state, mode, created_at, updated_at, last_seq, document_json)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         ON CONFLICT (id) DO UPDATE SET state = $3, updated_at = $6, last_seq = $7, document_json = $8`,
+         ON CONFLICT (id) DO UPDATE SET state = $3, updated_at = $6, last_seq = $7, document_json = $8, revision = runs.revision + 1`,
         [snapshot.id, snapshot.ownerId, snapshot.state, snapshot.mode, snapshot.createdAt, snapshot.updatedAt, snapshot.lastSeq ?? 0, JSON.stringify(snapshot)],
       );
       await this.project(tx, snapshot);
@@ -170,31 +184,40 @@ export class PostgresRunStore implements RunStoreLike {
   }
 
   /**
-   * AUD-06/AUD-15: applies a patch to a copy, validates the state transition,
-   * persists it, and only then publishes the new snapshot to the read cache.
+   * AUD-06/AUD-15/NEW-05: reads the authoritative row *inside* the transaction,
+   * validates the state transition against the database (not this instance's
+   * possibly stale cache), then persists via a revision compare-and-swap and
+   * only after a successful commit publishes the new snapshot to the read cache.
+   *
+   * Two web instances (rolling deploy) that both hydrated `reviewing` therefore
+   * cannot have instance B's late patch write `reviewing` back over instance A's
+   * committed `cancelled`: the merge is rebased on the locked database row and
+   * the illegal transition is rejected.
    */
   async updateRun(id: string, patch: Partial<Run>) {
-    const current = this.cache.get(id);
-    if (!current) throw new Error(`Run not found: ${id}`);
-    const next = { ...current, ...patch, updatedAt: new Date().toISOString() };
-    if (patch.state && patch.state !== current.state) {
-      assertTransition(current.state, patch.state);
-    }
-    await this.db.withTransaction(async (tx) => {
-      await tx.query(
-        `UPDATE runs SET state = $2, updated_at = $3, document_json = $4 WHERE id = $1`,
-        [next.id, next.state, next.updatedAt, JSON.stringify(next)],
-      );
-      await this.project(tx, next);
+    const next = await this.db.withTransaction(async (tx) => {
+      const row = await this.loadRunRow(tx, id);
+      if (!row) throw new Error(`Run not found: ${id}`);
+      if (patch.state && patch.state !== row.run.state) {
+        assertTransition(row.run.state, patch.state);
+      }
+      const candidate = this.mergePatch(row.run, patch);
+      const persisted = await this.casWrite(tx, id, row.revision, candidate);
+      await this.project(tx, persisted);
+      return persisted;
     });
     this.cache.set(id, next);
     return next;
   }
 
   /**
-   * AUD-15 / AT-REL-004: applies a patch and its event atomically under one
-   * delivery key. A repeated delivery is a no-op that returns the stored result,
-   * so a late retry can never rewind state or double count usage.
+   * AUD-15 / AT-REL-004 / NEW-05: applies a patch and its event atomically under
+   * one delivery key. A repeated delivery is a no-op that returns the stored
+   * result, so a late retry can never rewind state or double count usage.
+   *
+   * The patch is merged onto the row read *inside* the transaction (locked +
+   * revision CAS) rather than onto this instance's cache, so a stale instance
+   * cannot resurrect a terminal state another instance already committed.
    */
   async applyDelivery(input: {
     runId: string;
@@ -209,28 +232,27 @@ export class PostgresRunStore implements RunStoreLike {
     if (seen) {
       return { applied: false, seq: seen.seq === null ? undefined : Number(seen.seq) };
     }
-    const current = this.cache.get(input.runId);
-    if (!current) throw new Error(`Run not found: ${input.runId}`);
-    const next = input.patch ? { ...current, ...input.patch, updatedAt: new Date().toISOString() } : current;
-    if (input.patch?.state && input.patch.state !== current.state) {
-      assertTransition(current.state, input.patch.state);
-    }
 
     const result = await this.db.withTransaction(async (tx) => {
       const inserted = (await tx.query(
         "INSERT INTO run_deliveries (run_id, delivery_id, applied_at) VALUES ($1, $2, $3) ON CONFLICT (run_id, delivery_id) DO NOTHING RETURNING delivery_id",
         [input.runId, input.deliveryId, new Date().toISOString()],
       )).rows[0];
-      if (!inserted) return { applied: false, seq: undefined as number | undefined };
+      if (!inserted) return { applied: false, seq: undefined as number | undefined, snapshot: undefined as Run | undefined };
+
+      const row = await this.loadRunRow(tx, input.runId);
+      if (!row) throw new Error(`Run not found: ${input.runId}`);
+      let snapshot = row.run;
+      if (input.patch) {
+        if (input.patch.state && input.patch.state !== row.run.state) {
+          assertTransition(row.run.state, input.patch.state);
+        }
+        const candidate = this.mergePatch(row.run, input.patch);
+        snapshot = await this.casWrite(tx, input.runId, row.revision, candidate);
+        await this.project(tx, snapshot);
+      }
 
       let seq: number | undefined;
-      if (input.patch) {
-        await tx.query(
-          `UPDATE runs SET state = $2, updated_at = $3, last_seq = $4, document_json = $5 WHERE id = $1`,
-          [next.id, next.state, next.updatedAt, next.lastSeq ?? 0, JSON.stringify(next)],
-        );
-        await this.project(tx, next);
-      }
       if (input.event) {
         const bumped = await this.nextSequence(tx, input.runId, input.event.at);
         if (!bumped) throw new Error(`Run not found: ${input.runId}`);
@@ -252,11 +274,11 @@ export class PostgresRunStore implements RunStoreLike {
         );
         await tx.query("UPDATE run_deliveries SET seq = $3 WHERE run_id = $1 AND delivery_id = $2", [input.runId, input.deliveryId, seq]);
       }
-      return { applied: true, seq };
+      return { applied: true, seq, snapshot };
     });
 
-    if (result.applied) {
-      const snapshot = { ...next, lastSeq: result.seq ?? next.lastSeq };
+    if (result.applied && result.snapshot) {
+      const snapshot = { ...result.snapshot, lastSeq: result.seq ?? result.snapshot.lastSeq };
       this.cache.set(input.runId, snapshot);
       if (input.event && result.seq !== undefined) {
         const record: RunEvent = { ...input.event, seq: result.seq };
@@ -269,7 +291,60 @@ export class PostgresRunStore implements RunStoreLike {
         }
       }
     }
-    return result;
+    return { applied: result.applied, seq: result.seq };
+  }
+
+  /**
+   * NEW-05: reads the authoritative row inside the caller's transaction.
+   *
+   * On real PostgreSQL `FOR UPDATE` takes a row lock, so a concurrent writer
+   * blocks until this transaction commits and the revision guard below can
+   * never race. pg-mem accepts `FOR UPDATE` but does not enforce row locking,
+   * which is why the concurrency check is carried by the conditional UPDATE in
+   * `casWrite` (works on both back ends).
+   */
+  private async loadRunRow(tx: Db, id: string): Promise<{ run: Run; revision: number } | undefined> {
+    const row = (await tx.query(
+      "SELECT state, last_seq, revision, document_json FROM runs WHERE id = $1 FOR UPDATE",
+      [id],
+    )).rows[0];
+    if (!row) return undefined;
+    const run = JSON.parse(String(row.document_json)) as Run;
+    run.lastSeq = Number(row.last_seq);
+    return { run, revision: Number(row.revision) };
+  }
+
+  /**
+   * NEW-05: merges a patch onto the authoritative run (never the instance
+   * cache). `lastSeq` may only move forward, so a stale callback cannot rewind
+   * the per-run event sequence.
+   */
+  private mergePatch(current: Run, patch: Partial<Run>): Run {
+    const merged: Run = { ...current, ...patch, updatedAt: new Date().toISOString() };
+    merged.lastSeq = Math.max(current.lastSeq ?? 0, merged.lastSeq ?? 0);
+    return merged;
+  }
+
+  /**
+   * NEW-05: compare-and-swap write. The row is only updated when its `revision`
+   * still matches the value read under the lock; otherwise the commit that
+   * moved it on wins and the caller gets a RunConflictError instead of a silent
+   * lost update. `last_seq` is raised, never lowered.
+   */
+  private async casWrite(tx: Db, id: string, revision: number, candidate: Run): Promise<Run> {
+    const updated = await tx.query(
+      `UPDATE runs
+         SET state = $2, updated_at = $3, document_json = $4, revision = revision + 1,
+             last_seq = CASE WHEN last_seq < $5 THEN $5 ELSE last_seq END
+       WHERE id = $1 AND revision = $6
+       RETURNING last_seq`,
+      [id, candidate.state, candidate.updatedAt, JSON.stringify(candidate), candidate.lastSeq ?? 0, revision],
+    );
+    if (updated.rows.length === 0) {
+      throw new RunConflictError(id, `Run ${id} was modified concurrently; the stale write was rejected`);
+    }
+    const lastSeq = Number(updated.rows[0].last_seq);
+    return lastSeq === candidate.lastSeq ? candidate : { ...candidate, lastSeq };
   }
 
   /**

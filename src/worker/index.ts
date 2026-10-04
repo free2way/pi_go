@@ -1,18 +1,21 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, readdir, realpath, rm, stat, statfs } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
-import type { CheckResult, DevelopmentPlan, Finding, ProjectInfo, Run, RunEvent, RunRoleUsage, RunState, RunUsage, SubAgentTask, WorkspaceVerifyResult } from "../shared/types.js";
-import { CheckpointTracker, memoryCheckpointClient, stages, type Checkpoint, type CheckpointClient, type StoredChecks, type StoredReview } from "./checkpoints.js";
+import type { CheckResult, DevelopmentPlan, Finding, ProjectInfo, Run, RunEvent, RunRoleUsage, RunState, SubAgentTask, WorkspaceVerifyResult } from "../shared/types.js";
+import { CheckpointTracker, isCheckpointCurrent, memoryCheckpointClient, stages, type Checkpoint, type CheckpointClient, type StoredChecks, type StoredReview } from "./checkpoints.js";
 import { conflictFreeBatches, executionWaves, fallbackPlan, parseDevelopmentPlan } from "./orchestrator.js";
-import { UsageTracker, addUsage, assistantErrorFromEvent, assistantTextFromEvent, emptyUsage, toRunUsage, toolNameFromEvent, type UsageTotals } from "./pi-events.js";
+import { UsageTracker, addUsage, assistantErrorFromEvent, assistantTextFromEvent, toRunUsage, toolNameFromEvent, type UsageTotals } from "./pi-events.js";
 import { DockerApi } from "./docker-api.js";
-import { budgetWarningMessage, evaluateBudget, mergeRoleUsage, readBudgetLimits } from "./budget.js";
+import { readBudgetLimits } from "./budget.js";
+import { BudgetExceededError, createRunBudget, type RunBudgetContext } from "./run-budget.js";
+import { runProviderOperation } from "./provider-attempts.js";
 import { scrubEnvironment } from "./pi-env.js";
+import { hardenedGitConfigArgs, hardenedGitEnvironment, hardenedGitFlags } from "./git-hardening.js";
 import { apiKeyEnvName, classifyProviderError, providerErrorSummary } from "./provider-errors.js";
-import { sleep, withProviderRetry } from "./provider-retry.js";
+import { sleep } from "./provider-retry.js";
 import { blockingSeverities, parseReview, type ReviewResult } from "./review-protocol.js";
 import { buildContainerSpec, hostPathFor, resolveSandboxMode } from "./sandbox.js";
 import { mergeFindings, unresolvedFeedback } from "./review-findings.js";
@@ -28,6 +31,10 @@ import { WorkspacePathError, resolveInsideRoot, sanitizeRelativePath, sanitizeWo
 import { RunCleanupPathError, removeRunDirectory } from "./run-cleanup.js";
 import { WorkspaceLockManager, workspaceKeyFor } from "./workspace-lock.js";
 import { PiRunError, failureOutputForEvent } from "./agent-failure.js";
+import { recoveryResumePhase, recoveryUpdateState } from "./run-recovery.js";
+import { callbackBodyExceedsInlineLimit, encodeCallbackBody, persistDiffArtifact, type DiffArtifactRef } from "./diff-artifacts.js";
+import { uploadRunArtifact } from "./artifact-upload.js";
+import { captureSnapshotHash } from "./snapshot-hash.js";
 import { detectProjectPlugins, parsePluginPolicy, pluginArguments, pluginMounts, selectPlugins, type PluginDenial } from "./plugin-policy.js";
 
 const port = Number(process.env.PORT || 3200);
@@ -203,15 +210,16 @@ async function repositoryForWorktree(worktree: string): Promise<string | undefin
 }
 
 /**
- * AUD-04: content-bound identity of the run directory. Checks and reviews record
- * the hash they were produced for, so an approval can never be applied to a
- * different snapshot (manual edits included).
+ * AUD-04 / NEW-03: content-bound identity of the run directory. Delegates to a
+ * scratch-index tree OID (see `captureSnapshotHash`), so the identity is a pure
+ * function of the tracked + untracked (non-ignored) file contents.
  */
 async function snapshotHash(worktree: string, signal?: AbortSignal) {
-  const head = (await git(worktree, ["rev-parse", "HEAD"], signal)).trim();
-  const stash = await git(worktree, ["stash", "create"], signal).catch(() => "");
-  const pending = (await git(worktree, ["status", "--porcelain"], signal)).trim();
-  return createHash("sha256").update(`${head}\n${stash.trim()}\n${pending}`).digest("hex").slice(0, 40);
+  return captureSnapshotHash(
+    (cwd, args, options = {}) => git(cwd, args, options.signal ?? signal, { env: options.env }),
+    worktree,
+    signal,
+  );
 }
 
 interface SandboxRunInput {
@@ -467,36 +475,69 @@ function authorized(request: IncomingMessage) {
   return header.length === expected.length && timingSafeEqual(header, expected);
 }
 
-const maxCallbackBytes = 3 * 1024 * 1024;
-
-function encodeCallbackBody(input: {
-  patch?: Partial<Run>;
-  event?: Omit<RunEvent, "seq" | "runId" | "at">;
-  deliveryId?: string;
-}) {
-  let body = JSON.stringify(input);
-  if (Buffer.byteLength(body) <= maxCallbackBytes) return body;
-  const patch = input.patch as Record<string, unknown> | undefined;
-  if (patch && typeof patch.diff === "string") patch.diff = patch.diff.slice(0, 400_000);
-  body = JSON.stringify(input);
-  if (Buffer.byteLength(body) > maxCallbackBytes && Array.isArray(patch?.checks)) {
-    for (const check of patch.checks as Array<Record<string, unknown>>) {
-      if (typeof check.output === "string") check.output = check.output.slice(-4_000);
-    }
-    body = JSON.stringify(input);
+/**
+ * NEW-07: uploads a full diff as a server-side run artifact when the inline
+ * callback cannot carry it, returning a reference the inline marker/event can
+ * name. On failure the durable local artifact is kept and the failure is
+ * recorded as an audit event (never silently dropped).
+ */
+async function uploadFullDiffArtifact(runId: string, diff: string, local: DiffArtifactRef, options: { ownerId?: string; round?: number } = {}): Promise<{ ref: DiffArtifactRef; uploaded: boolean }> {
+  try {
+    const uploaded = await uploadRunArtifact({
+      callbackBase,
+      token: internalToken,
+      runId,
+      artifactId: local.id,
+      kind: "patch",
+      content: diff,
+      ownerId: options.ownerId,
+    });
+    return {
+      ref: { ...local, id: uploaded.artifactId, sha256: uploaded.sha256 ?? local.sha256, bytes: uploaded.bytes },
+      uploaded: true,
+    };
+  } catch (error) {
+    const message = `完整 Diff 制品上传失败，保留本地全量制品 ${local.id}（bytes=${local.bytes} sha256=${local.sha256}）：${(error as Error).message.slice(0, 300)}`;
+    await postUpdate(runId, {
+      event: {
+        round: options.round ?? 1,
+        source: "system",
+        type: "diff.upload_failed",
+        message,
+        meta: { artifactId: local.id, sha256: local.sha256, bytes: local.bytes },
+      },
+    }).catch(() => undefined);
+    return { ref: local, uploaded: false };
   }
-  if (Buffer.byteLength(body) > maxCallbackBytes) throw new Error("Callback payload exceeds the 3 MiB safety limit");
-  return body;
 }
 
 async function postUpdate(runId: string, input: {
   patch?: Partial<Run>;
   event?: Omit<RunEvent, "seq" | "runId" | "at">;
-}) {
+}, options: { diffArtifact?: DiffArtifactRef; ownerId?: string; round?: number } = {}) {
   let response: Response;
   // AUD-15: every internal update carries a delivery key so a retried or
   // duplicated call is applied at most once (patch and event atomically).
   const deliveryId = `${runId}:${Date.now().toString(36)}:${randomBytes(6).toString("hex")}`;
+  const payload: { patch?: object; event?: object; deliveryId: string } = {
+    ...input,
+    deliveryId,
+    ...(input.event ? { event: { ...input.event } } : {}),
+  };
+  // NEW-07: an oversized diff is uploaded as a real server artifact first; the
+  // inline body is still shrunk with an explicit marker, now naming that artifact.
+  const patch = input.patch as Record<string, unknown> | undefined;
+  const diff = typeof patch?.diff === "string" ? patch.diff : undefined;
+  const resolved = diff !== undefined && options.diffArtifact && callbackBodyExceedsInlineLimit(payload)
+    ? await uploadFullDiffArtifact(runId, diff, options.diffArtifact, { ownerId: options.ownerId, round: options.round })
+    : { ref: options.diffArtifact, uploaded: false };
+  if (resolved.uploaded && resolved.ref && payload.event) {
+    const event = payload.event as Record<string, unknown>;
+    event.meta = {
+      ...((event.meta as Record<string, unknown> | undefined) ?? {}),
+      diffArtifact: { artifactId: resolved.ref.id, sha256: resolved.ref.sha256, bytes: resolved.ref.bytes },
+    };
+  }
   try {
     response = await fetch(`${callbackBase}/api/internal/runs/${runId}/update`, {
       method: "POST",
@@ -504,7 +545,7 @@ async function postUpdate(runId: string, input: {
         Authorization: `Bearer ${internalToken}`,
         "Content-Type": "application/json",
       },
-      body: encodeCallbackBody({ ...input, deliveryId, ...(input.event ? { event: { ...input.event } } : {}) }),
+      body: encodeCallbackBody(payload, resolved.ref),
       signal: AbortSignal.timeout(15_000),
     });
   } catch (error) {
@@ -517,12 +558,12 @@ async function postUpdate(runId: string, input: {
   }
 }
 
-async function update(run: Run, state: RunState, source: RunEvent["source"], type: string, message: string, patch: Partial<Run> = {}) {
+async function update(run: Run, state: RunState, source: RunEvent["source"], type: string, message: string, patch: Partial<Run> = {}, options: { diffArtifact?: DiffArtifactRef } = {}) {
   Object.assign(run, patch, { state });
   await postUpdate(run.id, {
     patch: { state, ...patch },
     event: { round: run.round, source, type, message },
-  });
+  }, { ...options, ownerId: run.ownerId, round: run.round });
 }
 
 type CommandResult = { code: number; stdout: string; stderr: string };
@@ -565,26 +606,20 @@ function command(commandName: string, args: string[], options: {
 }
 
 /**
- * AUD-01: every platform Git invocation runs with hooks, credential helpers and
- * repository-local config disabled, and with a scrubbed environment. Untrusted
- * code from a task can therefore never execute inside the Worker through Git.
+ * AUD-01 / NEW-01: every platform Git invocation runs with hooks, credential
+ * helpers, repository-local filters/diff/merge drivers and fsmonitor disabled,
+ * and with a scrubbed environment. Untrusted code from a task can therefore
+ * never execute inside the Worker through Git.
  */
-async function git(cwd: string, args: string[], signal?: AbortSignal, options: { maxOutput?: number } = {}) {
-  const hardened = [
-    "-c", "core.hooksPath=/dev/null",
-    "-c", "credential.helper=",
-    "-c", "core.fsmonitor=false",
-    "-c", "protocol.file.allow=never",
-    "-c", "gc.auto=0",
-    "-c", "advice.detachedHead=false",
-    ...args,
-  ];
+async function git(cwd: string, args: string[], signal?: AbortSignal, options: { maxOutput?: number; env?: Record<string, string> } = {}) {
+  const configArgs = await hardenedGitConfigArgs(cwd);
+  const hardened = [...hardenedGitFlags, ...configArgs, ...args];
   const result = await command("git", hardened, {
     cwd,
     signal,
     timeoutMs: 120_000,
     maxOutput: options.maxOutput,
-    env: scrubEnvironment(process.env),
+    env: { ...hardenedGitEnvironment(), ...(options.env ?? {}) },
   });
   if (result.code !== 0) throw new Error(result.stderr.trim() || `git ${args[0]} failed`);
   return result.stdout.trim();
@@ -833,11 +868,13 @@ async function runPiWithRetry(
   context: { runId: string; round: number; label: string; role: RunRoleUsage["role"]; budget?: RunBudgetContext },
 ) {
   const budget = context.budget;
-  budget?.reserve(context.role);
-  let result: Awaited<ReturnType<typeof runPi>>;
-  try {
-    result = await withProviderRetry(() => runPi({ ...input, role: context.role }), {
+  // NEW-08/AUD-10: every provider attempt (including failed retries) is
+  // reserved and accounted; the hard model-call limit stops the retry loop.
+  const result = await runProviderOperation(() => runPi({ ...input, role: context.role }), {
     signal: input.signal,
+    budget: budget
+      ? { reserve: () => budget.reserve(context.role), recordUnknown: () => budget.recordUnknown() }
+      : undefined,
     onRetry: async ({ attempt, delayMs, kind, message }) => {
       await postUpdate(context.runId, {
         event: {
@@ -849,97 +886,10 @@ async function runPiWithRetry(
       }).catch(() => undefined);
     },
   });
-  } catch (error) {
-    // AUD-10: a failed call may still have consumed tokens; count it as unknown
-    // instead of silently treating it as free.
-    budget?.recordUnknown();
-    throw error;
-  }
   // GAP-02: surface allowlist decisions as audit events (never silent).
   await reportPluginPolicy(context.runId, context.round, result.plugins.enabled, result.plugins.denials);
   if (budget) await budget.record(context.role, input, result.usage);
   return result;
-}
-
-/** COST-002/003: per-run budget guard shared by every model call. */
-interface RunBudgetContext {
-  /** AUD-10: atomically reserves one model call slot before the call starts. */
-  reserve(role: RunRoleUsage["role"]): void;
-  /** Releases a reservation that never produced usage. */
-  release(): void;
-  /** AUD-10: records a call whose provider usage could not be determined. */
-  recordUnknown(): void;
-  record(role: RunRoleUsage["role"], input: { provider: string; model: string }, usage: UsageTotals): Promise<void>;
-}
-
-class BudgetExceededError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "BudgetExceededError";
-  }
-}
-
-/** Wires budget limits, per-role usage and 80% warnings into a running job. */
-function createBudgetContext(
-  run: Run,
-  startedAt: number,
-  limits = readBudgetLimits(),
-  usageProvider: () => RunUsage = () => run.usage ?? emptyUsage(),
-  onWarning?: (message: string) => Promise<void>,
-): RunBudgetContext {
-  const warned = new Set<string>();
-  // AUD-10: reservations make parallel sub-agents account for each other, so a
-  // limit of N can never be exceeded by N+1 concurrent calls.
-  let pendingCalls = 0;
-  const currentUsage = () => {
-    const live = usageProvider();
-    return {
-      inputTokens: live.inputTokens,
-      outputTokens: live.outputTokens,
-      cacheReadTokens: live.cacheReadTokens ?? 0,
-      cacheWriteTokens: live.cacheWriteTokens ?? 0,
-      totalTokens: live.totalTokens ?? (live.inputTokens + live.outputTokens + (live.cacheReadTokens ?? 0) + (live.cacheWriteTokens ?? 0)),
-      estimatedCost: live.estimatedCost,
-    };
-  };
-  return {
-    reserve() {
-      const status = evaluateBudget({
-        usage: currentUsage(),
-        modelCalls: (run.modelCalls ?? 0) + pendingCalls,
-        elapsedMs: Date.now() - startedAt,
-        limits,
-      });
-      if (status.state === "exhausted") throw new BudgetExceededError(status.reason ?? "运行预算已用尽");
-      pendingCalls += 1;
-    },
-    release() {
-      pendingCalls = Math.max(0, pendingCalls - 1);
-    },
-    recordUnknown() {
-      pendingCalls = Math.max(0, pendingCalls - 1);
-      run.usageUnknownCalls = (run.usageUnknownCalls ?? 0) + 1;
-      void postUpdate(run.id, { patch: { usageUnknownCalls: run.usageUnknownCalls } }).catch(() => undefined);
-    },
-    async record(role, input, usageTotals) {
-      pendingCalls = Math.max(0, pendingCalls - 1);
-      const usage: RunUsage = {
-        inputTokens: Math.round(usageTotals.input),
-        outputTokens: Math.round(usageTotals.output),
-        cacheReadTokens: Math.round(usageTotals.cacheRead),
-        cacheWriteTokens: Math.round(usageTotals.cacheWrite),
-        totalTokens: Math.round(usageTotals.totalTokens),
-        estimatedCost: usageTotals.cost,
-      };
-      mergeRoleUsage(run, { role, provider: input.provider, model: input.model, usage });
-      await postUpdate(run.id, { patch: { usageRoles: run.usageRoles, modelCalls: run.modelCalls, usageUnknownCalls: run.usageUnknownCalls } }).catch(() => undefined);
-      const status = evaluateBudget({ usage: currentUsage(), modelCalls: run.modelCalls ?? 0, elapsedMs: Date.now() - startedAt, limits });
-      if (status.state !== "ok" && status.dimension && !warned.has(status.dimension)) {
-        warned.add(status.dimension);
-        await onWarning?.(budgetWarningMessage(status));
-      }
-    },
-  };
 }
 
 async function planDevelopment(run: Run, worktree: string, credentials: JobInput["credentials"], signal: AbortSignal, usage: UsageTotals, budget?: RunBudgetContext) {
@@ -1287,7 +1237,6 @@ async function prepareReviewSnapshot(input: {
     developerTree: materialized.developerTreeHash,
     developerTreeAfter: materialized.developerTreeHashAfter,
     snapshotTree: materialized.snapshotTreeHash,
-    commit: materialized.commit,
     directory: path.relative(workspaceRoot, directory),
     diverged: decision.divergent,
     at: new Date().toISOString(),
@@ -1435,6 +1384,8 @@ async function executeRetryReview(input: {
   }
   const diff = await collectDiff(input.worktree, input.controller.signal, input.baseCommit);
   const reviewSnapshot = await snapshotHash(input.worktree, input.controller.signal);
+  // NEW-07: durable full-diff artifact for the retry-review path too.
+  const retryDiffArtifact = await persistDiffArtifact(input.worktree, diff, run.round);
   // GAP-03: the reviewer reads an immutable snapshot, never the live worktree.
   const snapshotPath = await prepareReviewSnapshot({ run, worktree: input.worktree, round: run.round, signal: input.controller.signal });
   if (!snapshotPath) return;
@@ -1471,7 +1422,7 @@ async function executeRetryReview(input: {
         summary: "存在未解决的阻断级问题，未完成任务",
         usage: toRunUsage(input.usage),
         durationMs: Date.now() - input.started,
-      });
+      }, { diffArtifact: retryDiffArtifact });
       return;
     }
     await update(run, "completed", "reviewer", "review.approved", "独立审核通过，代码保留在任务 worktree", {
@@ -1483,7 +1434,7 @@ async function executeRetryReview(input: {
       summary: review.summary,
       usage: toRunUsage(input.usage),
       durationMs: Date.now() - input.started,
-    });
+    }, { diffArtifact: retryDiffArtifact });
     return;
   }
   await update(run, "needs_human", "reviewer", "review.changes_requested", `重试审核仍发现 ${review.findings.length} 个问题，继续人工处理`, {
@@ -1494,7 +1445,7 @@ async function executeRetryReview(input: {
     summary: review.summary,
     usage: toRunUsage(input.usage),
     durationMs: Date.now() - input.started,
-  });
+  }, { diffArtifact: retryDiffArtifact });
 }
 
 function usageFromRun(documentUsage: Run["usage"] | undefined): UsageTotals {
@@ -1518,11 +1469,18 @@ async function executeJob(input: JobInput, controller: AbortController) {
   // COST-002/003: budgets are evaluated before every model call and after each
   // one, with a single 80% warning per dimension.
   const runLimits = run.budget ?? readBudgetLimits();
-  const budget = createBudgetContext(run, started, runLimits, () => toRunUsage(usage), async (message) => {
-    await postUpdate(run.id, {
-      patch: { usageRoles: run.usageRoles, modelCalls: run.modelCalls },
-      event: { round: run.round, source: "system", type: "run.budget_warning", message },
-    }).catch(() => undefined);
+  const budget = createRunBudget({
+    run,
+    startedAt: started,
+    limits: runLimits,
+    usage: () => toRunUsage(usage),
+    persist: (patch) => { void postUpdate(run.id, { patch }).catch(() => undefined); },
+    onWarning: async (message) => {
+      await postUpdate(run.id, {
+        patch: { usageRoles: run.usageRoles, modelCalls: run.modelCalls },
+        event: { round: run.round, source: "system", type: "run.budget_warning", message },
+      }).catch(() => undefined);
+    },
   });
   // A re-claimed job (worker restart) resumes against the checkpoints already
   // recorded for this run: reuse the worktree and skip finished stages (REL-002/003).
@@ -1569,14 +1527,19 @@ async function executeJob(input: JobInput, controller: AbortController) {
         : input.resume
           ? `人工恢复：复用已有运行目录（HEAD ${head.slice(0, 7)}${pending ? "，包含未提交的人工修改" : ""}）`
           : `Worker 恢复：复用已有运行目录（HEAD ${head.slice(0, 7)}${pending ? "，包含未提交的修改" : ""}）`;
+      const recoveryState = recoveryUpdateState({
+        current: run.state,
+        resume: Boolean(input.resume),
+        retryReview: Boolean(input.retryReview),
+      });
       await update(run,
-        input.retryReview ? "reviewing" : "preparing",
+        recoveryState,
         "system",
         input.retryReview ? "review.retry_started" : input.resume ? "run.resume_detected" : "run.recovery_detected",
         recoveryLabel,
         {
           worktree: path.relative(workspaceRoot, worktree),
-          summary: input.retryReview ? "Reviewer Agent 正在重新审核" : input.resume ? "人工恢复：正在准备继续执行" : "Worker 恢复：正在从检查点继续执行",
+          summary: input.retryReview ? "Reviewer Agent 正在重新审核" : input.resume ? "人工恢复：正在准备继续执行" : `Worker 恢复：保留当前阶段（${recoveryResumePhase(recoveryState)}）并从检查点继续`,
         });
       if (humanInstruction) {
         await postUpdate(run.id, { event: { round: run.round, source: "system", type: "run.resume_instruction", message: `人工指令：${humanInstruction.slice(0, 500)}` } });
@@ -1701,13 +1664,26 @@ async function executeJob(input: JobInput, controller: AbortController) {
       if (!developmentDone) await tracker.complete(stages.development(round), { round, at: new Date().toISOString() });
       const diff = await collectDiff(worktree, controller.signal, baseCommit);
       const checkSnapshot = await snapshotHash(worktree, controller.signal);
-      await update(run, "checking", "checks", "checks.started", "Developer 完成，开始确定性检查", { diff, checkSnapshot, summary: "正在运行项目检查", usage: toRunUsage(usage) });
-      const storedChecks = tracker.isCompleted(stages.checks(round)) ? tracker.payload<StoredChecks>(stages.checks(round)) : undefined;
+      // NEW-07: persist the full diff durably before reporting it, so an
+      // oversized inline patch is always recoverable (visible in the audit log).
+      const checkDiffArtifact = await persistDiffArtifact(worktree, diff, round);
+      await postUpdate(run.id, { event: {
+        round, source: "checks", type: "diff.artifact_persisted",
+        message: `第 ${round} 轮完整 diff 已持久化为制品 ${checkDiffArtifact.id}（${checkDiffArtifact.bytes} 字节，sha256=${checkDiffArtifact.sha256}）`,
+        meta: { artifactId: checkDiffArtifact.id, sha256: checkDiffArtifact.sha256, bytes: checkDiffArtifact.bytes, kind: "diff" },
+      } });
+      await update(run, "checking", "checks", "checks.started", "Developer 完成，开始确定性检查", { diff, checkSnapshot, summary: "正在运行项目检查", usage: toRunUsage(usage) }, { diffArtifact: checkDiffArtifact });
+      const storedChecksRaw = tracker.isCompleted(stages.checks(round)) ? tracker.payload<StoredChecks>(stages.checks(round)) : undefined;
+      const storedChecks = isCheckpointCurrent(storedChecksRaw, { round, snapshotHash: checkSnapshot }) ? storedChecksRaw : undefined;
       if (storedChecks) {
         await postUpdate(run.id, { event: { round, source: "checks", type: "checks.checkpoint_restored", message: `从检查点恢复第 ${round} 轮检查结果，未重复执行检查命令` } });
+      } else if (storedChecksRaw) {
+        // NEW-03: the recorded checks were produced for different content; never
+        // reuse them, re-run instead of trusting a stale verdict.
+        await postUpdate(run.id, { event: { round, source: "checks", type: "checks.checkpoint_stale", message: `第 ${round} 轮检查点与当前内容不匹配，重新执行检查命令` } });
       }
       const checked = storedChecks ?? await runChecks(run, worktree, input.checks, controller.signal);
-      if (!storedChecks) await tracker.complete(stages.checks(round), checked);
+      if (!storedChecks) await tracker.complete(stages.checks(round), { ...checked, round, snapshotHash: checkSnapshot });
       if (!checked.passed) {
         feedback = `The deterministic checks failed. Fix these failures:\n${checked.results.filter((item) => item.status === "failed").map((item) => `${item.command}\n${item.output}`).join("\n\n")}`;
         await update(run, "developing", "checks", "checks.returned", "检查失败，已退回 Developer 修复", { summary: "检查失败，等待修复", checkPassed: false, ...(storedChecks ? {} : { checks: checked.results }) });
@@ -1716,20 +1692,25 @@ async function executeJob(input: JobInput, controller: AbortController) {
 
       const latestDiff = await collectDiff(worktree, controller.signal, baseCommit);
       const reviewSnapshot = await snapshotHash(worktree, controller.signal);
+      const reviewDiffArtifact = await persistDiffArtifact(worktree, latestDiff, round);
       // AT-REL-003: a review that already produced a verdict is reused, so a
       // restarted worker can never emit two conflicting verdicts for one round.
       let review: ReviewResult;
-      const storedReview = tracker.isCompleted(stages.review(round)) ? tracker.payload<StoredReview>(stages.review(round)) : undefined;
+      const storedReviewRaw = tracker.isCompleted(stages.review(round)) ? tracker.payload<StoredReview>(stages.review(round)) : undefined;
+      const storedReview = isCheckpointCurrent(storedReviewRaw, { round, snapshotHash: reviewSnapshot }) ? storedReviewRaw : undefined;
       if (storedReview) {
-        await update(run, "reviewing", "reviewer", "review.started", `${run.reviewer.model} 开始独立只读审核`, { diff: latestDiff, checkSnapshot, reviewSnapshot, checkPassed: true, checks: checked.results, summary: "Reviewer Agent 正在审核" });
+        await update(run, "reviewing", "reviewer", "review.started", `${run.reviewer.model} 开始独立只读审核`, { diff: latestDiff, checkSnapshot, reviewSnapshot, checkPassed: true, checks: checked.results, summary: "Reviewer Agent 正在审核" }, { diffArtifact: reviewDiffArtifact });
         review = storedReview;
         await postUpdate(run.id, { event: { round, source: "system", type: "review.checkpoint_restored", message: "从检查点恢复本轮审核结论，跳过重复的审核模型调用" } });
       } else {
+        if (storedReviewRaw) {
+          await postUpdate(run.id, { event: { round, source: "system", type: "review.checkpoint_stale", message: "本轮审核检查点与当前内容不匹配，重新执行审核" } });
+        }
         // GAP-03: materialize the reviewer's immutable snapshot before announcing
         // the review, so the reviewer never reads the developer's live worktree.
         const snapshotPath = await prepareReviewSnapshot({ run, worktree, round, signal: controller.signal });
         if (!snapshotPath) return;
-        await update(run, "reviewing", "reviewer", "review.started", `${run.reviewer.model} 开始独立只读审核`, { diff: latestDiff, checkSnapshot, reviewSnapshot, checkPassed: true, checks: checked.results, summary: "Reviewer Agent 正在审核" });
+        await update(run, "reviewing", "reviewer", "review.started", `${run.reviewer.model} 开始独立只读审核`, { diff: latestDiff, checkSnapshot, reviewSnapshot, checkPassed: true, checks: checked.results, summary: "Reviewer Agent 正在审核" }, { diffArtifact: reviewDiffArtifact });
         await tracker.start(stages.review(round));
         let outcome: ReviewOutcome;
         try {
@@ -1740,7 +1721,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
         }
         if (outcome.stopped) return;
         review = outcome.review;
-        await tracker.complete(stages.review(round), review);
+        await tracker.complete(stages.review(round), { ...review, round, snapshotHash: reviewSnapshot });
       }
       findings = mergeFindings(findings, review.findings, { round, approved: review.verdict === "approved" });
       if (review.verdict === "approved") {
@@ -1764,7 +1745,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
             summary: "完成守卫拒绝：存在未满足的检查或未解决的阻断问题",
             usage: toRunUsage(usage),
             durationMs: Date.now() - started,
-          });
+          }, { diffArtifact: reviewDiffArtifact });
           return;
         }
         await update(run, "completed", "reviewer", "review.approved", "独立审核通过，代码保留在任务 worktree", {
@@ -1773,7 +1754,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
           summary: review.summary,
           usage: toRunUsage(usage),
           durationMs: Date.now() - started,
-        });
+        }, { diffArtifact: reviewDiffArtifact });
         return;
       }
       feedback = JSON.stringify(review.findings, null, 2);

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CheckpointTracker, memoryCheckpointClient, stages } from "./checkpoints.js";
+import { CheckpointTracker, isCheckpointCurrent, memoryCheckpointClient, stages } from "./checkpoints.js";
 
 describe("CheckpointTracker", () => {
   it("records stage progress with a stable idempotency key", async () => {
@@ -61,5 +61,18 @@ describe("CheckpointTracker", () => {
     await tracker.fail(stages.task("api"), "boom");
     expect(tracker.isCompleted(stages.task("api"))).toBe(false);
     expect(tracker.payload<{ error: string }>(stages.task("api"))?.error).toBe("boom");
+  });
+});
+
+describe("isCheckpointCurrent (NEW-03)", () => {
+  it("only reuses a checkpoint produced for the same round and content hash", () => {
+    const checkpoint = { passed: true, results: [], round: 2, snapshotHash: "tree-a" };
+    expect(isCheckpointCurrent(checkpoint, { round: 2, snapshotHash: "tree-a" })).toBe(true);
+    // Content changed after the checks ran: never reuse.
+    expect(isCheckpointCurrent(checkpoint, { round: 2, snapshotHash: "tree-b" })).toBe(false);
+    expect(isCheckpointCurrent(checkpoint, { round: 3, snapshotHash: "tree-a" })).toBe(false);
+    // Legacy checkpoint without a bound hash is not trusted.
+    expect(isCheckpointCurrent({ passed: true, results: [] }, { round: 2, snapshotHash: "tree-a" })).toBe(false);
+    expect(isCheckpointCurrent(undefined, { round: 2, snapshotHash: "tree-a" })).toBe(false);
   });
 });

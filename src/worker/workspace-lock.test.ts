@@ -80,18 +80,109 @@ describe("WorkspaceLockManager", () => {
     }
   });
 
-  it("allows the same run to re-acquire its own lock after a worker restart", async () => {
+  it("does not let a second worker displace a live same-run lock, but takes over once stale (NEW-06)", async () => {
     const dir = await tempDir();
-    const crashed = manager(dir, { workerId: "worker-old" });
+    let now = 1_000_000;
+    const crashed = manager(dir, { workerId: "worker-old", now: () => now });
     const first = await crashed.acquire("apps/api", "run-1");
     expect(first.acquired).toBe(true);
 
-    // A fresh process (empty in-memory map) resumes the same run immediately,
-    // even though the old heartbeat is still inside the stale window.
-    const restarted = manager(dir, { workerId: "worker-new" });
+    // A fresh process (empty in-memory map) resumes the same run: a shared run
+    // id alone must not displace the live holder while the heartbeat is fresh.
+    const restarted = manager(dir, { workerId: "worker-new", now: () => now });
+    const blocked = await restarted.acquire("apps/api", "run-1");
+    expect(blocked.acquired).toBe(false);
+    if (!blocked.acquired) expect(blocked.holder?.runId).toBe("run-1");
+
+    // Once the heartbeat goes stale the same run id may take over (recovery).
+    now += 61_000;
     const resumed = await restarted.acquire("apps/api", "run-1");
     expect(resumed.acquired).toBe(true);
-    if (resumed.acquired) await resumed.handle.release();
+    if (resumed.acquired) {
+      expect(resumed.reclaimedStale?.runId).toBe("run-1");
+      await resumed.handle.release();
+    }
+  });
+
+  it("grants a same-run lock to at most one of two racing managers while fresh (NEW-06)", async () => {
+    const dir = await tempDir();
+    const a = manager(dir, { workerId: "worker-a" });
+    const b = manager(dir, { workerId: "worker-b" });
+    const [ra, rb] = await Promise.all([a.acquire("apps/api", "run-1"), b.acquire("apps/api", "run-1")]);
+    expect([ra.acquired, rb.acquired].filter(Boolean)).toHaveLength(1);
+
+    // Whichever won, the loser cannot take the fresh same-run lock over.
+    const again = await b.acquire("apps/api", "run-1");
+    expect(again.acquired).toBe(false);
+
+    const winner = ra.acquired ? ra : rb;
+    if (winner.acquired) await winner.handle.release();
+  });
+
+  it("lets exactly one of two racing managers take over a stale lock (NEW-06)", async () => {
+    const dir = await tempDir();
+    let now = 1_000_000;
+    const dead = manager(dir, { workerId: "worker-dead", now: () => now });
+    expect((await dead.acquire("apps/api", "run-1")).acquired).toBe(true);
+
+    now += 61_000;
+    const a = manager(dir, { workerId: "worker-a", now: () => now });
+    const b = manager(dir, { workerId: "worker-b", now: () => now });
+    const [ra, rb] = await Promise.all([a.acquire("apps/api", "run-1"), b.acquire("apps/api", "run-1")]);
+    expect([ra.acquired, rb.acquired].filter(Boolean)).toHaveLength(1);
+
+    const winner = ra.acquired ? ra : rb;
+    if (winner.acquired) {
+      expect(winner.reclaimedStale?.runId).toBe("run-1");
+      const persisted = JSON.parse(await readFile(a.lockPath("apps/api"), "utf8")) as { token?: string };
+      expect(typeof persisted.token).toBe("string");
+      await winner.handle.release();
+    }
+  });
+
+  it("ignores touch/release from a former holder whose lease was taken over (NEW-06)", async () => {
+    const dir = await tempDir();
+    let now = 1_000_000;
+    const old = manager(dir, { workerId: "worker-old", now: () => now });
+    const first = await old.acquire("apps/api", "run-1");
+    expect(first.acquired).toBe(true);
+    if (!first.acquired) return;
+
+    now += 61_000;
+    const newer = manager(dir, { workerId: "worker-new", now: () => now });
+    const takeover = await newer.acquire("apps/api", "run-1");
+    expect(takeover.acquired).toBe(true);
+    if (!takeover.acquired) return;
+
+    const newToken = (JSON.parse(await readFile(newer.lockPath("apps/api"), "utf8")) as { token?: string }).token;
+    expect(newToken).toBeTruthy();
+
+    // The stale handle is a no-op: it neither refreshes nor deletes the lock.
+    expect(await first.handle.touch()).toBe(false);
+    expect(await first.handle.release()).toBe(false);
+    const stillThere = JSON.parse(await readFile(newer.lockPath("apps/api"), "utf8")) as { token?: string };
+    expect(stillThere.token).toBe(newToken);
+
+    // The new holder is unaffected and can still refresh and release.
+    expect(await takeover.handle.touch()).toBe(true);
+    expect(await takeover.handle.release()).toBe(true);
+  });
+
+  it("treats a release whose token no longer matches as a no-op (NEW-06)", async () => {
+    const dir = await tempDir();
+    const locks = manager(dir);
+    const held = await locks.acquire("apps/api", "run-1");
+    expect(held.acquired).toBe(true);
+    if (!held.acquired) return;
+
+    // Simulate a takeover by another worker overwriting the lock file.
+    await (await import("node:fs/promises")).writeFile(
+      locks.lockPath("apps/api"),
+      JSON.stringify({ key: "apps/api", runId: "run-1", workerId: "other", pid: 1, acquiredAt: 1, heartbeatAt: 2, token: "foreign-token" }),
+    );
+    expect(await held.handle.release()).toBe(false);
+    const onDisk = JSON.parse(await readFile(locks.lockPath("apps/api"), "utf8")) as { token?: string };
+    expect(onDisk.token).toBe("foreign-token");
   });
 
   it("keeps refreshing the heartbeat so a live holder is never reclaimed", async () => {

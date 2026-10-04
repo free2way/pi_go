@@ -356,5 +356,86 @@ describe("PostgresRunStore", () => {
     await store.hydrate(base.id);
     expect(store.getRun(base.id)?.title).toBe("新快照");
   });
+  it("never lets a stale second-instance patch resurrect a cancelled run (NEW-05)", async () => {
+    const db = await createTestDb();
+    const storeA = new PostgresRunStore(db);
+    const storeB = new PostgresRunStore(db);
+    await storeA.init();
+    await storeB.init();
+    const run = makeRun({ state: "reviewing" });
+    await storeA.createRun(run, event(run.id, "run.created"));
+
+    // Both web instances hydrate the same `reviewing` snapshot (rolling deploy).
+    await storeA.hydrate(run.id);
+    await storeB.hydrate(run.id);
+    expect(storeB.getRun(run.id)?.state).toBe("reviewing");
+
+    // Instance A commits a cancellation.
+    await storeA.updateRun(run.id, { state: "cancelled", summary: "已由用户取消" });
+    // Instance B still holds the stale snapshot.
+    expect(storeB.getRun(run.id)?.state).toBe("reviewing");
+
+    // A late callback on B carries only accounting fields; it must be rebased on
+    // the database row and must not write `reviewing` back.
+    await storeB.applyDelivery({ runId: run.id, deliveryId: "job1:late-model-calls", patch: { modelCalls: 3 } });
+
+    const stored = (await db.query("SELECT state, document_json FROM runs WHERE id = $1", [run.id])).rows[0];
+    expect(String(stored.state)).toBe("cancelled");
+    expect((JSON.parse(String(stored.document_json)) as Run).state).toBe("cancelled");
+    expect(storeB.getRun(run.id)?.state).toBe("cancelled");
+    expect(storeB.getRun(run.id)?.modelCalls).toBe(3);
+
+    // An explicit stale state patch is rejected, not silently applied.
+    await expect(storeB.updateRun(run.id, { state: "reviewing" })).rejects.toThrow(/Illegal run state transition/);
+    await expect(
+      storeB.applyDelivery({ runId: run.id, deliveryId: "job1:late-state", patch: { state: "reviewing" } }),
+    ).rejects.toThrow(/Illegal run state transition/);
+    expect(storeB.getRun(run.id)?.state).toBe("cancelled");
+  });
+
+  it("never regresses last_seq from a stale cache or duplicate delivery (NEW-05)", async () => {
+    const db = await createTestDb();
+    const storeA = new PostgresRunStore(db);
+    const storeB = new PostgresRunStore(db);
+    await storeA.init();
+    await storeB.init();
+    const run = makeRun();
+    await storeA.createRun(run, event(run.id, "run.created"));
+    await storeB.hydrate(run.id);
+
+    await storeA.appendEvent(event(run.id, "run.step"));
+    const committed = Number((await db.query("SELECT last_seq FROM runs WHERE id = $1", [run.id])).rows[0].last_seq);
+    expect(committed).toBe(2);
+    // B's cache is now stale (lastSeq 1 vs committed 2).
+    expect(storeB.getRun(run.id)?.lastSeq).toBe(1);
+
+    // Even an explicitly stale sequence in the patch cannot rewind the column.
+    await storeB.applyDelivery({ runId: run.id, deliveryId: "job1:stale-seq", patch: { summary: "stale", lastSeq: 0 } });
+    expect(Number((await db.query("SELECT last_seq FROM runs WHERE id = $1", [run.id])).rows[0].last_seq)).toBe(committed);
+
+    // A repeated delivery is a no-op and leaves the sequence untouched.
+    const replay = await storeB.applyDelivery({ runId: run.id, deliveryId: "job1:stale-seq", patch: { summary: "retry" } });
+    expect(replay.applied).toBe(false);
+    expect(Number((await db.query("SELECT last_seq FROM runs WHERE id = $1", [run.id])).rows[0].last_seq)).toBe(committed);
+    expect(storeB.getRun(run.id)?.lastSeq).toBe(committed);
+  });
+
+  it("still applies a legitimate sequential update and bumps the revision (NEW-05)", async () => {
+    const db = await createTestDb();
+    const store = new PostgresRunStore(db);
+    await store.init();
+    const run = makeRun();
+    await store.createRun(run, event(run.id, "run.created"));
+
+    await store.updateRun(run.id, { state: "preparing", summary: "first" });
+    const updated = await store.updateRun(run.id, { state: "developing", summary: "second" });
+
+    expect(updated.state).toBe("developing");
+    expect(updated.summary).toBe("second");
+    const stored = (await db.query("SELECT state, revision FROM runs WHERE id = $1", [run.id])).rows[0];
+    expect(String(stored.state)).toBe("developing");
+    expect(Number(stored.revision)).toBe(2);
+  });
 
 });
+

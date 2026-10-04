@@ -31,18 +31,29 @@ export async function withProviderRetry<T>(
     policy?: Partial<RetryPolicy>;
     signal?: AbortSignal;
     onRetry?: (info: { attempt: number; delayMs: number; kind: ProviderErrorKind; message: string }) => void | Promise<void>;
+    /**
+     * NEW-08: called before each provider attempt (first try included). Throwing
+     * here aborts the loop, which is how a hard model-call cap refuses a retry.
+     */
+    beforeAttempt?: (attempt: number) => void | Promise<void>;
+    /** NEW-08: called for every failed attempt, whether or not it is retried. */
+    onAttemptFailure?: (info: { attempt: number; kind: ProviderErrorKind; message: string; error: unknown }) => void | Promise<void>;
   } = {},
 ): Promise<T> {
   const policy: RetryPolicy = { ...defaultRetryPolicy, ...options.policy };
   const attempts = Math.max(1, Math.min(6, policy.attempts));
   let lastError: unknown;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    // Deliberately outside the try: a budget error must stop retries, not be
+    // reclassified as a retryable provider error.
+    await options.beforeAttempt?.(attempt);
     try {
       return await operation();
     } catch (error) {
       lastError = error;
       const message = (error as Error)?.message ?? String(error);
       const kind = classifyProviderError(message);
+      await options.onAttemptFailure?.({ attempt, kind, message, error });
       const canRetry = attempt < attempts && policy.retryable.includes(kind) && !options.signal?.aborted;
       if (!canRetry) break;
       const delayMs = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** (attempt - 1));

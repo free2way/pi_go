@@ -30,8 +30,20 @@ export const stages = {
   review: (round: number) => `review:${round}`,
 } as const;
 
-export type StoredReview = ReviewResult;
-export type StoredChecks = { passed: boolean; results: CheckResult[] };
+export type StoredReview = ReviewResult & { round?: number; snapshotHash?: string };
+export type StoredChecks = { passed: boolean; results: CheckResult[]; round?: number; snapshotHash?: string };
+
+/**
+ * NEW-03: a checkpoint is only reusable when it was produced for the exact same
+ * content (and round) as the current worktree. Older payloads without a
+ * `snapshotHash` never match, so the stage is re-run instead of trusted.
+ */
+export function isCheckpointCurrent(
+  payload: ({ round?: number; snapshotHash?: string } & Record<string, unknown>) | undefined | null,
+  current: { round: number; snapshotHash: string },
+): boolean {
+  return Boolean(payload) && payload?.round === current.round && payload?.snapshotHash === current.snapshotHash;
+}
 
 /**
  * Tracks which pipeline stages already finished so a restarted worker resumes

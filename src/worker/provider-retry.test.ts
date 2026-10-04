@@ -48,4 +48,34 @@ describe("withProviderRetry", () => {
     expect(calls).toBe(3);
     expect(onRetry).toHaveBeenCalledTimes(2);
   });
+
+  it("calls beforeAttempt and onAttemptFailure for every attempt (NEW-08)", async () => {
+    const attempts: number[] = [];
+    const failures: number[] = [];
+    let calls = 0;
+    const result = await withProviderRetry(async () => {
+      calls += 1;
+      if (calls < 3) throw new Error("503 service unavailable");
+      return "ok";
+    }, {
+      policy: { attempts: 4, baseDelayMs: 1 },
+      beforeAttempt: (attempt) => { attempts.push(attempt); },
+      onAttemptFailure: ({ attempt }) => { failures.push(attempt); },
+    });
+    expect(result).toBe("ok");
+    expect(attempts).toEqual([1, 2, 3]);
+    expect(failures).toEqual([1, 2]);
+  });
+
+  it("aborts the loop when beforeAttempt refuses the retry (hard budget cap)", async () => {
+    let calls = 0;
+    await expect(withProviderRetry(async () => {
+      calls += 1;
+      throw new Error("503 service unavailable");
+    }, {
+      policy: { attempts: 4, baseDelayMs: 1 },
+      beforeAttempt: (attempt) => { if (attempt > 1) throw new Error("budget exhausted"); },
+    })).rejects.toThrow(/budget exhausted/);
+    expect(calls).toBe(1);
+  });
 });

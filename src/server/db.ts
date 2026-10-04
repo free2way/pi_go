@@ -270,6 +270,16 @@ export const databaseMigrations: Migration[] = [
       ALTER TABLE run_checks ADD COLUMN exit_code INTEGER;
     `,
   },
+  {
+    // NEW-05: monotonic per-run revision used as the compare-and-swap guard for
+    // updateRun/applyDelivery, so a stale multi-instance cache cannot clobber a
+    // newer committed state.
+    id: 7,
+    name: "runs-revision",
+    sql: `
+      ALTER TABLE runs ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;
+    `,
+  },
 ];
 
 export async function runMigrations(db: Db) {
