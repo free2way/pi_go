@@ -146,11 +146,6 @@ services:
       # socket. It is a privileged mount: see docs/03 安全组说明 for the tradeoff
       # (replace with a socket proxy if the host is shared with untrusted users).
       - /var/run/docker.sock:/var/run/docker.sock
-    # The socket is owned by root:docker (typically 0660); the non-root worker
-    # user joins that group so it can create sandbox containers without running
-    # as root itself. Find the value with: stat -c %g /var/run/docker.sock
-    group_add:
-      - "${PI_DOCKER_GID:-983}"
       # SEC-004: agent processes must not see the interactive Pi configuration
       # volume (auth.json, session transcripts, caches). Only the secret-free
       # provider/model definition is mounted, read-only; keys arrive per job via
@@ -158,6 +153,11 @@ services:
       # role only. Regenerate the file with `deploy/docker/export-models.sh`.
       - ./pi-models.json:/home/node/.pi/agent/models.json:ro
       - pigo-worker-state:/home/node/.pi
+    # The socket is owned by root:docker (typically 0660); the non-root worker
+    # user joins that group so it can create sandbox containers without running
+    # as root itself. Find the value with: stat -c %g /var/run/docker.sock
+    group_add:
+      - "${PI_DOCKER_GID:-983}"
     networks:
       - pi-network
     security_opt:

@@ -8,7 +8,24 @@ function cleanJson(text: string) {
 
 function normalizeId(value: unknown, index: number) {
   const candidate = String(value || `task-${index + 1}`).toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
-  return candidate.slice(0, 32) || `task-${index + 1}`;
+  // Reserve room for a dedup suffix (`-12`): ids are capped at 32 characters, so
+  // the base must be shorter or the suffix is truncated away and dedup loops
+  // forever (AUD-13).
+  return candidate.slice(0, 27) || `task-${index + 1}`;
+}
+
+function uniqueId(base: string, index: number, taken: Set<string>) {
+  const suffix = index + 1;
+  const trimmedBase = base.slice(0, Math.max(1, 32 - String(suffix).length - 1));
+  const candidate = `${trimmedBase}-${suffix}`.slice(0, 32);
+  if (!taken.has(candidate)) return candidate;
+  // Bounded fallback: deterministic counter suffix that always fits.
+  for (let attempt = 1; attempt <= 1_000; attempt += 1) {
+    const marker = `-${attempt.toString(36)}`;
+    const value = `${base.slice(0, Math.max(1, 32 - marker.length))}${marker}`;
+    if (!taken.has(value)) return value;
+  }
+  throw new Error(`Planner returned more than 1000 tasks with colliding id "${base}"`);
 }
 
 export function parseDevelopmentPlan(text: string, maxSubagents: number): DevelopmentPlan {
@@ -30,7 +47,7 @@ export function parseDevelopmentPlan(text: string, maxSubagents: number): Develo
 
   const ids = new Set<string>();
   for (const [index, task] of tasks.entries()) {
-    while (ids.has(task.id)) task.id = `${task.id}-${index + 1}`.slice(0, 32);
+    if (ids.has(task.id)) task.id = uniqueId(task.id, index, ids);
     ids.add(task.id);
   }
 

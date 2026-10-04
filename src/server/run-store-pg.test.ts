@@ -198,4 +198,84 @@ describe("PostgresRunStore", () => {
     expect(counts.run_artifacts).toBe(0);
     expect(counts.run_checkpoints).toBe(0);
   });
+
+  it("upserts repeated findings instead of failing on the primary key (AUD-11)", async () => {
+    const db = await createTestDb();
+    const store = new PostgresRunStore(db);
+    await store.init();
+    const run = makeRun();
+    await store.createRun(run, event(run.id, "run.created"));
+
+    const finding = { id: "stable-finding", severity: "high" as const, file: "src/a.ts", line: 3, title: "Race", evidence: "first", requiredChange: "fix", resolved: false, fingerprint: "fp1", observations: 1, consecutiveRounds: 1 };
+    await store.updateRun(run.id, { findings: [finding] });
+    await store.updateRun(run.id, { findings: [{ ...finding, evidence: "second", observations: 2, consecutiveRounds: 2 }] });
+
+    const row = (await db.query("SELECT observations, consecutive_rounds, title FROM run_findings WHERE run_id = $1", [run.id])).rows[0];
+    expect(Number(row.observations)).toBe(2);
+    expect(Number(row.consecutive_rounds)).toBe(2);
+    const count = (await db.query("SELECT COUNT(*) AS total FROM run_findings WHERE run_id = $1", [run.id])).rows[0];
+    expect(Number(count.total)).toBe(1);
+  });
+
+  it("rejects illegal state transitions and keeps the cache consistent (AUD-15)", async () => {
+    const db = await createTestDb();
+    const store = new PostgresRunStore(db);
+    await store.init();
+    const run = makeRun();
+    await store.createRun(run, event(run.id, "run.created"));
+    await store.updateRun(run.id, { state: "cancelled" });
+
+    await expect(store.updateRun(run.id, { state: "completed" })).rejects.toThrow(/Illegal run state transition/);
+    expect(store.getRun(run.id)?.state).toBe("cancelled");
+    const stored = (await db.query("SELECT state FROM runs WHERE id = $1", [run.id])).rows[0];
+    expect(String(stored.state)).toBe("cancelled");
+  });
+
+  it("applies an internal delivery at most once, patch and event atomically (AUD-15)", async () => {
+    const db = await createTestDb();
+    const store = new PostgresRunStore(db);
+    await store.init();
+    const run = makeRun();
+    await store.createRun(run, event(run.id, "run.created"));
+
+    const first = await store.applyDelivery({
+      runId: run.id,
+      deliveryId: "job1:1",
+      patch: { summary: "round one" },
+      event: { runId: run.id, round: 1, source: "system", type: "run.usage", message: "usage", at: new Date().toISOString() },
+    });
+    expect(first.applied).toBe(true);
+    const repeat = await store.applyDelivery({
+      runId: run.id,
+      deliveryId: "job1:1",
+      patch: { summary: "stale retry", state: "cancelled" },
+      event: { runId: run.id, round: 1, source: "system", type: "run.usage", message: "usage", at: new Date().toISOString() },
+    });
+    expect(repeat.applied).toBe(false);
+    expect(store.getRun(run.id)?.summary).toBe("round one");
+    expect((await store.getEvents(run.id)).filter((item) => item.type === "run.usage").length).toBe(1);
+  });
+
+  it("does not publish a failed transaction to the read cache (AUD-06)", async () => {
+    const db = await createTestDb();
+    const store = new PostgresRunStore(db);
+    await store.init();
+    const run = makeRun();
+    await store.createRun(run, event(run.id, "run.created"));
+
+    const failing = new Proxy(db, {
+      get(target, property, receiver) {
+        if (property === "withTransaction") {
+          return async () => { throw new Error("injected transaction failure"); };
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const broken = new PostgresRunStore(failing as typeof db);
+    await broken.init();
+    await expect(broken.updateRun(run.id, { state: "preparing", summary: "should not stick" })).rejects.toThrow(/injected/);
+    expect(broken.getRun(run.id)?.state).toBe("queued");
+    expect(broken.getRun(run.id)?.summary).not.toBe("should not stick");
+  });
+
 });

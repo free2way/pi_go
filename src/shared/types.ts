@@ -20,6 +20,16 @@ export interface Finding {
   evidence: string;
   requiredChange: string;
   resolved: boolean;
+  /** AUD-11: stable identity across rounds (id-independent fingerprint). */
+  fingerprint?: string;
+  /** AUD-11: first round this problem was reported in. */
+  firstSeenRound?: number;
+  /** AUD-11: most recent round this problem was reported in. */
+  lastSeenRound?: number;
+  /** AUD-11: how many reviews reported this problem. */
+  observations?: number;
+  /** GAP-03: consecutive reviews that reported this problem unresolved. */
+  consecutiveRounds?: number;
 }
 
 export interface CheckResult {
@@ -28,6 +38,8 @@ export interface CheckResult {
   command: string;
   status: "pending" | "running" | "passed" | "failed";
   durationMs?: number;
+  /** GAP-04: process exit code for the check command (AT-REVIEW-002). */
+  exitCode?: number;
   output?: string;
 }
 
@@ -99,6 +111,34 @@ export interface Run {
   usageRoles?: RunRoleUsage[];
   /** COST-002: number of model calls started for this run. */
   modelCalls?: number;
+  /** AUD-04: content snapshot hash that passed the required checks. */
+  checkSnapshot?: string;
+  /** AUD-04: content snapshot hash the latest review verdict applies to. */
+  reviewSnapshot?: string;
+  /** AUD-04: whether the checks for `checkSnapshot` passed. */
+  checkPassed?: boolean;
+  /** GAP-01: idempotency key supplied at creation time. */
+  idempotencyKey?: string;
+  /** GAP-01: pinned base commit for reproducible diffs (AT-GIT-001). */
+  baseSha?: string;
+  /** GAP-01: acceptance criteria captured with the task. */
+  acceptanceCriteria?: string;
+  /** GAP-01/COST-002: hard budget fixed at creation and shown in the UI. */
+  budget?: {
+    maxTokens: number;
+    maxCostUsd: number;
+    maxModelCalls: number;
+    maxDurationSeconds: number;
+  };
+  /** GAP-01: credential fingerprint (sha256 prefix) per role at creation time. */
+  credentialVersions?: { developer?: string; reviewer?: string };
+  /** GAP-01: workflow/prompt/plugin policy snapshot used for this run. */
+  pipelineVersion?: string;
+  /** AUD-10: calls whose provider usage could not be determined. */
+  usageUnknownCalls?: number;
+  /** GAP-04: human approval of the delivered worktree. */
+  approvedAt?: string;
+  approvedBy?: string;
 }
 
 export interface RunUsage {

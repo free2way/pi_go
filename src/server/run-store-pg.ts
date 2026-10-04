@@ -5,6 +5,45 @@ import type { AppendEventOptions, EventListener, RunStoreLike } from "./store.js
 
 export type JobState = "queued" | "claimed" | "done" | "failed" | "cancelled";
 
+/**
+ * AUD-15 / AT-RUN-014: legal run state transitions. Terminal states can never be
+ * overwritten by a late worker callback (e.g. cancelled -> completed).
+ */
+const runTransitions: Record<string, ReadonlyArray<string>> = {
+  queued: ["preparing", "developing", "checking", "reviewing", "cancelled", "failed", "needs_human"],
+  preparing: ["developing", "checking", "reviewing", "cancelled", "failed", "needs_human"],
+  developing: ["checking", "reviewing", "cancelled", "failed", "needs_human"],
+  checking: ["developing", "reviewing", "cancelled", "failed", "needs_human"],
+  reviewing: ["developing", "completed", "cancelled", "failed", "needs_human"],
+  needs_human: ["queued", "reviewing", "checking", "developing", "cancelled", "failed"],
+  completed: [],
+  failed: [],
+  cancelled: [],
+};
+
+export class InvalidStateTransitionError extends Error {
+  readonly code = "INVALID_STATE_TRANSITION";
+  constructor(readonly from: string, readonly to: string) {
+    super(`Illegal run state transition: ${from} -> ${to}`);
+    this.name = "InvalidStateTransitionError";
+  }
+}
+
+export function assertTransition(from: string, to: string) {
+  if (from === to) return;
+  const allowed = runTransitions[from];
+  if (!allowed) throw new InvalidStateTransitionError(from, to);
+  if (!allowed.includes(to)) throw new InvalidStateTransitionError(from, to);
+}
+
+/** Creates the delivery table used to make internal updates idempotent. */
+export async function recordDelivery(db: Db, runId: string, deliveryId: string, seq?: number) {
+  await db.query(
+    "INSERT INTO run_deliveries (run_id, delivery_id, seq, applied_at) VALUES ($1, $2, $3, $4) ON CONFLICT (run_id, delivery_id) DO NOTHING",
+    [runId, deliveryId, seq ?? null, new Date().toISOString()],
+  );
+}
+
 export interface JobRecord {
   id: string;
   runId: string;
@@ -86,32 +125,126 @@ export class PostgresRunStore implements RunStoreLike {
   }
 
   async createRun(run: Run, event: Omit<RunEvent, "seq">) {
-    this.cache.set(run.id, { ...run });
+    const snapshot: Run = { ...run };
     await this.db.withTransaction(async (tx) => {
       await tx.query(
         `INSERT INTO runs (id, owner_id, state, mode, created_at, updated_at, last_seq, document_json)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          ON CONFLICT (id) DO UPDATE SET state = $3, updated_at = $6, last_seq = $7, document_json = $8`,
-        [run.id, run.ownerId, run.state, run.mode, run.createdAt, run.updatedAt, run.lastSeq ?? 0, JSON.stringify(run)],
+        [snapshot.id, snapshot.ownerId, snapshot.state, snapshot.mode, snapshot.createdAt, snapshot.updatedAt, snapshot.lastSeq ?? 0, JSON.stringify(snapshot)],
       );
-      await this.project(tx, run);
+      await this.project(tx, snapshot);
     });
+    // AUD-06: the cache is only published after the transaction committed.
+    this.cache.set(snapshot.id, snapshot);
     await this.appendEvent(event);
-    return run;
+    return this.cache.get(run.id) ?? snapshot;
   }
 
+  /**
+   * AUD-06/AUD-15: applies a patch to a copy, validates the state transition,
+   * persists it, and only then publishes the new snapshot to the read cache.
+   */
   async updateRun(id: string, patch: Partial<Run>) {
-    const run = this.cache.get(id);
-    if (!run) throw new Error(`Run not found: ${id}`);
-    Object.assign(run, patch, { updatedAt: new Date().toISOString() });
+    const current = this.cache.get(id);
+    if (!current) throw new Error(`Run not found: ${id}`);
+    const next = { ...current, ...patch, updatedAt: new Date().toISOString() };
+    if (patch.state && patch.state !== current.state) {
+      assertTransition(current.state, patch.state);
+    }
     await this.db.withTransaction(async (tx) => {
       await tx.query(
         `UPDATE runs SET state = $2, updated_at = $3, last_seq = $4, document_json = $5 WHERE id = $1`,
-        [run.id, run.state, run.updatedAt, run.lastSeq ?? 0, JSON.stringify(run)],
+        [next.id, next.state, next.updatedAt, next.lastSeq ?? 0, JSON.stringify(next)],
       );
-      await this.project(tx, run);
+      await this.project(tx, next);
     });
-    return run;
+    this.cache.set(id, next);
+    return next;
+  }
+
+  /**
+   * AUD-15 / AT-REL-004: applies a patch and its event atomically under one
+   * delivery key. A repeated delivery is a no-op that returns the stored result,
+   * so a late retry can never rewind state or double count usage.
+   */
+  async applyDelivery(input: {
+    runId: string;
+    deliveryId: string;
+    patch?: Partial<Run>;
+    event?: Omit<RunEvent, "seq">;
+  }) {
+    const seen = (await this.db.query(
+      "SELECT seq FROM run_deliveries WHERE run_id = $1 AND delivery_id = $2",
+      [input.runId, input.deliveryId],
+    )).rows[0];
+    if (seen) {
+      return { applied: false, seq: seen.seq === null ? undefined : Number(seen.seq) };
+    }
+    const current = this.cache.get(input.runId);
+    if (!current) throw new Error(`Run not found: ${input.runId}`);
+    const next = input.patch ? { ...current, ...input.patch, updatedAt: new Date().toISOString() } : current;
+    if (input.patch?.state && input.patch.state !== current.state) {
+      assertTransition(current.state, input.patch.state);
+    }
+
+    const result = await this.db.withTransaction(async (tx) => {
+      const inserted = (await tx.query(
+        "INSERT INTO run_deliveries (run_id, delivery_id, applied_at) VALUES ($1, $2, $3) ON CONFLICT (run_id, delivery_id) DO NOTHING RETURNING delivery_id",
+        [input.runId, input.deliveryId, new Date().toISOString()],
+      )).rows[0];
+      if (!inserted) return { applied: false, seq: undefined as number | undefined };
+
+      let seq: number | undefined;
+      if (input.patch) {
+        await tx.query(
+          `UPDATE runs SET state = $2, updated_at = $3, last_seq = $4, document_json = $5 WHERE id = $1`,
+          [next.id, next.state, next.updatedAt, next.lastSeq ?? 0, JSON.stringify(next)],
+        );
+        await this.project(tx, next);
+      }
+      if (input.event) {
+        const bumped = (await tx.query(
+          "UPDATE runs SET last_seq = last_seq + 1, updated_at = $2 WHERE id = $1 RETURNING last_seq",
+          [input.runId, input.event.at],
+        )).rows[0];
+        if (!bumped) throw new Error(`Run not found: ${input.runId}`);
+        seq = Number(bumped.last_seq);
+        await tx.query(
+          `INSERT INTO run_events (run_id, seq, at, round, source, type, message, meta_json, delivery_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [
+            input.event.runId,
+            seq,
+            input.event.at,
+            input.event.round,
+            input.event.source,
+            input.event.type,
+            input.event.message,
+            input.event.meta ? JSON.stringify(input.event.meta) : null,
+            null,
+          ],
+        );
+        await tx.query("UPDATE run_deliveries SET seq = $3 WHERE run_id = $1 AND delivery_id = $2", [input.runId, input.deliveryId, seq]);
+      }
+      return { applied: true, seq };
+    });
+
+    if (result.applied) {
+      const snapshot = { ...next, lastSeq: result.seq ?? next.lastSeq };
+      this.cache.set(input.runId, snapshot);
+      if (input.event && result.seq !== undefined) {
+        const record: RunEvent = { ...input.event, seq: result.seq };
+        for (const listener of this.listeners.get(input.runId) ?? []) {
+          try {
+            listener(record);
+          } catch (error) {
+            console.error("[store] event listener failed", error);
+          }
+        }
+      }
+    }
+    return result;
   }
 
   /**
@@ -456,9 +589,32 @@ export class PostgresRunStore implements RunStoreLike {
     }
     await tx.query("DELETE FROM run_findings WHERE run_id = $1", [run.id]);
     for (const finding of run.findings ?? []) {
+      // AUD-11: findings are upserted by their stable identity, so a reviewer that
+      // repeats an id (or reuses it across rounds) can never hit a primary key
+      // conflict; observation history is preserved instead.
       await tx.query(
-        "INSERT INTO run_findings (run_id, finding_id, severity, file, line, title, resolved) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-        [run.id, finding.id, finding.severity, finding.file, finding.line, finding.title, finding.resolved ? 1 : 0],
+        `INSERT INTO run_findings (run_id, finding_id, severity, file, line, title, resolved, fingerprint, first_seen_round, last_seen_round, observations, consecutive_rounds)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         ON CONFLICT (run_id, finding_id) DO UPDATE SET
+           severity = $3, file = $4, line = $5, title = $6, resolved = $7,
+           fingerprint = COALESCE($8, run_findings.fingerprint),
+           first_seen_round = COALESCE(run_findings.first_seen_round, $9),
+           last_seen_round = COALESCE($10, run_findings.last_seen_round),
+           observations = $11, consecutive_rounds = $12`,
+        [
+          run.id,
+          finding.id,
+          finding.severity,
+          finding.file,
+          finding.line,
+          finding.title,
+          finding.resolved ? 1 : 0,
+          finding.fingerprint ?? null,
+          finding.firstSeenRound ?? null,
+          finding.lastSeenRound ?? null,
+          finding.observations ?? 1,
+          finding.consecutiveRounds ?? 0,
+        ],
       );
     }
     await tx.query("DELETE FROM run_usage_role WHERE run_id = $1", [run.id]);

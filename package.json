@@ -13,7 +13,9 @@
     "build": "vite build && tsup src/server/index.ts --format esm --platform node --out-dir dist/server --clean",
     "start": "node dist/server/index.js",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "validate:compose": "node deploy/docker/validate-compose.mjs",
+    "lint": "tsc --noEmit"
   },
   "dependencies": {
     "@fastify/static": "^10.1.5",

@@ -72,4 +72,32 @@ describe("development orchestrator", () => {
     const batches = conflictFreeBatches(plan.tasks);
     expect(batches.map((batch) => batch.map((task) => task.id))).toEqual([["api", "ui"], ["api-tests"]]);
   });
+
+  it("resolves duplicate long task ids without looping (AUD-13)", () => {
+    const long = "x".repeat(32);
+    const plan = parseDevelopmentPlan(JSON.stringify({
+      complexity: "medium",
+      rationale: "duplicate ids",
+      tasks: [
+        { id: long, title: "A", description: "a", files: [], dependsOn: [] },
+        { id: long, title: "B", description: "b", files: [], dependsOn: [] },
+        { id: `${long}y`, title: "C", description: "c", files: [], dependsOn: [] },
+      ],
+    }), 4);
+    const ids = plan.tasks.map((task) => task.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const id of ids) expect(id.length).toBeLessThanOrEqual(32);
+  });
+
+  it("keeps deduped ids within the length budget for many collisions", () => {
+    const plan = parseDevelopmentPlan(JSON.stringify({
+      complexity: "large",
+      rationale: "many collisions",
+      tasks: Array.from({ length: 12 }, () => ({ id: "y".repeat(32), title: "t", description: "d", files: [], dependsOn: [] })),
+    }), 12);
+    const ids = plan.tasks.map((task) => task.id);
+    expect(new Set(ids).size).toBe(12);
+    for (const id of ids) expect(id.length).toBeLessThanOrEqual(32);
+  });
+
 });

@@ -130,6 +130,11 @@ const findingSchema = z.object({
   evidence: z.string().max(8_000),
   requiredChange: z.string().max(8_000),
   resolved: z.boolean(),
+  fingerprint: z.string().max(64).optional(),
+  firstSeenRound: z.number().int().min(1).max(99).optional(),
+  lastSeenRound: z.number().int().min(1).max(99).optional(),
+  observations: z.number().int().min(0).max(10_000).optional(),
+  consecutiveRounds: z.number().int().min(0).max(10_000).optional(),
 });
 const checkResultSchema = z.object({
   id: z.string().min(1).max(80),
@@ -137,6 +142,7 @@ const checkResultSchema = z.object({
   command: z.string().min(1).max(1_000),
   status: z.enum(["pending", "running", "passed", "failed"]),
   durationMs: z.number().min(0).optional(),
+  exitCode: z.number().int().min(-1_000).max(1_000).optional(),
   output: z.string().max(64_000).optional(),
 });
 const subAgentTaskSchema = z.object({
@@ -186,6 +192,11 @@ const runPatchSchema = z.object({
   usage: runUsageSchema,
   usageRoles: z.array(runRoleUsageSchema).max(20),
   modelCalls: z.number().int().min(0).max(10_000),
+  usageUnknownCalls: z.number().int().min(0).max(10_000),
+  checkSnapshot: z.string().max(80),
+  reviewSnapshot: z.string().max(80),
+  checkPassed: z.boolean(),
+  baseSha: z.string().max(80),
   durationMs: z.number().min(0).max(86_400_000),
   worktree: z.string().max(600),
 }).partial().strict();
@@ -838,9 +849,35 @@ app.post<{ Params: { id: string } }>("/api/internal/runs/:id/update", { bodyLimi
   const run = store.getRun(request.params.id);
   if (!run) return reply.code(404).send({ error: "Run not found" });
   const { patch, event, deliveryId } = parsed.data;
-  if (patch) await store.updateRun(run.id, patch as Partial<Run>);
-  if (event) await store.appendEvent({ ...event, runId: run.id, at: new Date().toISOString() }, { deliveryId });
-  return { ok: true };
+  try {
+    if (deliveryId && jobQueue) {
+      // AUD-15: patch + event + delivery record commit in one transaction, so a
+      // duplicated internal call can neither double count nor rewind state.
+      const result = await jobQueue.applyDelivery({
+        runId: run.id,
+        deliveryId,
+        patch: patch as Partial<Run> | undefined,
+        event: event ? { ...event, runId: run.id, at: new Date().toISOString() } : undefined,
+      });
+      return { ok: true, applied: result.applied, seq: result.seq };
+    }
+    if (patch) await store.updateRun(run.id, patch as Partial<Run>);
+    if (event) await store.appendEvent({ ...event, runId: run.id, at: new Date().toISOString() });
+    return { ok: true, applied: true };
+  } catch (error) {
+    if ((error as { code?: string }).code === "INVALID_STATE_TRANSITION") {
+      await store.appendEvent({
+        runId: run.id,
+        round: run.round,
+        source: "system",
+        type: "run.transition_rejected",
+        message: `拒绝非法状态转移：${(error as Error).message}`,
+        at: new Date().toISOString(),
+      }).catch(() => undefined);
+      return reply.code(409).send({ error: (error as Error).message, code: "INVALID_STATE_TRANSITION" });
+    }
+    throw error;
+  }
 });
 
 // ------------------------------------------- internal job + checkpoint API (REL-002/003)

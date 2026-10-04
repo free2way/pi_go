@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
-import { timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, readdir, realpath, rm, stat, statfs } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
@@ -13,7 +13,7 @@ import { budgetWarningMessage, evaluateBudget, mergeRoleUsage, readBudgetLimits 
 import { scrubEnvironment } from "./pi-env.js";
 import { apiKeyEnvName, classifyProviderError, providerErrorSummary } from "./provider-errors.js";
 import { sleep, withProviderRetry } from "./provider-retry.js";
-import { parseReview, type ReviewResult } from "./review-protocol.js";
+import { blockingSeverities, parseReview, type ReviewResult } from "./review-protocol.js";
 import { buildContainerSpec, hostPathFor, resolveSandboxMode } from "./sandbox.js";
 import { mergeFindings, unresolvedFeedback } from "./review-findings.js";
 import { WorkspacePathError, resolveInsideRoot, sanitizeRelativePath, sanitizeWorkspaceName, validateCloneUrl } from "./workspace-paths.js";
@@ -126,6 +126,18 @@ async function repositoryForWorktree(worktree: string): Promise<string | undefin
   } catch {
     return undefined;
   }
+}
+
+/**
+ * AUD-04: content-bound identity of the run directory. Checks and reviews record
+ * the hash they were produced for, so an approval can never be applied to a
+ * different snapshot (manual edits included).
+ */
+async function snapshotHash(worktree: string, signal?: AbortSignal) {
+  const head = (await git(worktree, ["rev-parse", "HEAD"], signal)).trim();
+  const stash = await git(worktree, ["stash", "create"], signal).catch(() => "");
+  const pending = (await git(worktree, ["status", "--porcelain"], signal)).trim();
+  return createHash("sha256").update(`${head}\n${stash.trim()}\n${pending}`).digest("hex").slice(0, 40);
 }
 
 interface SandboxRunInput {
@@ -287,6 +299,7 @@ const maxCallbackBytes = 3 * 1024 * 1024;
 function encodeCallbackBody(input: {
   patch?: Partial<Run>;
   event?: Omit<RunEvent, "seq" | "runId" | "at">;
+  deliveryId?: string;
 }) {
   let body = JSON.stringify(input);
   if (Buffer.byteLength(body) <= maxCallbackBytes) return body;
@@ -308,6 +321,9 @@ async function postUpdate(runId: string, input: {
   event?: Omit<RunEvent, "seq" | "runId" | "at">;
 }) {
   let response: Response;
+  // AUD-15: every internal update carries a delivery key so a retried or
+  // duplicated call is applied at most once (patch and event atomically).
+  const deliveryId = `${runId}:${Date.now().toString(36)}:${randomBytes(6).toString("hex")}`;
   try {
     response = await fetch(`${callbackBase}/api/internal/runs/${runId}/update`, {
       method: "POST",
@@ -315,7 +331,7 @@ async function postUpdate(runId: string, input: {
         Authorization: `Bearer ${internalToken}`,
         "Content-Type": "application/json",
       },
-      body: encodeCallbackBody(input),
+      body: encodeCallbackBody({ ...input, deliveryId, ...(input.event ? { event: { ...input.event } } : {}) }),
       signal: AbortSignal.timeout(15_000),
     });
   } catch (error) {
@@ -1024,10 +1040,29 @@ async function executeRetryReview(input: {
   controller: AbortController;
   usage: UsageTotals;
   started: number;
+  budget?: RunBudgetContext;
+  checks: string[];
 }) {
   const { run } = input;
+  // AUD-04 / AT-RUN-007 / CHECK-003: an approval may only be produced for a
+  // snapshot whose required checks passed. Re-run them here instead of trusting
+  // a previous round or manual edits.
+  await update(run, "checking", "checks", "checks.started", "重新审核前先复验当前代码快照", { summary: "正在复验检查命令" });
+  const checked = await runChecks(run, input.worktree, input.checks, input.controller.signal);
+  const checkSnapshot = await snapshotHash(input.worktree, input.controller.signal);
+  await postUpdate(run.id, { patch: { checks: checked.results, checkSnapshot, checkPassed: checked.passed } });
+  if (!checked.passed) {
+    const failed = checked.results.filter((item) => item.status === "failed").map((item) => item.command);
+    await update(run, "needs_human", "checks", "checks.blocked_retry_review", `当前快照检查未通过，已阻止重试审核：${failed.join(" / ")}`, {
+      summary: "检查未通过，重试审核被拒绝",
+      usage: toRunUsage(input.usage),
+      durationMs: Date.now() - input.started,
+    });
+    return;
+  }
   await update(run, "reviewing", "reviewer", "review.started", `${run.reviewer.model} 重新审核（人工触发）`, { summary: "Reviewer Agent 正在重新审核" });
   const diff = await collectDiff(input.worktree, input.controller.signal, input.baseCommit);
+  const reviewSnapshot = await snapshotHash(input.worktree, input.controller.signal);
   const outcome = await performReview({
     run,
     worktree: input.worktree,
@@ -1037,14 +1072,31 @@ async function executeRetryReview(input: {
     signal: input.controller.signal,
     usage: input.usage,
     started: input.started,
+    budget: input.budget,
   });
   if (outcome.stopped) return;
   const review = outcome.review;
-  const findings = mergeFindings(run.findings ?? [], review.findings);
+  const findings = mergeFindings(run.findings ?? [], review.findings, { approved: review.verdict === "approved" });
   if (review.verdict === "approved") {
+    const blocking = findings.filter((finding) => !finding.resolved && blockingSeverities.includes(finding.severity));
+    if (blocking.length > 0) {
+      await update(run, "needs_human", "system", "run.completion_blocked", `完成守卫拒绝：审核结论为通过但仍存在 ${blocking.length} 个阻断级问题`, {
+        findings,
+        diff,
+        checkSnapshot,
+        reviewSnapshot,
+        summary: "存在未解决的阻断级问题，未完成任务",
+        usage: toRunUsage(input.usage),
+        durationMs: Date.now() - input.started,
+      });
+      return;
+    }
     await update(run, "completed", "reviewer", "review.approved", "独立审核通过，代码保留在任务 worktree", {
       findings,
       diff,
+      checkSnapshot,
+      reviewSnapshot,
+      checkPassed: true,
       summary: review.summary,
       usage: toRunUsage(input.usage),
       durationMs: Date.now() - input.started,
@@ -1054,6 +1106,8 @@ async function executeRetryReview(input: {
   await update(run, "needs_human", "reviewer", "review.changes_requested", `重试审核仍发现 ${review.findings.length} 个问题，继续人工处理`, {
     findings,
     diff,
+    checkSnapshot,
+    reviewSnapshot,
     summary: review.summary,
     usage: toRunUsage(input.usage),
     durationMs: Date.now() - input.started,
@@ -1127,7 +1181,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
     }
 
     if (input.retryReview) {
-      await executeRetryReview({ run, worktree, baseCommit, credentials: input.credentials, controller, usage, started });
+      await executeRetryReview({ run, worktree, baseCommit, credentials: input.credentials, controller, usage, started, budget, checks: input.checks });
       return;
     }
     await update(run, "developing", "developer", "agent.started", `${run.developer.model} 主 Agent 开始评估工作量`, { summary: "主 Agent 正在分析任务并决定是否拆分 Sub Agent" });
@@ -1212,7 +1266,8 @@ async function executeJob(input: JobInput, controller: AbortController) {
       }
       if (!developmentDone) await tracker.complete(stages.development(round), { round, at: new Date().toISOString() });
       const diff = await collectDiff(worktree, controller.signal, baseCommit);
-      await update(run, "checking", "checks", "checks.started", "Developer 完成，开始确定性检查", { diff, summary: "正在运行项目检查", usage: toRunUsage(usage) });
+      const checkSnapshot = await snapshotHash(worktree, controller.signal);
+      await update(run, "checking", "checks", "checks.started", "Developer 完成，开始确定性检查", { diff, checkSnapshot, summary: "正在运行项目检查", usage: toRunUsage(usage) });
       const storedChecks = tracker.isCompleted(stages.checks(round)) ? tracker.payload<StoredChecks>(stages.checks(round)) : undefined;
       if (storedChecks) {
         await postUpdate(run.id, { event: { round, source: "checks", type: "checks.checkpoint_restored", message: `从检查点恢复第 ${round} 轮检查结果，未重复执行检查命令` } });
@@ -1221,12 +1276,13 @@ async function executeJob(input: JobInput, controller: AbortController) {
       if (!storedChecks) await tracker.complete(stages.checks(round), checked);
       if (!checked.passed) {
         feedback = `The deterministic checks failed. Fix these failures:\n${checked.results.filter((item) => item.status === "failed").map((item) => `${item.command}\n${item.output}`).join("\n\n")}`;
-        await update(run, "developing", "checks", "checks.returned", "检查失败，已退回 Developer 修复", { summary: "检查失败，等待修复", ...(storedChecks ? {} : { checks: checked.results }) });
+        await update(run, "developing", "checks", "checks.returned", "检查失败，已退回 Developer 修复", { summary: "检查失败，等待修复", checkPassed: false, ...(storedChecks ? {} : { checks: checked.results }) });
         continue;
       }
 
       const latestDiff = await collectDiff(worktree, controller.signal, baseCommit);
-      await update(run, "reviewing", "reviewer", "review.started", `${run.reviewer.model} 开始独立只读审核`, { diff: latestDiff, summary: "Reviewer Agent 正在审核" });
+      const reviewSnapshot = await snapshotHash(worktree, controller.signal);
+      await update(run, "reviewing", "reviewer", "review.started", `${run.reviewer.model} 开始独立只读审核`, { diff: latestDiff, checkSnapshot, reviewSnapshot, checkPassed: true, checks: checked.results, summary: "Reviewer Agent 正在审核" });
       // AT-REL-003: a review that already produced a verdict is reused, so a
       // restarted worker can never emit two conflicting verdicts for one round.
       let review: ReviewResult;
@@ -1241,8 +1297,31 @@ async function executeJob(input: JobInput, controller: AbortController) {
         review = outcome.review;
         await tracker.complete(stages.review(round), review);
       }
-      findings = mergeFindings(findings, review.findings);
+      findings = mergeFindings(findings, review.findings, { round, approved: review.verdict === "approved" });
       if (review.verdict === "approved") {
+        // AUD-03/AUD-04: independent completion guard. The review verdict alone
+        // never completes a run: the checks for this snapshot must have passed
+        // and no blocking finding may remain open.
+        const blocking = findings.filter((finding) => !finding.resolved && blockingSeverities.includes(finding.severity));
+        const snapshotConsistent = !run.checkSnapshot || !reviewSnapshot || run.checkSnapshot === reviewSnapshot;
+        if (blocking.length > 0 || !checked.passed || !snapshotConsistent) {
+          const reasons = [
+            blocking.length > 0 ? `${blocking.length} 个阻断级问题未解决` : "",
+            checked.passed ? "" : "当前快照检查未通过",
+            snapshotConsistent ? "" : "检查与审核的快照不一致（代码在检查后被修改）",
+          ].filter(Boolean).join("；");
+          await update(run, "needs_human", "system", "run.completion_blocked", `完成守卫拒绝：${reasons}`, {
+            findings,
+            diff: latestDiff,
+            checkSnapshot,
+            reviewSnapshot,
+            checkPassed: checked.passed,
+            summary: "完成守卫拒绝：存在未满足的检查或未解决的阻断问题",
+            usage: toRunUsage(usage),
+            durationMs: Date.now() - started,
+          });
+          return;
+        }
         await update(run, "completed", "reviewer", "review.approved", "独立审核通过，代码保留在任务 worktree", {
           findings,
           diff: latestDiff,
@@ -1255,10 +1334,13 @@ async function executeJob(input: JobInput, controller: AbortController) {
       feedback = JSON.stringify(review.findings, null, 2);
       await update(run, "developing", "reviewer", "review.changes_requested", `审核发现 ${review.findings.length} 个问题，退回 Developer`, { findings, summary: review.summary, usage: toRunUsage(usage) });
     }
-    await update(run, "needs_human", "system", "run.needs_human", "达到最大审核轮次，需要人工处理", { findings, usage: toRunUsage(usage), durationMs: Date.now() - started });
+    await update(run, "needs_human", "system", "run.needs_human", "达到最大审核轮次，需要人工处理", { findings, usage: toRunUsage(usage), usageRoles: run.usageRoles, modelCalls: run.modelCalls, durationMs: Date.now() - started });
   } catch (error) {
     const cancelled = controller.signal.aborted;
     outcomeState = cancelled ? "cancelled" : "failed";
+    // AUD-06: nothing is recorded yet; the finally block may only finish the job
+    // after this retry loop wrote the terminal state successfully.
+    terminalRecorded = false;
     if (error instanceof BudgetExceededError && !cancelled) {
       // COST-003 / AT-PERF-008: 100% of a hard budget stops new model calls.
       outcomeState = "failed";

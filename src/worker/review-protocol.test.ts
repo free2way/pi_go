@@ -47,4 +47,37 @@ describe("review protocol", () => {
     expect(() => parseReview(JSON.stringify({ verdict: "approved" }))).toThrow();
     expect(() => parseReview("not json at all")).toThrow();
   });
+
+  it("rejects an approved verdict that carries blocking findings (AUD-03)", () => {
+    const approvedWithHigh = JSON.stringify({
+      verdict: "approved",
+      summary: "looks fine",
+      findings: [{ id: "f1", severity: "high", file: "src/a.ts", line: 1, title: "Broken auth", evidence: "e", requiredChange: "r" }],
+    });
+    expect(() => parseReview(approvedWithHigh)).toThrow(/blocking/);
+
+    const approvedWithMedium = JSON.stringify({
+      verdict: "approved",
+      summary: "ok",
+      findings: [{ id: "f2", severity: "medium", file: null, line: null, title: "Medium issue", evidence: "e", requiredChange: "r" }],
+    });
+    expect(() => parseReview(approvedWithMedium)).toThrow(/blocking/);
+
+    // Low severity notes are allowed alongside an approval.
+    const approvedWithLow = JSON.stringify({
+      verdict: "approved",
+      summary: "ok",
+      findings: [{ id: "f3", severity: "low", file: null, line: null, title: "nit", evidence: "e", requiredChange: "r" }],
+    });
+    expect(parseReview(approvedWithLow).verdict).toBe("approved");
+
+    // changes_requested may carry any severity.
+    const changes = JSON.stringify({
+      verdict: "changes_requested",
+      summary: "fix",
+      findings: [{ id: "f4", severity: "critical", file: null, line: null, title: "critical", evidence: "e", requiredChange: "r" }],
+    });
+    expect(parseReview(changes).verdict).toBe("changes_requested");
+  });
+
 });

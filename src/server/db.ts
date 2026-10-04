@@ -231,6 +231,34 @@ export const databaseMigrations: Migration[] = [
       );
     `,
   },
+  {
+    id: 5,
+    name: "finding-observations-and-deliveries",
+    sql: `
+      ALTER TABLE run_findings ADD COLUMN fingerprint TEXT;
+      ALTER TABLE run_findings ADD COLUMN first_seen_round INTEGER;
+      ALTER TABLE run_findings ADD COLUMN last_seen_round INTEGER;
+      ALTER TABLE run_findings ADD COLUMN observations INTEGER NOT NULL DEFAULT 1;
+      ALTER TABLE run_findings ADD COLUMN consecutive_rounds INTEGER NOT NULL DEFAULT 0;
+
+      CREATE TABLE run_deliveries (
+        run_id TEXT NOT NULL,
+        delivery_id TEXT NOT NULL,
+        seq INTEGER,
+        applied_at TEXT NOT NULL,
+        PRIMARY KEY (run_id, delivery_id)
+      );
+
+      CREATE TABLE workspace_grants (
+        workspace_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        granted_by TEXT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (workspace_id, user_id)
+      );
+      CREATE UNIQUE INDEX idx_workspaces_canonical ON workspaces(canonical_path);
+    `,
+  },
 ];
 
 export async function runMigrations(db: Db) {

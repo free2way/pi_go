@@ -15,7 +15,10 @@ KEEP_DAYS="${PI_BACKUP_KEEP_DAYS:-14}"
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 TARGET="$BACKUP_ROOT/$TS"
+# AUD-14: backups contain ciphertext and configuration, never shared credentials.
+umask 077
 mkdir -p "$TARGET"
+chmod 700 "$TARGET"
 
 echo "== backup $TS =="
 
@@ -37,8 +40,13 @@ if [ -f "$PROJECT_DIR/.env" ]; then
   cp "$PROJECT_DIR/.env" "$TARGET/env.backup"
   chmod 600 "$TARGET/env.backup"
 fi
-docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$WEB_CONTAINER" | sed -E 's/(SECRET|TOKEN|PASSWORD|API_KEY)=.*/\1=[redacted]/' > "$TARGET/web.env.sanitized"
-docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "${PI_WORKER_CONTAINER:-pi-agent-worker-1}" | sed -E 's/(SECRET|TOKEN|PASSWORD|API_KEY)=.*/\1=[redacted]/' > "$TARGET/worker.env.sanitized"
+# AUD-14: whitelist-based sanitizer. Values are only kept for explicitly
+# non-sensitive keys, and URL userinfo is stripped, so no password can leak into
+# the "sanitized" diagnostics copy.
+SANITIZER="$(cd "$(dirname "$0")" && pwd)/env-sanitize.mjs"
+docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$WEB_CONTAINER" | node "$SANITIZER" > "$TARGET/web.env.sanitized"
+docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "${PI_WORKER_CONTAINER:-pi-agent-worker-1}" | node "$SANITIZER" > "$TARGET/worker.env.sanitized"
+chmod 600 "$TARGET/web.env.sanitized" "$TARGET/worker.env.sanitized"
 
 # ---------------------------------------------------------------- manifest
 counts() {
@@ -65,6 +73,7 @@ cat > "$TARGET/manifest.json" <<EOF
 }
 EOF
 cat "$TARGET/manifest.json"
+chmod 600 "$TARGET"/* 2>/dev/null || true
 echo "backup complete: $TARGET"
 
 # ---------------------------------------------------------------- retention
