@@ -95,6 +95,31 @@ export interface Run {
   lastSeq: number;
   worktree?: string;
   plan?: DevelopmentPlan;
+  /** COST-001: per-role (planner/developer/sub-agent/integrator/reviewer) usage. */
+  usageRoles?: RunRoleUsage[];
+  /** COST-002: number of model calls started for this run. */
+  modelCalls?: number;
+}
+
+export interface RunUsage {
+  inputTokens: number;
+  outputTokens: number;
+  estimatedCost: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  totalTokens?: number;
+}
+
+export interface RunRoleUsage {
+  role: "planner" | "developer" | "sub-agent" | "integrator" | "reviewer" | string;
+  provider: string;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  estimatedCost: number;
+  calls: number;
 }
 
 export interface ProjectInfo {

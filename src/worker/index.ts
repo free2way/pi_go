@@ -4,11 +4,12 @@ import { timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, readdir, realpath, rm, stat, statfs } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
-import type { CheckResult, DevelopmentPlan, Finding, ProjectInfo, Run, RunEvent, RunState, SubAgentTask, WorkspaceVerifyResult } from "../shared/types.js";
+import type { CheckResult, DevelopmentPlan, Finding, ProjectInfo, Run, RunEvent, RunRoleUsage, RunState, RunUsage, SubAgentTask, WorkspaceVerifyResult } from "../shared/types.js";
 import { CheckpointTracker, memoryCheckpointClient, stages, type Checkpoint, type CheckpointClient, type StoredChecks, type StoredReview } from "./checkpoints.js";
 import { conflictFreeBatches, executionWaves, fallbackPlan, parseDevelopmentPlan } from "./orchestrator.js";
 import { UsageTracker, addUsage, assistantErrorFromEvent, assistantTextFromEvent, emptyUsage, toRunUsage, toolNameFromEvent, type UsageTotals } from "./pi-events.js";
 import { DockerApi } from "./docker-api.js";
+import { budgetWarningMessage, evaluateBudget, mergeRoleUsage, readBudgetLimits } from "./budget.js";
 import { scrubEnvironment } from "./pi-env.js";
 import { apiKeyEnvName, classifyProviderError, providerErrorSummary } from "./provider-errors.js";
 import { sleep, withProviderRetry } from "./provider-retry.js";
@@ -172,7 +173,9 @@ async function runInSandbox(input: SandboxRunInput): Promise<CommandResult> {
   let stdout = "";
   let stderr = "";
   const timer = setTimeout(() => { void docker.killContainer(containerId).catch(() => undefined); }, input.timeoutMs);
+  const onAbort = () => { void docker.killContainer(containerId).catch(() => undefined); };
   try {
+    input.signal.addEventListener("abort", onAbort, { once: true });
     await docker.startContainer(containerId);
     // Logs are read after the container starts: Docker only exposes the full
     // log of a started container, and `follow=1` then streams to completion.
@@ -189,6 +192,7 @@ async function runInSandbox(input: SandboxRunInput): Promise<CommandResult> {
     return { code: StatusCode, stdout, stderr };
   } finally {
     clearTimeout(timer);
+    input.signal.removeEventListener("abort", onAbort);
     await docker.removeContainer(containerId).catch(() => undefined);
     await rm(runStateDir, { recursive: true, force: true }).catch(() => undefined);
   }
@@ -467,6 +471,8 @@ async function runPi(input: {
   prompt: string;
   sessionId?: string;
   readOnly?: boolean;
+  /** Reasoning effort for Pi (planner uses a cheaper level, COST-006). */
+  thinking?: "low" | "medium" | "high";
   apiKey: string;
   apiKeyEnvironmentName: string;
   signal: AbortSignal;
@@ -480,7 +486,7 @@ async function runPi(input: {
     "--no-prompt-templates",
     "--provider", input.provider,
     "--model", input.model,
-    "--thinking", "high",
+    "--thinking", input.thinking === "low" || input.thinking === "medium" ? input.thinking : "high",
     "--tools", input.readOnly ? "read,grep,find,ls" : "read,bash,edit,write,grep,find,ls",
   ];
   if (input.sessionId) args.push("--session-id", input.sessionId);
@@ -546,9 +552,11 @@ async function collectDiff(worktree: string, signal: AbortSignal, baseRef?: stri
  */
 async function runPiWithRetry(
   input: Parameters<typeof runPi>[0],
-  context: { runId: string; round: number; label: string },
+  context: { runId: string; round: number; label: string; role: RunRoleUsage["role"]; budget?: RunBudgetContext },
 ) {
-  return withProviderRetry(() => runPi(input), {
+  const budget = context.budget;
+  budget?.assertAvailable(context.role);
+  const result = await withProviderRetry(() => runPi(input), {
     signal: input.signal,
     onRetry: async ({ attempt, delayMs, kind, message }) => {
       await postUpdate(context.runId, {
@@ -561,9 +569,52 @@ async function runPiWithRetry(
       }).catch(() => undefined);
     },
   });
+  if (budget) await budget.record(context.role, input, result.usage);
+  return result;
 }
 
-async function planDevelopment(run: Run, worktree: string, credentials: JobInput["credentials"], signal: AbortSignal, usage: UsageTotals) {
+/** COST-002/003: per-run budget guard shared by every model call. */
+interface RunBudgetContext {
+  assertAvailable(role: RunRoleUsage["role"]): void;
+  record(role: RunRoleUsage["role"], input: { provider: string; model: string }, usage: UsageTotals): Promise<void>;
+}
+
+class BudgetExceededError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BudgetExceededError";
+  }
+}
+
+/** Wires budget limits, per-role usage and 80% warnings into a running job. */
+function createBudgetContext(run: Run, startedAt: number, limits = readBudgetLimits(), onWarning?: (message: string) => Promise<void>): RunBudgetContext {
+  let warned = new Set<string>();
+  return {
+    assertAvailable() {
+      const status = evaluateBudget({ usage: run.usage ?? emptyUsage(), modelCalls: run.modelCalls ?? 0, elapsedMs: Date.now() - startedAt, limits });
+      if (status.state === "exhausted") throw new BudgetExceededError(status.reason ?? "运行预算已用尽");
+    },
+    async record(role, input, usageTotals) {
+      const usage: RunUsage = {
+        inputTokens: Math.round(usageTotals.input),
+        outputTokens: Math.round(usageTotals.output),
+        cacheReadTokens: Math.round(usageTotals.cacheRead),
+        cacheWriteTokens: Math.round(usageTotals.cacheWrite),
+        totalTokens: Math.round(usageTotals.totalTokens),
+        estimatedCost: usageTotals.cost,
+      };
+      mergeRoleUsage(run, { role, provider: input.provider, model: input.model, usage });
+      await postUpdate(run.id, { patch: { usageRoles: run.usageRoles, modelCalls: run.modelCalls } }).catch(() => undefined);
+      const status = evaluateBudget({ usage: run.usage ?? emptyUsage(), modelCalls: run.modelCalls ?? 0, elapsedMs: Date.now() - startedAt, limits });
+      if (status.state !== "ok" && status.dimension && !warned.has(status.dimension)) {
+        warned.add(status.dimension);
+        await onWarning?.(budgetWarningMessage(status));
+      }
+    },
+  };
+}
+
+async function planDevelopment(run: Run, worktree: string, credentials: JobInput["credentials"], signal: AbortSignal, usage: UsageTotals, budget?: RunBudgetContext) {
   const prompt = [
     "You are the lead engineering planner. Inspect the current repository read-only and size the requested implementation.",
     `Task: ${run.task}`,
@@ -580,11 +631,13 @@ async function planDevelopment(run: Run, worktree: string, credentials: JobInput
       model: run.developer.model,
       prompt,
       readOnly: true,
+      // COST-006: planning is a sizing decision, so it runs with low reasoning.
+      thinking: process.env.PI_PLANNER_THINKING === "high" || process.env.PI_PLANNER_THINKING === "medium" ? process.env.PI_PLANNER_THINKING : "low",
       apiKey: credentials.developer,
       apiKeyEnvironmentName: apiKeyEnvName(run.developer.provider),
       signal,
       onActivity: (message) => postUpdate(run.id, { event: { round: run.round, source: "developer", type: "planner.activity", message: `主 Agent：${message}` } }),
-    }, { runId: run.id, round: run.round, label: "主 Agent 规划" });
+    }, { runId: run.id, round: run.round, label: "主 Agent 规划", role: "planner", budget });
     addUsage(usage, result.usage);
     return parseDevelopmentPlan(redactJobSecrets(result.text, credentials), maxSubagents);
   } catch (error) {
@@ -603,6 +656,8 @@ async function runDeveloperAgent(input: {
   sessionSuffix: string;
   activityPrefix?: string;
   usage: UsageTotals;
+  budget?: RunBudgetContext;
+  role?: RunRoleUsage["role"];
 }) {
   const result = await runPiWithRetry({
     cwd: input.worktree,
@@ -621,7 +676,7 @@ async function runDeveloperAgent(input: {
         message: input.activityPrefix ? `${input.activityPrefix}：${message}` : message,
       },
     }),
-  }, { runId: input.run.id, round: input.run.round, label: input.activityPrefix ?? "开发 Agent" });
+  }, { runId: input.run.id, round: input.run.round, label: input.activityPrefix ?? "开发 Agent", role: input.role ?? "developer", budget: input.budget });
   addUsage(input.usage, result.usage);
   return result.text;
 }
@@ -642,6 +697,7 @@ async function runSubAgent(input: {
   credentials: JobInput["credentials"];
   signal: AbortSignal;
   usage: UsageTotals;
+  budget?: RunBudgetContext;
 }): Promise<SubAgentResult> {
   const startedAt = Date.now();
   const branch = `${input.mainBranch}-sub-${input.task.id}`;
@@ -669,6 +725,8 @@ async function runSubAgent(input: {
       sessionSuffix: `sub-${input.task.id}`,
       activityPrefix: `Sub Agent「${input.task.title}」`,
       usage: input.usage,
+      budget: input.budget,
+      role: "sub-agent",
     });
     const changed = await git(worktree, ["status", "--porcelain"], input.signal);
     let commit: string | undefined;
@@ -709,6 +767,7 @@ async function orchestrateSubAgents(input: {
   signal: AbortSignal;
   usage: UsageTotals;
   tracker: CheckpointTracker;
+  budget?: RunBudgetContext;
 }) {
   const integrationNotes: string[] = [];
   const restored: string[] = [];
@@ -762,6 +821,7 @@ async function orchestrateSubAgents(input: {
         credentials: input.credentials,
         signal: input.signal,
         usage: input.usage,
+        budget: input.budget,
       })));
       for (const result of results) {
         let keepBranch = false;
@@ -858,6 +918,7 @@ async function performReview(input: {
   signal: AbortSignal;
   usage: UsageTotals;
   started: number;
+  budget?: RunBudgetContext;
 }): Promise<ReviewOutcome> {
   const reviewPrompt = [
     "You are an independent read-only code reviewer. Do not modify files.",
@@ -880,7 +941,7 @@ async function performReview(input: {
       apiKeyEnvironmentName: apiKeyEnvName(input.run.reviewer.provider),
       signal: input.signal,
       onActivity: (message) => postUpdate(input.run.id, { event: { round: input.round, source: "reviewer", type: "agent.activity", message } }),
-    }, { runId: input.run.id, round: input.round, label: "审核 Agent" });
+    }, { runId: input.run.id, round: input.round, label: "审核 Agent", role: "reviewer", budget: input.budget });
   } catch (providerError) {
     const reason = redactJobSecrets((providerError as Error).message, input.credentials).slice(0, 500);
     const kind = classifyProviderError(reason);
@@ -909,7 +970,7 @@ async function performReview(input: {
         apiKeyEnvironmentName: apiKeyEnvName(input.run.reviewer.provider),
         signal: input.signal,
         onActivity: (message) => postUpdate(input.run.id, { event: { round: input.round, source: "reviewer", type: "agent.activity", message } }),
-      }, { runId: input.run.id, round: input.round, label: "审核 Agent（协议重试）" });
+      }, { runId: input.run.id, round: input.round, label: "审核 Agent（协议重试）", role: "reviewer", budget: input.budget });
     } catch (providerError) {
       const providerReason = redactJobSecrets((providerError as Error).message, input.credentials).slice(0, 500);
       const kind = classifyProviderError(providerReason);
@@ -984,6 +1045,14 @@ async function executeJob(input: JobInput, controller: AbortController) {
   const started = Date.now();
   const usage: UsageTotals = emptyUsage();
   const tracker = await loadTracker(run.id);
+  // COST-002/003: budgets are evaluated before every model call and after each
+  // one, with a single 80% warning per dimension.
+  const budget = createBudgetContext(run, started, readBudgetLimits(), async (message) => {
+    await postUpdate(run.id, {
+      patch: { usageRoles: run.usageRoles, modelCalls: run.modelCalls },
+      event: { round: run.round, source: "system", type: "run.budget_warning", message },
+    }).catch(() => undefined);
+  });
   // A re-claimed job (worker restart) resumes against the checkpoints already
   // recorded for this run: reuse the worktree and skip finished stages (REL-002/003).
   const recovering = Boolean(!input.resume && !input.retryReview && (input.recovery || tracker.size > 0));
@@ -1061,7 +1130,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
         findings = [...(run.findings ?? [])];
       } else if (round === 1) {
         const storedPlan = tracker.isCompleted(stages.planning) ? tracker.payload<DevelopmentPlan>(stages.planning) : undefined;
-        plan = storedPlan ?? await planDevelopment(run, worktree, input.credentials, controller.signal, usage);
+        plan = storedPlan ?? await planDevelopment(run, worktree, input.credentials, controller.signal, usage, budget);
         run.plan = plan;
         if (storedPlan) {
           await postUpdate(run.id, {
@@ -1083,7 +1152,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
           await tracker.complete(stages.planning, plan);
         }
         if (plan.tasks.length > 1) {
-          const integrationNotes = await orchestrateSubAgents({ run, project, worktree, plan, credentials: input.credentials, signal: controller.signal, usage, tracker });
+          const integrationNotes = await orchestrateSubAgents({ run, project, worktree, plan, credentials: input.credentials, signal: controller.signal, usage, tracker, budget });
           const integrationPrompt = [
             "You are the lead integration agent. Work only in the current Git worktree.",
             `Original task: ${run.task}`,
@@ -1092,7 +1161,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
             "Inspect the combined code, resolve integration gaps, complete any skipped work, and add or update end-to-end tests.",
             "Do not push, deploy, delete the repository, or read credentials. Do not undo correct sub-agent work.",
           ].join("\n\n");
-          await runDeveloperAgent({ run, worktree, credentials: input.credentials, signal: controller.signal, prompt: integrationPrompt, sessionSuffix: "integrator", activityPrefix: "集成 Agent", usage });
+          await runDeveloperAgent({ run, worktree, credentials: input.credentials, signal: controller.signal, prompt: integrationPrompt, sessionSuffix: "integrator", activityPrefix: "集成 Agent", usage, budget, role: "integrator" });
         } else {
           const task = plan.tasks[0];
           task.status = "running";
@@ -1103,7 +1172,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
             "Inspect the repository, implement the task completely, and add or update tests.",
             "Do not push, deploy, delete the repository, or read credentials. Do not claim checks passed unless you ran them.",
           ].join("\n\n");
-          const summary = await runDeveloperAgent({ run, worktree, credentials: input.credentials, signal: controller.signal, prompt: developerPrompt, sessionSuffix: "developer", usage });
+          const summary = await runDeveloperAgent({ run, worktree, credentials: input.credentials, signal: controller.signal, prompt: developerPrompt, sessionSuffix: "developer", usage, budget });
           task.status = "merged";
           task.summary = redactJobSecrets(summary, input.credentials).slice(0, 1_000);
           await postUpdate(run.id, { patch: { plan }, event: { round, source: "developer", type: "developer.completed", message: "单 Agent 实现完成" } });
@@ -1118,7 +1187,8 @@ async function executeJob(input: JobInput, controller: AbortController) {
           repairSections.push(`人工指令（来自工作区所有者，最高优先级，必须满足）：\n${humanInstruction}`);
         }
         repairSections.push("Inspect the existing combined implementation, make the required fixes, and update tests.", "Do not push, deploy, delete the repository, or read credentials.");
-        await runDeveloperAgent({ run, worktree, credentials: input.credentials, signal: controller.signal, prompt: repairSections.join("\n\n"), sessionSuffix: `repair-${round}`, activityPrefix: "修复 Agent", usage });
+        // COST-004: 返修复用 Developer 会话（保留已实现上下文），只注入新增反馈与必要上下文。
+        await runDeveloperAgent({ run, worktree, credentials: input.credentials, signal: controller.signal, prompt: repairSections.join("\n\n"), sessionSuffix: "developer", activityPrefix: "修复 Agent", usage, budget });
       }
       if (!developmentDone) await tracker.complete(stages.development(round), { round, at: new Date().toISOString() });
       const diff = await collectDiff(worktree, controller.signal, baseCommit);
@@ -1146,7 +1216,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
         await postUpdate(run.id, { event: { round, source: "system", type: "review.checkpoint_restored", message: "从检查点恢复本轮审核结论，跳过重复的审核模型调用" } });
       } else {
         await tracker.start(stages.review(round));
-        const outcome = await performReview({ run, worktree, credentials: input.credentials, round, diff: latestDiff, signal: controller.signal, usage, started });
+        const outcome = await performReview({ run, worktree, credentials: input.credentials, round, diff: latestDiff, signal: controller.signal, usage, started, budget });
         if (outcome.stopped) return;
         review = outcome.review;
         await tracker.complete(stages.review(round), review);
@@ -1169,6 +1239,28 @@ async function executeJob(input: JobInput, controller: AbortController) {
   } catch (error) {
     const cancelled = controller.signal.aborted;
     outcomeState = cancelled ? "cancelled" : "failed";
+    if (error instanceof BudgetExceededError && !cancelled) {
+      // COST-003 / AT-PERF-008: 100% of a hard budget stops new model calls.
+      outcomeState = "failed";
+      const message = `运行预算已用尽，已停止新的模型调用：${error.message}`;
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        try {
+          await update(run, "needs_human", "system", "run.budget_exhausted", message, {
+            usage: toRunUsage(usage),
+            usageRoles: run.usageRoles,
+            modelCalls: run.modelCalls,
+            durationMs: Date.now() - started,
+            summary: message.slice(0, 300),
+          });
+          terminalRecorded = true;
+          break;
+        } catch (writeError) {
+          console.warn(`[store] budget terminal update failed (attempt ${attempt}): ${(writeError as Error).message}`);
+          if (attempt < 3) await sleep(1_000 * 2 ** (attempt - 1));
+        }
+      }
+      return;
+    }
     const safeMessage = redactJobSecrets((error as Error).message, input.credentials).slice(0, 2_000);
     const followup = Boolean(input.resume || input.retryReview);
     const kind = cancelled ? undefined : classifyProviderError(safeMessage);

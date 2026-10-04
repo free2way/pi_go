@@ -87,6 +87,9 @@ if (scenario.dumpEnv) {
       names,
       // Flag-only argv snapshot: prompts and values stay out of the probe.
       flags: args.filter((value) => value.startsWith("--")),
+      // Session id is not secret: it proves which role/session was reused.
+      sessionId: args.includes("--session-id") ? args[args.indexOf("--session-id") + 1] : null,
+      thinking: args.includes("--thinking") ? args[args.indexOf("--thinking") + 1] : null,
       toolArg: args.includes("--tools") ? args[args.indexOf("--tools") + 1] : null,
     }),
   );

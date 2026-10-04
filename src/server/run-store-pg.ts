@@ -208,6 +208,7 @@ export class PostgresRunStore implements RunStoreLike {
       await tx.query("DELETE FROM run_checks WHERE run_id = $1", [id]);
       await tx.query("DELETE FROM run_findings WHERE run_id = $1", [id]);
       await tx.query("DELETE FROM run_artifacts WHERE run_id = $1", [id]);
+      await tx.query("DELETE FROM run_usage_role WHERE run_id = $1", [id]);
       await tx.query("DELETE FROM run_checkpoints WHERE run_id = $1", [id]);
       await tx.query("DELETE FROM runs WHERE id = $1", [id]);
     });
@@ -343,7 +344,7 @@ export class PostgresRunStore implements RunStoreLike {
 
   /** Row counts per table for backup/restore verification (AT-REL-009). */
   async statistics() {
-    const tables = ["runs", "run_events", "run_agents", "run_checks", "run_findings", "run_artifacts", "run_checkpoints", "jobs"];
+    const tables = ["runs", "run_events", "run_agents", "run_checks", "run_findings", "run_artifacts", "run_usage_role", "run_checkpoints", "jobs"];
     const counts: Record<string, number> = {};
     for (const table of tables) {
       const row = (await this.db.query(`SELECT COUNT(*) AS total FROM ${table}`)).rows[0];
@@ -458,6 +459,26 @@ export class PostgresRunStore implements RunStoreLike {
       await tx.query(
         "INSERT INTO run_findings (run_id, finding_id, severity, file, line, title, resolved) VALUES ($1, $2, $3, $4, $5, $6, $7)",
         [run.id, finding.id, finding.severity, finding.file, finding.line, finding.title, finding.resolved ? 1 : 0],
+      );
+    }
+    await tx.query("DELETE FROM run_usage_role WHERE run_id = $1", [run.id]);
+    for (const entry of run.usageRoles ?? []) {
+      await tx.query(
+        `INSERT INTO run_usage_role (run_id, role, model, provider, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, estimated_cost, calls, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        [
+          run.id,
+          entry.role,
+          entry.model,
+          entry.provider,
+          entry.inputTokens,
+          entry.outputTokens,
+          entry.cacheReadTokens ?? 0,
+          entry.cacheWriteTokens ?? 0,
+          entry.estimatedCost,
+          entry.calls,
+          run.updatedAt,
+        ],
       );
     }
     await tx.query("DELETE FROM run_artifacts WHERE run_id = $1", [run.id]);

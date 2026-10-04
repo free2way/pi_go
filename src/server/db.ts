@@ -211,6 +211,26 @@ export const databaseMigrations: Migration[] = [
       CREATE INDEX idx_jobs_run ON jobs(run_id, created_at);
     `,
   },
+  {
+    id: 4,
+    name: "run-usage-per-role",
+    sql: `
+      CREATE TABLE run_usage_role (
+        run_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        model TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+        estimated_cost DOUBLE PRECISION NOT NULL DEFAULT 0,
+        calls INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (run_id, role, model)
+      );
+    `,
+  },
 ];
 
 export async function runMigrations(db: Db) {
