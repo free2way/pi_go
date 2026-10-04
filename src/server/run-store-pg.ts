@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { Run, RunEvent } from "../shared/types.js";
 import type { Db } from "./db.js";
+import { mergeHumanNotes } from "./run-notes.js";
 import type {
   AppendEventOptions,
   ArtifactContent,
@@ -317,10 +318,16 @@ export class PostgresRunStore implements RunStoreLike {
   /**
    * NEW-05: merges a patch onto the authoritative run (never the instance
    * cache). `lastSeq` may only move forward, so a stale callback cannot rewind
-   * the per-run event sequence.
+   * the per-run event sequence. `humanNotes` are append-only, so they are
+   * unioned instead of replaced: a stale patch that carries a note written
+   * before a concurrent append cannot drop the newer note (and cannot duplicate
+   * its own).
    */
   private mergePatch(current: Run, patch: Partial<Run>): Run {
     const merged: Run = { ...current, ...patch, updatedAt: new Date().toISOString() };
+    if (patch.humanNotes !== undefined) {
+      merged.humanNotes = mergeHumanNotes(current.humanNotes, patch.humanNotes);
+    }
     merged.lastSeq = Math.max(current.lastSeq ?? 0, merged.lastSeq ?? 0);
     return merged;
   }

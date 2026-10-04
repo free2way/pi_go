@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Run, RunArtifact, RunEvent } from "../shared/types.js";
+import { mergeHumanNotes } from "./run-notes.js";
 
 interface DatabaseShape {
   runs: Run[];
@@ -94,7 +95,12 @@ export class RunStore implements RunStoreLike {
   async updateRun(id: string, patch: Partial<Run>) {
     const run = this.getRun(id);
     if (!run) throw new Error(`Run not found: ${id}`);
-    Object.assign(run, patch, { updatedAt: new Date().toISOString() });
+    // 需求历史: humanNotes are append-only and never edited, so merge them
+    // instead of letting a replace-style patch drop a concurrently added note.
+    const next = patch.humanNotes !== undefined
+      ? { ...patch, humanNotes: mergeHumanNotes(run.humanNotes, patch.humanNotes) }
+      : patch;
+    Object.assign(run, next, { updatedAt: new Date().toISOString() });
     this.projectArtifact(run);
     await this.persist();
     return run;

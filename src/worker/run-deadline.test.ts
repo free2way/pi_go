@@ -48,3 +48,65 @@ describe("run deadline 0/absent = unlimited (COST-002)", () => {
     expect(deadline.exceeded()).toBe(false);
   });
 });
+
+/**
+ * run_50b554e824954ecd: a run kept a positive budget (1800s) from before the
+ * "0 = unlimited" fix, so its original createdAt window had long elapsed and
+ * every human 「继续开发」 bounced straight back to needs_human with
+ * `run.deadline_exceeded`. A `deadlineBaseAt` marker written on human
+ * continue/resume gives the continued round a fresh window.
+ */
+describe("resume window (deadlineBaseAt)", () => {
+  const createdAt = Date.parse("2026-01-01T00:00:00.000Z");
+  const resumedAt = Date.parse("2026-08-01T12:00:00.000Z");
+
+  it("does not expire immediately when the original window already elapsed", () => {
+    const delay = runDeadlineDelayMs({
+      startedAt: resumedAt,
+      createdAt,
+      maxDurationSeconds: 1800,
+      deadlineBaseAt: resumedAt,
+      now: resumedAt,
+    });
+    expect(delay).toBe(1_800_000);
+  });
+
+  it("expires only after a full 1800s window measured from the marker", () => {
+    const base = { startedAt: resumedAt, createdAt, maxDurationSeconds: 1800, deadlineBaseAt: resumedAt };
+    expect(runDeadlineDelayMs({ ...base, now: resumedAt + 900_000 })).toBe(900_000);
+    expect(runDeadlineDelayMs({ ...base, now: resumedAt + 1_799_999 })).toBe(1);
+    expect(runDeadlineDelayMs({ ...base, now: resumedAt + 1_800_000 })).toBe(0);
+    expect(runDeadlineDelayMs({ ...base, now: resumedAt + 1_800_001 })).toBe(0);
+  });
+
+  it("never bounces instantly when the worker claims the job after the marker window elapsed", () => {
+    const lateStart = resumedAt + 3_000_000;
+    const delay = runDeadlineDelayMs({
+      startedAt: lateStart,
+      createdAt: resumedAt,
+      maxDurationSeconds: 1800,
+      deadlineBaseAt: resumedAt,
+      now: lateStart,
+    });
+    expect(delay).toBe(1_800_000);
+  });
+
+  it("stays unlimited for maxDurationSeconds 0 even with a marker", () => {
+    expect(runDeadlineDelayMs({
+      startedAt: resumedAt,
+      createdAt,
+      maxDurationSeconds: 0,
+      deadlineBaseAt: resumedAt,
+      now: resumedAt,
+    })).toBeUndefined();
+  });
+
+  it("keeps the previous behaviour for a stale base without the marker", () => {
+    expect(runDeadlineDelayMs({
+      startedAt: resumedAt,
+      createdAt,
+      maxDurationSeconds: 1800,
+      now: resumedAt,
+    })).toBe(0);
+  });
+});

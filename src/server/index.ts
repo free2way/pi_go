@@ -24,6 +24,9 @@ import { PostgresRunStore } from "./run-store-pg.js";
 import { saveInternalRunArtifact } from "./artifact-api.js";
 import { type ApprovePlan, approveEventMeta, planApprove } from "./approve.js";
 import { conflictReplyFor } from "./request-errors.js";
+import { appendHumanNote } from "./run-notes.js";
+import { resumeDeadlinePatch } from "./run-deadline-base.js";
+import { parseRunSearch, searchRuns } from "./run-search.js";
 import type { RunStoreLike } from "./store.js";
 import { WorkspaceError, WorkspaceService } from "./workspaces.js";
 
@@ -434,7 +437,7 @@ app.get("/api/health", async (_request, reply) => {
   try {
     await pingDatabase();
     alerts.clear("database_unavailable");
-    return { status: "ok", service: "pigo-web", version: "0.21.4", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.21.5", db: "ok" };
   } catch (error) {
     // AT-REL-005: fail loudly instead of pretending the service is healthy.
     alerts.raise({
@@ -443,7 +446,7 @@ app.get("/api/health", async (_request, reply) => {
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
       details: { error: (error as Error).message.slice(0, 200) },
     });
-    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.21.4", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.21.5", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
   }
 });
 
@@ -458,7 +461,7 @@ interface StorageStatus {
 app.get("/api/health/detail", async (request, reply) => {
   const internal = safeTokenMatch(request.headers.authorization);
   if (!internal && !auth.user(request)) return reply.code(401).send({ error: "Unauthorized" });
-  const health: Record<string, unknown> = { version: "0.21.4", at: new Date().toISOString() };
+  const health: Record<string, unknown> = { version: "0.21.5", at: new Date().toISOString() };
   try {
     await pingDatabase();
     health.database = { status: "ok" };
@@ -695,7 +698,16 @@ app.delete<{ Params: { id: string } }>("/api/workspaces/:id", async (request, re
   }
 });
 
-app.get("/api/runs", async (request) => store.listRuns(ownerKeysFor(request)));
+// 需求历史: `?query=` is a case-insensitive substring over title/task/human
+// notes and `?state=` filters by run state; both are optional so callers that
+// omit them get the unchanged owner-scoped, newest-first list. Filtering runs
+// over that owner-scoped list with no additional pagination (the list is
+// already bounded to one owner and rendered client-side).
+app.get<{ Querystring: { query?: string; state?: string } }>("/api/runs", async (request, reply) => {
+  const parsed = parseRunSearch(request.query ?? {});
+  if (!parsed.ok) return reply.code(400).send({ error: "Invalid request", details: [{ message: parsed.error }] });
+  return searchRuns(store.listRuns(ownerKeysFor(request)), parsed.filter);
+});
 
 app.get<{ Params: { id: string } }>("/api/runs/:id", async (request, reply) => {
   const run = store.getRun(request.params.id, ownerKeysFor(request));
@@ -960,6 +972,13 @@ async function dispatchContinueJob(
       round,
       maxRounds: Math.max(run.maxRounds, round),
       summary,
+      // RESUME: fresh deadline window so the continued round is not aborted
+      // against the run's original createdAt window.
+      ...resumeDeadlinePatch(now),
+      // 需求历史: keep the operator's written requirement, not just the event meta.
+      ...(options.note
+        ? { humanNotes: appendHumanNote(run.humanNotes, { at: now, kind: "approve_continue", note: options.note, by: options.userId }) }
+        : {}),
     });
   } catch (error) {
     const conflict = conflictReplyFor(error);
@@ -1029,6 +1048,9 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/approve", async (request, re
       approvedAt: now,
       approvedBy: user.id,
       summary: note ? `人工审批通过：${note}` : "人工审批通过，交付已确认",
+      ...(note
+        ? { humanNotes: appendHumanNote(run.humanNotes, { at: now, kind: "approve_accept", note, by: user.id }) }
+        : {}),
     });
   } catch (error) {
     const conflict = conflictReplyFor(error);
@@ -1063,6 +1085,9 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/reject", async (request, rep
     updated = await store.updateRun(run.id, {
       state: "cancelled",
       summary: reason ? `人工拒绝交付：${reason}` : "人工拒绝交付，任务已终止",
+      ...(reason
+        ? { humanNotes: appendHumanNote(run.humanNotes, { at: now, kind: "reject", note: reason, by: user.id }) }
+        : {}),
     });
   } catch (error) {
     const conflict = conflictReplyFor(error);
@@ -1250,9 +1275,26 @@ async function dispatchFollowupJob(
 
   const instruction = options.kind === "resume" ? options.instruction?.trim() : undefined;
   const round = options.kind === "resume" ? run.round + 1 : run.round;
+  const noteAt = new Date().toISOString();
   const updated = await store.updateRun(run.id, options.kind === "resume"
-    ? { state: "queued", round, maxRounds: Math.max(run.maxRounds, round), summary: "人工恢复：等待 Worker 接收" }
-    : { state: "reviewing", summary: "人工触发：重新审核中" });
+    ? {
+        state: "queued",
+        round,
+        maxRounds: Math.max(run.maxRounds, round),
+        summary: "人工恢复：等待 Worker 接收",
+        // RESUME: fresh deadline window for the resumed round (see run-deadline-base).
+        ...resumeDeadlinePatch(noteAt),
+        // 需求历史: the resume instruction is the operator's written requirement.
+        ...(instruction
+          ? { humanNotes: appendHumanNote(run.humanNotes, { at: noteAt, kind: "resume", note: instruction, by: auth.user(request).id }) }
+          : {}),
+      }
+    : {
+        state: "reviewing",
+        summary: "人工触发：重新审核中",
+        // 同一类问题：窗口已过的任务重试审核时也会秒超时，一并给新窗口。
+        ...resumeDeadlinePatch(noteAt),
+      });
   await store.appendEvent({
     runId: run.id,
     round,

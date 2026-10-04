@@ -1563,6 +1563,9 @@ async function executeJob(input: JobInput, controller: AbortController) {
     startedAt: started,
     createdAt: new Date(run.createdAt).getTime(),
     maxDurationSeconds: runLimits.maxDurationSeconds,
+    // RESUME: a human continue/resume stamps a fresh window base so the round is
+    // not aborted against the original createdAt window that already elapsed.
+    deadlineBaseAt: run.deadlineBaseAt ? new Date(run.deadlineBaseAt).getTime() : undefined,
   }, () => {
     deadlineExceeded = true;
     controller.abort();

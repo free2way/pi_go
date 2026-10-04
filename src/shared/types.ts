@@ -54,6 +54,20 @@ export interface RunEvent {
   meta?: Record<string, unknown>;
 }
 
+/** The human action a stored requirement note came from. */
+export type HumanNoteKind = "approve_continue" | "approve_accept" | "resume" | "reject";
+
+/**
+ * A durable, human-authored note attached to a run (approve note, resume
+ * instruction, reject reason). Distinct from event `meta`, which stays as-is.
+ */
+export interface HumanNote {
+  at: string;
+  kind: HumanNoteKind;
+  note: string;
+  by?: string;
+}
+
 export type WorkloadSize = "small" | "medium" | "large";
 
 export interface SubAgentTask {
@@ -134,11 +148,26 @@ export interface Run {
   credentialVersions?: { developer?: string; reviewer?: string };
   /** GAP-01: workflow/prompt/plugin policy snapshot used for this run. */
   pipelineVersion?: string;
+  /**
+   * RESUME: ISO timestamp stamped whenever a human continues/resumes a run. The
+   * worker measures the next round's `maxDurationSeconds` window from
+   * `max(deadlineBaseAt, startedAt, createdAt)`, so a run whose original window
+   * already elapsed gets a fresh budget instead of bouncing to needs_human with
+   * `run.deadline_exceeded`. Additive and backward compatible — runs written
+   * before this field exist without it (initial-round semantics unchanged).
+   */
+  deadlineBaseAt?: string;
   /** AUD-10: calls whose provider usage could not be determined. */
   usageUnknownCalls?: number;
   /** GAP-04: human approval of the delivered worktree. */
   approvedAt?: string;
   approvedBy?: string;
+  /**
+   * 需求历史: durable human notes (approve/resume/reject) written on this run.
+   * Additive and backward compatible — runs written before this field exist
+   * without it and must be treated as an empty array.
+   */
+  humanNotes?: HumanNote[];
 }
 
 export interface RunUsage {

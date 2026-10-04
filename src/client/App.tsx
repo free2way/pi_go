@@ -29,6 +29,7 @@ import {
   FolderGit2,
   GitBranch,
   GitPullRequestArrow,
+  History,
   KeyRound,
   ListChecks,
   LoaderCircle,
@@ -51,6 +52,8 @@ import {
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ConfigStatus, CurrentUser, Finding, ModelCatalogResponse, Run, RunArtifact, RunEvent, RunMode, RunRoleUsage, RunState, Workspace } from "../shared/types";
 import { api } from "./api";
+import { HistoryPage } from "./HistoryPage";
+import { runStateLabels, requirementSummary } from "./requirement-history";
 import { MAX_BUFFERED_EVENTS, mergeRunEvents, shouldAcceptRun } from "./run-events";
 import { ModelsPage } from "./ModelsPage";
 import { WorkspacesPage } from "./WorkspacesPage";
@@ -65,18 +68,6 @@ type FlowNodeData = {
 };
 
 const terminalStates: RunState[] = ["completed", "needs_human", "failed", "cancelled"];
-
-const stateLabels: Record<RunState, string> = {
-  queued: "排队中",
-  preparing: "准备工作区",
-  developing: "开发中",
-  checking: "检查中",
-  reviewing: "审核中",
-  completed: "已通过",
-  needs_human: "需要人工处理",
-  failed: "失败",
-  cancelled: "已取消",
-};
 
 const stateOrder: Record<RunState, number> = {
   queued: 0,
@@ -214,7 +205,7 @@ function Logo() {
 }
 
 function StatusPill({ state }: { state: RunState }) {
-  return <span className={`status-pill status-${state}`}><i />{stateLabels[state]}</span>;
+  return <span className={`status-pill status-${state}`}><i />{runStateLabels[state]}</span>;
 }
 
 function ProviderStatus({ label, provider, model, ready, icon: Icon }: {
@@ -233,11 +224,12 @@ function ProviderStatus({ label, provider, model, ready, icon: Icon }: {
   );
 }
 
-function CreateRunDialog({ open, onClose, onCreated, config, onGoWorkspaces }: {
+function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, onGoWorkspaces }: {
   open: boolean;
   onClose: () => void;
   onCreated: (run: Run) => void;
   config?: ConfigStatus;
+  recentRuns: Run[];
   onGoWorkspaces: () => void;
 }) {
   const [title, setTitle] = useState("修复并发刷新竞态");
@@ -369,6 +361,25 @@ function CreateRunDialog({ open, onClose, onCreated, config, onGoWorkspaces }: {
           )
         ) : <label>仓库<input value={repository} onChange={(event) => setRepository(event.target.value)} /></label>}
         <label>需求与验收条件<textarea rows={5} value={task} onChange={(event) => setTask(event.target.value)} /></label>
+        {recentRuns.length > 0 && (
+          <div className="recent-requirements">
+            <span className="eyebrow">最近需求 · 点击填入</span>
+            <div className="recent-list">
+              {recentRuns.slice(0, 5).map((item) => (
+                <button
+                  type="button"
+                  className="recent-item"
+                  key={item.id}
+                  title={requirementSummary(item.task, 300)}
+                  onClick={() => { setTitle(item.title); setTask(item.task); }}
+                >
+                  <strong>{item.title}</strong>
+                  <small>{requirementSummary(item.task, 70)}</small>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
         {mode === "real" && <label>检查命令（每行一个）<textarea rows={3} value={checks} onChange={(event) => setChecks(event.target.value)} placeholder="npm test" /></label>}
         {error && <div className="form-error">{error}</div>}
         <div className="modal-actions">
@@ -624,7 +635,7 @@ export function App() {
   const [config, setConfig] = useState<ConfigStatus>();
   const [user, setUser] = useState<CurrentUser>();
   const [tab, setTab] = useState<Tab>("activity");
-  const [view, setView] = useState<"run" | "workspaces" | "models">("run");
+  const [view, setView] = useState<"run" | "workspaces" | "models" | "history">("run");
   const [createOpen, setCreateOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -729,6 +740,7 @@ export function App() {
         <button className="new-run" onClick={() => setCreateOpen(true)}><Plus size={17} />新建任务<span>⌘ K</span></button>
         <nav className="primary-nav">
           <button type="button" className={view === "run" ? "active" : ""} onClick={() => setView("run")}><GitBranch size={16} />工作流</button>
+          <button type="button" className={view === "history" ? "active" : ""} onClick={() => setView("history")}><History size={16} />需求历史</button>
           <button type="button" className={view === "workspaces" ? "active" : ""} onClick={() => setView("workspaces")}><FolderGit2 size={16} />工作区</button>
           <button type="button" className={view === "models" ? "active" : ""} onClick={() => setView("models")}><Cpu size={16} />模型与凭据</button>
           <a href="#system"><Activity size={16} />运行状态</a>
@@ -767,7 +779,9 @@ export function App() {
               ? <><span>WORKSPACES</span><ChevronRight size={13} /><strong>工作区</strong></>
               : view === "models"
                 ? <><span>MODELS</span><ChevronRight size={13} /><strong>模型与凭据</strong></>
-                : <><span>WORKFLOWS</span><ChevronRight size={13} /><strong>{run?.id.slice(0, 12) || "OVERVIEW"}</strong></>}
+                : view === "history"
+                  ? <><span>HISTORY</span><ChevronRight size={13} /><strong>需求历史</strong></>
+                  : <><span>WORKFLOWS</span><ChevronRight size={13} /><strong>{run?.id.slice(0, 12) || "OVERVIEW"}</strong></>}
           </div>
           <div className="topbar-actions">
             {view === "run" && (run?.mode === "demo" ? <span className="demo-chip"><Sparkles size={13} />演示数据</span> : run && <span className="demo-chip real-chip"><Code2 size={13} />真实工作区</span>)}
@@ -780,6 +794,8 @@ export function App() {
           <ModelsPage config={config} onChanged={() => { void api.config().then(setConfig); }} />
         ) : view === "workspaces" ? (
           <WorkspacesPage config={config} runs={runs} onOpenCredentials={() => setView("models")} />
+        ) : view === "history" ? (
+          <HistoryPage runs={runs} onOpenRun={(id) => { setSelectedId(id); setView("run"); setSidebarOpen(false); }} />
         ) : !run ? (
           <section className="welcome-state">
             <div className="welcome-orbit"><div><Bot size={32} /></div><i /><i /><i /></div>
@@ -810,7 +826,7 @@ export function App() {
             )}
 
             <section className="metrics-grid">
-              <div className="metric"><span><Activity size={14} />状态</span><strong>{stateLabels[run.state]}</strong><small>{running} 个任务运行中</small></div>
+              <div className="metric"><span><Activity size={14} />状态</span><strong>{runStateLabels[run.state]}</strong><small>{running} 个任务运行中</small></div>
               <div className="metric"><span><Clock3 size={14} />耗时</span><strong>{formatDuration(run.durationMs)}</strong><small>端到端执行时间</small></div>
               <div className="metric"><span><Braces size={14} />Tokens</span><strong>{compactNumber(run.usage.inputTokens + run.usage.outputTokens)}</strong><small>输入 {compactNumber(run.usage.inputTokens)} · 输出 {compactNumber(run.usage.outputTokens)}</small></div>
               <div className="metric"><span><Zap size={14} />估算成本</span><strong>${run.usage.estimatedCost.toFixed(3)}</strong><small>{run.mode === "demo" ? "演示估算值" : "当前统计值"}</small></div>
@@ -854,7 +870,7 @@ export function App() {
           </div>
         )}
       </main>
-      <CreateRunDialog open={createOpen} onClose={() => setCreateOpen(false)} onCreated={handleCreated} config={config} onGoWorkspaces={() => { setCreateOpen(false); setView("workspaces"); }} />
+      <CreateRunDialog open={createOpen} onClose={() => setCreateOpen(false)} onCreated={handleCreated} config={config} recentRuns={runs} onGoWorkspaces={() => { setCreateOpen(false); setView("workspaces"); }} />
     </div>
   );
 }

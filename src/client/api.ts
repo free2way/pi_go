@@ -1,4 +1,4 @@
-import type { ConfigStatus, CredentialStatus, CurrentUser, ModelCatalogResponse, ModelSelection, Run, RunArtifact, RunEvent, Workspace } from "../shared/types";
+import type { ConfigStatus, CredentialStatus, CurrentUser, ModelCatalogResponse, ModelSelection, Run, RunArtifact, RunEvent, RunState, Workspace } from "../shared/types";
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -37,7 +37,13 @@ export const api = {
   patchWorkspace: (id: string, body: { defaultChecks?: string[]; defaultBranch?: string }) =>
     request<Workspace>(`/api/workspaces/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   unregisterWorkspace: (id: string) => request<void>(`/api/workspaces/${id}`, { method: "DELETE" }),
-  runs: () => request<Run[]>("/api/runs"),
+  runs: (params: { query?: string; state?: RunState } = {}) => {
+    const search = new URLSearchParams();
+    if (params.query?.trim()) search.set("query", params.query.trim());
+    if (params.state) search.set("state", params.state);
+    const suffix = search.toString();
+    return request<Run[]>(`/api/runs${suffix ? `?${suffix}` : ""}`);
+  },
   run: (id: string) => request<Run>(`/api/runs/${id}`),
   events: (id: string) => request<RunEvent[]>(`/api/runs/${id}/events`),
   artifacts: (id: string) => request<{ artifacts: RunArtifact[] }>(`/api/runs/${id}/artifacts`),
