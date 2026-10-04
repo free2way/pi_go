@@ -39,7 +39,32 @@ export function parseConflictingPaths(output: string | null | undefined, limit =
   return [...paths].filter(Boolean).slice(0, limit);
 }
 
-export interface MergeConflictReply {
+/**
+ * R: the workspace-restore state the worker reports on a failed merge. Forwarded
+ * verbatim so the UI can distinguish "restored to the original branch" from
+ * "restore failed, needs a human". Absent fields stay absent (never fabricated).
+ */
+export interface MergeRestoreFields {
+  restored?: boolean;
+  restoreError?: string;
+}
+
+/** Narrows an untrusted merge failure payload into the two restore fields. */
+export function mergeRestoreFields(input: { restored?: unknown; restoreError?: unknown }): MergeRestoreFields {
+  const fields: MergeRestoreFields = {};
+  if (typeof input.restored === "boolean") fields.restored = input.restored;
+  if (typeof input.restoreError === "string" && input.restoreError.trim()) fields.restoreError = input.restoreError;
+  return fields;
+}
+
+/** Human-readable line for the run detail's merge/approve area. */
+export function describeMergeRestore(input: MergeRestoreFields): string | undefined {
+  if (input.restored === true) return "工作区已恢复原分支";
+  if (input.restored === false) return `工作区恢复失败，需人工处理${input.restoreError ? `：${input.restoreError}` : ""}`;
+  return undefined;
+}
+
+export interface MergeConflictReply extends MergeRestoreFields {
   status: 409;
   code: "MERGE_CONFLICT";
   message: string;
@@ -47,13 +72,14 @@ export interface MergeConflictReply {
 }
 
 /** Client-visible shape of a refused merge (workspace left untouched). */
-export function mergeConflictReply(paths: string[]): MergeConflictReply {
+export function mergeConflictReply(paths: string[], detail: MergeRestoreFields = {}): MergeConflictReply {
   const conflictingPaths = [...new Set(paths.filter(Boolean))].slice(0, 50);
   return {
     status: 409,
     code: "MERGE_CONFLICT",
     message: `合并存在冲突（${conflictingPaths.length} 个文件），已中止且未修改工作区：${conflictingPaths.slice(0, 5).join("、")}`,
     conflictingPaths,
+    ...mergeRestoreFields(detail),
   };
 }
 
@@ -67,4 +93,4 @@ export interface MergeOutcome {
 
 export type MergeResult =
   | MergeOutcome
-  | { ok: false; code: string; error: string; conflictingPaths?: string[] };
+  | ({ ok: false; code: string; error: string; conflictingPaths?: string[] } & MergeRestoreFields);

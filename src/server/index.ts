@@ -33,7 +33,7 @@ import { buildAcceptanceSnapshot } from "./acceptance.js";
 import { batchItemFailure, batchItemSuccess, parseBatchRunIds, summarizeBatch, MAX_BATCH_RUN_IDS, type BatchItemOutcome } from "./batch-runs.js";
 import { buildDeploymentStatus, parseDeployLog, resolveDeployLogPath, type DeploymentStatus } from "./deployments.js";
 import { FAILURE_SCAN_LIMIT, USAGE_RUN_SCAN_LIMIT, buildSystemStatus, utcDayStart, type DeploymentInfo, type FailureEventRow, type StateCountRow, type SystemStatusInput, type TodayRunRow } from "./system-status.js";
-import { mergeConflictReply, type MergeResult } from "../shared/merge.js";
+import { mergeConflictReply, mergeRestoreFields, type MergeResult } from "../shared/merge.js";
 import { buildDeployHookPayload, planMergeGate, planPostMergeDeploy, type MergeRecord, type PostMergeDeployPlan } from "./run-merge.js";
 import { coordinateApprovedMerge, replayPendingMerge } from "./merge-approval.js";
 import { buildMergeRequestPayload, mergeRequestUnavailable, patchFileName, resolveMergeRequestConfig, selectPatch, type PatchSelection } from "./run-patch.js";
@@ -539,7 +539,7 @@ app.get("/api/health", async (_request, reply) => {
   try {
     await pingDatabase();
     alerts.clear("database_unavailable");
-    return { status: "ok", service: "pigo-web", version: "0.23.0", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.23.1", db: "ok" };
   } catch (error) {
     // AT-REL-005: fail loudly instead of pretending the service is healthy.
     alerts.raise({
@@ -548,7 +548,7 @@ app.get("/api/health", async (_request, reply) => {
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
       details: { error: (error as Error).message.slice(0, 200) },
     });
-    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.23.0", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.23.1", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
   }
 });
 
@@ -563,7 +563,7 @@ interface StorageStatus {
 app.get("/api/health/detail", async (request, reply) => {
   const internal = safeTokenMatch(request.headers.authorization);
   if (!internal && !auth.user(request)) return reply.code(401).send({ error: "Unauthorized" });
-  const health: Record<string, unknown> = { version: "0.23.0", at: new Date().toISOString() };
+  const health: Record<string, unknown> = { version: "0.23.1", at: new Date().toISOString() };
   try {
     await pingDatabase();
     health.database = { status: "ok" };
@@ -908,7 +908,7 @@ app.post("/api/workspaces/create", async (request, reply) => {
 app.get<{ Params: { id: string } }>("/api/workspaces/:id", async (request, reply) => {
   if (!workspacesEnabled) return workspacesDisabled(reply);
   try {
-    return await workspaces.get(ownerKeysFor(request), request.params.id);
+    return await workspaces.get(ownerKeysFor(request), request.params.id, { isAdmin: await identities.isAdmin(auth.user(request).id) });
   } catch (error) {
     return workspaceErrorReply(reply, error);
   }
@@ -917,7 +917,8 @@ app.get<{ Params: { id: string } }>("/api/workspaces/:id", async (request, reply
 app.post<{ Params: { id: string } }>("/api/workspaces/:id/refresh", async (request, reply) => {
   if (!workspacesEnabled) return workspacesDisabled(reply);
   try {
-    return await workspaces.refresh(ownerKeysFor(request), request.params.id);
+    // B4: refreshing git metadata mutates stored state, so a read grant is refused.
+    return await workspaces.refresh(ownerKeysFor(request), request.params.id, { isAdmin: await identities.isAdmin(auth.user(request).id) });
   } catch (error) {
     return workspaceErrorReply(reply, error);
   }
@@ -928,7 +929,7 @@ app.patch<{ Params: { id: string } }>("/api/workspaces/:id", async (request, rep
   const parsed = workspacePatchSchema.safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
   try {
-    return await workspaces.patch(ownerKeysFor(request), request.params.id, parsed.data);
+    return await workspaces.patch(ownerKeysFor(request), request.params.id, parsed.data, { isAdmin: await identities.isAdmin(auth.user(request).id) });
   } catch (error) {
     return workspaceErrorReply(reply, error);
   }
@@ -937,7 +938,8 @@ app.patch<{ Params: { id: string } }>("/api/workspaces/:id", async (request, rep
 app.delete<{ Params: { id: string } }>("/api/workspaces/:id", async (request, reply) => {
   if (!workspacesEnabled) return workspacesDisabled(reply);
   try {
-    await workspaces.unregister(ownerKeysFor(request), request.params.id);
+    // B4: only the owner, an admin or a write grant may unregister.
+    await workspaces.unregister(ownerKeysFor(request), request.params.id, { isAdmin: await identities.isAdmin(auth.user(request).id) });
     return reply.code(204).send();
   } catch (error) {
     return workspaceErrorReply(reply, error);
@@ -1128,9 +1130,12 @@ app.post("/api/runs", async (request, reply) => {
   if (!creationLimit.allowed) return tooManyRequests(reply, creationLimit.retryAfterMs);
   if (parsed.data.mode === "real") {
     // WS-008: real runs may only target the user's own registered, healthy workspaces.
+    // B4: a read grant may start a run against a shared workspace, so the
+    // preflight refresh is allowed for read access too (the general refresh route
+    // still requires write).
     let workspace: Workspace;
     try {
-      workspace = await workspaces.refresh(ownerKeysFor(request), parsed.data.workspaceId!);
+      workspace = await workspaces.refresh(ownerKeysFor(request), parsed.data.workspaceId!, { isAdmin: await identities.isAdmin(user.id), allowRead: true });
     } catch (error) {
       return workspaceErrorReply(reply, error);
     }
@@ -1443,11 +1448,20 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/approve", async (request, re
     });
     if (outcome.kind === "conflict") return reply.code(outcome.status).send({ error: outcome.message, code: outcome.code });
     if (outcome.kind === "worker-error") {
+      // R: forward the workspace-restore state (`restored`/`restoreError`) on
+      // every merge failure, not just conflicts, so the UI can tell the operator
+      // whether the workspace is back on its pre-merge branch or needs manual care.
       if (outcome.code === "MERGE_CONFLICT") {
-        const conflict = mergeConflictReply(outcome.conflictingPaths ?? []);
-        return reply.code(conflict.status).send({ error: conflict.message, code: conflict.code, conflictingPaths: conflict.conflictingPaths });
+        const restore = mergeRestoreFields(outcome);
+        const conflict = mergeConflictReply(outcome.conflictingPaths ?? [], restore);
+        return reply.code(conflict.status).send({
+          error: conflict.message,
+          code: conflict.code,
+          conflictingPaths: conflict.conflictingPaths,
+          ...restore,
+        });
       }
-      return reply.code(outcome.status).send({ error: outcome.error, code: outcome.code });
+      return reply.code(outcome.status).send({ error: outcome.error, code: outcome.code, ...mergeRestoreFields(outcome) });
     }
     if (outcome.kind === "record-failed") {
       // The worker already merged: the durable `committed_unrecorded` intent
@@ -1614,6 +1628,9 @@ const cleanupSchema = z.object({
   olderThanDays: z.number().min(0).max(3_650).optional(),
   scope: z.enum(["own", "all"]).default("own"),
   dryRun: z.boolean().default(false),
+  // B6: explicit on-disk intent. Defaults to true because that has been the
+  // server behavior since v0.22 (the UI wording was the stale part).
+  deleteRunDirectory: z.boolean().default(true),
 });
 
 app.post("/api/runs/cleanup", async (request, reply) => {
@@ -1643,10 +1660,10 @@ app.post("/api/runs/cleanup", async (request, reply) => {
     return true;
   });
   if (parsed.data.dryRun) {
-    const storage = await Promise.all(
-      matched.map((run) => cleanupRunDirectory(run, { dryRun: true, cleaner: runDirectoryCleaner })),
-    );
-    return { dryRun: true, matched: matched.length, runIds: matched.map((run) => run.id), storage };
+    const storage = parsed.data.deleteRunDirectory
+      ? await Promise.all(matched.map((run) => cleanupRunDirectory(run, { dryRun: true, cleaner: runDirectoryCleaner })))
+      : matched.map((run) => keptRunStorageOutcome(run.id, "未请求删除运行目录（deleteRunDirectory=false）"));
+    return { dryRun: true, deleteRunDirectory: parsed.data.deleteRunDirectory, matched: matched.length, runIds: matched.map((run) => run.id), storage };
   }
   const deleted: string[] = [];
   const storage: Awaited<ReturnType<typeof cleanupRunDirectory>>[] = [];
@@ -1661,10 +1678,12 @@ app.post("/api/runs/cleanup", async (request, reply) => {
     }
     // Best-effort on-disk cleanup after the records are gone: a worker that is
     // unreachable (or refuses an unsafe path) only marks the run as kept.
-    storage.push(await cleanupRunDirectory(run, { dryRun: false, cleaner: runDirectoryCleaner }));
+    storage.push(parsed.data.deleteRunDirectory
+      ? await cleanupRunDirectory(run, { dryRun: false, cleaner: runDirectoryCleaner })
+      : keptRunStorageOutcome(run.id, "未请求删除运行目录（deleteRunDirectory=false）"));
   }
   if (deleted.length > 0) app.log.info({ actor: user.id, deleted }, "cleaned up finished runs");
-  return { dryRun: false, deleted: deleted.length, runIds: deleted, matched: matched.length, storage };
+  return { dryRun: false, deleteRunDirectory: parsed.data.deleteRunDirectory, deleted: deleted.length, runIds: deleted, matched: matched.length, storage };
 });
 
 /**
@@ -1678,6 +1697,9 @@ const batchSchema = z.object({
   runIds: z.array(z.string().trim().min(1).max(120)).max(MAX_BATCH_RUN_IDS),
   note: z.string().trim().max(2_000).optional(),
   acknowledgeOpenFindings: z.boolean().optional(),
+  // B6: explicit on-disk intent for cleanup. Defaults to true (today's behavior);
+  // `false` keeps the run directory/worktree on the server.
+  deleteRunDirectory: z.boolean().default(true),
 });
 
 app.post("/api/runs/batch", async (request, reply) => {
@@ -1704,11 +1726,15 @@ app.post("/api/runs/batch", async (request, reply) => {
       }
       try {
         await store.deleteRun(run.id);
-        await cleanupRunDirectory(run, { dryRun: false, cleaner: runDirectoryCleaner });
-        outcomes.push(batchItemSuccess(id, run.state));
       } catch (error) {
-        outcomes.push(batchItemFailure(id, 500, undefined, (error as Error).message));
+        // Records could not be removed, so the directory was never touched.
+        outcomes.push(batchItemFailure(id, 500, undefined, (error as Error).message, "kept"));
+        continue;
       }
+      const storage = parsed.data.deleteRunDirectory
+        ? (await cleanupRunDirectory(run, { dryRun: false, cleaner: runDirectoryCleaner })).outcome
+        : "kept";
+      outcomes.push(batchItemSuccess(id, run.state, storage));
       continue;
     }
 

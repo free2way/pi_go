@@ -59,10 +59,12 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { chatChannelLabels, chatCounts, chatMessageView, chatMessagesFromEvents, chatParticipantLabels, chatTabs, filterChatMessages, isReviewMessage, messageFindings, reworkBranchDetails, reworkBranchRounds, type ChatTab, type ReworkBranchDetail } from "../shared/chat";
+import { describeMergeRestore, mergeRestoreFields } from "../shared/merge";
 import type { ChatMessage, ConfigStatus, CurrentUser, Finding, ModelCatalogResponse, Run, RunArtifact, RunEvent, RunMode, RunRoleUsage, RunState, Workspace } from "../shared/types";
 import { api, type DeploymentStatus } from "./api";
 import { HistoryPage } from "./HistoryPage";
 import { runStateLabels, requirementSummary } from "./requirement-history";
+import { batchCleanupConfirmMessage, cleanupFinishedConfirmMessage, cleanupStorageDetailLines, summarizeCleanupStorage } from "./run-cleanup-view";
 import { MAX_BUFFERED_EVENTS, mergeRunEvents, shouldAcceptRun } from "./run-events";
 import { createRunSelectionGuard, eventsForRun, isRunSelected, pickSelectedRun } from "./run-selection";
 import { ModelsPage } from "./ModelsPage";
@@ -932,16 +934,28 @@ function EmptyPanel({ icon: Icon, text }: { icon: typeof Activity; text: string 
   return <div className="empty-panel"><Icon size={22} /><span>{text}</span></div>;
 }
 
-function HumanInterventionPanel({ run, onUpdated }: { run: Run; onUpdated: (run: Run) => void }) {
+function HumanInterventionPanel({ run, events, onUpdated }: { run: Run; events: RunEvent[]; onUpdated: (run: Run) => void }) {
   const [instruction, setInstruction] = useState("");
   const [busy, setBusy] = useState<"" | "resume" | "review" | "terminate" | "continue" | "approve" | "reject">("");
   const [error, setError] = useState("");
+  const [mergeNotice, setMergeNotice] = useState("");
   // A2: admin-only merge on accept; the server enforces the admin check.
   const [mergeIntoWorkspace, setMergeIntoWorkspace] = useState(false);
   const unresolved = run.findings.filter((item) => !item.resolved).length;
+  // R: the latest merge failure's restore state, so the line survives a reload
+  // (the worker records `run.merge_failed` with `restored`/`restoreError`).
+  const eventNotice = useMemo(() => {
+    const failure = [...events].reverse().find((event) => event.type === "run.merge_failed");
+    return failure
+      ? describeMergeRestore(mergeRestoreFields({ restored: failure.meta?.restored, restoreError: failure.meta?.restoreError }))
+      : undefined;
+  }, [events]);
+  const restoreNotice = mergeNotice || eventNotice;
+  const restoreFailed = restoreNotice?.startsWith("工作区恢复失败") ?? false;
 
   const act = async (kind: "resume" | "review" | "terminate" | "continue" | "approve" | "reject") => {
     setError("");
+    setMergeNotice("");
     if (kind === "terminate" && !window.confirm(`终止任务「${run.title}」？\n\n任务会标记为已取消；代码与 worktree 全部保留，不会自动合并。`)) return;
     if (kind === "reject" && !window.confirm(`拒绝任务「${run.title}」的交付？\n\n任务将标记为已取消；代码与 worktree 全部保留。`)) return;
     if (kind === "approve" && !window.confirm(
@@ -969,7 +983,11 @@ function HumanInterventionPanel({ run, onUpdated }: { run: Run; onUpdated: (run:
         onUpdated(await api.cancelRun(run.id));
       }
     } catch (cause) {
-      setError((cause as Error).message);
+      const failure = cause as Error & { body?: Record<string, unknown> };
+      setError(failure.message);
+      // R: surface the workspace-restore state even before the event list refreshes.
+      const immediate = describeMergeRestore(mergeRestoreFields({ restored: failure.body?.restored, restoreError: failure.body?.restoreError }));
+      if (immediate) setMergeNotice(immediate);
     } finally {
       setBusy("");
     }
@@ -991,6 +1009,7 @@ function HumanInterventionPanel({ run, onUpdated }: { run: Run; onUpdated: (run:
         <input type="checkbox" checked={mergeIntoWorkspace} onChange={(event) => setMergeIntoWorkspace(event.target.checked)} disabled={Boolean(busy)} />
         审批通过后合并到工作区默认分支（仅管理员；冲突会被拒绝且不修改工作区）
       </label>
+      {restoreNotice && <div className={`merge-notice ${restoreFailed ? "merge-notice-warn" : ""}`}>{restoreNotice}</div>}
       {error && <div className="form-error">{error}</div>}
       <div className="human-actions">
         <button type="button" className="button primary" disabled={Boolean(busy)} onClick={() => void act("continue")}>
@@ -1040,6 +1059,9 @@ export function App() {
   // B3: run ids selected for a batch operation.
   const [batchSelected, setBatchSelected] = useState<Set<string>>(new Set());
   const [batchBusy, setBatchBusy] = useState(false);
+  // B6: explicit on-disk intent for batch cleanup; checked by default (matches
+  // the server's long-standing behavior of deleting the run directory).
+  const [batchDeleteRunDirectory, setBatchDeleteRunDirectory] = useState(true);
 
   const refreshRuns = useCallback(async () => {
     const next = await api.runs();
@@ -1161,9 +1183,11 @@ export function App() {
   };
 
   const handleCleanup = async () => {
-    if (!window.confirm("清理 7 天前已结束（通过/失败/取消/需人工）的任务？\n\n任务记录、事件与制品会一并删除；worktree 保留在服务器。")) return;
+    // B6: state exactly what is removed. The server deletes the run directory by
+    // default, so the old "worktree 保留" wording was wrong.
+    if (!window.confirm(cleanupFinishedConfirmMessage({ olderThanDays: 7, deleteRunDirectory: true }))) return;
     try {
-      const result = await api.cleanupRuns({ olderThanDays: 7 });
+      const result = await api.cleanupRuns({ olderThanDays: 7, deleteRunDirectory: true });
       await refreshRuns();
       window.alert(`已清理 ${result.deleted ?? 0} 个已结束任务。`);
     } catch (cause) {
@@ -1212,18 +1236,22 @@ export function App() {
     const ids = selected.map((item) => item.id);
     if (ids.length === 0) return;
     if (action === "cleanup") {
-      if (!window.confirm(`清理选中的 ${ids.length} 个已结束任务？\n\n任务记录、事件与制品会一并删除；worktree 保留在服务器。`)) return;
+      if (!window.confirm(batchCleanupConfirmMessage({ count: ids.length, deleteRunDirectory: batchDeleteRunDirectory }))) return;
     } else if (action === "accept") {
       const openCount = selected.reduce((total, item) => total + item.findings.filter((finding) => !finding.resolved).length, 0);
       if (!window.confirm(`批量接受 ${ids.length} 个任务的交付？${openCount > 0 ? `\n\n其中共有 ${openCount} 条未解决意见将被记录为已知接受。` : ""}`)) return;
     } else if (!window.confirm(`将选中的 ${ids.length} 个任务退回开发再跑一轮？`)) return;
     setBatchBusy(true);
     try {
-      const summary = await api.batchRuns({ action, runIds: ids, acknowledgeOpenFindings: true });
+      const summary = await api.batchRuns({ action, runIds: ids, acknowledgeOpenFindings: true, deleteRunDirectory: action === "cleanup" ? batchDeleteRunDirectory : undefined });
       await refreshRuns();
       const failed = summary.results.filter((result) => !result.ok);
       const label = action === "accept" ? "接受交付" : action === "continue" ? "继续开发" : "清理";
-      window.alert(`批量${label}完成：成功 ${summary.succeeded}，失败 ${summary.failed}${failed.length ? `\n${failed.slice(0, 5).map((result) => `${result.runId.slice(0, 12)}：${result.error ?? result.code ?? "失败"}`).join("\n")}` : ""}`);
+      // B6: the cleanup summary reports each run's on-disk outcome.
+      const storage = action === "cleanup"
+        ? `\n${summarizeCleanupStorage(summary.results)}${summary.results.length ? `\n${cleanupStorageDetailLines(summary.results).join("\n")}` : ""}`
+        : "";
+      window.alert(`批量${label}完成：成功 ${summary.succeeded}，失败 ${summary.failed}${storage}${failed.length ? `\n${failed.slice(0, 5).map((result) => `${result.runId.slice(0, 12)}：${result.error ?? result.code ?? "失败"}`).join("\n")}` : ""}`);
       setBatchSelected(new Set());
     } catch (cause) {
       window.alert(`批量操作失败：${(cause as Error).message}`);
@@ -1251,6 +1279,10 @@ export function App() {
             <span>已选 {batchSelected.size} 个</span>
             <button type="button" className="button secondary" disabled={batchBusy} onClick={() => void handleBatch("accept")}>接受交付</button>
             <button type="button" className="button secondary" disabled={batchBusy} onClick={() => void handleBatch("continue")}>继续开发</button>
+            <label className="batch-cleanup-option" title="选中后，清理会同时删除服务器上的运行目录/worktree；取消勾选则只删除运行记录与制品。">
+              <input type="checkbox" checked={batchDeleteRunDirectory} disabled={batchBusy} onChange={(event) => setBatchDeleteRunDirectory(event.target.checked)} />
+              清理时删除运行目录
+            </label>
             <button type="button" className="button danger-text" disabled={batchBusy} onClick={() => void handleBatch("cleanup")}>清理</button>
             <button type="button" className="button secondary" disabled={batchBusy} onClick={() => setBatchSelected(new Set())}>取消</button>
           </div>
@@ -1349,6 +1381,7 @@ export function App() {
             {activeRun.state === "needs_human" && (
               <HumanInterventionPanel
                 run={activeRun}
+                events={events}
                 onUpdated={(next) => {
                   setRun(next);
                   setRuns((current) => current.map((item) => (item.id === next.id ? next : item)));

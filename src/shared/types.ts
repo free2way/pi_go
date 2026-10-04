@@ -504,6 +504,9 @@ export interface WorkspaceGitInfo {
   dirtyFiles: string[];
 }
 
+/** B4: what the *calling* user may do with a workspace. */
+export type WorkspacePermission = "read" | "write";
+
 export interface Workspace {
   id: string;
   ownerId: string;
@@ -520,6 +523,12 @@ export interface Workspace {
   lastCheckedAt: string | null;
   createdAt: string;
   updatedAt: string;
+  /**
+   * B4: the caller's permission on this workspace — `write` for the owner/an
+   * admin or a write grant, `read` for a read-only grant. Mutating routes reject
+   * `read` with `WORKSPACE_READ_ONLY`.
+   */
+  permission: WorkspacePermission;
 }
 
 export interface WorkspaceVerifyResult {

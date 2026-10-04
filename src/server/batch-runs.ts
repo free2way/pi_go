@@ -24,6 +24,9 @@ export function parseBatchRunIds(value: unknown): BatchResult {
   return { ok: true, ids };
 }
 
+/** B6: on-disk run directory fate after a cleanup action. */
+export type BatchStorageOutcome = "removed" | "kept";
+
 export interface BatchItemOutcome {
   runId: string;
   ok: boolean;
@@ -32,6 +35,8 @@ export interface BatchItemOutcome {
   error?: string;
   /** The run state after the operation, when it succeeded. */
   state?: string;
+  /** B6: for cleanup, whether the server-side run directory/worktree was removed or kept. */
+  storage?: BatchStorageOutcome;
 }
 
 export interface BatchSummary {
@@ -42,12 +47,12 @@ export interface BatchSummary {
   results: BatchItemOutcome[];
 }
 
-export function batchItemSuccess(runId: string, state: string): BatchItemOutcome {
-  return { runId, ok: true, state };
+export function batchItemSuccess(runId: string, state: string, storage?: BatchStorageOutcome): BatchItemOutcome {
+  return { runId, ok: true, state, ...(storage ? { storage } : {}) };
 }
 
-export function batchItemFailure(runId: string, status: number, code: string | undefined, error: string): BatchItemOutcome {
-  return { runId, ok: false, ...(code ? { code } : {}), error: error || `HTTP ${status}` };
+export function batchItemFailure(runId: string, status: number, code: string | undefined, error: string, storage?: BatchStorageOutcome): BatchItemOutcome {
+  return { runId, ok: false, ...(code ? { code } : {}), error: error || `HTTP ${status}`, ...(storage ? { storage } : {}) };
 }
 
 /** Shapes the ordered per-run outcomes into the response body. */

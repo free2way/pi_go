@@ -25,7 +25,8 @@ export interface BatchSummary {
   total: number;
   succeeded: number;
   failed: number;
-  results: Array<{ runId: string; ok: boolean; code?: string; error?: string; state?: string }>;
+  /** B6: per-run on-disk outcome for cleanup actions. */
+  results: Array<{ runId: string; ok: boolean; code?: string; error?: string; state?: string; storage?: "removed" | "kept" }>;
 }
 
 /** SYS-01: availability marker shared by every system status section. */
@@ -98,10 +99,13 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     },
   });
   if (!response.ok) {
-    const error = (await response.json().catch(() => ({}))) as { error?: string; code?: string };
-    const failure = new Error(error.error || `Request failed: ${response.status}`) as Error & { code?: string; status?: number };
+    const error = (await response.json().catch(() => ({}))) as Record<string, unknown> & { error?: string; code?: string };
+    // Keep the whole failure body: merge failures carry `restored`/`restoreError`
+    // (R) that the run detail renders, beyond the human-readable `error`.
+    const failure = new Error(error.error || `Request failed: ${response.status}`) as Error & { code?: string; status?: number; body?: Record<string, unknown> };
     failure.code = error.code;
     failure.status = response.status;
+    failure.body = error;
     throw failure;
   }
   if (response.status === 204) return undefined as T;
@@ -147,7 +151,7 @@ export const api = {
   systemStatus: () => request<SystemStatusResponse>("/api/system/status"),
   reopenRun: (id: string, body: { note?: string; confirm?: boolean } = {}) =>
     request<Run>(`/api/runs/${id}/reopen`, { method: "POST", body: JSON.stringify(body) }),
-  batchRuns: (body: { action: "continue" | "accept" | "cleanup"; runIds: string[]; note?: string; acknowledgeOpenFindings?: boolean }) =>
+  batchRuns: (body: { action: "continue" | "accept" | "cleanup"; runIds: string[]; note?: string; acknowledgeOpenFindings?: boolean; deleteRunDirectory?: boolean }) =>
     request<BatchSummary>("/api/runs/batch", { method: "POST", body: JSON.stringify(body) }),
   createRun: (body: { title: string; task: string; repository?: string; workspaceId?: string; mode: "demo" | "real"; checks?: string[]; developerModel?: ModelSelection; reviewerModel?: ModelSelection }) =>
     request<Run>("/api/runs", { method: "POST", body: JSON.stringify(body) }),
@@ -156,8 +160,8 @@ export const api = {
     request<Run>(`/api/runs/${id}/approve`, { method: "POST", body: JSON.stringify(body) }),
   rejectRun: (id: string, body: { reason?: string } = {}) =>
     request<Run>(`/api/runs/${id}/reject`, { method: "POST", body: JSON.stringify(body) }),
-  cleanupRuns: (body: { runIds?: string[]; states?: Run["state"][]; olderThanDays?: number; scope?: "own" | "all"; dryRun?: boolean } = {}) =>
-    request<{ dryRun: boolean; deleted?: number; runIds: string[]; matched: number }>("/api/runs/cleanup", { method: "POST", body: JSON.stringify(body) }),
+  cleanupRuns: (body: { runIds?: string[]; states?: Run["state"][]; olderThanDays?: number; scope?: "own" | "all"; dryRun?: boolean; deleteRunDirectory?: boolean } = {}) =>
+    request<{ dryRun: boolean; deleteRunDirectory?: boolean; deleted?: number; runIds: string[]; matched: number }>("/api/runs/cleanup", { method: "POST", body: JSON.stringify(body) }),
   resumeRun: (id: string, body: { instruction?: string }) =>
     request<Run>(`/api/runs/${id}/resume`, { method: "POST", body: JSON.stringify(body) }),
   retryReviewRun: (id: string) => request<Run>(`/api/runs/${id}/retry-review`, { method: "POST" }),

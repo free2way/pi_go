@@ -41,6 +41,8 @@ function describeError(cause: unknown): string {
     }
     case "WORKSPACES_DISABLED":
       return "服务器未启用工作区功能（PI_WORKSPACES_ENABLED=false）。";
+    case "WORKSPACE_READ_ONLY":
+      return "只读授权：只有工作区所有者、管理员或拥有写权限的成员可以修改默认检查、刷新元数据或解除注册。";
     default:
       return (cause as Error).message || "操作失败，请稍后重试。";
   }
@@ -306,7 +308,9 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
         </div>
       ) : (
         <div className="ws-grid">
-          {workspaces.map((workspace) => (
+          {workspaces.map((workspace) => {
+            const readOnly = workspace.permission === "read";
+            return (
             <article className="ws-card" key={workspace.id}>
               <header className="ws-card-head">
                 <div className={`ws-icon ws-icon-${workspace.status}`}><FolderGit2 size={16} /></div>
@@ -314,6 +318,7 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
                   <strong>{workspace.name}</strong>
                   <span>{workspace.nodeId} · {workspace.rootPath}</span>
                 </div>
+                {readOnly && <span className="ws-permission" title="共享工作区：只读授权">只读</span>}
                 <span className={`ws-status ws-status-${workspace.status}`}>{statusLabel[workspace.status]}</span>
               </header>
 
@@ -334,7 +339,7 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
               {workspace.git?.dirty && <div className="ws-dirty-note"><AlertTriangle size={11} />存在未提交修改；创建真实任务前建议先提交或清理，避免混入待审核的 Diff。</div>}
               {workspace.status === "invalid" && <div className="ws-dirty-note">路径校验失败：目录可能已移动或不再是 Git 仓库。可尝试“刷新 Git 状态”，或解除注册后重新注册。</div>}
 
-              {editingId === workspace.id && (
+              {!readOnly && editingId === workspace.id && (
                 <div className="ws-editor">
                   <label>默认检查命令（每行一个）
                     <textarea rows={3} value={editChecks} onChange={(event) => setEditChecks(event.target.value)} placeholder="npm test" />
@@ -353,14 +358,15 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
               )}
 
               <footer className="ws-actions">
-                <button type="button" disabled={pendingId === workspace.id} onClick={() => void refresh(workspace)}>
+                <button type="button" disabled={readOnly || pendingId === workspace.id} title={readOnly ? "只读授权：无法刷新元数据" : undefined} onClick={() => void refresh(workspace)}>
                   {pendingId === workspace.id ? <LoaderCircle className="spin" size={13} /> : <RotateCcw size={13} />}刷新 Git 状态
                 </button>
-                <button type="button" onClick={() => startEdit(workspace)}><SlidersHorizontal size={13} />默认检查</button>
-                <button type="button" className="danger" disabled={pendingId === workspace.id} onClick={() => void unregister(workspace)}><Trash2 size={13} />解除注册</button>
+                <button type="button" disabled={readOnly} title={readOnly ? "只读授权：无法修改默认检查" : undefined} onClick={() => startEdit(workspace)}><SlidersHorizontal size={13} />默认检查</button>
+                <button type="button" className="danger" disabled={readOnly || pendingId === workspace.id} title={readOnly ? "只读授权：无法解除注册" : undefined} onClick={() => void unregister(workspace)}><Trash2 size={13} />解除注册</button>
               </footer>
             </article>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>

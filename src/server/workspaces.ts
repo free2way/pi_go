@@ -1,7 +1,15 @@
-import type { Workspace, WorkspaceStatus, WorkspaceVerifyResult } from "../shared/types.js";
+import type { Workspace, WorkspacePermission, WorkspaceStatus, WorkspaceVerifyResult } from "../shared/types.js";
 import { newId, type Db } from "./db.js";
 
 export type WorkerCall = <T>(pathName: string, init?: RequestInit) => Promise<T>;
+
+/**
+ * B4: extra context for access decisions. `isAdmin` lets an admin act on a
+ * workspace they do not own (matching the reopen/cleanup `scope=all` rules);
+ * `allowRead` lets the run-start preflight refresh metadata on behalf of a
+ * read-granted user without granting the general `/refresh` mutation.
+ */
+export type WorkspaceAccessOptions = { isAdmin?: boolean; allowRead?: boolean };
 
 export class WorkspaceError extends Error {
   constructor(
@@ -34,7 +42,7 @@ type WorkspaceRow = {
   updated_at: string;
 };
 
-function toWorkspace(row: WorkspaceRow): Workspace {
+function toWorkspace(row: WorkspaceRow, permission: WorkspacePermission = "write"): Workspace {
   return {
     id: row.id,
     ownerId: row.owner_id,
@@ -53,6 +61,7 @@ function toWorkspace(row: WorkspaceRow): Workspace {
     lastCheckedAt: row.last_checked_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    permission,
   };
 }
 
@@ -81,7 +90,7 @@ export class WorkspaceService {
 
   async list(ownerKeys: string[]): Promise<Workspace[]> {
     if (ownerKeys.length === 0) return [];
-    const placeholders = ownerKeys.map((_, index) => `$${index + 1}`).join(", ");
+    const placeholders = ownerKeys.map((_, index) => "$" + (index + 1)).join(", ");
     // AUD-02: owned workspaces plus explicitly granted ones (shared access).
     const rows = (await this.db.query(
       `SELECT * FROM workspaces
@@ -91,13 +100,26 @@ export class WorkspaceService {
        ORDER BY updated_at DESC`,
       ownerKeys,
     )).rows as WorkspaceRow[];
-    return rows.map(toWorkspace);
+    if (rows.length === 0) return [];
+    // B4: resolve the caller's permission for each row that is not owned.
+    const grants = (await this.db.query(
+      `SELECT workspace_id, permission FROM workspace_grants WHERE user_id IN (${placeholders})`,
+      ownerKeys,
+    )).rows as Array<{ workspace_id: string; permission: string }>;
+    const byWorkspace = new Map<string, WorkspacePermission>();
+    for (const grant of grants) {
+      if (grant.permission === "write" || !byWorkspace.has(grant.workspace_id)) {
+        byWorkspace.set(grant.workspace_id, grant.permission === "write" ? "write" : "read");
+      }
+    }
+    const owners = new Set(ownerKeys);
+    return rows.map((row) => toWorkspace(row, owners.has(row.owner_id) ? "write" : (byWorkspace.get(row.id) ?? "read")));
   }
 
-  async get(ownerKeys: string[], id: string): Promise<Workspace> {
-    const row = await this.findRow(ownerKeys, id);
-    if (!row) throw new WorkspaceError("WORKSPACE_NOT_FOUND", "Workspace not found", 404);
-    return toWorkspace(row);
+  async get(ownerKeys: string[], id: string, options: WorkspaceAccessOptions = {}): Promise<Workspace> {
+    const access = await this.resolveAccess(ownerKeys, id, options.isAdmin ?? false);
+    if (!access) throw new WorkspaceError("WORKSPACE_NOT_FOUND", "Workspace not found", 404);
+    return toWorkspace(access.row, access.permission);
   }
 
   async register(ownerId: string, relativePath: string, options: { isAdmin?: boolean } = {}): Promise<Workspace> {
@@ -110,13 +132,15 @@ export class WorkspaceService {
    * second user either already owns it, holds an explicit grant, or is rejected.
    */
   private async resolvePathOwnership(tx: Db, ownerId: string, canonicalPath: string, isAdmin: boolean, currentId?: string):
-  Promise<{ sharedWorkspaceId?: string }> {
+  Promise<{ sharedWorkspaceId?: string; permission?: WorkspacePermission }> {
     if (!canonicalPath) return {};
     const existing = (await tx.query("SELECT id, owner_id FROM workspaces WHERE canonical_path = $1", [canonicalPath])).rows[0] as { id: string; owner_id: string } | undefined;
     if (!existing || existing.id === currentId) return {};
-    if (existing.owner_id === ownerId || isAdmin) return { sharedWorkspaceId: existing.id };
-    const grant = (await tx.query("SELECT 1 AS ok FROM workspace_grants WHERE workspace_id = $1 AND user_id = $2", [existing.id, ownerId])).rows[0];
-    if (grant) return { sharedWorkspaceId: existing.id };
+    if (existing.owner_id === ownerId || isAdmin) return { sharedWorkspaceId: existing.id, permission: "write" };
+    // B4: a shared registration echoes the grant's actual permission, so a
+    // read-only member cannot be told they may mutate the owner's workspace.
+    const grant = (await tx.query("SELECT permission FROM workspace_grants WHERE workspace_id = $1 AND user_id = $2", [existing.id, ownerId])).rows[0] as { permission: string } | undefined;
+    if (grant) return { sharedWorkspaceId: existing.id, permission: grant.permission === "write" ? "write" : "read" };
     throw new WorkspaceError(
       "WORKSPACE_PATH_TAKEN",
       "该物理仓库已归属于其他用户；如需共享，请联系管理员在 workspace_grants 中授权",
@@ -152,9 +176,9 @@ export class WorkspaceService {
     return this.persist(ownerId, result, null);
   }
 
-  async refresh(ownerKeys: string[], id: string): Promise<Workspace> {
-    const row = await this.findRow(ownerKeys, id);
-    if (!row) throw new WorkspaceError("WORKSPACE_NOT_FOUND", "Workspace not found", 404);
+  async refresh(ownerKeys: string[], id: string, options: WorkspaceAccessOptions = {}): Promise<Workspace> {
+    const access = await this.requirePermission(ownerKeys, id, options);
+    const row = access.row;
     const result = await this.callWorker<WorkspaceVerifyResult>("/workspaces/verify", {
       method: "POST",
       body: JSON.stringify({ relativePath: row.root_path }),
@@ -169,12 +193,12 @@ export class WorkspaceService {
       SET status = 'active', canonical_path = $1, git_branch = $2, git_head = $3, git_dirty = $4, git_dirty_files_json = $5, last_checked_at = $6, updated_at = $7
       WHERE id = $8
     `, [result.canonicalPath ?? row.canonical_path, result.branch ?? null, result.head ?? null, result.dirty ? 1 : 0, JSON.stringify(result.dirtyFiles ?? []), now, now, row.id]);
-    return toWorkspace((await this.db.query("SELECT * FROM workspaces WHERE id = $1", [row.id])).rows[0] as WorkspaceRow);
+    return toWorkspace((await this.db.query("SELECT * FROM workspaces WHERE id = $1", [row.id])).rows[0] as WorkspaceRow, access.permission);
   }
 
-  async patch(ownerKeys: string[], id: string, patch: { defaultChecks?: string[]; defaultBranch?: string }): Promise<Workspace> {
-    const row = await this.findRow(ownerKeys, id);
-    if (!row) throw new WorkspaceError("WORKSPACE_NOT_FOUND", "Workspace not found", 404);
+  async patch(ownerKeys: string[], id: string, patch: { defaultChecks?: string[]; defaultBranch?: string }, options: WorkspaceAccessOptions = {}): Promise<Workspace> {
+    const access = await this.requirePermission(ownerKeys, id, options);
+    const row = access.row;
     const now = new Date().toISOString();
     if (patch.defaultChecks !== undefined) {
       await this.db.query("UPDATE workspaces SET default_checks_json = $1 WHERE id = $2", [JSON.stringify(patch.defaultChecks), row.id]);
@@ -183,13 +207,12 @@ export class WorkspaceService {
       await this.db.query("UPDATE workspaces SET default_branch = $1 WHERE id = $2", [patch.defaultBranch, row.id]);
     }
     await this.db.query("UPDATE workspaces SET updated_at = $1 WHERE id = $2", [now, row.id]);
-    return toWorkspace((await this.db.query("SELECT * FROM workspaces WHERE id = $1", [row.id])).rows[0] as WorkspaceRow);
+    return toWorkspace((await this.db.query("SELECT * FROM workspaces WHERE id = $1", [row.id])).rows[0] as WorkspaceRow, access.permission);
   }
 
-  async unregister(ownerKeys: string[], id: string): Promise<void> {
-    const row = await this.findRow(ownerKeys, id);
-    if (!row) throw new WorkspaceError("WORKSPACE_NOT_FOUND", "Workspace not found", 404);
-    await this.db.query("UPDATE workspaces SET status = 'unregistered', updated_at = $1 WHERE id = $2", [new Date().toISOString(), row.id]);
+  async unregister(ownerKeys: string[], id: string, options: WorkspaceAccessOptions = {}): Promise<void> {
+    const access = await this.requirePermission(ownerKeys, id, options);
+    await this.db.query("UPDATE workspaces SET status = 'unregistered', updated_at = $1 WHERE id = $2", [new Date().toISOString(), access.row.id]);
   }
 
   private async verifyOnWorker(relativePath: string): Promise<WorkspaceVerifyResult> {
@@ -210,7 +233,7 @@ export class WorkspaceService {
       if (ownership.sharedWorkspaceId && !existing) {
         // AUD-02: a granted (or admin) caller shares the owner's workspace record
         // instead of creating a second row for the same physical repository.
-        return toWorkspace((await tx.query("SELECT * FROM workspaces WHERE id = $1", [ownership.sharedWorkspaceId])).rows[0] as WorkspaceRow);
+        return toWorkspace((await tx.query("SELECT * FROM workspaces WHERE id = $1", [ownership.sharedWorkspaceId])).rows[0] as WorkspaceRow, ownership.permission ?? "write");
       }
       if (existing) {
         await tx.query(`
@@ -242,9 +265,11 @@ export class WorkspaceService {
     return new WorkspaceError(code, result.error || "Workspace validation failed", status);
   }
 
-  private async findRow(ownerKeys: string[], id: string): Promise<WorkspaceRow | undefined> {
+  private async findRow(ownerKeys: string[], id: string, isAdmin = false): Promise<WorkspaceRow | undefined> {
+    // B4: an admin may read/mutate any workspace, even without ownership/grant.
+    if (isAdmin) return (await this.db.query("SELECT * FROM workspaces WHERE id = $1", [id])).rows[0] as WorkspaceRow | undefined;
     if (ownerKeys.length === 0) return undefined;
-    const placeholders = ownerKeys.map((_, index) => `$${index + 2}`).join(", ");
+    const placeholders = ownerKeys.map((_, index) => "$" + (index + 2)).join(", ");
     return (await this.db.query(
       `SELECT * FROM workspaces
        WHERE id = $1
@@ -252,5 +277,42 @@ export class WorkspaceService {
               OR id IN (SELECT workspace_id FROM workspace_grants WHERE user_id IN (${placeholders})))`,
       [id, ...ownerKeys],
     )).rows[0] as WorkspaceRow | undefined;
+  }
+
+  /** B4: the caller's permission on a workspace, if they may see it at all. */
+  private async resolveAccess(
+    ownerKeys: string[],
+    id: string,
+    isAdmin: boolean,
+  ): Promise<{ row: WorkspaceRow; permission: WorkspacePermission } | undefined> {
+    const row = await this.findRow(ownerKeys, id, isAdmin);
+    if (!row) return undefined;
+    if (isAdmin || ownerKeys.includes(row.owner_id)) return { row, permission: "write" };
+    const placeholders = ownerKeys.map((_, index) => "$" + (index + 2)).join(", ");
+    const grants = ownerKeys.length === 0
+      ? []
+      : (await this.db.query(
+        `SELECT permission FROM workspace_grants WHERE workspace_id = $1 AND user_id IN (${placeholders})`,
+        [id, ...ownerKeys],
+      )).rows as Array<{ permission: string }>;
+    return { row, permission: grants.some((grant) => grant.permission === "write") ? "write" : "read" };
+  }
+
+  /**
+   * B4: resolves access and enforces the write requirement for mutating routes.
+   * A read-granted caller (or a missing workspace) gets a typed error; the run
+   * preflight passes `allowRead` so a read grant may still start a run.
+   */
+  private async requirePermission(
+    ownerKeys: string[],
+    id: string,
+    options: WorkspaceAccessOptions,
+  ): Promise<{ row: WorkspaceRow; permission: WorkspacePermission }> {
+    const access = await this.resolveAccess(ownerKeys, id, options.isAdmin ?? false);
+    if (!access) throw new WorkspaceError("WORKSPACE_NOT_FOUND", "Workspace not found", 404);
+    if (!options.allowRead && access.permission !== "write") {
+      throw new WorkspaceError("WORKSPACE_READ_ONLY", "只读授权：仅工作区所有者、管理员或拥有写权限的成员可以修改该工作区", 403);
+    }
+    return access;
   }
 }

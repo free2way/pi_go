@@ -369,13 +369,14 @@ button { color: inherit; }
 .ws-form-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 .ws-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 12px; margin-top: 14px; }
 .ws-card { border: 1px solid var(--line-soft); background: rgba(13,16,20,.9); border-radius: 11px; padding: 14px; display: flex; flex-direction: column; gap: 11px; }
-.ws-card-head { display: grid; grid-template-columns: 32px 1fr auto; gap: 9px; align-items: center; }
+.ws-card-head { display: grid; grid-template-columns: 32px 1fr auto auto; gap: 9px; align-items: center; }
 .ws-icon { width: 32px; height: 32px; border-radius: 8px; display: grid; place-items: center; background: rgba(223,248,84,.07); color: #c4d371; }
 .ws-icon-invalid { background: rgba(243,166,90,.08); color: #d9a06c; }
 .ws-title { min-width: 0; }
 .ws-title strong { display: block; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ws-title span { display: block; margin-top: 3px; color: #59636d; font: 8px "DM Mono", monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ws-status { height: 20px; padding: 0 8px; border-radius: 999px; display: inline-flex; align-items: center; color: #8eddb2; background: rgba(115,214,162,.08); border: 1px solid rgba(115,214,162,.16); font: 600 8px "Manrope", sans-serif; }
+.ws-permission { height: 20px; padding: 0 8px; border-radius: 999px; display: inline-flex; align-items: center; color: #9aa6b2; background: rgba(154,166,178,.08); border: 1px solid rgba(154,166,178,.18); font: 600 8px "Manrope", sans-serif; }
 .ws-status-invalid { color: #e7aa72; background: rgba(243,166,90,.08); border-color: rgba(243,166,90,.2); }
 .ws-status-unregistered { color: #8a939d; background: #171c21; border-color: #272e35; }
 .ws-meta { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px 10px; border: 1px solid #1d232a; border-radius: 8px; background: #0f1317; padding: 10px; }
@@ -586,6 +587,8 @@ button { color: inherit; }
 .batch-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 4px 0 8px; padding: 7px 8px; border: 1px solid var(--line-soft); border-radius: 8px; background: #0d1115; }
 .batch-bar > span { color: #8b96a0; font: 9px "DM Mono", monospace; margin-right: auto; }
 .batch-bar .button { height: 26px; padding: 0 8px; font-size: 9px; }
+.batch-cleanup-option { display: inline-flex; align-items: center; gap: 4px; color: #8b96a0; font-size: 9px; cursor: pointer; }
+.batch-cleanup-option input { accent-color: #dfe754; }
 .run-select { display: grid; place-items: center; padding: 0 2px 0 6px; }
 .run-select input { width: 13px; height: 13px; accent-color: #dfF854; cursor: pointer; }
 .deployments-card { margin-top: 8px; border: 1px solid var(--line-soft); border-radius: 10px; padding: 10px 11px; background: #0d1115; }
@@ -600,6 +603,8 @@ button { color: inherit; }
 .deploy-hint { display: block; margin-top: 6px; color: #6b7680; font-size: 9px; }
 .merge-option { display: flex !important; align-items: center; gap: 7px; color: #98a2ac !important; font-size: 10px !important; margin-top: 11px !important; }
 .merge-option input { accent-color: #dfF854; }
+.merge-notice { margin-top: 10px; padding: 7px 9px; border-radius: 6px; color: #8eddb2; background: rgba(115,214,162,.07); border: 1px solid rgba(115,214,162,.18); font-size: 10px; line-height: 1.5; }
+.merge-notice-warn { color: #e0a06a; background: rgba(243,166,90,.07); border-color: rgba(243,166,90,.22); }
 .reopen-button { margin-top: 8px; height: 30px; font-size: 10px; }
 .acceptance-panel { margin-top: 16px; }
 .acceptance-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 8px; padding: 14px 17px; }

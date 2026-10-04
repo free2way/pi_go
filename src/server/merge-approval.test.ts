@@ -223,6 +223,32 @@ describe("coordinateApprovedMerge (B1 two-phase)", () => {
     expect(stored.mergePending).toBeUndefined();
   });
 
+  it("forwards restored/restoreError from a non-conflict worker failure (R)", async () => {
+    const db = await createTestDb();
+    const store = new PostgresRunStore(db);
+    await store.init();
+    const run = makeRun();
+    await seededStore(store, run);
+
+    const outcome = await coordinateApprovedMerge(store, mergeRequest(run, "t1", async () => ({
+      ok: false,
+      code: "TARGET_BRANCH_UNAVAILABLE",
+      error: "目标分支不可用",
+      restored: false,
+      restoreError: "无法恢复工作区",
+    })));
+    expect(outcome).toMatchObject({ kind: "worker-error", status: 409, code: "TARGET_BRANCH_UNAVAILABLE", restored: false, restoreError: "无法恢复工作区" });
+
+    // A payload without the fields must not invent them.
+    const clean = await coordinateApprovedMerge(store, mergeRequest(store.getRun(run.id)!, "t2", async () => ({
+      ok: false,
+      code: "MERGE_FETCH_FAILED",
+      error: "fetch failed",
+    })));
+    expect(clean).not.toHaveProperty("restored");
+    expect(clean).not.toHaveProperty("restoreError");
+  });
+
   it("converges a committed_unrecorded marker without calling the worker again", async () => {
     const db = await createTestDb();
     const store = new PostgresRunStore(db);

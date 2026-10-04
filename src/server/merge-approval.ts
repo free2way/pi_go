@@ -24,7 +24,7 @@
 
 import type { Run, RunMergePending, RunMergeRecord, RunEvent } from "../shared/types.js";
 import type { AppendEventOptions, GuardedUpdateResult, UpdateGuard } from "./store.js";
-import type { MergeResult } from "../shared/merge.js";
+import { mergeRestoreFields, type MergeRestoreFields, type MergeResult } from "../shared/merge.js";
 import { buildMergeRecord } from "./run-merge.js";
 
 export const MERGE_IN_PROGRESS_CODE = "MERGE_IN_PROGRESS" as const;
@@ -179,7 +179,7 @@ export interface MergeApprovalRequest {
 export type MergeApprovalOutcome =
   | { kind: "merged"; merge: RunMergeRecord; run: Run; replayed: boolean }
   | { kind: "conflict"; status: 409; code: typeof MERGE_IN_PROGRESS_CODE; message: string }
-  | { kind: "worker-error"; status: number; code: string; error: string; conflictingPaths?: string[] }
+  | ({ kind: "worker-error"; status: number; code: string; error: string; conflictingPaths?: string[] } & MergeRestoreFields)
   | { kind: "record-failed"; status: 503; code: typeof MERGE_RECORD_FAILED_CODE; error: string; merge: RunMergeRecord };
 
 const WORKSPACE_MERGE_ERRORS = ["MERGE_CONFLICT", "RUN_DIRECTORY_MISSING", "WORKSPACE_DIRTY", "TARGET_BRANCH_UNAVAILABLE", "MERGE_FETCH_FAILED", "TARGET_BRANCH_UNKNOWN"];
@@ -281,6 +281,9 @@ export async function coordinateApprovedMerge(
       code: workerResult.code,
       error: workerResult.error,
       ...(workerResult.conflictingPaths ? { conflictingPaths: workerResult.conflictingPaths } : {}),
+      // R: surface whether the workspace was verified back on its pre-merge
+      // branch/HEAD so the response (and the UI) can report it.
+      ...mergeRestoreFields(workerResult),
     };
   }
 

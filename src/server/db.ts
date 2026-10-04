@@ -280,6 +280,16 @@ export const databaseMigrations: Migration[] = [
       ALTER TABLE runs ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;
     `,
   },
+  {
+    // B4: separate "can view/run" from "can modify" for shared workspaces.
+    // Existing rows default to `read` so a previously granted user cannot keep
+    // changing the owner's default checks or unregister the workspace.
+    id: 8,
+    name: "workspace-grant-permission",
+    sql: `
+      ALTER TABLE workspace_grants ADD COLUMN permission TEXT NOT NULL DEFAULT 'read';
+    `,
+  },
 ];
 
 export async function runMigrations(db: Db) {

@@ -138,12 +138,80 @@ describe("workspace service", () => {
     const again = await service.register("owner-a", "private-project");
     expect(again.id).toBe(first.id);
 
-    // An explicit grant shares the owner's workspace record instead of cloning it.
-    await db.query("INSERT INTO workspace_grants (workspace_id, user_id, granted_by, created_at) VALUES ($1, $2, $3, $4)", [first.id, "owner-b", "admin", new Date().toISOString()]);
+    // An explicit write grant shares the owner's workspace record instead of cloning it.
+    await db.query("INSERT INTO workspace_grants (workspace_id, user_id, permission, granted_by, created_at) VALUES ($1, $2, 'write', $3, $4)", [first.id, "owner-b", "admin", new Date().toISOString()]);
     const shared = await service.register("owner-b", "private-project");
     expect(shared.id).toBe(first.id);
     expect((await service.list(["owner-b"])).map((item) => item.id)).toEqual([first.id]);
-    expect(await service.refresh(["owner-b"], first.id)).toMatchObject({ id: first.id });
+    expect(await service.refresh(["owner-b"], first.id)).toMatchObject({ id: first.id, permission: "write" });
+  });
+
+  describe("workspace grant permissions (B4)", () => {
+    async function sharedWorkspace(grant: "read" | "write" | null) {
+      const { db, service } = await createService(async () => verifyOk());
+      const workspace = await service.register("owner-a", "pi_go");
+      if (grant) {
+        await db.query("INSERT INTO workspace_grants (workspace_id, user_id, permission, granted_by, created_at) VALUES ($1, $2, $3, $4, $5)", [workspace.id, "member", grant, "owner-a", new Date().toISOString()]);
+      }
+      return { db, service, workspace };
+    }
+
+    it("defaults a pre-B4 grant row to read-only", async () => {
+      const { db, service } = await createService(async () => verifyOk());
+      const workspace = await service.register("owner-a", "pi_go");
+      // Insert without `permission` to exercise the migration default.
+      await db.query("INSERT INTO workspace_grants (workspace_id, user_id, granted_by, created_at) VALUES ($1, $2, $3, $4)", [workspace.id, "member", "owner-a", new Date().toISOString()]);
+
+      const listed = await service.list(["member"]);
+      expect(listed).toHaveLength(1);
+      expect(listed[0].permission).toBe("read");
+      const row = (await db.query("SELECT permission FROM workspace_grants WHERE workspace_id = $1 AND user_id = $2", [workspace.id, "member"])).rows[0] as { permission: string };
+      expect(row.permission).toBe("read");
+    });
+
+    it("a read grant may view and start runs but cannot change checks or unregister", async () => {
+      const { service, workspace } = await sharedWorkspace("read");
+      expect((await service.get(["member"], workspace.id)).permission).toBe("read");
+      // Run-start preflight allows read access.
+      await expect(service.refresh(["member"], workspace.id, { allowRead: true })).resolves.toMatchObject({ id: workspace.id });
+      // Mutating actions are refused with a clear 403.
+      await expect(service.patch(["member"], workspace.id, { defaultChecks: ["rm -rf /"] })).rejects.toMatchObject({ code: "WORKSPACE_READ_ONLY", status: 403 });
+      await expect(service.refresh(["member"], workspace.id)).rejects.toMatchObject({ code: "WORKSPACE_READ_ONLY", status: 403 });
+      await expect(service.unregister(["member"], workspace.id)).rejects.toMatchObject({ code: "WORKSPACE_READ_ONLY", status: 403 });
+      // The owner's checks are untouched and the workspace is still listed.
+      expect((await service.get(["owner-a"], workspace.id)).defaultChecks).toEqual([]);
+      expect((await service.list(["member"]))[0].status).toBe("active");
+    });
+
+    it("a write grant may change checks, refresh and unregister", async () => {
+      const { service, workspace } = await sharedWorkspace("write");
+      expect((await service.list(["member"]))[0].permission).toBe("write");
+      expect((await service.patch(["member"], workspace.id, { defaultChecks: ["npm test"] })).defaultChecks).toEqual(["npm test"]);
+      await expect(service.refresh(["member"], workspace.id)).resolves.toMatchObject({ id: workspace.id });
+      await service.unregister(["member"], workspace.id);
+      expect(await service.list(["owner-a"])).toHaveLength(0);
+    });
+
+    it("leaves the owner and admins unaffected", async () => {
+      const { service, workspace } = await sharedWorkspace(null);
+      expect((await service.get(["owner-a"], workspace.id)).permission).toBe("write");
+      expect((await service.patch(["owner-a"], workspace.id, { defaultChecks: ["npm run lint"] })).defaultChecks).toEqual(["npm run lint"]);
+      // An admin who does not own or hold a grant may still mutate and sees write.
+      expect((await service.get(["admin-x"], workspace.id, { isAdmin: true })).permission).toBe("write");
+      expect((await service.patch(["admin-x"], workspace.id, { defaultChecks: ["npm test"] }, { isAdmin: true })).defaultChecks).toEqual(["npm test"]);
+      await service.unregister(["admin-x"], workspace.id, { isAdmin: true });
+      expect(await service.list(["owner-a"])).toHaveLength(0);
+    });
+
+    it("echoes the grant's permission when a member re-registers the shared path", async () => {
+      const { service, workspace } = await sharedWorkspace("read");
+      expect(await service.register("member", "pi_go")).toMatchObject({ id: workspace.id, permission: "read" });
+    });
+
+    it("returns 404 (not read-only) for a user with no access at all", async () => {
+      const { service, workspace } = await sharedWorkspace("read");
+      await expect(service.patch(["stranger"], workspace.id, { defaultChecks: ["x"] })).rejects.toMatchObject({ code: "WORKSPACE_NOT_FOUND", status: 404 });
+    });
   });
 
 });

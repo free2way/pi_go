@@ -18,6 +18,25 @@ describe("parseBatchRunIds (B3)", () => {
   });
 });
 
+describe("batch cleanup storage outcomes (B6)", () => {
+  it("carries the on-disk outcome on success and failure", () => {
+    expect(batchItemSuccess("run_a", "completed", "removed")).toEqual({ runId: "run_a", ok: true, state: "completed", storage: "removed" });
+    expect(batchItemSuccess("run_b", "failed", "kept")).toEqual({ runId: "run_b", ok: true, state: "failed", storage: "kept" });
+    // Non-cleanup actions must not invent a storage label.
+    expect(batchItemSuccess("run_c", "completed")).toEqual({ runId: "run_c", ok: true, state: "completed" });
+    expect(batchItemFailure("run_d", 500, undefined, "boom", "kept")).toMatchObject({ ok: false, error: "boom", storage: "kept" });
+  });
+
+  it("preserves per-run storage through summarizeBatch", () => {
+    const summary = summarizeBatch("cleanup", [
+      batchItemSuccess("run_a", "completed", "removed"),
+      batchItemSuccess("run_b", "cancelled", "kept"),
+      batchItemFailure("run_c", 409, "RUN_ACTIVE", "无法清理状态为 developing 的任务"),
+    ]);
+    expect(summary.results.map((result) => result.storage)).toEqual(["removed", "kept", undefined]);
+  });
+});
+
 describe("summarizeBatch (B3)", () => {
   it("reports partial failures individually with their codes", () => {
     const summary = summarizeBatch("accept", [
