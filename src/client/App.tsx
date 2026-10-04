@@ -534,23 +534,34 @@ function EmptyPanel({ icon: Icon, text }: { icon: typeof Activity; text: string 
 
 function HumanInterventionPanel({ run, onUpdated }: { run: Run; onUpdated: (run: Run) => void }) {
   const [instruction, setInstruction] = useState("");
-  const [busy, setBusy] = useState<"" | "resume" | "review" | "terminate" | "approve" | "reject">("");
+  const [busy, setBusy] = useState<"" | "resume" | "review" | "terminate" | "continue" | "approve" | "reject">("");
   const [error, setError] = useState("");
   const unresolved = run.findings.filter((item) => !item.resolved).length;
 
-  const act = async (kind: "resume" | "review" | "terminate" | "approve" | "reject") => {
+  const act = async (kind: "resume" | "review" | "terminate" | "continue" | "approve" | "reject") => {
     setError("");
     if (kind === "terminate" && !window.confirm(`终止任务「${run.title}」？\n\n任务会标记为已取消；代码与 worktree 全部保留，不会自动合并。`)) return;
-    if (kind === "approve" && !window.confirm(`确认通过任务「${run.title}」的交付？\n\n任务将标记为已通过；worktree 中的代码不会自动推送或合并。`)) return;
     if (kind === "reject" && !window.confirm(`拒绝任务「${run.title}」的交付？\n\n任务将标记为已取消；代码与 worktree 全部保留。`)) return;
+    if (kind === "approve" && !window.confirm(
+      unresolved > 0
+        ? `任务「${run.title}」仍有 ${unresolved} 条未解决意见。\n\n确认接受交付？这些意见会被记录为已知接受，不会继续修复。`
+        : `确认通过任务「${run.title}」的交付？\n\n任务将标记为已通过；worktree 中的代码不会自动推送或合并。`,
+    )) return;
     setBusy(kind);
     try {
       if (kind === "resume") {
         onUpdated(await api.resumeRun(run.id, { instruction: instruction.trim() || undefined }));
       } else if (kind === "review") {
         onUpdated(await api.retryReviewRun(run.id));
+      } else if (kind === "continue") {
+        // "继续开发" never warns: it sends the run back for another round.
+        onUpdated(await api.approveRun(run.id, { mode: "continue", note: instruction.trim() || undefined }));
       } else if (kind === "approve") {
-        onUpdated(await api.approveRun(run.id, { note: instruction.trim() || undefined }));
+        onUpdated(await api.approveRun(run.id, {
+          mode: "accept",
+          note: instruction.trim() || undefined,
+          acknowledgeOpenFindings: unresolved > 0,
+        }));
       } else if (kind === "reject") {
         onUpdated(await api.rejectRun(run.id, { reason: instruction.trim() || undefined }));
       } else {
@@ -570,15 +581,18 @@ function HumanInterventionPanel({ run, onUpdated }: { run: Run; onUpdated: (run:
         <span className="human-reason">{run.summary}</span>
       </div>
       <p className="human-hint">
-        当前有 {unresolved} 条未解决意见，代码保留在服务器 worktree（未自动提交或合并）。你可以「通过」确认交付，或直接编辑 worktree 后「恢复下一轮」（会记录恢复点 HEAD 与人工指令）、「重试审核」让 Reviewer 复查当前代码，或「拒绝」终止交付。
+        当前有 {unresolved} 条未解决意见，代码保留在服务器 worktree（未自动提交或合并）。选择「继续开发」会带着未解决意见回到开发再跑一轮；选择「接受交付」会直接完成交付（仍有未解决意见时会先二次确认），也可以直接编辑 worktree 后「恢复下一轮」（会记录恢复点 HEAD 与人工指令）、「重试审核」让 Reviewer 复查当前代码，或「拒绝」终止交付。
       </p>
       <label>人工指令 / 审批备注（可选，随恢复或审批记录）
         <textarea rows={3} value={instruction} onChange={(event) => setInstruction(event.target.value)} placeholder="例如：优先修复凭据隔离问题；其余按审核意见逐条处理。" disabled={Boolean(busy)} />
       </label>
       {error && <div className="form-error">{error}</div>}
       <div className="human-actions">
+        <button type="button" className="button primary" disabled={Boolean(busy)} onClick={() => void act("continue")}>
+          {busy === "continue" ? <LoaderCircle className="spin" size={15} /> : <Play size={15} />}继续开发
+        </button>
         <button type="button" className="button primary" disabled={Boolean(busy)} onClick={() => void act("approve")}>
-          {busy === "approve" ? <LoaderCircle className="spin" size={15} /> : <CheckCircle2 size={15} />}通过交付
+          {busy === "approve" ? <LoaderCircle className="spin" size={15} /> : <CheckCircle2 size={15} />}接受交付
         </button>
         <button type="button" className="button secondary" disabled={Boolean(busy)} onClick={() => void act("resume")}>
           {busy === "resume" ? <LoaderCircle className="spin" size={15} /> : <RotateCcw size={15} />}恢复下一轮

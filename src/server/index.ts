@@ -22,6 +22,7 @@ import { verifyPendingCredentials } from "./credential-verification.js";
 import { RateLimiter } from "./rate-limit.js";
 import { PostgresRunStore } from "./run-store-pg.js";
 import { saveInternalRunArtifact } from "./artifact-api.js";
+import { type ApprovePlan, approveEventMeta, planApprove } from "./approve.js";
 import { conflictReplyFor } from "./request-errors.js";
 import type { RunStoreLike } from "./store.js";
 import { WorkspaceError, WorkspaceService } from "./workspaces.js";
@@ -433,7 +434,7 @@ app.get("/api/health", async (_request, reply) => {
   try {
     await pingDatabase();
     alerts.clear("database_unavailable");
-    return { status: "ok", service: "pigo-web", version: "0.21.3", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.21.4", db: "ok" };
   } catch (error) {
     // AT-REL-005: fail loudly instead of pretending the service is healthy.
     alerts.raise({
@@ -442,7 +443,7 @@ app.get("/api/health", async (_request, reply) => {
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
       details: { error: (error as Error).message.slice(0, 200) },
     });
-    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.21.3", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.21.4", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
   }
 });
 
@@ -457,7 +458,7 @@ interface StorageStatus {
 app.get("/api/health/detail", async (request, reply) => {
   const internal = safeTokenMatch(request.headers.authorization);
   if (!internal && !auth.user(request)) return reply.code(401).send({ error: "Unauthorized" });
-  const health: Record<string, unknown> = { version: "0.21.3", at: new Date().toISOString() };
+  const health: Record<string, unknown> = { version: "0.21.4", at: new Date().toISOString() };
   try {
     await pingDatabase();
     health.database = { status: "ok" };
@@ -916,10 +917,85 @@ app.delete<{ Params: { id: string } }>("/api/runs/:id", async (request, reply) =
 });
 
 // GAP-04 / AT-RUN-009: explicit human approval or rejection of a delivered
-// worktree. Both are guarded by the state machine (needs_human -> completed /
-// cancelled) and recorded as audit events.
-const approveSchema = z.object({ note: z.string().trim().max(2_000).optional() });
+// worktree. Approval carries two distinct intents: continue development for
+// another round, or accept the delivery. Accepting a run that still has open
+// review findings requires an explicit acknowledgement (RUN-006).
+const approveSchema = z.object({
+  mode: z.enum(["continue", "accept"]).optional(),
+  note: z.string().trim().max(2_000).optional(),
+  acknowledgeOpenFindings: z.boolean().optional(),
+});
 const rejectSchema = z.object({ reason: z.string().trim().max(2_000).optional() });
+
+/**
+ * RUN-006: `mode: "continue"` sends a run stopped at needs_human back to
+ * development for another round using the existing human-resume job intent
+ * (AUD-05 `payload.resume`), so the six open findings are actually worked on
+ * instead of being silently accepted. Mirrors the worker/credentials guards of
+ * `dispatchFollowupJob`; on a rejected job the run returns to needs_human.
+ */
+async function dispatchContinueJob(
+  request: FastifyRequest<{ Params: { id: string } }>,
+  reply: FastifyReply,
+  run: Run,
+  options: { note?: string; plan: Extract<ApprovePlan, { decision: "continue" }>; userId: string },
+) {
+  const openFindings = options.plan.openFindings;
+  if (run.mode !== "real") return reply.code(409).send({ error: "只有真实任务支持「继续开发」", code: "RUN_NOT_RESUMABLE" });
+  if (!realRunsEnabled || !internalToken) return reply.code(503).send({ error: "Real agent execution is disabled", code: "REAL_RUNNER_NOT_AVAILABLE" });
+  const developerKey = vault.get(vaultKeyFor(request), run.developer.provider);
+  const reviewerKey = vault.get(vaultKeyFor(request), run.reviewer.provider);
+  if (!developerKey || !reviewerKey) {
+    return reply.code(403).send({ error: "该任务所用模型的 provider 凭据缺失，请在「模型与凭据」页配置", code: "PERSONAL_CREDENTIALS_REQUIRED" });
+  }
+  const credentials = { developer: developerKey, reviewer: reviewerKey };
+
+  const now = new Date().toISOString();
+  const round = run.round + 1;
+  const summary = options.note ? `人工选择继续开发：${options.note}` : `人工选择继续开发：第 ${round} 轮处理未解决意见`;
+  let updated: Run;
+  try {
+    updated = await store.updateRun(run.id, {
+      state: "developing",
+      round,
+      maxRounds: Math.max(run.maxRounds, round),
+      summary,
+    });
+  } catch (error) {
+    const conflict = conflictReplyFor(error);
+    if (conflict) return reply.code(conflict.status).send({ error: conflict.message, code: conflict.code });
+    throw error;
+  }
+  await store.appendEvent({
+    runId: run.id,
+    round,
+    source: "system",
+    type: "run.approved",
+    message: summary,
+    at: now,
+    meta: approveEventMeta(options.plan, options.userId),
+  });
+
+  try {
+    await dispatchJob(updated, run.checks.map((check) => check.command), { resume: { instruction: options.note } }, credentials);
+    credentials.developer = "";
+    credentials.reviewer = "";
+    return reply.code(201).send({ ...store.getRun(run.id, ownerKeysFor(request)), openFindings });
+  } catch (error) {
+    credentials.developer = "";
+    credentials.reviewer = "";
+    await store.updateRun(run.id, { state: "needs_human", summary: "Worker 拒绝任务，保持人工处理" });
+    await store.appendEvent({
+      runId: run.id,
+      round,
+      source: "system",
+      type: "run.resume_failed",
+      message: `Worker 拒绝任务：${(error as Error).message}`,
+      at: new Date().toISOString(),
+    });
+    return reply.code(503).send({ error: (error as Error).message });
+  }
+}
 
 app.post<{ Params: { id: string } }>("/api/runs/:id/approve", async (request, reply) => {
   const actionLimit = runActions.check(auth.user(request).id);
@@ -930,8 +1006,22 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/approve", async (request, re
   if (!run) return reply.code(404).send({ error: "Run not found" });
   if (run.state !== "needs_human") return reply.code(409).send({ error: "仅「需要人工处理」的任务可以审批", code: "RUN_NOT_APPROVABLE" });
   const user = auth.user(request);
-  const now = new Date().toISOString();
   const note = parsed.data.note?.trim();
+  const plan = planApprove({
+    mode: parsed.data.mode,
+    acknowledgeOpenFindings: parsed.data.acknowledgeOpenFindings,
+    findings: run.findings,
+  });
+
+  // RUN-006: never silently accept open findings — make the operator acknowledge.
+  if (plan.decision === "conflict") {
+    return reply.code(plan.status).send({ error: plan.message, code: plan.code, openFindings: plan.openFindings });
+  }
+  if (plan.decision === "continue") {
+    return dispatchContinueJob(request, reply, run, { note, plan, userId: user.id });
+  }
+
+  const now = new Date().toISOString();
   let updated: Run;
   try {
     updated = await store.updateRun(run.id, {
@@ -952,9 +1042,9 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/approve", async (request, re
     type: "run.approved",
     message: note ? `人工审批通过：${note}` : "人工审批通过，交付已确认",
     at: now,
-    meta: { approvedBy: user.id },
+    meta: approveEventMeta(plan, user.id),
   });
-  return updated;
+  return { ...updated, acceptedOpenFindings: plan.openFindings };
 });
 
 app.post<{ Params: { id: string } }>("/api/runs/:id/reject", async (request, reply) => {

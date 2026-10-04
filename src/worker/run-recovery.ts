@@ -25,7 +25,16 @@ export interface RecoveryStateInput {
 
 export function recoveryUpdateState(input: RecoveryStateInput): RunState {
   if (input.retryReview) return "reviewing";
-  if (input.resume) return "preparing";
+  if (input.resume) {
+    // 人工"继续开发"：服务器已把状态推进到工作阶段（developing/checking/reviewing），
+    // 此时必须保留当前阶段——强行回到 preparing 会被状态机拒绝
+    // （developing|checking|reviewing -> preparing 非法），任务会被打回 needs_human。
+    // 只有从还没有工作阶段的入口（如 needs_human）恢复时才重新 prepare。
+    if (input.current === "developing" || input.current === "checking" || input.current === "reviewing") {
+      return input.current;
+    }
+    return "preparing";
+  }
   return input.current;
 }
 

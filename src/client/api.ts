@@ -45,7 +45,7 @@ export const api = {
   createRun: (body: { title: string; task: string; repository?: string; workspaceId?: string; mode: "demo" | "real"; checks?: string[]; developerModel?: ModelSelection; reviewerModel?: ModelSelection }) =>
     request<Run>("/api/runs", { method: "POST", body: JSON.stringify(body) }),
   cancelRun: (id: string) => request<Run>(`/api/runs/${id}/cancel`, { method: "POST" }),
-  approveRun: (id: string, body: { note?: string } = {}) =>
+  approveRun: (id: string, body: { mode?: "continue" | "accept"; note?: string; acknowledgeOpenFindings?: boolean } = {}) =>
     request<Run>(`/api/runs/${id}/approve`, { method: "POST", body: JSON.stringify(body) }),
   rejectRun: (id: string, body: { reason?: string } = {}) =>
     request<Run>(`/api/runs/${id}/reject`, { method: "POST", body: JSON.stringify(body) }),

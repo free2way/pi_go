@@ -36,4 +36,12 @@ describe("recoveryResumePhase (NEW-04)", () => {
     expect(recoveryResumePhase("checking")).toBe("checks");
     expect(recoveryResumePhase("reviewing")).toBe("review");
   });
+
+  it("keeps the human-continue phase instead of forcing preparing (审批「继续开发」端到端可用)", () => {
+    expect(recoveryUpdateState({ current: "developing", resume: true })).toBe("developing");
+    expect(recoveryUpdateState({ current: "checking", resume: true })).toBe("checking");
+    expect(recoveryUpdateState({ current: "reviewing", resume: true })).toBe("reviewing");
+    expect(recoveryUpdateState({ current: "needs_human", resume: true })).toBe("preparing");
+  });
+
 });
