@@ -51,6 +51,44 @@ describe("CredentialVault", () => {
     expect(() => reloaded.get("owner-b", "deepseek")).toThrow();
   });
 
+  it("uses a random IV and an authentication tag per write (AT-SEC-002)", async () => {
+    const file = await vaultFile();
+    const vault = new CredentialVault(file, secretFor(13));
+    await vault.init();
+    await vault.set("owner-a", { provider: "deepseek", apiKey: "dev-secret-value" });
+    type Stored = { users: Record<string, { providers: Record<string, { apiKey: { iv: string; tag: string; ciphertext: string } }> }> };
+    const first = JSON.parse(await readFile(file, "utf8")) as Stored;
+    await vault.set("owner-a", { provider: "deepseek", apiKey: "dev-secret-value" });
+    const second = JSON.parse(await readFile(file, "utf8")) as Stored;
+
+    const before = first.users["owner-a"].providers.deepseek.apiKey;
+    const after = second.users["owner-a"].providers.deepseek.apiKey;
+    expect(before.iv).not.toBe(after.iv);
+    expect(before.ciphertext).not.toBe(after.ciphertext);
+    expect(Buffer.from(after.iv, "base64").length).toBe(12);
+    expect(Buffer.from(after.tag, "base64").length).toBe(16);
+    expect(vault.get("owner-a", "deepseek")).toBe("dev-secret-value");
+  });
+
+  it("rejects tampered ciphertext (GCM authentication)", async () => {
+    const file = await vaultFile();
+    const secret = secretFor(17);
+    const vault = new CredentialVault(file, secret);
+    await vault.init();
+    await vault.set("owner-a", { provider: "deepseek", apiKey: "dev-secret-value" });
+
+    const raw = JSON.parse(await readFile(file, "utf8")) as { users: Record<string, { providers: Record<string, { apiKey: { ciphertext: string } }> }> };
+    const record = raw.users["owner-a"].providers.deepseek.apiKey;
+    const bytes = Buffer.from(record.ciphertext, "base64");
+    bytes[0] ^= 0xff;
+    record.ciphertext = bytes.toString("base64");
+    await writeFile(file, JSON.stringify(raw), "utf8");
+
+    const reloaded = new CredentialVault(file, secret);
+    await reloaded.init();
+    expect(() => reloaded.get("owner-a", "deepseek")).toThrow();
+  });
+
   it("migrates the legacy role-based vault to per-provider records", async () => {
     const file = await vaultFile();
     const secret = secretFor(11);

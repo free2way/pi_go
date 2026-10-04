@@ -136,7 +136,13 @@ services:
       PI_RUN_TIMEOUT_SECONDS: ${PI_RUN_TIMEOUT_SECONDS:-1800}
     volumes:
       - ./workspace:/workspace
-      - pi-config:/home/node/.pi
+      # SEC-004: agent processes must not see the interactive Pi configuration
+      # volume (auth.json, session transcripts, caches). Only the secret-free
+      # provider/model definition is mounted, read-only; keys arrive per job via
+      # the vault and are injected into the child environment for the current
+      # role only. Regenerate the file with `deploy/docker/export-models.sh`.
+      - ./pi-models.json:/home/node/.pi/agent/models.json:ro
+      - pigo-worker-state:/home/node/.pi
     networks:
       - pi-network
     security_opt:
@@ -163,6 +169,8 @@ networks:
 volumes:
   pi-config:
     name: pi-agent-config
+  pigo-worker-state:
+    name: pigo-worker-state
   pigo-web-data:
     name: pigo-web-data
   pigo-postgres-data:

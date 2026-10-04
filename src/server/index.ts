@@ -15,6 +15,7 @@ import { baseDemoRun, runDemo } from "./demo-runner.js";
 import { IdentityService } from "./identity.js";
 import { availableModels, defaultSelections, loadModelCatalog, validateModelSelection } from "./model-catalog.js";
 import { baseRealRun } from "./real-run.js";
+import { RateLimiter } from "./rate-limit.js";
 import { PostgresRunStore } from "./run-store-pg.js";
 import type { RunStoreLike } from "./store.js";
 import { WorkspaceError, WorkspaceService } from "./workspaces.js";
@@ -189,13 +190,14 @@ const internalUpdateSchema = z.object({
   deliveryId: z.string().min(1).max(160).optional(),
 }).strict();
 
-const credentialWrites = new Map<string, number[]>();
-function credentialWriteAllowed(userId: string) {
-  const cutoff = Date.now() - 60_000;
-  const attempts = (credentialWrites.get(userId) ?? []).filter((value) => value > cutoff);
-  attempts.push(Date.now());
-  credentialWrites.set(userId, attempts);
-  return attempts.length <= 10;
+// SEC-008 / AT-SEC-005: per-user write limits for credential and run mutations.
+const credentialWrites = new RateLimiter(10);
+const runCreations = new RateLimiter(Number(process.env.PI_RUN_CREATE_PER_MINUTE || 20));
+const runActions = new RateLimiter(Number(process.env.PI_RUN_ACTIONS_PER_MINUTE || 30));
+
+function tooManyRequests(reply: FastifyReply, retryAfterMs: number) {
+  reply.header("Retry-After", String(Math.max(1, Math.ceil(retryAfterMs / 1000))));
+  return reply.code(429).send({ error: "请求过于频繁，请稍后再试", code: "RATE_LIMITED" });
 }
 
 function safeTokenMatch(value: string | undefined) {
@@ -286,7 +288,7 @@ app.get("/api/health", async (_request, reply) => {
   try {
     await pingDatabase();
     alerts.clear("database_unavailable");
-    return { status: "ok", service: "pigo-web", version: "0.12.2", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.13.0", db: "ok" };
   } catch (error) {
     // AT-REL-005: fail loudly instead of pretending the service is healthy.
     alerts.raise({
@@ -295,7 +297,7 @@ app.get("/api/health", async (_request, reply) => {
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
       details: { error: (error as Error).message.slice(0, 200) },
     });
-    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.12.2", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.13.0", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
   }
 });
 
@@ -310,7 +312,7 @@ interface StorageStatus {
 app.get("/api/health/detail", async (request, reply) => {
   const internal = safeTokenMatch(request.headers.authorization);
   if (!internal && !auth.user(request)) return reply.code(401).send({ error: "Unauthorized" });
-  const health: Record<string, unknown> = { version: "0.12.2", at: new Date().toISOString() };
+  const health: Record<string, unknown> = { version: "0.13.0", at: new Date().toISOString() };
   try {
     await pingDatabase();
     health.database = { status: "ok" };
@@ -356,7 +358,8 @@ app.get("/api/credentials/status", async (request) => vault.status(vaultKeyFor(r
 
 app.put("/api/credentials", async (request, reply) => {
   const user = auth.user(request);
-  if (!credentialWriteAllowed(user.id)) return reply.code(429).send({ error: "Too many credential updates" });
+  const credentialLimit = credentialWrites.check(user.id);
+  if (!credentialLimit.allowed) return tooManyRequests(reply, credentialLimit.retryAfterMs);
   const parsed = credentialSchema.safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: "Invalid credential request" });
   const userId = vaultKeyFor(request);
@@ -375,7 +378,8 @@ app.put("/api/credentials", async (request, reply) => {
 
 app.delete<{ Querystring: { provider?: string } }>("/api/credentials", async (request, reply) => {
   const user = auth.user(request);
-  if (!credentialWriteAllowed(user.id)) return reply.code(429).send({ error: "Too many credential updates" });
+  const credentialLimit = credentialWrites.check(user.id);
+  if (!credentialLimit.allowed) return tooManyRequests(reply, credentialLimit.retryAfterMs);
   await vault.delete(vaultKeyFor(request), request.query?.provider || undefined);
   return reply.code(204).send();
 });
@@ -547,6 +551,8 @@ app.post("/api/runs", async (request, reply) => {
   const parsed = createRunSchema.safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
   const user = auth.user(request);
+  const creationLimit = runCreations.check(user.id);
+  if (!creationLimit.allowed) return tooManyRequests(reply, creationLimit.retryAfterMs);
   if (parsed.data.mode === "real") {
     // WS-008: real runs may only target the user's own registered, healthy workspaces.
     let workspace: Workspace;
@@ -632,6 +638,8 @@ app.post("/api/runs", async (request, reply) => {
 });
 
 app.post<{ Params: { id: string } }>("/api/runs/:id/cancel", async (request, reply) => {
+  const cancelLimit = runActions.check(auth.user(request).id);
+  if (!cancelLimit.allowed) return tooManyRequests(reply, cancelLimit.retryAfterMs);
   const run = store.getRun(request.params.id, ownerKeysFor(request));
   if (!run) return reply.code(404).send({ error: "Run not found" });
   if (["completed", "failed", "cancelled"].includes(run.state)) return reply.code(409).send({ error: `Cannot cancel run in ${run.state}` });
@@ -741,6 +749,8 @@ async function dispatchFollowupJob(
   reply: FastifyReply,
   options: { kind: "resume"; instruction?: string } | { kind: "retry-review" },
 ) {
+  const actionLimit = runActions.check(auth.user(request).id);
+  if (!actionLimit.allowed) return tooManyRequests(reply, actionLimit.retryAfterMs);
   const run = store.getRun(request.params.id, ownerKeysFor(request));
   if (!run) return reply.code(404).send({ error: "Run not found" });
   if (run.mode !== "real") return reply.code(409).send({ error: "只有真实任务支持人工恢复", code: "RUN_NOT_RESUMABLE" });

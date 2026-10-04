@@ -73,6 +73,17 @@ const isPlanner = prompt.includes("You are the lead engineering planner");
 const isReviewer = prompt.includes("You are an independent read-only code reviewer");
 const isDeveloper = prompt.includes("developer agent") || prompt.includes("implementation sub-agent") || prompt.includes("integration agent");
 
+// AT-SEC-008 probe: records which provider key names were visible to this
+// process. Only booleans/names are written — never a credential value.
+const role = isPlanner ? "planner" : isReviewer ? "reviewer" : "developer";
+if (scenario.dumpEnv) {
+  const names = Object.keys(process.env).filter((key) => /API_KEY|TOKEN|SECRET/.test(key)).sort();
+  writeFileSync(
+    path.join(stateDir, `env-probe-${runId}-${role}.json`),
+    JSON.stringify({ role, hasOpenAIKey: Boolean(process.env.OPENAI_API_KEY), hasDeepSeekKey: Boolean(process.env.DEEPSEEK_API_KEY), names }),
+  );
+}
+
 if (isPlanner) {
   activity("read");
   if (scenario.plannerError) finish("", scenario.plannerError);
