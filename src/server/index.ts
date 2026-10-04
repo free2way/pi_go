@@ -6,6 +6,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { internalUpdateRejection } from "../shared/run-state.js";
 import type { ConfigStatus, CurrentUser, ModelCatalogResponse, Run, RunEvent, Workspace } from "../shared/types.js";
 import { AlertManager, createAlertSink } from "./alerts.js";
 import { Authenticator } from "./auth.js";
@@ -437,7 +438,7 @@ app.get("/api/health", async (_request, reply) => {
   try {
     await pingDatabase();
     alerts.clear("database_unavailable");
-    return { status: "ok", service: "pigo-web", version: "0.21.6", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.21.7", db: "ok" };
   } catch (error) {
     // AT-REL-005: fail loudly instead of pretending the service is healthy.
     alerts.raise({
@@ -446,7 +447,7 @@ app.get("/api/health", async (_request, reply) => {
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
       details: { error: (error as Error).message.slice(0, 200) },
     });
-    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.21.6", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.21.7", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
   }
 });
 
@@ -461,7 +462,7 @@ interface StorageStatus {
 app.get("/api/health/detail", async (request, reply) => {
   const internal = safeTokenMatch(request.headers.authorization);
   if (!internal && !auth.user(request)) return reply.code(401).send({ error: "Unauthorized" });
-  const health: Record<string, unknown> = { version: "0.21.6", at: new Date().toISOString() };
+  const health: Record<string, unknown> = { version: "0.21.7", at: new Date().toISOString() };
   try {
     await pingDatabase();
     health.database = { status: "ok" };
@@ -1365,6 +1366,10 @@ app.post<{ Params: { id: string } }>("/api/internal/runs/:id/update", { bodyLimi
   if (!parsed.success) return reply.code(400).send({ error: "Invalid internal update", details: parsed.error.issues });
   const run = store.getRun(request.params.id);
   if (!run) return reply.code(404).send({ error: "Run not found" });
+  // Chat/状态抑制：终态运行（例如用户刚取消）不再接受任何 worker 内部更新，
+  // 否则迟到的 chat.message 会追加在 run.cancelled 之后并覆盖终态。
+  const rejection = internalUpdateRejection(run);
+  if (rejection) return reply.code(409).send({ error: rejection });
   const { patch, event, deliveryId } = parsed.data;
   try {
     if (deliveryId && jobQueue) {

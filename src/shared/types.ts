@@ -54,6 +54,25 @@ export interface RunEvent {
   meta?: Record<string, unknown>;
 }
 
+export type ChatChannel = "developer" | "reviewer" | "handoff" | "checks" | "system";
+
+export type ChatParticipant = "orchestrator" | "developer" | "reviewer" | "checks" | "user";
+
+export type ChatRole = "prompt" | "response" | "feedback" | "status" | "tool";
+
+export interface ChatMessage {
+  id: string;
+  seq: number;
+  runId: string;
+  round: number;
+  channel: ChatChannel;
+  from: ChatParticipant;
+  to: ChatParticipant;
+  role: ChatRole;
+  content: string;
+  at: string;
+}
+
 /** The human action a stored requirement note came from. */
 export type HumanNoteKind = "approve_continue" | "approve_accept" | "resume" | "reject";
 

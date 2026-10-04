@@ -1,3 +1,4 @@
+import { mergeRunEvents as mergeRunEventsByRun } from "../shared/events";
 import type { Run, RunEvent } from "../shared/types";
 
 /**
@@ -12,15 +13,11 @@ import type { Run, RunEvent } from "../shared/types";
 export const MAX_BUFFERED_EVENTS = 2_000;
 
 export function mergeRunEvents(current: RunEvent[], incoming: RunEvent[], cap = MAX_BUFFERED_EVENTS): RunEvent[] {
-  const merged = new Map<number, RunEvent>();
-  for (const event of current) merged.set(event.seq, event);
-  for (const event of incoming) {
-    // Same seq = same event; keep the first occurrence (dedupe).
-    if (!merged.has(event.seq)) merged.set(event.seq, event);
-  }
-  const sorted = [...merged.values()].sort((a, b) => a.seq - b.seq);
-  const bounded = cap > 0 && sorted.length > cap ? sorted.slice(sorted.length - cap) : sorted;
-  return bounded;
+  // Delegate the merge to the shared helper (keyed by `runId:seq`, so two runs
+  // sharing seq numbers can never overwrite each other) and keep the AUD-17
+  // memory cap on top of it.
+  const sorted = mergeRunEventsByRun(current, incoming);
+  return cap > 0 && sorted.length > cap ? sorted.slice(sorted.length - cap) : sorted;
 }
 
 /**

@@ -4,7 +4,8 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, readdir, realpath, rm, stat, statfs } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
-import type { CheckResult, DevelopmentPlan, Finding, ProjectInfo, Run, RunEvent, RunRoleUsage, RunState, SubAgentTask, WorkspaceVerifyResult } from "../shared/types.js";
+import type { ChatChannel, ChatParticipant, ChatRole, DevelopmentPlan, Finding, ProjectInfo, Run, RunEvent, RunRoleUsage, RunState, SubAgentTask, WorkspaceVerifyResult } from "../shared/types.js";
+import { runChecks as runCheckSuite, throwIfCancelled, type CommandResult } from "./checks.js";
 import { CheckpointTracker, isCheckpointCurrent, memoryCheckpointClient, stages, type Checkpoint, type CheckpointClient, type StoredChecks, type StoredReview } from "./checkpoints.js";
 import { conflictFreeBatches, executionWaves, fallbackPlan, parseDevelopmentPlan } from "./orchestrator.js";
 import { UsageTracker, addUsage, assistantErrorFromEvent, assistantTextFromEvent, toRunUsage, toolNameFromEvent, type UsageTotals } from "./pi-events.js";
@@ -571,7 +572,34 @@ async function update(run: Run, state: RunState, source: RunEvent["source"], typ
   }, { ...options, ownerId: run.ownerId, round: run.round });
 }
 
-type CommandResult = { code: number; stdout: string; stderr: string };
+/**
+ * Appends one structured `chat.message` event (the collaboration transcript the
+ * run detail page renders). The cancellation guard means a run cancelled while
+ * an agent was mid-response never emits a phantom chat entry after
+ * `run.cancelled` — the server would reject it anyway (terminal-state guard).
+ */
+async function chat(
+  run: Run,
+  channel: ChatChannel,
+  from: ChatParticipant,
+  to: ChatParticipant,
+  role: ChatRole,
+  content: string,
+  signal?: AbortSignal,
+) {
+  throwIfCancelled(signal);
+  const clipped = content.length > 6_000 ? `${content.slice(0, 6_000)}\n\n…（内容已截断）` : content;
+  if (!clipped.trim()) return;
+  await postUpdate(run.id, {
+    event: {
+      round: run.round,
+      source: from === "developer" || from === "reviewer" || from === "checks" ? from : "system",
+      type: "chat.message",
+      message: clipped.replace(/\s+/g, " ").slice(0, 110),
+      meta: { chat: { channel, from, to, role, content: clipped } },
+    },
+  });
+}
 
 function command(commandName: string, args: string[], options: {
   cwd: string;
@@ -953,6 +981,7 @@ async function runDeveloperAgent(input: {
   budget?: RunBudgetContext;
   role?: RunRoleUsage["role"];
 }) {
+  await chat(input.run, "developer", "orchestrator", "developer", "prompt", input.prompt, input.signal);
   const result = await runPiWithRetry({
     cwd: input.worktree,
     provider: input.run.developer.provider,
@@ -972,6 +1001,7 @@ async function runDeveloperAgent(input: {
     }),
   }, { runId: input.run.id, round: input.run.round, label: input.activityPrefix ?? "开发 Agent", role: input.role ?? "developer", budget: input.budget });
   addUsage(input.usage, result.usage);
+  await chat(input.run, "developer", "developer", "orchestrator", "response", redactJobSecrets(result.text, input.credentials), input.signal);
   return result.text;
 }
 
@@ -1235,42 +1265,41 @@ async function orchestrateSubAgents(input: {
 }
 
 async function runChecks(run: Run, worktree: string, commands: string[], signal: AbortSignal) {
-  const results: CheckResult[] = [];
-  for (let index = 0; index < commands.length; index += 1) {
-    const checkCommand = commands[index];
-    const started = Date.now();
-    const current: CheckResult = { id: `check-${index + 1}`, name: `Check ${index + 1}`, command: checkCommand, status: "running" };
-    await update(run, "checking", "checks", "check.started", `执行检查：${checkCommand}`, { checks: [...results, current] });
-    // SEC-004/010: check commands run with the worker's secrets stripped, so a
-    // malicious check cannot read the internal callback token or provider keys.
-    const result = sandboxMode === "container"
-      ? await runInSandbox({
-          argv: ["/bin/sh", "-lc", checkCommand],
-          worktree,
-          repository: await repositoryForWorktree(worktree),
-          env: sandboxEnvironment({}),
-          network: "none",
-          timeoutMs: 600_000,
-          signal,
-          label: "check",
-        })
-      : await command("/bin/sh", ["-lc", checkCommand], {
-          cwd: worktree,
-          signal,
-          timeoutMs: 600_000,
-          env: scrubEnvironment(process.env),
-        });
-    results.push({
-      ...current,
-      status: result.code === 0 ? "passed" : "failed",
-      durationMs: Date.now() - started,
-      exitCode: result.code,
-      output: `${result.stdout}\n${result.stderr}`.trim().slice(-12_000),
-    });
-    await postUpdate(run.id, { patch: { checks: [...results] }, event: { round: run.round, source: "checks", type: result.code === 0 ? "check.passed" : "check.failed", message: `${checkCommand} ${result.code === 0 ? "通过" : "失败"}` } });
-    if (result.code !== 0) return { passed: false, results };
-  }
-  return { passed: true, results };
+  // Delegates to the extracted suite so check execution, cancellation handling
+  // and the structured `checks` chat entries are unit-tested in one place.
+  return runCheckSuite({
+    commands,
+    signal,
+    execute: async (checkCommand, execSignal) => {
+      // SEC-004/010: check commands run with the worker's secrets stripped, so a
+      // malicious check cannot read the internal callback token or provider keys.
+      return sandboxMode === "container"
+        ? await runInSandbox({
+            argv: ["/bin/sh", "-lc", checkCommand],
+            worktree,
+            repository: await repositoryForWorktree(worktree),
+            env: sandboxEnvironment({}),
+            network: "none",
+            timeoutMs: 600_000,
+            signal: execSignal,
+            label: "check",
+          })
+        : await command("/bin/sh", ["-lc", checkCommand], {
+            cwd: worktree,
+            signal: execSignal,
+            timeoutMs: 600_000,
+            env: scrubEnvironment(process.env),
+          });
+    },
+    started: (checks, checkCommand) =>
+      update(run, "checking", "checks", "check.started", `执行检查：${checkCommand}`, { checks }),
+    finished: (checks, checkCommand, passed) =>
+      postUpdate(run.id, {
+        patch: { checks },
+        event: { round: run.round, source: "checks", type: passed ? "check.passed" : "check.failed", message: `${checkCommand} ${passed ? "通过" : "失败"}` },
+      }),
+    chat: (payload) => chat(run, payload.channel, payload.from, payload.to, payload.role, payload.content, signal),
+  });
 }
 
 type ReviewOutcome = { stopped: true } | { stopped: false; review: ReviewResult };
@@ -1354,6 +1383,7 @@ async function performReview(input: {
     `Diff:\n${input.diff.slice(0, 90_000)}`,
   ].join("\n\n");
   let firstReview: { text: string; usage: UsageTotals };
+  await chat(input.run, "reviewer", "orchestrator", "reviewer", "prompt", reviewPrompt, input.signal);
   try {
     firstReview = await runPiWithRetry({
       cwd: input.snapshotPath,
@@ -1378,6 +1408,7 @@ async function performReview(input: {
     return { stopped: true };
   }
   addUsage(input.usage, firstReview.usage);
+  await chat(input.run, "reviewer", "reviewer", "orchestrator", "response", redactJobSecrets(firstReview.text, input.credentials), input.signal);
   try {
     return { stopped: false, review: parseReview(redactJobSecrets(firstReview.text, input.credentials), input.round) };
   } catch (protocolError) {
@@ -1761,6 +1792,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
       if (!storedChecks) await tracker.complete(stages.checks(round), { ...checked, round, snapshotHash: checkSnapshot });
       if (!checked.passed) {
         feedback = `The deterministic checks failed. Fix these failures:\n${checked.results.filter((item) => item.status === "failed").map((item) => `${item.command}\n${item.output}`).join("\n\n")}`;
+        await chat(run, "handoff", "checks", "developer", "feedback", feedback, controller.signal);
         await update(run, "developing", "checks", "checks.returned", "检查失败，已退回 Developer 修复", { summary: "检查失败，等待修复", checkPassed: false, ...(storedChecks ? {} : { checks: checked.results }) });
         continue;
       }
@@ -1859,6 +1891,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
         return;
       }
       feedback = JSON.stringify(review.findings, null, 2);
+      await chat(run, "handoff", "reviewer", "developer", "feedback", feedback, controller.signal);
       await update(run, "developing", "reviewer", "review.changes_requested", `审核发现 ${review.findings.length} 个问题，退回 Developer`, { findings, summary: review.summary, usage: toRunUsage(usage) });
     }
     await update(run, "needs_human", "system", "run.needs_human", "达到最大审核轮次，需要人工处理", { findings, usage: toRunUsage(usage), usageRoles: run.usageRoles, modelCalls: run.modelCalls, durationMs: Date.now() - started });

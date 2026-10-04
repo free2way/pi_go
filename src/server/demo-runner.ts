@@ -1,4 +1,4 @@
-import type { CheckResult, Finding, Run, RunEvent, RunState } from "../shared/types.js";
+import type { ChatChannel, ChatParticipant, ChatRole, CheckResult, Finding, Run, RunEvent, RunState } from "../shared/types.js";
 import type { RunStoreLike } from "./store.js";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -43,7 +43,7 @@ const finding: Finding = {
   resolved: false,
 };
 
-export function baseDemoRun(input: { title: string; task: string; repository: string }, ownerId: string): Run {
+export function baseDemoRun(input: { title: string; task: string; repository: string }, ownerId = "owner_demo"): Run {
   const now = new Date().toISOString();
   return {
     id: `run_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`,
@@ -70,8 +70,9 @@ export function baseDemoRun(input: { title: string; task: string; repository: st
   };
 }
 
-export async function runDemo(store: RunStoreLike, runId: string) {
+export async function runDemo(store: RunStoreLike, runId: string, options: { delayMs?: number } = {}) {
   const startedAt = Date.now();
+  const stepDelay = options.delayMs ?? 850;
   const emit = async (
     state: RunState,
     source: RunEvent["source"],
@@ -90,13 +91,55 @@ export async function runDemo(store: RunStoreLike, runId: string) {
       message,
       at: new Date().toISOString(),
     });
-    await sleep(850);
+    await sleep(stepDelay);
   };
+
+  const say = async (
+    round: number,
+    channel: ChatChannel,
+    from: ChatParticipant,
+    to: ChatParticipant,
+    role: ChatRole,
+    content: string,
+  ) => {
+    // Mirror `emit`'s guard so a cancellation during the preceding wait cannot
+    // append a phantom agent message after `run.cancelled`.
+    const current = store.getRun(runId);
+    if (!current || current.state === "cancelled") throw new Error("cancelled");
+    await store.appendEvent({
+      runId,
+      round,
+      source: from === "developer" || from === "reviewer" || from === "checks" ? from : "system",
+      type: "chat.message",
+      message: content.replace(/\s+/g, " ").slice(0, 110),
+      at: new Date().toISOString(),
+      meta: { chat: { channel, from, to, role, content } },
+    });
+    await sleep(Math.max(1, Math.round(stepDelay * 0.38)));
+  };
+
+  const task = store.getRun(runId)?.task ?? "";
 
   try {
     await emit("preparing", "system", "workspace.created", "已创建隔离 Git worktree，锁定基线提交 8fd2a91");
+    await say(
+      1,
+      "developer",
+      "orchestrator",
+      "developer",
+      "prompt",
+      `你是开发 Agent，请只修改当前 worktree。\n\n任务：${task}\n\n要求：完整实现需求，补充或更新测试，并说明本轮改动与验证方式。不要推送、部署或读取凭据。`,
+    );
     await emit("developing", "developer", "agent.started", "DeepSeek 正在分析认证模块与并发刷新路径");
     await emit("developing", "developer", "tool.read", "读取 src/auth/session.ts、调用方与现有测试");
+    await say(
+      1,
+      "developer",
+      "developer",
+      "orchestrator",
+      "response",
+      "定位到 refreshSession 每次调用都会直接触发 client.refresh，并发场景下会产生重复刷新请求。\n方案：引入 refreshLocks(按 token 去重) 复用进行中的 Promise，并补充并发回归测试。下一步开始编辑 session.ts 与测试文件。",
+    );
     await emit("developing", "developer", "tool.edit", "加入 refresh request 去重，并补充并发测试", {
       diff: demoDiff,
       summary: "实现 token 刷新去重，新增并发回归测试",
@@ -114,13 +157,47 @@ export async function runDemo(store: RunStoreLike, runId: string) {
       output: index === 2 ? "42 tests passed" : "0 errors",
     }));
     await emit("reviewing", "checks", "checks.passed", "3 项确定性检查全部通过", { checks: passedChecks });
+    await say(
+      1,
+      "checks",
+      "checks",
+      "orchestrator",
+      "status",
+      "确定性检查全部通过：lint 0 errors · typecheck 0 errors · 42 tests passed（1280ms / 2140ms / 3820ms）。进入独立审核阶段。",
+    );
     await emit("reviewing", "reviewer", "review.started", "OpenAI 审核 Agent 正在检查需求覆盖、边界条件和测试质量");
+    await say(
+      1,
+      "reviewer",
+      "orchestrator",
+      "reviewer",
+      "prompt",
+      "你是独立只读审核 Agent，请勿修改文件。\n\n原始任务：" +
+        task +
+        "\n\n请审查当前仓库与提供的 diff，重点关注正确性、需求覆盖、安全、回归风险与测试质量，并按协议返回 JSON 审核结论。",
+    );
+    await say(
+      1,
+      "handoff",
+      "reviewer",
+      "developer",
+      "feedback",
+      "审核结论：changes_requested（1 个高优先级问题）。\n\n[high] 失败请求可能污染并发锁\n文件：src/auth/session.ts:46\n证据：refresh promise 被缓存，但第一版实现没有在 rejected path 中清理锁，失败后锁会长期占用。\n需要修改：使用 finally 清理 refreshLocks，并增加失败后可重试的测试。",
+    );
     await emit("developing", "reviewer", "review.changes_requested", "审核发现 1 个高优先级问题，已退回 DeepSeek", {
       findings: [finding],
       summary: "第一轮审核：需要修复 rejected promise 的锁清理路径",
     });
 
     await emit("developing", "developer", "agent.repair_started", "DeepSeek 收到结构化审核意见，开始第二轮修复", { round: 2 });
+    await say(
+      2,
+      "developer",
+      "developer",
+      "orchestrator",
+      "response",
+      "已收到第一轮审核意见。本轮使用 try/finally 在成功与失败路径都清理 refreshLocks，并新增“失败后可重试”的回归测试，避免 rejected promise 长期占用锁。",
+    );
     await emit("developing", "developer", "tool.edit", "使用 finally 清理锁，并新增失败后重试测试", {
       round: 2,
       findings: [{ ...finding, resolved: true }],
@@ -136,7 +213,23 @@ export async function runDemo(store: RunStoreLike, runId: string) {
         check.id === "tests" ? { ...check, output: "44 tests passed" } : check,
       ),
     });
+    await say(
+      2,
+      "checks",
+      "checks",
+      "orchestrator",
+      "status",
+      "第二轮确定性检查通过：lint 0 errors · typecheck 0 errors · 44 tests passed。已提交复审。",
+    );
     await emit("reviewing", "reviewer", "review.started", "OpenAI 正在执行独立复审", { round: 2 });
+    await say(
+      2,
+      "reviewer",
+      "reviewer",
+      "orchestrator",
+      "response",
+      "复审结论：approved。锁清理已覆盖 rejected 路径，失败后重试测试有效，未发现新的高优先级问题。可以进入人工合并流程。",
+    );
     await emit("completed", "reviewer", "review.approved", "复审通过，等待人工合并", {
       round: 2,
       summary: "并发刷新竞态已修复；检查与独立复审均通过",

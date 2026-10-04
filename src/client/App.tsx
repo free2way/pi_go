@@ -1,19 +1,24 @@
 import {
   Background,
   BackgroundVariant,
+  BaseEdge,
   Controls,
+  EdgeLabelRenderer,
   Handle,
   MarkerType,
   MiniMap,
   Position,
   ReactFlow,
+  getSmoothStepPath,
   type Edge,
+  type EdgeProps,
   type Node,
   type NodeProps,
 } from "@xyflow/react";
 import {
   Activity,
   AlertTriangle,
+  ArrowRight,
   ArrowUpRight,
   Bot,
   Braces,
@@ -23,6 +28,7 @@ import {
   CircleDot,
   Clock3,
   Code2,
+  CornerDownLeft,
   Cpu,
   Download,
   FileCode2,
@@ -35,6 +41,7 @@ import {
   LoaderCircle,
   LogOut,
   Menu,
+  MessagesSquare,
   PanelRightClose,
   Play,
   Plus,
@@ -50,11 +57,13 @@ import {
   Zap,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { ConfigStatus, CurrentUser, Finding, ModelCatalogResponse, Run, RunArtifact, RunEvent, RunMode, RunRoleUsage, RunState, Workspace } from "../shared/types";
+import { chatChannelLabels, chatCounts, chatParticipantLabels, chatMessagesFromEvents, chatTabs, filterChatMessages, reworkBranchRounds, type ChatTab } from "../shared/chat";
+import type { ChatMessage, ConfigStatus, CurrentUser, Finding, ModelCatalogResponse, Run, RunArtifact, RunEvent, RunMode, RunRoleUsage, RunState, Workspace } from "../shared/types";
 import { api } from "./api";
 import { HistoryPage } from "./HistoryPage";
 import { runStateLabels, requirementSummary } from "./requirement-history";
 import { MAX_BUFFERED_EVENTS, mergeRunEvents, shouldAcceptRun } from "./run-events";
+import { createRunSelectionGuard, eventsForRun } from "./run-selection";
 import { ModelsPage } from "./ModelsPage";
 import { WorkspacesPage } from "./WorkspacesPage";
 
@@ -93,7 +102,7 @@ function FlowCard({ data }: NodeProps<Node<FlowNodeData>>) {
   const Icon = iconForKind[data.kind];
   return (
     <div className={`flow-card flow-${data.kind} is-${data.status}`}>
-      <Handle type="target" position={Position.Left} className="flow-handle" />
+      <Handle type="target" position={Position.Left} id="main-target" className="flow-handle" />
       <div className="flow-icon"><Icon size={17} strokeWidth={1.8} /></div>
       <div className="flow-copy">
         <div className="flow-title">{data.label}</div>
@@ -102,14 +111,50 @@ function FlowCard({ data }: NodeProps<Node<FlowNodeData>>) {
       {data.status === "active" && <LoaderCircle className="spin flow-state-icon" size={15} />}
       {data.status === "done" && <Check className="flow-state-icon" size={15} />}
       {data.meta && <span className="flow-meta">{data.meta}</span>}
-      <Handle type="source" position={Position.Right} className="flow-handle" />
+      <Handle type="source" position={Position.Right} id="main-source" className="flow-handle" />
+      <Handle type="target" position={Position.Bottom} id="bottom-target" className="flow-handle flow-handle-bottom" style={{ left: "30%" }} />
+      <Handle type="source" position={Position.Bottom} id="bottom-source" className="flow-handle flow-handle-bottom" style={{ left: "70%" }} />
     </div>
   );
 }
 
 const nodeTypes = { flowCard: FlowCard };
 
-function flowForRun(run?: Run): { nodes: Node<FlowNodeData>[]; edges: Edge[] } {
+// Renders a rework branch that dips below the main pipeline instead of
+// travelling back along the original path.
+function ReworkEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, markerEnd, style, data }: EdgeProps) {
+  const label = typeof data?.label === "string" ? data.label : "";
+  const centerY = typeof data?.centerY === "number" ? data.centerY : Math.max(sourceY, targetY) + 96;
+  const [edgePath, labelX, labelY] = getSmoothStepPath({
+    sourceX,
+    sourceY,
+    targetX,
+    targetY,
+    sourcePosition,
+    targetPosition,
+    borderRadius: 16,
+    centerY,
+  });
+  return (
+    <>
+      <BaseEdge id={id} path={edgePath} markerEnd={markerEnd} style={style} />
+      {label && (
+        <EdgeLabelRenderer>
+          <div
+            className="rework-label"
+            style={{ transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)` }}
+          >
+            <CornerDownLeft size={11} />{label}
+          </div>
+        </EdgeLabelRenderer>
+      )}
+    </>
+  );
+}
+
+const edgeTypes = { rework: ReworkEdge };
+
+function flowForRun(run?: Run, events: RunEvent[] = []): { nodes: Node<FlowNodeData>[]; edges: Edge[] } {
   const currentOrder = run ? stateOrder[run.state] : -1;
   const statusAt = (order: number): FlowNodeData["status"] => {
     if (!run) return "waiting";
@@ -174,24 +219,28 @@ function flowForRun(run?: Run): { nodes: Node<FlowNodeData>[]; edges: Edge[] } {
     style: { strokeWidth: 1.5 },
   };
   const edges: Edge[] = [
-    { id: "task-dev", source: "task", target: "developer", ...edgeDefaults },
-    { id: "dev-check", source: "developer", target: "checks", ...edgeDefaults },
-    { id: "check-review", source: "checks", target: "reviewer", ...edgeDefaults },
-    { id: "review-done", source: "reviewer", target: "complete", ...edgeDefaults },
-    {
-      id: "feedback",
+    { id: "task-dev", source: "task", target: "developer", sourceHandle: "main-source", targetHandle: "main-target", ...edgeDefaults },
+    { id: "dev-check", source: "developer", target: "checks", sourceHandle: "main-source", targetHandle: "main-target", ...edgeDefaults },
+    { id: "check-review", source: "checks", target: "reviewer", sourceHandle: "main-source", targetHandle: "main-target", ...edgeDefaults },
+    { id: "review-done", source: "reviewer", target: "complete", sourceHandle: "main-source", targetHandle: "main-target", ...edgeDefaults },
+  ];
+  // Each return round is drawn as its own branch below the pipeline rather
+  // than as a reverse traversal over the original edges. Only real review
+  // returns qualify — checks failures advance the round without the reviewer.
+  const returns = reworkBranchRounds(events);
+  for (const [index, round] of returns.entries()) {
+    edges.push({
+      id: `rework-${round}`,
       source: "reviewer",
       target: "developer",
-      sourceHandle: null,
-      targetHandle: null,
-      type: "smoothstep",
-      label: "changes requested",
-      animated: run?.round === 1 && run?.state === "developing" && run.findings.length > 0,
-      style: { stroke: "#f3a65a", strokeWidth: 1.4 },
-      labelStyle: { fill: "#dca06a", fontSize: 10, fontWeight: 600 },
+      sourceHandle: "bottom-source",
+      targetHandle: "bottom-target",
+      type: "rework",
+      data: { label: `round ${round} · 返修`, centerY: 208 + index * 54 },
+      style: { stroke: "#f3a65a", strokeWidth: 1.5, strokeDasharray: "5 4" },
       markerEnd: { type: MarkerType.ArrowClosed, width: 15, height: 15, color: "#f3a65a" },
-    },
-  ];
+    });
+  }
   return { nodes, edges };
 }
 
@@ -394,10 +443,13 @@ function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, onGoWor
 }
 
 function ActivityPanel({ events }: { events: RunEvent[] }) {
-  if (!events.length) return <EmptyPanel icon={Activity} text="等待事件" />;
+  // Chat entries have their own transcript panel; the activity feed stays a
+  // pure orchestration timeline instead of duplicating every chat message.
+  const activity = events.filter((event) => event.type !== "chat.message");
+  if (!activity.length) return <EmptyPanel icon={Activity} text="等待事件" />;
   return (
     <div className="timeline">
-      {[...events].reverse().map((event) => (
+      {[...activity].reverse().map((event) => (
         <div className={`timeline-item source-${event.source}`} key={event.seq}>
           <span className="timeline-dot" />
           <div className="timeline-content">
@@ -539,6 +591,79 @@ function BudgetPanel({ run }: { run: Run }) {
   );
 }
 
+function participantName(participant: ChatMessage["from"], run: Run) {
+  if (participant === "developer") return run.developer.model;
+  if (participant === "reviewer") return run.reviewer.model;
+  return chatParticipantLabels[participant];
+}
+
+function participantInitials(participant: ChatMessage["from"]) {
+  if (participant === "orchestrator") return "OR";
+  if (participant === "developer") return "DEV";
+  if (participant === "reviewer") return "REV";
+  if (participant === "checks") return "CI";
+  return "USR";
+}
+
+function ChatLog({ messages, run, activeTab, onTabChange }: {
+  messages: ChatMessage[];
+  run: Run;
+  activeTab: ChatTab;
+  onTabChange: (tab: ChatTab) => void;
+}) {
+  const counts = useMemo(() => chatCounts(messages), [messages]);
+  const visible = useMemo(() => filterChatMessages(messages, activeTab), [messages, activeTab]);
+  return (
+    <section className="panel chat-panel">
+      <div className="chat-head">
+        <div className="chat-title">
+          <span className="eyebrow">AGENT CONVERSATION</span>
+          <h3><MessagesSquare size={15} />协作对话日志</h3>
+        </div>
+        <div className="chat-tabs" role="tablist" aria-label="对话筛选">
+          {chatTabs.map((tab) => (
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === tab.id}
+              className={activeTab === tab.id ? "active" : ""}
+              key={tab.id}
+              title={tab.hint}
+              onClick={() => onTabChange(tab.id)}
+            >
+              {tab.label}<em>{counts[tab.id]}</em>
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="chat-body">
+        {visible.length === 0 ? (
+          <EmptyPanel icon={MessagesSquare} text={activeTab === "all" ? "等待 Agent 对话" : "该分类暂无对话"} />
+        ) : (
+          <div className="chat-stream">
+            {visible.map((message) => (
+              <article className={`chat-message chat-${message.channel} role-${message.role}`} key={message.id}>
+                <span className="chat-avatar">{participantInitials(message.from)}</span>
+                <div className="chat-bubble">
+                  <div className="chat-meta">
+                    <strong>{participantName(message.from, run)}</strong>
+                    <ArrowRight size={11} />
+                    <span>{participantName(message.to, run)}</span>
+                    <em className={`chat-channel-tag tag-${message.channel}`}>{chatChannelLabels[message.channel]}</em>
+                    <em className="chat-round">R{message.round}</em>
+                    <time>{formatClock(message.at)}</time>
+                  </div>
+                  <p>{message.content}</p>
+                </div>
+              </article>
+            ))}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
 function EmptyPanel({ icon: Icon, text }: { icon: typeof Activity; text: string }) {
   return <div className="empty-panel"><Icon size={22} /><span>{text}</span></div>;
 }
@@ -635,6 +760,7 @@ export function App() {
   const [config, setConfig] = useState<ConfigStatus>();
   const [user, setUser] = useState<CurrentUser>();
   const [tab, setTab] = useState<Tab>("activity");
+  const [chatTab, setChatTab] = useState<ChatTab>("all");
   const [view, setView] = useState<"run" | "workspaces" | "models" | "history">("run");
   const [createOpen, setCreateOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -662,30 +788,34 @@ export function App() {
 
   useEffect(() => {
     if (!selectedId) { setRun(undefined); setEvents([]); setArtifacts([]); return; }
-    let active = true;
     // Reset for the newly selected run before any snapshot/stream data merges in,
     // so seq numbers from different runs are never mixed.
     setEvents([]);
     setArtifacts([]);
+    // Stale-response guard: every in-flight request/stream for the previously
+    // selected run is invalidated here, so a late api.run/SSE event cannot
+    // overwrite the newly selected run.
+    const guard = createRunSelectionGuard(selectedId);
     void Promise.all([api.run(selectedId), api.events(selectedId), api.artifacts(selectedId)]).then(([nextRun, nextEvents, nextArtifacts]) => {
-      if (!active) return;
+      if (!guard.acceptRun(nextRun)) return;
       applyRun(nextRun);
       // Merge (not replace): the SSE stream may already have delivered newer events.
-      setEvents((current) => mergeRunEvents(current, nextEvents, MAX_BUFFERED_EVENTS));
+      // Keep only events of this run so a draining previous stream cannot collide.
+      setEvents((current) => mergeRunEvents(eventsForRun(current, guard.runId), nextEvents.filter((event) => guard.acceptEvent(event)), MAX_BUFFERED_EVENTS));
       setArtifacts(nextArtifacts.artifacts);
     }).catch(() => undefined);
     const stream = new EventSource(`/api/runs/${selectedId}/stream`);
     stream.onmessage = (message) => {
-      if (!active) return;
       const event = JSON.parse(message.data) as RunEvent;
+      if (!guard.acceptEvent(event)) return;
       // Dedupe by monotonic seq and cap the buffer so long runs stay bounded.
-      setEvents((current) => mergeRunEvents(current, [event], MAX_BUFFERED_EVENTS));
+      setEvents((current) => mergeRunEvents(eventsForRun(current, guard.runId), [event], MAX_BUFFERED_EVENTS));
       void api.run(selectedId).then((nextRun) => {
-        if (!active) return;
+        if (!guard.acceptRun(nextRun)) return;
         applyRun(nextRun);
       }).catch(() => undefined);
     };
-    return () => { active = false; stream.close(); };
+    return () => { guard.invalidate(); stream.close(); };
   }, [selectedId, applyRun]);
 
   // GAP-04: the artifact list becomes meaningful at terminal state.
@@ -698,7 +828,8 @@ export function App() {
     return () => { active = false; };
   }, [selectedId, run?.state]);
 
-  const flow = useMemo(() => flowForRun(run), [run]);
+  const flow = useMemo(() => flowForRun(run, events), [run, events]);
+  const chatMessages = useMemo(() => chatMessagesFromEvents(events), [events]);
   const running = runs.filter((item) => !terminalStates.includes(item.state)).length;
 
   const handleCreated = (created: Run) => {
@@ -840,7 +971,7 @@ export function App() {
               <section className="panel flow-panel">
                 <div className="panel-head"><div><span className="eyebrow">LIVE ORCHESTRATION</span><h3>工作流拓扑</h3></div><div className="live-indicator"><i />LIVE</div></div>
                 <div className="flow-wrap">
-                  <ReactFlow nodes={flow.nodes} edges={flow.edges} nodeTypes={nodeTypes} fitView minZoom={0.6} maxZoom={1.4} nodesDraggable={false} nodesConnectable={false} elementsSelectable={false} proOptions={{ hideAttribution: true }}>
+                  <ReactFlow nodes={flow.nodes} edges={flow.edges} nodeTypes={nodeTypes} edgeTypes={edgeTypes} fitView minZoom={0.6} maxZoom={1.4} nodesDraggable={false} nodesConnectable={false} elementsSelectable={false} proOptions={{ hideAttribution: true }}>
                     <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#252a31" />
                     <Controls showInteractive={false} />
                     <MiniMap pannable={false} zoomable={false} nodeColor={(node) => node.data.status === "active" ? "#e6ff62" : "#353b44"} maskColor="rgba(8,10,13,.76)" />
@@ -871,6 +1002,8 @@ export function App() {
                 </div>
               </section>
             </div>
+
+            <ChatLog messages={chatMessages} run={run} activeTab={chatTab} onTabChange={setChatTab} />
           </div>
         )}
       </main>
