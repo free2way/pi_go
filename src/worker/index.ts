@@ -191,12 +191,13 @@ async function runInSandbox(input: SandboxRunInput): Promise<CommandResult> {
     await docker.startContainer(containerId);
     // Logs are read after the container starts: Docker only exposes the full
     // log of a started container, and `follow=1` then streams to completion.
+    const maxSandboxOutput = 256_000;
     const logs = docker.logsFollow(containerId, (line, stream) => {
       if (stream === "stderr") {
-        stderr += `${line}\n`;
+        stderr = `${stderr}${line}\n`.slice(-maxSandboxOutput);
         return;
       }
-      stdout += `${line}\n`;
+      stdout = `${stdout}${line}\n`.slice(-maxSandboxOutput);
       input.onStdoutLine?.(line);
     }, input.signal).catch((error) => { stderr += String(error.message); });
     const { StatusCode } = await docker.waitContainer(containerId);
@@ -206,7 +207,9 @@ async function runInSandbox(input: SandboxRunInput): Promise<CommandResult> {
     clearTimeout(timer);
     input.signal.removeEventListener("abort", onAbort);
     await docker.removeContainer(containerId).catch(() => undefined);
-    await rm(runStateDir, { recursive: true, force: true }).catch(() => undefined);
+    // AUD-07: the per-run Pi state directory is intentionally kept so the next
+    // call (repair round, retry review, recovery) can resume the same session.
+    // It is removed together with the run directory during explicit cleanup.
   }
 }
 
