@@ -80,7 +80,15 @@ if (scenario.dumpEnv) {
   const names = Object.keys(process.env).filter((key) => /API_KEY|TOKEN|SECRET/.test(key)).sort();
   writeFileSync(
     path.join(stateDir, `env-probe-${runId}-${role}.json`),
-    JSON.stringify({ role, hasOpenAIKey: Boolean(process.env.OPENAI_API_KEY), hasDeepSeekKey: Boolean(process.env.DEEPSEEK_API_KEY), names }),
+    JSON.stringify({
+      role,
+      hasOpenAIKey: Boolean(process.env.OPENAI_API_KEY),
+      hasDeepSeekKey: Boolean(process.env.DEEPSEEK_API_KEY),
+      names,
+      // Flag-only argv snapshot: prompts and values stay out of the probe.
+      flags: args.filter((value) => value.startsWith("--")),
+      toolArg: args.includes("--tools") ? args[args.indexOf("--tools") + 1] : null,
+    }),
   );
 }
 
