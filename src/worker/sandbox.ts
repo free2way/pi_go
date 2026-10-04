@@ -102,7 +102,16 @@ export async function resolveSandboxMode(
   ping: () => Promise<boolean>,
 ): Promise<{ mode: "container" | "process"; reason?: string }> {
   if (mode === "process") return { mode: "process", reason: "disabled by PI_SANDBOX_MODE=process" };
-  if (mode === "container") return { mode: "container" };
+  if (mode === "container") {
+    // Requested explicitly: keep it even when the socket is unreachable so the
+    // failure is loud instead of silently degrading isolation.
+    try {
+      await ping();
+      return { mode: "container" };
+    } catch (error) {
+      return { mode: "container", reason: `docker socket not usable: ${(error as Error).message}` };
+    }
+  }
   try {
     await ping();
     return { mode: "container" };

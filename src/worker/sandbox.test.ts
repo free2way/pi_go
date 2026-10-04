@@ -77,8 +77,10 @@ describe("resolveSandboxMode", () => {
     expect(result.reason).toContain("ENOENT");
   });
 
-  it("respects an explicit mode", async () => {
+  it("respects an explicit mode and reports an unusable socket instead of degrading", async () => {
     expect((await resolveSandboxMode("process", async () => true)).mode).toBe("process");
-    expect((await resolveSandboxMode("container", async () => { throw new Error("no socket"); })).mode).toBe("container");
+    const forced = await resolveSandboxMode("container", async () => { throw new Error("EACCES"); });
+    expect(forced.mode).toBe("container");
+    expect(forced.reason).toContain("EACCES");
   });
 });
