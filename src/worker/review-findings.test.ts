@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Finding } from "../shared/types.js";
-import { findingFingerprint, mergeFindings, repeatedFindings, unresolvedFeedback } from "./review-findings.js";
+import { findingFingerprint, mergeFindings, repeatedFindings, repeatedSevereFindings, severeRepeatThreshold, unresolvedFeedback } from "./review-findings.js";
 
 const finding = (overrides: Partial<Finding> = {}): Finding => ({
   id: "stable-finding",
@@ -68,6 +68,41 @@ describe("mergeFindings", () => {
     const a = findingFingerprint({ file: "src/a.ts", title: "Race", requiredChange: "Fix the race" });
     const b = findingFingerprint({ file: "src/a.ts", title: " race ", requiredChange: "fix the race" });
     expect(a).toBe(b);
+  });
+
+  it("breaks the consecutive streak when a round does not re-report the finding", () => {
+    let findings = mergeFindings([], [incoming()], { round: 1 });
+    findings = mergeFindings(findings, [incoming({ id: "other", title: "Different", file: "src/b.ts" })], { round: 2 });
+    expect(findings[0].resolved).toBe(false);
+    expect(findings[0].consecutiveRounds).toBe(0);
+  });
+});
+
+describe("repeatedSevereFindings (AT-REVIEW-010)", () => {
+  it("escalates the same critical/high finding reported across the threshold of consecutive rounds", () => {
+    expect(severeRepeatThreshold).toBe(3);
+    let findings = mergeFindings([], [incoming({ severity: "critical" })], { round: 1 });
+    findings = mergeFindings(findings, [incoming({ severity: "high", id: "renamed-by-reviewer" })], { round: 2 });
+    expect(repeatedSevereFindings(findings)).toEqual([]);
+    findings = mergeFindings(findings, [incoming({ severity: "high" })], { round: 3 });
+    expect(repeatedSevereFindings(findings).map((item) => item.id)).toEqual(["stable-finding"]);
+  });
+
+  it("does not escalate a single occurrence or a resolved finding", () => {
+    const single = mergeFindings([], [incoming({ severity: "high" })], { round: 1 });
+    expect(repeatedSevereFindings(single)).toEqual([]);
+
+    let findings = mergeFindings([], [incoming({ severity: "high" })], { round: 1 });
+    findings = mergeFindings(findings, [], { round: 2, approved: true });
+    expect(findings[0].resolved).toBe(true);
+    expect(repeatedSevereFindings(findings)).toEqual([]);
+  });
+
+  it("ignores medium/low findings repeated beyond the threshold", () => {
+    let findings = mergeFindings([], [incoming({ severity: "medium" })], { round: 1 });
+    findings = mergeFindings(findings, [incoming({ severity: "medium" })], { round: 2 });
+    findings = mergeFindings(findings, [incoming({ severity: "medium" })], { round: 3 });
+    expect(repeatedSevereFindings(findings)).toEqual([]);
   });
 });
 

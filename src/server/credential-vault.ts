@@ -1,7 +1,12 @@
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { CredentialStatus, ProviderAvailability } from "../shared/types.js";
+import type {
+  CredentialStatus,
+  CredentialVerificationState,
+  ProviderAvailability,
+  ProviderModelCapability,
+} from "../shared/types.js";
 
 /** Credentials the worker receives for a single job (resolved from the run's pinned models). */
 export type ModelCredentials = {
@@ -21,6 +26,15 @@ type ProviderRecord = {
   verifiedAt: string | null;
   /** AUD-08 / AT-MODEL-001: provider-reported model ids from the last probe. */
   verifiedModels: string[] | null;
+  /**
+   * AUD-08: how this credential was accepted. Optional for backward
+   * compatibility; derived from `verifiedAt` when absent (`live` if set,
+   * otherwise `unchecked`). `operator_asserted` is only written when probing is
+   * disabled — it never fabricates `verifiedAt`.
+   */
+  verification?: CredentialVerificationState;
+  /** AUD-08 / AT-MODEL-001: provider-reported per-model capabilities, by model. */
+  capabilities?: Record<string, ProviderModelCapability> | null;
 };
 
 type UserRecord = {
@@ -48,6 +62,20 @@ type LegacyVaultFile = {
 function mask(apiKey: string) {
   const tail = apiKey.slice(-4);
   return `••••••${tail}`;
+}
+
+/** Derives the verification state, tolerating records written before it existed. */
+function verificationState(record: Pick<ProviderRecord, "verifiedAt" | "verification">): CredentialVerificationState {
+  if (record.verification === "operator_asserted") return "operator_asserted";
+  if (record.verification === "live" || record.verifiedAt !== null) return "live";
+  return "unchecked";
+}
+
+/** Human-readable label; asserted credentials must never read as verified. */
+export function verificationLabel(state: CredentialVerificationState): string {
+  if (state === "live") return "已验证";
+  if (state === "operator_asserted") return "未校验（操作者断言）";
+  return "未校验";
 }
 
 export class CredentialVault {
@@ -96,24 +124,38 @@ export class CredentialVault {
   providerAvailability(userId: string): ProviderAvailability[] {
     const record = this.data.users[userId];
     if (!record) return [];
-    return Object.entries(record.providers).map(([provider, value]) => ({
-      provider,
-      configured: true,
-      verifiedAt: value.verifiedAt ?? null,
-      verifiedModels: value.verifiedModels ?? null,
-    }));
+    return Object.entries(record.providers).map(([provider, value]) => {
+      const verification = verificationState(value);
+      return {
+        provider,
+        configured: true,
+        verifiedAt: value.verifiedAt ?? null,
+        verifiedModels: value.verifiedModels ?? null,
+        verification,
+        asserted: verification === "operator_asserted",
+        verified: verification === "live",
+        capabilities: value.capabilities ?? null,
+      };
+    });
   }
 
   status(userId: string): CredentialStatus {
     const record = this.data.users[userId];
-    const providers = Object.entries(record?.providers ?? {}).map(([provider, value]) => ({
-      provider,
-      configured: true,
-      masked: mask(this.decrypt(userId, provider, value.apiKey)),
-      updatedAt: value.updatedAt,
-      verifiedAt: value.verifiedAt ?? null,
-      verifiedModels: value.verifiedModels ?? null,
-    }));
+    const providers = Object.entries(record?.providers ?? {}).map(([provider, value]) => {
+      const verification = verificationState(value);
+      return {
+        provider,
+        configured: true,
+        masked: mask(this.decrypt(userId, provider, value.apiKey)),
+        updatedAt: value.updatedAt,
+        verifiedAt: value.verifiedAt ?? null,
+        verifiedModels: value.verifiedModels ?? null,
+        verification,
+        asserted: verification === "operator_asserted",
+        verificationLabel: verificationLabel(verification),
+        capabilities: value.capabilities ?? null,
+      };
+    });
     const configured = new Set(providers.map((item) => item.provider));
     return {
       developerConfigured: configured.has(this.legacyProviders.developer),
@@ -137,6 +179,8 @@ export class CredentialVault {
       updatedAt: now,
       verifiedAt: null,
       verifiedModels: null,
+      verification: "unchecked",
+      capabilities: null,
     };
     current.updatedAt = now;
     this.data.users[userId] = current;
@@ -148,15 +192,42 @@ export class CredentialVault {
    * AUD-08 / AT-MODEL-004: records a successful live probe. `models` is the
    * provider-reported model id list; `null` (or an empty list) means "the
    * credential is valid but no per-model restriction applies", so every model on
-   * the provider may be used. This is the explicit operator assertion path for
-   * `PI_MODEL_PROBE_MODE=off` deployments without a reachable /models endpoint.
+   * the provider may be used. `capabilities` are provider-reported per-model
+   * capabilities, stored alongside the model ids. Only this path sets
+   * `verifiedAt` and `verification: "live"`.
    */
-  async markVerified(userId: string, provider: string, models: string[] | null) {
+  async markVerified(
+    userId: string,
+    provider: string,
+    models: string[] | null,
+    capabilities?: Record<string, ProviderModelCapability> | null,
+  ) {
     const record = this.data.users[userId]?.providers?.[provider];
     if (!record) return this.status(userId);
     const now = new Date().toISOString();
     record.verifiedAt = now;
     record.verifiedModels = models === null ? null : models.slice(0, 500);
+    record.verification = "live";
+    record.capabilities = capabilities && Object.keys(capabilities).length > 0 ? capabilities : null;
+    this.data.users[userId].updatedAt = now;
+    await this.persist();
+    return this.status(userId);
+  }
+
+  /**
+   * AUD-08: records an operator assertion made when probing is disabled
+   * (`PI_MODEL_PROBE_MODE=off`). The credential becomes usable but is NOT
+   * live-verified: `verifiedAt` is never fabricated and `verifiedModels` stays
+   * `null` (no per-model restriction was observed).
+   */
+  async markOperatorAsserted(userId: string, provider: string) {
+    const record = this.data.users[userId]?.providers?.[provider];
+    if (!record) return this.status(userId);
+    const now = new Date().toISOString();
+    record.verifiedAt = null;
+    record.verifiedModels = null;
+    record.verification = "operator_asserted";
+    record.capabilities = null;
     this.data.users[userId].updatedAt = now;
     await this.persist();
     return this.status(userId);
@@ -164,27 +235,30 @@ export class CredentialVault {
 
   /**
    * AUD-08 cutover safety: every stored provider credential that has never been
-   * verified (`verifiedAt === null`). Used by the bounded startup pass so keys
-   * written before live verification existed do not block every real run. Only
-   * ids/providers are returned; key material stays inside the vault.
+   * resolved (`unchecked`). Operator-asserted and live-verified credentials are
+   * not returned. Used by the bounded startup pass so keys written before live
+   * verification existed do not block every real run. Only ids/providers are
+   * returned; key material stays inside the vault.
    */
   pendingVerifications(): Array<{ userId: string; provider: string }> {
     const pending: Array<{ userId: string; provider: string }> = [];
     for (const [userId, record] of Object.entries(this.data.users)) {
       for (const [provider, value] of Object.entries(record.providers ?? {})) {
-        if (value.verifiedAt === null) pending.push({ userId, provider });
+        if (verificationState(value) === "unchecked") pending.push({ userId, provider });
       }
     }
     return pending;
   }
 
-  /** Records a failed/incomplete probe so the credential is shown as unverified. */
+  /** Records a failed/incomplete probe so the credential is shown as unchecked. */
   async markUnverified(userId: string, provider: string) {
     const record = this.data.users[userId]?.providers?.[provider];
     if (!record) return this.status(userId);
-    if (record.verifiedAt === null && record.verifiedModels === null) return this.status(userId);
+    if (verificationState(record) === "unchecked") return this.status(userId);
     record.verifiedAt = null;
     record.verifiedModels = null;
+    record.verification = "unchecked";
+    record.capabilities = null;
     await this.persist();
     return this.status(userId);
   }
@@ -215,6 +289,8 @@ export class CredentialVault {
           updatedAt: record.updatedAt,
           verifiedAt: null,
           verifiedModels: null,
+          verification: "unchecked",
+          capabilities: null,
         };
       }
       users[userId] = { providers, updatedAt: record.updatedAt };

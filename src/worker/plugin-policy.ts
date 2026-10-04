@@ -1,4 +1,5 @@
-import { stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 
 /**
@@ -10,20 +11,35 @@ import path from "node:path";
  * silently dropped.
  *
  * Allowlist / request environment format (comma separated entries):
- *   <kind>:<path>[@role1;role2]
+ *   <kind>:<path>[@role1;role2][#sha256=<hex>[;version=<v>]]
  * where <kind> is extension | skill | prompt-template (a bare path is treated
  * as an extension). Paths are absolute; roles are optional and default to all
  * roles.
+ *
+ * AT-PI-007 / AT-SEC-014: an entry may pin the plugin's content identity so a
+ * changed file is detected. `sha256` is the hex digest of the plugin file, or
+ * of the sorted skill bundle (relative path + bytes). The pin is re-verified
+ * immediately before every Pi invocation; with `PI_PLUGIN_REQUIRE_PIN=true` a
+ * plugin without a sha256 pin is denied instead of loaded.
  */
 export type PluginKind = "extension" | "skill" | "prompt-template";
 
 export const pluginKinds: readonly PluginKind[] = ["extension", "skill", "prompt-template"];
+
+export interface PluginPin {
+  /** Lowercase hex sha256 of the plugin file or skill bundle. */
+  sha256?: string;
+  /** Optional human/audit version string; not used for tamper detection. */
+  version?: string;
+}
 
 export interface PluginAllowEntry {
   kind: PluginKind;
   path: string;
   /** Roles the resource is enabled for; undefined means every role. */
   roles?: string[];
+  /** AT-PI-007/AT-SEC-014: pinned content identity, when configured. */
+  pin?: PluginPin;
 }
 
 export interface PluginDenial {
@@ -61,9 +77,33 @@ export function pluginShortFlag(kind: PluginKind): string {
   return shortFlagByKind[kind];
 }
 
+function parsePin(fragment: string | undefined): { pin?: PluginPin; reason?: string } {
+  if (fragment === undefined) return {};
+  const pin: PluginPin = {};
+  for (const part of fragment.split(/[;&]/).map((item) => item.trim()).filter(Boolean)) {
+    const eq = part.indexOf("=");
+    if (eq <= 0) return { reason: `invalid plugin pin fragment "${part.slice(0, 40)}"` };
+    const key = part.slice(0, eq).trim().toLowerCase();
+    const value = part.slice(eq + 1).trim();
+    if (key === "sha256") {
+      if (!/^[a-f0-9]{64}$/i.test(value)) return { reason: `invalid sha256 pin "${value.slice(0, 16)}"` };
+      pin.sha256 = value.toLowerCase();
+    } else if (key === "version") {
+      if (!value) return { reason: "empty plugin version pin" };
+      pin.version = value.slice(0, 120);
+    } else {
+      return { reason: `unknown plugin pin key "${key.slice(0, 40)}"` };
+    }
+  }
+  return Object.keys(pin).length > 0 ? { pin } : { reason: "empty plugin pin" };
+}
+
 function parseEntry(raw: string): PluginAllowEntry | PluginDenial {
-  const trimmed = raw.trim();
-  if (!trimmed) return { path: raw, reason: "empty allowlist entry" };
+  const trimmedRaw = raw.trim();
+  if (!trimmedRaw) return { path: raw, reason: "empty allowlist entry" };
+  const hashIndex = trimmedRaw.indexOf("#");
+  const pinFragment = hashIndex >= 0 ? trimmedRaw.slice(hashIndex + 1) : undefined;
+  const trimmed = (hashIndex >= 0 ? trimmedRaw.slice(0, hashIndex) : trimmedRaw).trim();
   const colon = trimmed.indexOf(":");
   let kind: PluginKind = "extension";
   let rest = trimmed;
@@ -87,7 +127,9 @@ function parseEntry(raw: string): PluginAllowEntry | PluginDenial {
   pluginPath = pluginPath.trim();
   if (!pluginPath) return { path: trimmed, kind, reason: "plugin path is empty" };
   if (!path.isAbsolute(pluginPath)) return { path: pluginPath, kind, reason: "plugin path must be absolute" };
-  return { kind, path: pluginPath, ...(roles ? { roles } : {}) };
+  const parsedPin = parsePin(pinFragment);
+  if (parsedPin.reason) return { path: pluginPath, kind, reason: parsedPin.reason };
+  return { kind, path: pluginPath, ...(roles ? { roles } : {}), ...(parsedPin.pin ? { pin: parsedPin.pin } : {}) };
 }
 
 function splitList(raw: string | undefined): string[] {
@@ -138,6 +180,94 @@ export function selectPlugins(policy: PluginPolicy, role: string): { enabled: Pl
     if (!allowed) denials.push({ kind: parsed.kind, path: parsed.path, reason: "requested plugin is not in the allowlist" });
   }
   return { enabled, denials };
+}
+
+/** Sorted relative file paths of a directory (skill bundle) for stable hashing. */
+async function listBundleFiles(root: string, prefix = ""): Promise<string[]> {
+  const entries = await readdir(root, { withFileTypes: true });
+  const files: string[] = [];
+  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) files.push(...await listBundleFiles(path.join(root, entry.name), relative));
+    else if (entry.isFile()) files.push(relative);
+  }
+  return files;
+}
+
+/**
+ * AT-PI-007: content identity of a plugin. A single file hashes to the sha256 of
+ * its bytes (matching `sha256sum`); a directory (skill bundle) hashes the sorted
+ * relative paths and each file's bytes so renames/additions/edits all change it.
+ */
+export async function hashPluginPath(target: string): Promise<string> {
+  const info = await stat(target);
+  const hash = createHash("sha256");
+  if (info.isDirectory()) {
+    for (const relative of await listBundleFiles(target)) {
+      hash.update(`path:${relative}\u0000`);
+      hash.update(await readFile(path.join(target, relative)));
+      hash.update("\u0000");
+    }
+  } else {
+    hash.update(await readFile(target));
+  }
+  return hash.digest("hex");
+}
+
+export interface VerifyPluginPinsOptions {
+  /** Deny any plugin without a sha256 pin (PI_PLUGIN_REQUIRE_PIN=true). */
+  requirePin?: boolean;
+  /** Injectable hasher for tests; defaults to hashPluginPath. */
+  hash?: (absPath: string) => Promise<string>;
+}
+
+/**
+ * AT-PI-007 / AT-SEC-014: re-verifies every enabled plugin's pinned content
+ * hash immediately before a Pi invocation. A mismatch, an unreadable plugin or
+ * (when `requirePin`) a missing sha256 pin removes the entry from `enabled` and
+ * returns a denial, so tampered code is never passed to Pi. The caller reports
+ * the denials as `plugin.denied` audit events.
+ */
+export async function verifyPluginPins(
+  enabled: PluginAllowEntry[],
+  options: VerifyPluginPinsOptions = {},
+): Promise<{ enabled: PluginAllowEntry[]; denials: PluginDenial[] }> {
+  const hash = options.hash ?? hashPluginPath;
+  const allowed: PluginAllowEntry[] = [];
+  const denials: PluginDenial[] = [];
+  for (const entry of enabled) {
+    if (!entry.pin?.sha256) {
+      if (options.requirePin) {
+        denials.push({
+          kind: entry.kind,
+          path: entry.path,
+          reason: "plugin pinning is required (PI_PLUGIN_REQUIRE_PIN=true) but the allowlist entry has no sha256 pin",
+        });
+        continue;
+      }
+      allowed.push(entry);
+      continue;
+    }
+    try {
+      const actual = await hash(entry.path);
+      if (actual !== entry.pin.sha256) {
+        denials.push({
+          kind: entry.kind,
+          path: entry.path,
+          reason: `plugin content hash mismatch (tamper detected): expected sha256=${entry.pin.sha256} actual sha256=${actual}`,
+        });
+        continue;
+      }
+      allowed.push(entry);
+    } catch (error) {
+      denials.push({
+        kind: entry.kind,
+        path: entry.path,
+        reason: `plugin content could not be verified: ${(error as Error).message.slice(0, 200)}`,
+      });
+    }
+  }
+  return { enabled: allowed, denials };
 }
 
 /** Explicit CLI arguments that re-enable only the allowed resources. */

@@ -130,18 +130,26 @@ describe("CredentialVault", () => {
     await vault.set("owner-a", { provider: "deepseek", apiKey: "dev-secret-value" });
 
     const before = vault.providerAvailability("owner-a");
-    expect(before).toEqual([{ provider: "deepseek", configured: true, verifiedAt: null, verifiedModels: null }]);
+    expect(before[0]).toMatchObject({ provider: "deepseek", configured: true, verifiedAt: null, verifiedModels: null, verification: "unchecked", asserted: false });
     expect(vault.status("owner-a").providers[0].verifiedAt).toBeNull();
+    expect(vault.status("owner-a").providers[0].verification).toBe("unchecked");
+    expect(vault.status("owner-a").providers[0].verificationLabel).toBe("未校验");
 
-    await vault.markVerified("owner-a", "deepseek", ["deepseek-chat"]);
+    await vault.markVerified("owner-a", "deepseek", ["deepseek-chat"], { "deepseek-chat": { contextWindow: 128_000 } });
     const after = vault.providerAvailability("owner-a");
     expect(after[0].verifiedAt).not.toBeNull();
     expect(after[0].verifiedModels).toEqual(["deepseek-chat"]);
+    expect(after[0].verification).toBe("live");
+    expect(after[0].asserted).toBe(false);
+    expect(after[0].capabilities).toEqual({ "deepseek-chat": { contextWindow: 128_000 } });
     expect(vault.status("owner-a").providers[0].verifiedModels).toEqual(["deepseek-chat"]);
+    expect(vault.status("owner-a").providers[0].verificationLabel).toBe("已验证");
 
     // Rotating the key resets verification until the new key is probed again.
     await vault.set("owner-a", { provider: "deepseek", apiKey: "rotated-secret-value" });
     expect(vault.providerAvailability("owner-a")[0].verifiedAt).toBeNull();
+    expect(vault.providerAvailability("owner-a")[0].verification).toBe("unchecked");
+    expect(vault.providerAvailability("owner-a")[0].capabilities).toBeNull();
   });
 
   it("keeps persisting after a transient write failure", async () => {
@@ -181,17 +189,46 @@ describe("CredentialVault", () => {
     expect(JSON.stringify(pending)).not.toContain("secret-value");
   });
 
-  it("marks a credential verified for all models when the probe is disabled (AUD-08 cutover)", async () => {
+  it("records the opt-out as operator_asserted without fabricating verifiedAt (AUD-08)", async () => {
     const file = await vaultFile();
     const vault = new CredentialVault(file, secretFor(37));
     await vault.init();
     await vault.set("owner-a", { provider: "openai-proxy", apiKey: "review-secret-value" });
 
-    await vault.markVerified("owner-a", "openai-proxy", null);
+    await vault.markOperatorAsserted("owner-a", "openai-proxy");
     const availability = vault.providerAvailability("owner-a")[0];
-    expect(availability.verifiedAt).not.toBeNull();
-    // null = "no per-model restriction" for the operator-asserted path.
+    // The opt-out must never look like a live verification.
+    expect(availability.verifiedAt).toBeNull();
     expect(availability.verifiedModels).toBeNull();
+    expect(availability.verification).toBe("operator_asserted");
+    expect(availability.asserted).toBe(true);
+    expect(availability.verified).toBe(false);
+    const status = vault.status("owner-a").providers[0];
+    expect(status.verificationLabel).toBe("未校验（操作者断言）");
+    expect(status.verifiedAt).toBeNull();
+    // Asserted credentials are resolved, so the startup pass will not re-probe.
     expect(vault.pendingVerifications()).toEqual([]);
+  });
+
+  it("treats a pre-existing live verification as live when reloaded (backward compatible)", async () => {
+    const file = await vaultFile();
+    const secret = secretFor(41);
+    const vault = new CredentialVault(file, secret);
+    await vault.init();
+    await vault.set("owner-a", { provider: "deepseek", apiKey: "dev-secret-value" });
+    await vault.markVerified("owner-a", "deepseek", ["deepseek-chat"]);
+
+    // Simulate a record written before the `verification` field existed.
+    const raw = JSON.parse(await readFile(file, "utf8")) as {
+      users: Record<string, { providers: Record<string, { verification?: string }> }>;
+    };
+    delete raw.users["owner-a"].providers.deepseek.verification;
+    await writeFile(file, JSON.stringify(raw), "utf8");
+
+    const reloaded = new CredentialVault(file, secret);
+    await reloaded.init();
+    const availability = reloaded.providerAvailability("owner-a")[0];
+    expect(availability.verification).toBe("live");
+    expect(availability.verifiedAt).not.toBeNull();
   });
 });

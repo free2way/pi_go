@@ -1,9 +1,11 @@
 import type {
+  CredentialVerificationState,
   ModelCatalogEntry,
   ModelInfo,
   ModelRole,
   ModelSelection,
   ProviderAvailability,
+  ProviderModelCapability,
 } from "../shared/types.js";
 
 /**
@@ -39,6 +41,7 @@ function normalizeEntry(raw: unknown, index: number): ModelCatalogEntry | undefi
     model: model.slice(0, 120),
     label: String(item.label || model).slice(0, 120),
     contextWindow: typeof item.contextWindow === "number" ? item.contextWindow : undefined,
+    maxOutputTokens: typeof item.maxOutputTokens === "number" ? item.maxOutputTokens : undefined,
     toolCalling: item.toolCalling !== false,
     reasoning: item.reasoning === true,
     roles: roles.length ? roles : ["developer", "reviewer"],
@@ -130,7 +133,7 @@ function normalizeAvailability(input: ProviderAvailabilityInput): ProviderAvaila
   if (input instanceof Set) {
     // A bare Set is the legacy "these providers are usable" shorthand.
     for (const provider of input) {
-      index.set(provider, { provider, configured: true, verifiedAt: null, verifiedModels: null, verified: true });
+      index.set(provider, { provider, configured: true, verifiedAt: null, verifiedModels: null, verified: true, verification: "live" });
     }
     return index;
   }
@@ -138,9 +141,21 @@ function normalizeAvailability(input: ProviderAvailabilityInput): ProviderAvaila
   return index;
 }
 
-export type ProviderModelState = "missing" | "unverified" | "model_unverified" | "ready";
+export type ProviderModelState = "missing" | "unverified" | "model_unverified" | "ready" | "asserted";
 
-/** AUD-08 / AT-MODEL-004: a stored key is not "available" until a live probe verified it. */
+/** Resolves the verification state, tolerating records written before it existed. */
+export function availabilityVerification(record: ProviderAvailability): CredentialVerificationState {
+  if (record.verification) return record.verification;
+  if (record.asserted === true) return "operator_asserted";
+  if (record.verified === true || record.verifiedAt !== null) return "live";
+  return "unchecked";
+}
+
+/**
+ * AUD-08 / AT-MODEL-004: a stored key is not "available" until a live probe
+ * verified it, or the operator explicitly asserted it with probing disabled.
+ * A live verification always wins over a stale assertion.
+ */
 export function providerModelState(
   availability: ProviderAvailabilityInput,
   provider: string,
@@ -149,12 +164,15 @@ export function providerModelState(
   const index = normalizeAvailability(availability);
   const record = index.get(provider);
   if (!record || !record.configured) return "missing";
-  const verified = record.verified ?? record.verifiedAt !== null;
-  if (!verified) return "unverified";
-  if (Array.isArray(record.verifiedModels) && record.verifiedModels.length > 0 && !record.verifiedModels.includes(model)) {
-    return "model_unverified";
+  const verification = availabilityVerification(record);
+  if (verification === "live") {
+    if (Array.isArray(record.verifiedModels) && record.verifiedModels.length > 0 && !record.verifiedModels.includes(model)) {
+      return "model_unverified";
+    }
+    return "ready";
   }
-  return "ready";
+  if (verification === "operator_asserted") return "asserted";
+  return "unverified";
 }
 
 export type ModelValidation =
@@ -193,10 +211,12 @@ export function validateModelSelection(
 }
 
 /** Optional runtime capability overrides captured from a provider probe. */
-export interface RuntimeCapability {
-  toolCalling?: boolean;
-  reasoning?: boolean;
-  contextWindow?: number;
+export type RuntimeCapability = ProviderModelCapability;
+
+function verificationText(state: CredentialVerificationState): string {
+  if (state === "live") return "已验证";
+  if (state === "operator_asserted") return "未校验（操作者断言）";
+  return "未校验";
 }
 
 export function availableModels(
@@ -206,19 +226,30 @@ export function availableModels(
 ): ModelInfo[] {
   const index = normalizeAvailability(availability);
   return entries.map((entry) => {
-    const runtimeCapability = runtime?.[`${entry.provider}/${entry.model}`];
-    const merged = runtimeCapability ? { ...entry, ...runtimeCapability } : entry;
     const record = index.get(entry.provider);
+    const capability = record?.capabilities?.[entry.model] ?? runtime?.[`${entry.provider}/${entry.model}`];
+    const capabilitiesVerified = Boolean(record?.capabilities?.[entry.model]);
+    const merged = capability ? { ...entry, ...capability } : entry;
+    const verification = record ? availabilityVerification(record) : "unchecked";
+    const base = {
+      ...merged,
+      verifiedAt: record?.verifiedAt ?? null,
+      verification,
+      asserted: verification === "operator_asserted",
+      verificationLabel: verificationText(verification),
+      capabilitiesVerified,
+      capabilities: capability ?? null,
+    };
     if (!entry.roles.length) {
-      return { ...merged, available: false, unavailableReason: "role_restricted", verified: false, verifiedAt: record?.verifiedAt ?? null };
+      return { ...base, available: false, unavailableReason: "role_restricted" as const, verified: false };
     }
     const state = providerModelState(index, entry.provider, entry.model);
-    const verifiedAt = record?.verifiedAt ?? null;
-    if (state === "ready") {
-      return { ...merged, available: true, unavailableReason: null, verified: true, verifiedAt };
+    if (state === "ready" || state === "asserted") {
+      return { ...base, available: true, unavailableReason: null, verified: state === "ready" };
     }
-    const unavailableReason = state === "missing" ? "credential_missing" : state === "unverified" ? "credential_unverified" : "model_unverified";
-    return { ...merged, available: false, unavailableReason, verified: false, verifiedAt };
+    const unavailableReason =
+      state === "missing" ? "credential_missing" : state === "unverified" ? "credential_unverified" : "model_unverified";
+    return { ...base, available: false, unavailableReason, verified: false };
   });
 }
 

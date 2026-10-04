@@ -4,19 +4,24 @@
  * credential can be marked verified (`verifiedAt` + `verifiedModels`) instead of
  * being trusted purely because its length looked valid.
  *
+ * AT-MODEL-001: when the provider response also carries per-model capabilities
+ * (context window, max output tokens, tool-calling / reasoning support), they are
+ * captured verbatim and returned so `/api/models` can surface runtime data
+ * instead of a static catalog. Nothing is invented: a capability is only emitted
+ * when the payload actually contains a recognizable field.
+ *
  * The probe is intentionally injectable: `fetchImpl` can be stubbed in tests and
  * the endpoint map can be overridden per deployment, so unit tests never need a
  * real network call.
  */
 
-export interface ModelCapabilityOverride {
-  toolCalling?: boolean;
-  reasoning?: boolean;
-  contextWindow?: number;
-}
+import type { ProviderModelCapability } from "../shared/types.js";
+
+/** @deprecated kept as an alias for older call sites; use ProviderModelCapability. */
+export type ModelCapabilityOverride = ProviderModelCapability;
 
 export type ProviderProbeResult =
-  | { ok: true; models: string[]; capabilities?: Record<string, ModelCapabilityOverride> }
+  | { ok: true; models: string[]; capabilities?: Record<string, ProviderModelCapability> }
   | { ok: false; code: "PROBE_UNSUPPORTED" | "PROBE_UNAUTHORIZED" | "PROBE_UNREACHABLE" | "PROBE_ERROR"; message: string };
 
 export type ProviderProbe = (input: { provider: string; apiKey: string }) => Promise<ProviderProbeResult>;
@@ -54,6 +59,98 @@ export function providerProbeDisabled(env: NodeJS.ProcessEnv = process.env): boo
   return (env.PI_MODEL_PROBE_MODE || "probe").toLowerCase() === "off";
 }
 
+function asPositiveInt(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : undefined;
+  }
+  return undefined;
+}
+
+function asBool(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["true", "yes", "1", "supported", "enabled"].includes(normalized)) return true;
+    if (["false", "no", "0", "unsupported", "disabled"].includes(normalized)) return false;
+  }
+  return undefined;
+}
+
+function objectOrUndefined(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+/**
+ * Extracts capabilities from a single `/models` item. Only recognizable fields
+ * are read, from the item itself and from common nested containers. Returns
+ * `undefined` when the provider reported nothing we understand.
+ */
+export function extractModelCapability(raw: unknown): ProviderModelCapability | undefined {
+  const item = objectOrUndefined(raw);
+  if (!item) return undefined;
+  const containers = [objectOrUndefined(item.capabilities), objectOrUndefined(item.capability), objectOrUndefined(item.features)].filter(
+    (value): value is Record<string, unknown> => Boolean(value),
+  );
+  const sources = [item, ...containers];
+  const pick = (...keys: string[]): unknown => {
+    for (const source of sources) {
+      for (const key of keys) {
+        if (source[key] !== undefined && source[key] !== null) return source[key];
+      }
+    }
+    return undefined;
+  };
+
+  const capability: ProviderModelCapability = {};
+  const contextWindow = asPositiveInt(
+    pick("context_window", "context_length", "contextWindow", "contextLength", "max_context_length", "max_input_tokens"),
+  );
+  if (contextWindow !== undefined) capability.contextWindow = contextWindow;
+
+  const topProvider = objectOrUndefined(item.top_provider) ?? objectOrUndefined(item.topProvider);
+  const maxOutputTokens =
+    asPositiveInt(pick("max_output_tokens", "maxOutputTokens", "max_completion_tokens", "maxCompletionTokens")) ??
+    asPositiveInt(topProvider?.max_completion_tokens);
+  if (maxOutputTokens !== undefined) capability.maxOutputTokens = maxOutputTokens;
+
+  const toolCalling = asBool(
+    pick("tool_calling", "toolCalling", "function_calling", "functionCalling", "supports_tools", "supports_function_calling", "tools"),
+  );
+  const reasoning = asBool(pick("reasoning", "supports_reasoning", "supports_thinking"));
+
+  // OpenRouter-style `supported_parameters` list as a fallback signal.
+  const supported = item.supported_parameters ?? item.supportedParameters;
+  const supportedParams = Array.isArray(supported) ? supported.map((value) => String(value)) : [];
+  const toolFromParams = supportedParams.some((param) => ["tools", "tool_choice", "function_call", "functions"].includes(param));
+  const reasoningFromParams = supportedParams.some((param) => ["reasoning", "include_reasoning", "reasoning_effort"].includes(param));
+
+  const resolvedToolCalling = toolCalling ?? (toolFromParams ? true : undefined);
+  const resolvedReasoning = reasoning ?? (reasoningFromParams ? true : undefined);
+  if (resolvedToolCalling !== undefined) capability.toolCalling = resolvedToolCalling;
+  if (resolvedReasoning !== undefined) capability.reasoning = resolvedReasoning;
+
+  return Object.keys(capability).length > 0 ? capability : undefined;
+}
+
+function extractCapabilities(rawModels: unknown[]): Record<string, ProviderModelCapability> | undefined {
+  const capabilities: Record<string, ProviderModelCapability> = {};
+  for (const item of rawModels) {
+    try {
+      const record = objectOrUndefined(item);
+      if (!record) continue;
+      const id = String(record.id || "").trim();
+      if (!id) continue;
+      const capability = extractModelCapability(record);
+      if (capability) capabilities[id] = capability;
+    } catch {
+      // A malformed item must never break the whole probe.
+    }
+  }
+  return Object.keys(capabilities).length > 0 ? capabilities : undefined;
+}
+
 export function createProviderProbe(options: ProviderProbeOptions = {}): ProviderProbe {
   const env = options.env ?? process.env;
   const fetchImpl = options.fetchImpl ?? fetch;
@@ -72,10 +169,13 @@ export function createProviderProbe(options: ProviderProbeOptions = {}): Provide
         const code = response.status === 401 || response.status === 403 ? "PROBE_UNAUTHORIZED" : "PROBE_ERROR";
         return { ok: false, code, message: `provider 探测返回 HTTP ${response.status}` };
       }
-      const body = (await response.json().catch(() => undefined)) as { data?: Array<{ id?: unknown }>; models?: Array<{ id?: unknown }> } | undefined;
-      const rawModels = Array.isArray(body?.data) ? body!.data : Array.isArray(body?.models) ? body!.models : [];
-      const models = rawModels.map((item) => String(item?.id || "").trim()).filter(Boolean);
-      return { ok: true, models };
+      const body = (await response.json().catch(() => undefined)) as
+        | { data?: unknown; models?: unknown }
+        | undefined;
+      const rawList = Array.isArray(body?.data) ? body!.data : Array.isArray(body?.models) ? body!.models : [];
+      const models = rawList.map((item) => String(objectOrUndefined(item)?.id || "").trim()).filter(Boolean);
+      const capabilities = extractCapabilities(rawList);
+      return capabilities ? { ok: true, models, capabilities } : { ok: true, models };
     } catch (error) {
       return { ok: false, code: "PROBE_UNREACHABLE", message: `provider 探测失败：${(error as Error).message}` };
     }

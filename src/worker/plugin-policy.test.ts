@@ -1,13 +1,16 @@
-import { mkdtemp, mkdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   detectProjectPlugins,
+  hashPluginPath,
   parsePluginPolicy,
   pluginArguments,
   pluginMounts,
   selectPlugins,
+  verifyPluginPins,
 } from "./plugin-policy.js";
 
 describe("parsePluginPolicy (GAP-02 / AT-PI-005)", () => {
@@ -88,6 +91,86 @@ describe("pluginArguments and pluginMounts", () => {
     const policy = parsePluginPolicy({ allowlist: "extension:/opt/pigo/a.ts" });
     const { enabled } = selectPlugins(policy, "developer");
     expect(pluginArguments(enabled, (hostPath) => hostPath)).toEqual(["--extension", "/opt/pigo/a.ts"]);
+  });
+});
+
+describe("plugin content pinning (AT-PI-007 / AT-SEC-014)", () => {
+  const sha256File = async (file: string) => createHash("sha256").update(await readFile(file)).digest("hex");
+
+  it("parses a sha256 pin with an optional version without touching the path or roles", () => {
+    const digest = "a".repeat(64);
+    const policy = parsePluginPolicy({ allowlist: `extension:/opt/pigo/review.ts@developer#sha256=${digest};version=1.2.3` });
+    expect(policy.denials).toEqual([]);
+    expect(policy.entries).toEqual([
+      { kind: "extension", path: "/opt/pigo/review.ts", roles: ["developer"], pin: { sha256: digest, version: "1.2.3" } },
+    ]);
+  });
+
+  it("rejects a malformed sha256 pin with a clear denial", () => {
+    const policy = parsePluginPolicy({ allowlist: "extension:/opt/pigo/a.ts#sha256=nothex" });
+    expect(policy.entries).toEqual([]);
+    expect(policy.denials[0].reason).toContain("invalid sha256 pin");
+  });
+
+  it("loads a plugin whose content matches the pinned hash", async () => {
+    const file = path.join(await mkdtemp(path.join(tmpdir(), "pigo-pin-")), "plugin.ts");
+    await writeFile(file, "export const x = 1;\n", "utf8");
+    const sha = await sha256File(file);
+    const entry = { kind: "extension" as const, path: file, pin: { sha256: sha } };
+    const verified = await verifyPluginPins([entry]);
+    expect(verified.enabled).toEqual([entry]);
+    expect(verified.denials).toEqual([]);
+  });
+
+  it("denies a plugin whose content does not match the pin", async () => {
+    const file = path.join(await mkdtemp(path.join(tmpdir(), "pigo-pin-")), "plugin.ts");
+    await writeFile(file, "malicious", "utf8");
+    const verified = await verifyPluginPins([{ kind: "extension", path: file, pin: { sha256: "b".repeat(64) } }]);
+    expect(verified.enabled).toEqual([]);
+    expect(verified.denials).toHaveLength(1);
+    expect(verified.denials[0].reason).toContain("tamper detected");
+  });
+
+  it("denies a plugin tampered with after the pin was established (run-time re-verification)", async () => {
+    const file = path.join(await mkdtemp(path.join(tmpdir(), "pigo-pin-")), "plugin.ts");
+    await writeFile(file, "export const x = 1;\n", "utf8");
+    const entry = { kind: "extension" as const, path: file, pin: { sha256: await sha256File(file) } };
+    expect((await verifyPluginPins([entry])).enabled).toHaveLength(1);
+    await writeFile(file, "export const x = 2;\n", "utf8");
+    const reverified = await verifyPluginPins([entry]);
+    expect(reverified.enabled).toEqual([]);
+    expect(reverified.denials[0].reason).toContain("hash mismatch");
+  });
+
+  it("denies an unpinned plugin when pinning is required", async () => {
+    const file = path.join(await mkdtemp(path.join(tmpdir(), "pigo-pin-")), "plugin.ts");
+    await writeFile(file, "export const x = 1;\n", "utf8");
+    const verified = await verifyPluginPins([{ kind: "extension", path: file }], { requirePin: true });
+    expect(verified.enabled).toEqual([]);
+    expect(verified.denials[0].reason).toContain("PI_PLUGIN_REQUIRE_PIN");
+  });
+
+  it("still loads a plain allowlist path when no pin is configured and pinning is not required", async () => {
+    const file = path.join(await mkdtemp(path.join(tmpdir(), "pigo-pin-")), "plugin.ts");
+    await writeFile(file, "export const x = 1;\n", "utf8");
+    const verified = await verifyPluginPins([{ kind: "extension", path: file }]);
+    expect(verified.enabled.map((entry) => entry.path)).toEqual([file]);
+    expect(verified.denials).toEqual([]);
+  });
+
+  it("hashes a whole skill bundle so an added/changed file is detected", async () => {
+    const bundle = await mkdtemp(path.join(tmpdir(), "pigo-bundle-"));
+    await writeFile(path.join(bundle, "SKILL.md"), "v1", "utf8");
+    const first = await hashPluginPath(bundle);
+    await writeFile(path.join(bundle, "SKILL.md"), "v2", "utf8");
+    const second = await hashPluginPath(bundle);
+    expect(second).not.toBe(first);
+  });
+
+  it("denies a pinned plugin whose file cannot be read", async () => {
+    const verified = await verifyPluginPins([{ kind: "extension", path: "/opt/pigo/missing.ts", pin: { sha256: "c".repeat(64) } }]);
+    expect(verified.enabled).toEqual([]);
+    expect(verified.denials[0].reason).toContain("could not be verified");
   });
 });
 

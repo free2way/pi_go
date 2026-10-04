@@ -10,11 +10,13 @@ function harness(input: {
   now?: () => number;
 }) {
   const verified: Array<{ userId: string; provider: string; models: string[] | null }> = [];
+  const asserted: Array<{ userId: string; provider: string }> = [];
   const unverified: Array<{ userId: string; provider: string }> = [];
   const logs: Array<{ message: string; detail?: Record<string, unknown> }> = [];
   const keyFor = (credential: PendingCredential) => input.keys?.[`${credential.userId}/${credential.provider}`];
   return {
     verified,
+    asserted,
     unverified,
     logs,
     deps: {
@@ -22,8 +24,11 @@ function harness(input: {
       readKey: (userId: string, provider: string) => input.keys?.[`${userId}/${provider}`],
       probe: async ({ provider }: { provider: string; apiKey: string }): Promise<ProviderProbeResult> =>
         input.probeResults?.[provider] ?? { ok: true, models: [] },
-      markVerified: async (userId: string, provider: string, models: string[] | null) => {
+      markVerified: async (userId: string, provider: string, models: string[] | null, _capabilities?: Record<string, unknown> | null) => {
         verified.push({ userId, provider, models });
+      },
+      markOperatorAsserted: async (userId: string, provider: string) => {
+        asserted.push({ userId, provider });
       },
       markUnverified: async (userId: string, provider: string) => {
         unverified.push({ userId, provider });
@@ -59,7 +64,7 @@ describe("verifyPendingCredentials (AUD-08 cutover safety)", () => {
     expect(JSON.stringify(h.logs)).not.toContain("k2");
   });
 
-  it("marks every credential verified for all models when probing is disabled", async () => {
+  it("marks every credential operator-asserted (not verified) when probing is disabled", async () => {
     const h = harness({
       pending: [
         { userId: "u1", provider: "deepseek" },
@@ -70,9 +75,36 @@ describe("verifyPendingCredentials (AUD-08 cutover safety)", () => {
     });
     const result = await verifyPendingCredentials(h.deps, { budgetMs: 1_000 });
     expect(result.probeDisabled).toBe(true);
-    expect(result.verified.sort()).toEqual(["anthropic", "deepseek"]);
-    expect(h.verified.every((item) => item.models === null)).toBe(true);
+    expect(result.asserted.sort()).toEqual(["anthropic", "deepseek"]);
+    // The opt-out must never report a live verification.
+    expect(result.verified).toEqual([]);
+    expect(h.verified).toEqual([]);
+    expect(h.asserted.sort((a, b) => a.provider.localeCompare(b.provider))).toEqual([
+      { userId: "u2", provider: "anthropic" },
+      { userId: "u1", provider: "deepseek" },
+    ]);
     expect(h.unverified).toEqual([]);
+  });
+
+  it("passes provider-reported capabilities through to markVerified", async () => {
+    const h = harness({
+      pending: [{ userId: "u1", provider: "deepseek" }],
+      keys: { "u1/deepseek": "k1" },
+      probeResults: {
+        deepseek: { ok: true, models: ["deepseek-chat"], capabilities: { "deepseek-chat": { contextWindow: 128_000, toolCalling: true } } },
+      },
+    });
+    const seen: Array<Record<string, unknown>> = [];
+    h.deps.markVerified = async (userId: string, provider: string, models: string[] | null, capabilities?: Record<string, unknown> | null) => {
+      seen.push({ userId, provider, models, capabilities });
+    };
+    const result = await verifyPendingCredentials(h.deps, { budgetMs: 5_000 });
+    expect(result.verified).toEqual(["deepseek"]);
+    expect(seen[0]).toMatchObject({
+      provider: "deepseek",
+      models: ["deepseek-chat"],
+      capabilities: { "deepseek-chat": { contextWindow: 128_000, toolCalling: true } },
+    });
   });
 
   it("skips credentials whose key cannot be resolved", async () => {

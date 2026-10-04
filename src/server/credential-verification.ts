@@ -1,3 +1,4 @@
+import type { ProviderModelCapability } from "../shared/types.js";
 import type { ProviderProbeResult } from "./provider-probe.js";
 
 /**
@@ -9,10 +10,12 @@ import type { ProviderProbeResult } from "./provider-probe.js";
  * re-enter them. This bounded startup pass resolves exactly those credentials:
  *
  * - `PI_MODEL_PROBE_MODE=off` (probe disabled) → the operator asserts the stored
- *   keys are valid, so each is marked verified once with `verifiedModels: null`
- *   (null means "all models on this provider are allowed").
+ *   keys are valid, so each is marked `operator_asserted` (a distinct state that
+ *   never fabricates `verifiedAt`) and can pass preflight. It is reported under
+ *   `asserted`, never under `verified`.
  * - otherwise → each credential is probed once (reusing `createProviderProbe`)
- *   and marked verified (with the provider-reported model ids) or unverified.
+ *   and marked verified (with the provider-reported model ids and capabilities)
+ *   or unverified.
  *
  * It never logs key material — only provider names, model counts and outcome
  * codes. A budget bounds the wall-clock time the caller waits.
@@ -28,7 +31,13 @@ export interface CredentialVerificationDeps {
   /** Resolves the stored key for one provider; the callee owns the key material. */
   readKey: (userId: string, provider: string) => string | undefined;
   probe: (input: { provider: string; apiKey: string }) => Promise<ProviderProbeResult>;
-  markVerified: (userId: string, provider: string, models: string[] | null) => Promise<unknown>;
+  markVerified: (
+    userId: string,
+    provider: string,
+    models: string[] | null,
+    capabilities?: Record<string, ProviderModelCapability> | null,
+  ) => Promise<unknown>;
+  markOperatorAsserted: (userId: string, provider: string) => Promise<unknown>;
   markUnverified: (userId: string, provider: string) => Promise<unknown>;
   /** True when `PI_MODEL_PROBE_MODE=off`. */
   probeDisabled?: () => boolean;
@@ -44,8 +53,10 @@ export interface CredentialVerificationOptions {
 }
 
 export interface CredentialVerificationResult {
-  /** Provider names marked verified. */
+  /** Provider names marked live-verified. */
   verified: string[];
+  /** Provider names marked operator-asserted because probing is disabled. */
+  asserted: string[];
   /** Provider names that failed a probe or errored. */
   unverified: string[];
   /** Credentials whose key could not be resolved (no key material). */
@@ -75,6 +86,7 @@ export async function verifyPendingCredentials(
 
   const result: CredentialVerificationResult = {
     verified: [],
+    asserted: [],
     unverified: [],
     skipped: [],
     deferred: [],
@@ -99,16 +111,20 @@ export async function verifyPendingCredentials(
           continue;
         }
         if (probeDisabled) {
-          await deps.markVerified(item.userId, item.provider, null);
-          pushUnique(result.verified, item.provider);
-          deps.log?.("credential marked verified (probe disabled)", { provider: item.provider, models: "all" });
+          await deps.markOperatorAsserted(item.userId, item.provider);
+          pushUnique(result.asserted, item.provider);
+          deps.log?.("credential marked operator-asserted (probe disabled)", { provider: item.provider, models: "unchecked" });
           continue;
         }
         const probe = await deps.probe({ provider: item.provider, apiKey });
         if (probe.ok) {
-          await deps.markVerified(item.userId, item.provider, probe.models);
+          await deps.markVerified(item.userId, item.provider, probe.models, probe.capabilities ?? null);
           pushUnique(result.verified, item.provider);
-          deps.log?.("credential verified", { provider: item.provider, models: probe.models.length });
+          deps.log?.("credential verified", {
+            provider: item.provider,
+            models: probe.models.length,
+            capabilityModels: Object.keys(probe.capabilities ?? {}).length,
+          });
         } else {
           await deps.markUnverified(item.userId, item.provider);
           pushUnique(result.unverified, item.provider);

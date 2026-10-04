@@ -18,7 +18,7 @@ import { apiKeyEnvName, classifyProviderError, providerErrorSummary } from "./pr
 import { sleep } from "./provider-retry.js";
 import { blockingSeverities, parseReview, type ReviewResult } from "./review-protocol.js";
 import { buildContainerSpec, hostPathFor, resolveSandboxMode } from "./sandbox.js";
-import { mergeFindings, unresolvedFeedback } from "./review-findings.js";
+import { mergeFindings, repeatedSevereFindings, severeRepeatThreshold, unresolvedFeedback } from "./review-findings.js";
 import {
   buildSnapshotDivergenceFinding,
   createGitReviewSnapshotMaterializer,
@@ -31,11 +31,12 @@ import { WorkspacePathError, resolveInsideRoot, sanitizeRelativePath, sanitizeWo
 import { RunCleanupPathError, removeRunDirectory } from "./run-cleanup.js";
 import { WorkspaceLockManager, workspaceKeyFor } from "./workspace-lock.js";
 import { PiRunError, failureOutputForEvent } from "./agent-failure.js";
+import { captureFailedSubAgentWorktree } from "./subagent-artifacts.js";
 import { recoveryResumePhase, recoveryUpdateState } from "./run-recovery.js";
 import { callbackBodyExceedsInlineLimit, encodeCallbackBody, persistDiffArtifact, type DiffArtifactRef } from "./diff-artifacts.js";
 import { uploadRunArtifact } from "./artifact-upload.js";
 import { captureSnapshotHash } from "./snapshot-hash.js";
-import { detectProjectPlugins, parsePluginPolicy, pluginArguments, pluginMounts, selectPlugins, type PluginDenial } from "./plugin-policy.js";
+import { detectProjectPlugins, parsePluginPolicy, pluginArguments, pluginMounts, selectPlugins, verifyPluginPins, type PluginDenial } from "./plugin-policy.js";
 
 const port = Number(process.env.PORT || 3200);
 const host = process.env.HOST || "localhost";
@@ -150,6 +151,8 @@ const pluginPolicy = parsePluginPolicy({
   requests: process.env.PI_PLUGIN_REQUESTS,
 });
 const allowProjectPlugins = process.env.PI_PLUGIN_ALLOW_PROJECT === "true";
+/** AT-PI-007/AT-SEC-014: when set, every allowlisted plugin must carry a sha256 pin. */
+const requirePluginPin = process.env.PI_PLUGIN_REQUIRE_PIN === "true";
 /** Container directory that hosts read-only allowlisted plugin mounts. */
 const pluginContainerBase = process.env.PI_PLUGIN_CONTAINER_DIR || "/opt/pigo/plugins";
 
@@ -778,7 +781,13 @@ async function runPi(input: {
   // GAP-02: re-enable only allowlisted resources. The `--no-*` flags above
   // disable discovery (including project `.pi/extensions`); explicit paths still
   // load, so the allowlist is the single source of truth.
-  const { enabled, denials } = selectPlugins(pluginPolicy, input.role ?? "developer");
+  const selected = selectPlugins(pluginPolicy, input.role ?? "developer");
+  // AT-PI-007 / AT-SEC-014: re-verify pinned content immediately before every Pi
+  // invocation. A mismatch (or a missing pin when required) denies that plugin;
+  // it is never passed to Pi and the denial is reported as a `plugin.denied` event.
+  const verified = await verifyPluginPins(selected.enabled, { requirePin: requirePluginPin });
+  const enabled = verified.enabled;
+  const denials = [...selected.denials, ...verified.denials];
   const mounts = sandboxMode === "container" ? pluginMounts(enabled, pluginContainerBase) : [];
   const containerPathByHost = new Map(mounts.map((mount) => [mount.hostPath, mount.containerPath]));
   args.push(...pluginArguments(enabled, (hostPath) => containerPathByHost.get(hostPath) ?? hostPath));
@@ -1051,6 +1060,56 @@ async function removeSubAgentWorktree(project: string, worktree: string) {
   await serializeWorktreeMutation(() => git(project, ["worktree", "remove", "--force", worktree])).catch(() => undefined);
 }
 
+/**
+ * AT-AGENT-008: before a failed sub-agent's worktree is force-removed, persist
+ * its uncommitted work (patch + per-file inventory) under the run's
+ * `.state/artifacts/` and emit a `subagent.failure_artifact` event. A capture
+ * failure is recorded as `subagent.failure_artifact_failed`, never dropped.
+ */
+async function captureFailedSubAgentArtifact(run: Run, mainWorktree: string, worktree: string, task: SubAgentTask) {
+  const artifactsDirectory = path.join(`${mainWorktree}.state`, "artifacts");
+  const result = await captureFailedSubAgentWorktree({
+    worktree,
+    artifactsDirectory,
+    taskId: task.id,
+    // Deliberately independent of the run's abort signal: retention must still
+    // work when the sub-agent failed because the run was cancelled/timed out.
+    exec: (args) => command("git", args, { cwd: worktree, timeoutMs: 30_000 }),
+  });
+  if (result.ok) {
+    const artifact = result.artifact;
+    await postUpdate(run.id, {
+      event: {
+        round: run.round,
+        source: "developer",
+        type: "subagent.failure_artifact",
+        message: `Sub Agent「${task.title}」未提交成果已保留为制品 ${artifact.id}（patch ${artifact.patchBytes} 字节 sha256=${artifact.patchSha256}；共 ${artifact.files.length} 个文件）`,
+        meta: {
+          taskId: task.id,
+          artifactId: artifact.id,
+          path: artifact.patchPath,
+          bytes: artifact.patchBytes,
+          sha256: artifact.patchSha256,
+          inventoryPath: artifact.inventoryPath,
+          inventorySha256: artifact.inventorySha256,
+          files: artifact.files.length,
+          truncated: artifact.truncated,
+        },
+      },
+    }).catch(() => undefined);
+    return;
+  }
+  await postUpdate(run.id, {
+    event: {
+      round: run.round,
+      source: "developer",
+      type: "subagent.failure_artifact_failed",
+      message: `Sub Agent「${task.title}」未提交成果保存失败：${result.error}`,
+      meta: { taskId: task.id, error: result.error },
+    },
+  }).catch(() => undefined);
+}
+
 async function deleteSubAgentBranch(project: string, branch: string) {
   await serializeWorktreeMutation(() => git(project, ["branch", "-D", branch])).catch(() => undefined);
 }
@@ -1156,6 +1215,9 @@ async function orchestrateSubAgents(input: {
           });
           await postUpdate(input.run.id, { event: { round: input.run.round, source: "developer", type: "subagent.merged", message: `Sub Agent「${result.task.title}」已合并` } });
         } finally {
+          // AT-AGENT-008: retain the failed sub-agent's uncommitted work before
+          // its worktree is force-removed.
+          if (result.error) await captureFailedSubAgentArtifact(input.run, input.worktree, result.worktree, result.task);
           await removeSubAgentWorktree(input.project, result.worktree);
           if (!keepBranch) await deleteSubAgentBranch(input.project, result.branch);
         }
@@ -1724,6 +1786,32 @@ async function executeJob(input: JobInput, controller: AbortController) {
         await tracker.complete(stages.review(round), { ...review, round, snapshotHash: reviewSnapshot });
       }
       findings = mergeFindings(findings, review.findings, { round, approved: review.verdict === "approved" });
+      // AT-REVIEW-010 / REVIEW-007: stop auto-repairing when the same severe
+      // finding persists across the policy threshold of consecutive rounds,
+      // instead of starting yet another repair round.
+      const repeatedSevere = repeatedSevereFindings(findings);
+      if (repeatedSevere.length > 0) {
+        const labels = repeatedSevere
+          .slice(0, 3)
+          .map((finding) => `${finding.severity}「${finding.title}」(${finding.consecutiveRounds ?? 0} 轮)`)
+          .join("；");
+        await update(
+          run,
+          "needs_human",
+          "reviewer",
+          "review.severe_finding_repeated",
+          `同一严重问题连续 ${severeRepeatThreshold} 轮未解决（fingerprint 稳定），已停止自动返修并转人工处理：${labels}`,
+          {
+            findings,
+            diff: latestDiff,
+            summary: `重复严重问题达到策略阈值（${severeRepeatThreshold} 轮），停止自动循环`,
+            usage: toRunUsage(usage),
+            durationMs: Date.now() - started,
+          },
+          { diffArtifact: reviewDiffArtifact },
+        );
+        return;
+      }
       if (review.verdict === "approved") {
         // AUD-03/AUD-04: independent completion guard. The review verdict alone
         // never completes a run: the checks for this snapshot must have passed

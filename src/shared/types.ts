@@ -201,12 +201,39 @@ export interface ConfigStatus {
   configuredProviders?: string[];
   /** Configured providers whose key was live-verified (AUD-08 / AT-MODEL-004). */
   verifiedProviders?: string[];
+  /**
+   * AUD-08: providers whose key was asserted valid by the operator because
+   * probing is disabled (`PI_MODEL_PROBE_MODE=off`). These are NOT live-verified
+   * and must never be presented as such.
+   */
+  assertedProviders?: string[];
 }
 
 export interface CurrentUser {
   id: string;
   email: string;
   legacyOwnerId?: string;
+}
+
+/**
+ * AUD-08 / AT-MODEL-004: credential verification history for one provider.
+ * - `unchecked`: a key is stored but nothing is known about it.
+ * - `operator_asserted`: probing is disabled and the operator asserted the key
+ *   is valid (`PI_MODEL_PROBE_MODE=off`). Never carries a `verifiedAt`.
+ * - `live`: a live provider `/models` probe succeeded and set `verifiedAt`.
+ */
+export type CredentialVerificationState = "unchecked" | "operator_asserted" | "live";
+
+/**
+ * AUD-08 / AT-MODEL-001: per-model capabilities reported by the provider at
+ * probe time. Every field is optional and only present when the provider
+ * actually reported it — values are never invented from the static catalog.
+ */
+export interface ProviderModelCapability {
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  toolCalling?: boolean;
+  reasoning?: boolean;
 }
 
 export interface CredentialStatus {
@@ -222,6 +249,14 @@ export interface CredentialStatus {
     verifiedAt?: string | null;
     /** AUD-08 / AT-MODEL-001: provider-reported model ids captured by the probe. */
     verifiedModels?: string[] | null;
+    /** AUD-08: `live` | `operator_asserted` | `unchecked`. */
+    verification?: CredentialVerificationState;
+    /** Convenience: true only for the opt-out `operator_asserted` state. */
+    asserted?: boolean;
+    /** Human-readable status label, e.g. 未校验（操作者断言）. */
+    verificationLabel?: string;
+    /** AUD-08 / AT-MODEL-001: provider-reported per-model capabilities. */
+    capabilities?: Record<string, ProviderModelCapability> | null;
   }>;
 }
 
@@ -229,15 +264,22 @@ export interface CredentialStatus {
  * AUD-08 / AT-MODEL-004: what we actually know about a provider credential.
  * `configured` only means a key is stored; `verifiedAt`/`verifiedModels` come
  * from a live provider preflight. A length-valid key on its own is never enough
- * to call a model available.
+ * to call a model available. `operator_asserted` credentials were explicitly
+ * accepted by the operator with probing disabled, and are surfaced distinctly.
  */
 export interface ProviderAvailability {
   provider: string;
   configured: boolean;
   verifiedAt: string | null;
   verifiedModels: string[] | null;
-  /** Convenience flag; when omitted it is derived from `verifiedAt !== null`. */
+  /** Convenience flag; when omitted it is derived from a live `verifiedAt`. */
   verified?: boolean;
+  /** AUD-08: full verification state; defaults to derived value when omitted. */
+  verification?: CredentialVerificationState;
+  /** Convenience: true only for `operator_asserted`. */
+  asserted?: boolean;
+  /** AUD-08 / AT-MODEL-001: provider-reported per-model capabilities, by model. */
+  capabilities?: Record<string, ProviderModelCapability> | null;
 }
 
 export type ModelRole = "developer" | "reviewer";
@@ -248,6 +290,7 @@ export interface ModelCatalogEntry {
   model: string;
   label: string;
   contextWindow?: number;
+  maxOutputTokens?: number;
   toolCalling: boolean;
   reasoning: boolean;
   roles: ModelRole[];
@@ -257,10 +300,24 @@ export interface ModelCatalogEntry {
 export interface ModelInfo extends ModelCatalogEntry {
   available: boolean;
   unavailableReason: "credential_missing" | "credential_unverified" | "model_unverified" | "role_restricted" | null;
-  /** AUD-08 / AT-MODEL-001: model is backed by a verified runtime probe. */
+  /** AUD-08 / AT-MODEL-001: model is backed by a live-verified credential. */
   verified?: boolean;
   /** AUD-08 / AT-MODEL-004: when the backing provider key was last verified. */
   verifiedAt?: string | null;
+  /** AUD-08: `live` | `operator_asserted` | `unchecked` for the backing provider. */
+  verification?: CredentialVerificationState;
+  /** AUD-08: true when usable only because the operator asserted the key. */
+  asserted?: boolean;
+  /** Human-readable verification label, e.g. 未校验（操作者断言）. */
+  verificationLabel?: string;
+  /**
+   * AUD-08 / AT-MODEL-001: true only when the provider itself reported
+   * capabilities for this model. When false the catalog values are used but are
+   * not runtime-verified.
+   */
+  capabilitiesVerified?: boolean;
+  /** AUD-08 / AT-MODEL-001: the provider-reported capability payload, if any. */
+  capabilities?: ProviderModelCapability | null;
 }
 
 export interface ModelSelection {
@@ -276,7 +333,15 @@ export interface ModelCatalogResponse {
    * AUD-08 / AT-MODEL-001: provider-level runtime verification, so the UI can
    * surface the concrete verifiedModels captured from the Pi/provider probe.
    */
-  verifiedProviders?: Array<{ provider: string; verifiedAt: string | null; verifiedModels: string[] | null }>;
+  verifiedProviders?: Array<{
+    provider: string;
+    verifiedAt: string | null;
+    verifiedModels: string[] | null;
+    verification?: CredentialVerificationState;
+    asserted?: boolean;
+    verificationLabel?: string;
+    capabilities?: Record<string, ProviderModelCapability> | null;
+  }>;
 }
 
 export type WorkspaceStatus = "active" | "unregistered" | "invalid";

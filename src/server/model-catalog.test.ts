@@ -113,6 +113,71 @@ describe("model catalog", () => {
     expect(flash?.contextWindow).toBe(64_000);
   });
 
+  it("treats operator-asserted credentials as usable but not verified (AUD-08)", () => {
+    const entries = loadModelCatalog({} as NodeJS.ProcessEnv);
+    const availability: ProviderAvailability[] = [
+      { provider: "deepseek", configured: true, verifiedAt: null, verifiedModels: null, verification: "operator_asserted", asserted: true },
+    ];
+    // Preflight passes for the opt-out path so real runs remain possible…
+    expect(preflightRunModels(
+      entries,
+      { developer: { provider: "deepseek", model: "deepseek-flash" }, reviewer: { provider: "deepseek", model: "deepseek-chat" } },
+      availability,
+    ).ok).toBe(true);
+    // …but the model is never presented as verified.
+    const flash = availableModels(entries, availability).find((entry) => entry.model === "deepseek-flash");
+    expect(flash?.available).toBe(true);
+    expect(flash?.verified).toBe(false);
+    expect(flash?.asserted).toBe(true);
+    expect(flash?.verification).toBe("operator_asserted");
+    expect(flash?.verificationLabel).toBe("未校验（操作者断言）");
+    expect(providerModelState(availability, "deepseek", "deepseek-flash")).toBe("asserted");
+    // Asserted credentials carry no per-model restriction.
+    expect(validateModelSelection(entries, "developer", { provider: "deepseek", model: "deepseek-flash" }, availability).ok).toBe(true);
+  });
+
+  it("prefers a live verification over an older assertion (AUD-08)", () => {
+    const entries = loadModelCatalog({} as NodeJS.ProcessEnv);
+    const availability: ProviderAvailability[] = [
+      {
+        provider: "deepseek",
+        configured: true,
+        verifiedAt: "2026-01-01T00:00:00.000Z",
+        verifiedModels: ["deepseek-chat"],
+        verification: "live",
+      },
+    ];
+    const flash = availableModels(entries, availability).find((entry) => entry.model === "deepseek-flash");
+    expect(flash?.available).toBe(false);
+    expect(flash?.unavailableReason).toBe("model_unverified");
+  });
+
+  it("surfaces provider-reported capabilities and flags them as verified (AT-MODEL-001)", () => {
+    const entries = loadModelCatalog({} as NodeJS.ProcessEnv);
+    const availability: ProviderAvailability[] = [
+      {
+        provider: "deepseek",
+        configured: true,
+        verifiedAt: "2026-01-01T00:00:00.000Z",
+        verifiedModels: ["deepseek-flash", "deepseek-chat"],
+        verification: "live",
+        capabilities: { "deepseek-flash": { contextWindow: 128_000, maxOutputTokens: 8_192, toolCalling: true, reasoning: true } },
+      },
+    ];
+    const models = availableModels(entries, availability);
+    const flash = models.find((entry) => entry.model === "deepseek-flash");
+    expect(flash?.contextWindow).toBe(128_000);
+    expect(flash?.maxOutputTokens).toBe(8_192);
+    expect(flash?.toolCalling).toBe(true);
+    expect(flash?.reasoning).toBe(true);
+    expect(flash?.capabilitiesVerified).toBe(true);
+    // A model the probe enumerated but reported no capabilities for keeps the
+    // catalog values, flagged as not runtime-verified.
+    const chat = models.find((entry) => entry.model === "deepseek-chat");
+    expect(chat?.capabilitiesVerified).toBe(false);
+    expect(chat?.capabilities).toBeNull();
+  });
+
   it("passes preflight when one provider serves both roles (AT-MODEL-007/008)", () => {
     const entries = loadModelCatalog({
       PI_MODEL_CATALOG_JSON: JSON.stringify([

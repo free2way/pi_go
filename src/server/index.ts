@@ -13,7 +13,7 @@ import { CredentialVault } from "./credential-vault.js";
 import { createDb, createPool, newId, runMigrations } from "./db.js";
 import { baseDemoRun, runDemo } from "./demo-runner.js";
 import { IdentityService } from "./identity.js";
-import { availableModels, defaultSelections, loadModelCatalog, preflightRunModels, type RuntimeCapability } from "./model-catalog.js";
+import { availableModels, defaultSelections, loadModelCatalog, preflightRunModels } from "./model-catalog.js";
 import { RunEventStream } from "./event-stream.js";
 import { cleanupRunDirectory, keptRunStorageOutcome, type RunDirectoryCleaner } from "./run-cleanup.js";
 import { baseRealRun } from "./real-run.js";
@@ -59,11 +59,9 @@ await vault.init();
 // AUD-08 / AT-MODEL-004: live provider probe used to verify credentials. It is
 // injectable and never throws; a failed probe simply leaves a key unverified.
 const providerProbe = createProviderProbe();
-// AT-MODEL-001: capability overrides reported by a probe, keyed `provider/model`.
-const runtimeCapabilities = new Map<string, RuntimeCapability>();
 
 // AUD-08 cutover safety: credentials stored before live verification existed
-// have `verifiedAt === null` and would block every real run. Verify them once at
+// have `verifiedAt === null` and would block every real run. Resolve them once at
 // startup, bounded so boot is not delayed by more than ~10s. Logs carry provider
 // names and outcomes only — never key material.
 try {
@@ -74,7 +72,8 @@ try {
       listPending: () => pending,
       readKey: (userId, provider) => vault.get(userId, provider),
       probe: providerProbe,
-      markVerified: (userId, provider, models) => vault.markVerified(userId, provider, models),
+      markVerified: (userId, provider, models, capabilities) => vault.markVerified(userId, provider, models, capabilities),
+      markOperatorAsserted: (userId, provider) => vault.markOperatorAsserted(userId, provider),
       markUnverified: (userId, provider) => vault.markUnverified(userId, provider),
       probeDisabled: providerProbeDisabled,
       log: (message, detail) => app.log.info(detail ?? {}, message),
@@ -88,7 +87,7 @@ try {
     ]);
     if (outcome) {
       app.log.info(
-        { pending: outcome.considered, verified: outcome.verified, unverified: outcome.unverified, skipped: outcome.skipped, deferred: outcome.deferred },
+        { pending: outcome.considered, verified: outcome.verified, asserted: outcome.asserted, unverified: outcome.unverified, skipped: outcome.skipped, deferred: outcome.deferred },
         "startup credential verification pass finished",
       );
     } else {
@@ -433,7 +432,7 @@ app.get("/api/health", async (_request, reply) => {
   try {
     await pingDatabase();
     alerts.clear("database_unavailable");
-    return { status: "ok", service: "pigo-web", version: "0.21.0", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.21.1", db: "ok" };
   } catch (error) {
     // AT-REL-005: fail loudly instead of pretending the service is healthy.
     alerts.raise({
@@ -442,7 +441,7 @@ app.get("/api/health", async (_request, reply) => {
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
       details: { error: (error as Error).message.slice(0, 200) },
     });
-    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.21.0", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.21.1", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
   }
 });
 
@@ -457,7 +456,7 @@ interface StorageStatus {
 app.get("/api/health/detail", async (request, reply) => {
   const internal = safeTokenMatch(request.headers.authorization);
   if (!internal && !auth.user(request)) return reply.code(401).send({ error: "Unauthorized" });
-  const health: Record<string, unknown> = { version: "0.21.0", at: new Date().toISOString() };
+  const health: Record<string, unknown> = { version: "0.21.1", at: new Date().toISOString() };
   try {
     await pingDatabase();
     health.database = { status: "ok" };
@@ -521,17 +520,15 @@ app.put("/api/credentials", async (request, reply) => {
     status = await vault.set(userId, write);
     // AUD-08 / AT-MODEL-004: verify the key against the provider before it can be
     // considered available. `PI_MODEL_PROBE_MODE=off` is the explicit opt-out for
-    // providers without a reachable /models endpoint.
+    // providers without a reachable /models endpoint: it records an operator
+    // assertion, never a fake verification.
     if (providerProbeDisabled()) {
-      status = await vault.markVerified(userId, write.provider, []);
+      status = await vault.markOperatorAsserted(userId, write.provider);
       continue;
     }
     const probe = await providerProbe(write).catch(() => undefined);
     if (probe?.ok) {
-      status = await vault.markVerified(userId, write.provider, probe.models);
-      for (const [model, capability] of Object.entries(probe.capabilities ?? {})) {
-        runtimeCapabilities.set(`${write.provider}/${model}`, capability);
-      }
+      status = await vault.markVerified(userId, write.provider, probe.models, probe.capabilities ?? null);
     } else {
       status = await vault.markUnverified(userId, write.provider);
     }
@@ -550,14 +547,20 @@ app.delete<{ Querystring: { provider?: string } }>("/api/credentials", async (re
 app.get("/api/models", async (request): Promise<ModelCatalogResponse> => {
   const availability = vault.providerAvailability(vaultKeyFor(request));
   return {
-    models: availableModels(modelCatalog, availability, Object.fromEntries(runtimeCapabilities)),
+    models: availableModels(modelCatalog, availability),
     defaultDeveloper: modelDefaults.developer,
     defaultReviewer: modelDefaults.reviewer,
-    // AUD-08 / AT-MODEL-001: surface the provider-reported verifiedModels.
+    // AUD-08 / AT-MODEL-001: surface the provider-reported verifiedModels,
+    // the honest verification state (live vs operator-asserted) and the
+    // runtime-reported per-model capabilities.
     verifiedProviders: availability.map((item) => ({
       provider: item.provider,
       verifiedAt: item.verifiedAt,
       verifiedModels: item.verifiedModels,
+      verification: item.verification,
+      asserted: item.asserted,
+      verificationLabel: item.verification === "live" ? "已验证" : item.verification === "operator_asserted" ? "未校验（操作者断言）" : "未校验",
+      capabilities: item.capabilities ?? null,
     })),
   };
 });
@@ -576,7 +579,8 @@ app.get("/api/config/status", async (request): Promise<ConfigStatus> => {
     reviewer: { provider: modelDefaults.reviewer.provider, model: modelDefaults.reviewer.model, credentialConfigured: configured.has(modelDefaults.reviewer.provider) },
     realRunsAvailable: realRunsEnabled && Boolean(internalToken) && configured.size > 0,
     configuredProviders: [...configured],
-    verifiedProviders: credentials.providers.filter((item) => item.verifiedAt !== null).map((item) => item.provider),
+    verifiedProviders: credentials.providers.filter((item) => item.verification === "live").map((item) => item.provider),
+    assertedProviders: credentials.providers.filter((item) => item.verification === "operator_asserted").map((item) => item.provider),
   };
 });
 

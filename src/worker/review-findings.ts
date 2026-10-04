@@ -38,6 +38,7 @@ export function mergeFindings(
   const merged = previous.map((item) => ({ ...item }));
   const byId = new Map(merged.map((item, index) => [item.id, index]));
   const byFingerprint = new Map(merged.map((item, index) => [item.fingerprint ?? findingFingerprint(item), index]));
+  const matched = new Set<number>();
 
   for (const raw of incoming) {
     const fingerprint = findingFingerprint(raw);
@@ -53,6 +54,7 @@ export function mergeFindings(
     };
     if (existingIndex === undefined || merged[existingIndex] === undefined) {
       merged.push(observed);
+      matched.add(merged.length - 1);
       byId.set(observed.id, merged.length - 1);
       byFingerprint.set(fingerprint, merged.length - 1);
       continue;
@@ -74,6 +76,7 @@ export function mergeFindings(
       observations: (current.observations ?? 1) + 1,
       consecutiveRounds: (current.consecutiveRounds ?? 1) + 1,
     };
+    matched.add(existingIndex);
     byId.set(current.id, existingIndex);
     byFingerprint.set(current.fingerprint ?? fingerprint, existingIndex);
   }
@@ -89,7 +92,9 @@ export function mergeFindings(
       return { ...item, resolved: true, consecutiveRounds: 0 };
     });
   }
-  return merged;
+  // AT-REVIEW-010: a problem that was not re-reported this round breaks its
+  // "consecutive rounds" streak (it stays open, but is no longer continuous).
+  return merged.map((item, index) => (matched.has(index) || item.resolved ? item : { ...item, consecutiveRounds: 0 }));
 }
 
 /** Serialized unresolved findings, used as the repair brief when a human resumes a run. */
@@ -101,4 +106,28 @@ export function unresolvedFeedback(findings: Finding[] | undefined): string {
 /** GAP-03: problems reported unresolved across consecutive reviews. */
 export function repeatedFindings(findings: Finding[] | undefined, threshold = 2) {
   return (findings ?? []).filter((item) => !item.resolved && (item.consecutiveRounds ?? 0) >= threshold);
+}
+
+/**
+ * AT-REVIEW-010 / REVIEW-007: how many consecutive reviews may report the same
+ * blocking (critical/high) problem before the run stops auto-repairing and is
+ * escalated to `needs_human`. The acceptance spec only says "策略阈值" (policy
+ * threshold) and documents no number, so PiGO uses 3: a single repeat is a
+ * normal repair iteration, but the same severe finding in 3 consecutive rounds
+ * is treated as no progress. Identity is the stable fingerprint, so this holds
+ * even when the reviewer renames the id.
+ */
+export const severeRepeatThreshold = 3;
+
+/** Blocking findings that must be fixed (not merely advisory). */
+const severeSeverities: ReadonlyArray<Finding["severity"]> = ["critical", "high"];
+
+/**
+ * AT-REVIEW-010: unresolved severe findings reported in `threshold` consecutive
+ * rounds. Resolved findings and single/occasional occurrences are excluded.
+ */
+export function repeatedSevereFindings(findings: Finding[] | undefined, threshold = severeRepeatThreshold) {
+  return (findings ?? []).filter(
+    (item) => !item.resolved && severeSeverities.includes(item.severity) && (item.consecutiveRounds ?? 0) >= threshold,
+  );
 }

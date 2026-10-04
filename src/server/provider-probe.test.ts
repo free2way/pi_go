@@ -50,4 +50,68 @@ describe("provider probe", () => {
     const probe = createProviderProbe({ env: {} as NodeJS.ProcessEnv });
     expect(await probe({ provider: "unknown-provider", apiKey: "key" })).toMatchObject({ ok: false, code: "PROBE_UNSUPPORTED" });
   });
+
+  it("captures provider-reported capabilities when present (AT-MODEL-001)", async () => {
+    const probe = createProviderProbe({
+      env: { PI_PROVIDER_PROBE_BASE_URL: "https://provider.example/v1" } as NodeJS.ProcessEnv,
+      fetchImpl: (async () => jsonResponse({
+        data: [
+          {
+            id: "deepseek-chat",
+            context_window: 128000,
+            max_output_tokens: 8192,
+            capabilities: { tool_calling: true, reasoning: false },
+          },
+          {
+            id: "deepseek-reasoner",
+            context_length: "65536",
+            top_provider: { max_completion_tokens: 4096 },
+            supported_parameters: ["tools", "reasoning"],
+          },
+        ],
+      })) as unknown as typeof fetch,
+    });
+    const result = await probe({ provider: "deepseek", apiKey: "secret-key" });
+    expect(result).toMatchObject({
+      ok: true,
+      models: ["deepseek-chat", "deepseek-reasoner"],
+      capabilities: {
+        "deepseek-chat": { contextWindow: 128000, maxOutputTokens: 8192, toolCalling: true, reasoning: false },
+        "deepseek-reasoner": { contextWindow: 65536, maxOutputTokens: 4096, toolCalling: true, reasoning: true },
+      },
+    });
+  });
+
+  it("never invents capabilities the provider did not report (AT-MODEL-001)", async () => {
+    const probe = createProviderProbe({
+      env: { PI_PROVIDER_PROBE_BASE_URL: "https://provider.example/v1" } as NodeJS.ProcessEnv,
+      fetchImpl: (async () => jsonResponse({ data: [{ id: "deepseek-chat", object: "model", owned_by: "deepseek" }] })) as unknown as typeof fetch,
+    });
+    const result = await probe({ provider: "deepseek", apiKey: "secret-key" });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.models).toEqual(["deepseek-chat"]);
+      expect(result.capabilities).toBeUndefined();
+    }
+  });
+
+  it("ignores malformed items without failing the probe (AT-MODEL-001)", async () => {
+    const probe = createProviderProbe({
+      env: { PI_PROVIDER_PROBE_BASE_URL: "https://provider.example/v1" } as NodeJS.ProcessEnv,
+      fetchImpl: (async () => jsonResponse({
+        models: [null, "not-an-object", { id: "ok-model", context_window: "abc", reasoning: "maybe" }, { noId: true, context_window: 10 }],
+      })) as unknown as typeof fetch,
+    });
+    const result = await probe({ provider: "deepseek", apiKey: "secret-key" });
+    expect(result).toMatchObject({ ok: true, models: ["ok-model"] });
+    if (result.ok) expect(result.capabilities).toBeUndefined();
+  });
+
+  it("ignores a non-object /models body gracefully", async () => {
+    const probe = createProviderProbe({
+      env: { PI_PROVIDER_PROBE_BASE_URL: "https://provider.example/v1" } as NodeJS.ProcessEnv,
+      fetchImpl: (async () => ({ ok: true, status: 200, json: async () => 42 }) as Response) as unknown as typeof fetch,
+    });
+    expect(await probe({ provider: "deepseek", apiKey: "secret-key" })).toMatchObject({ ok: true, models: [] });
+  });
 });
