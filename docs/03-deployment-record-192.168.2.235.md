@@ -166,3 +166,38 @@ docker compose --env-file .env down
 - AT-REL-008：客户端落后 → 分页补拉（1,2,3 / 4,5,6），带 `Last-Event-ID` 重连从下一条继续（seq 28）。
 - AT-REL-009：见上文备份/恢复验证。
 - AT-REL-010：磁盘 critical（阈值 `PI_MIN_FREE_DISK_MB`）→ 新建任务返回 507 `DISK_FULL`，`/api/health/detail` 暴露 critical 水位与告警。
+
+## v0.13.0～v0.13.2 升级记录：安全组（SEC）
+
+升级日期：2026-10-04（Asia/Shanghai）。生产容器 `pi-agent-web-1` / `pi-agent-worker-1` 已重建，runtime / postgres 未重建。回滚标签：web `prev16`/`prev17`、worker `prev12`/`prev13`；源码留档 `source.prev16-*` ～ `source.prev18-*`。
+
+### 本次变更（代码与部署）
+
+- **SEC-004（真实运行高优发现修复）**：Worker 不再挂载交互式 Pi 配置卷 `pi-agent-config`（其中含 auth、会话转录与缓存）。改为：
+  - `/app/pi-agent/pi-models.json` 只读挂载到 `/home/node/.pi/agent/models.json`（由 `deploy/docker/export-models.sh` 生成，剥离任何字面量凭据，仅保留 `$ENV` 引用）；
+  - 容器内命名卷 `pigo-worker-state` 承载 Worker 自己的 Pi 状态与会话，与其他进程隔离；
+  - Worker 镜像预建 `/home/node/.pi/agent`（`node` 属主），确保非 root 用户可写凭据存储（首次上线曾因该目录 root 属主导致真实运行报 `Credential store read failed`，已修复并回归）。
+- **SEC-003/010**：子进程环境改为白名单式清洗（`src/worker/pi-env.ts`）——Agent 进程只拿到当前角色的 provider Key；检查命令拿不到任何 provider Key、内部回调 token、数据库口令。生产验证：检查命令输出 `guard:CLEAN_TOKEN,CLEAN_OPENAI,CLEAN_DEEPSEEK`。
+- **SEC-008**：写接口按用户限流（凭据写入 10/分、建单 20/分、取消与人工操作 30/分），超限 429 + `RATE_LIMITED`，其他用户不受影响。
+- **SEC-002/005/007/009/011/014**：沿用并复核既有措施（AES-256-GCM+AAD、日志/事件脱敏、非 root + cap_drop ALL + no-new-privileges + 只读根 + 资源上限、realpath/允许根校验、`--no-extensions --no-skills`）。
+
+### 验收证据（隔离 e2e，v0.13.1/v0.13.2 + 假运行时）
+
+| 用例 | 结果 |
+| --- | --- |
+| AT-SEC-001 | 源码、前端 bundle、数据库事件/运行文档、Web/Worker 日志、凭据文件均无密钥样式明文（命中数 0） |
+| AT-SEC-002/003 | 凭据密文随机 IV、16 字节认证 tag、AAD 绑定 user/provider；篡改密文或跨用户复制均解密失败（单元测试） |
+| AT-SEC-004 | 跨 Origin 写请求 403；受信任 Origin 201 |
+| AT-SEC-005 | 凭据写入第 9 次起 429（窗口内 8 次成功 + 此前 2 次调用），建单第 21 次 429；另一用户仍可建单（201） |
+| AT-SEC-006 | `../../etc`、`/etc/passwd`、嵌套 `fixture-rel/../../etc` 全部 `WORKSPACE_INVALID` |
+| AT-SEC-008 | planner/developer 仅见 `DEEPSEEK_API_KEY`，reviewer 仅见 `OPENAI_API_KEY`；内部 token 对 Agent 不可见 |
+| AT-SEC-009/014 | reviewer `--tools read,grep,find,ls`（只读）；所有角色均 `--no-extensions --no-skills --no-prompt-templates` |
+| AT-SEC-011 | `docker inspect`：user=node、cap_drop=[ALL]、no-new-privileges、web/worker read_only、pids/mem/cpu 上限、非特权 |
+| AT-SEC-012 | 缺 token / 错误值 / 错误长度 → 401；常量时间比较；正确 token 200 |
+| AT-SEC-013 | 8MB 请求体、20 万字符任务、5MB 内部 patch 全部 413，服务保持健康 |
+
+### 残余风险（需决策）
+
+- **AT-SEC-007**：同一 Worker 容器内，Agent 与检查命令仍可读取 `/workspace` 下其他项目的**只读**内容（同 UID、共享挂载命名空间）。要彻底隔离需：为每个任务启用独立容器，或允许 `seccomp=unconfined` 后使用 bubblewrap 命名空间沙箱，或改造为 `git clone --shared` + 只读挂载源仓库（仍无法阻止读取）。
+- **SEC-006 / AT-SEC-010 的网络部分**：容器无入站端口，出站未做目的地 allowlist；检查命令与 Agent 共享容器网络。要做目的地 allowlist 需要 egress 代理或网络命名空间支持。
+- 上述两项在容器权限模型不变的前提下无法满足，建议按“每任务容器”或“命名空间沙箱（需放宽 seccomp）”方案推进。
