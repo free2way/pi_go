@@ -6,6 +6,7 @@ import path from "node:path";
 import readline from "node:readline";
 import type { ChatChannel, ChatParticipant, ChatRole, DevelopmentPlan, Finding, ProjectInfo, Run, RunEvent, RunRoleUsage, RunState, SubAgentTask, WorkspaceVerifyResult } from "../shared/types.js";
 import { clipChatContent } from "../shared/chat.js";
+import { assignSubAgentCodenames } from "../shared/codenames.js";
 import { runChecks as runCheckSuite, throwIfCancelled, type CommandResult } from "./checks.js";
 import { CheckpointTracker, isCheckpointCurrent, memoryCheckpointClient, stages, type Checkpoint, type CheckpointClient, type StoredChecks, type StoredReview } from "./checkpoints.js";
 import { conflictFreeBatches, executionWaves, fallbackPlan, parseDevelopmentPlan } from "./orchestrator.js";
@@ -578,6 +579,10 @@ async function update(run: Run, state: RunState, source: RunEvent["source"], typ
  * run detail page renders). The cancellation guard means a run cancelled while
  * an agent was mid-response never emits a phantom chat entry after
  * `run.cancelled` — the server would reject it anyway (terminal-state guard).
+ *
+ * `extra` is additive: review hand-offs attach their structured `findings` so
+ * the UI renders severity/file:line/title/requiredChange without re-parsing, and
+ * sub-agent messages attach their `agent` codename so the sender is readable.
  */
 async function chat(
   run: Run,
@@ -587,6 +592,7 @@ async function chat(
   role: ChatRole,
   content: string,
   signal?: AbortSignal,
+  extra: { findings?: Finding[]; agent?: string } = {},
 ) {
   throwIfCancelled(signal);
   // Bounded per message, but never silent: `clipChatContent` appends an explicit
@@ -599,7 +605,7 @@ async function chat(
       source: from === "developer" || from === "reviewer" || from === "checks" ? from : "system",
       type: "chat.message",
       message: clipped.replace(/\s+/g, " ").slice(0, 110),
-      meta: { chat: { channel, from, to, role, content: clipped } },
+      meta: { chat: { channel, from, to, role, content: clipped, ...(extra.findings?.length ? { findings: extra.findings } : {}), ...(extra.agent ? { agent: extra.agent } : {}) } },
     },
   });
 }
@@ -1007,11 +1013,14 @@ async function runDeveloperAgent(input: {
   prompt: string;
   sessionSuffix: string;
   activityPrefix?: string;
+  /** Item-3: sub-agent codename surfaced in chat instead of only the task title. */
+  agentName?: string;
   usage: UsageTotals;
   budget?: RunBudgetContext;
   role?: RunRoleUsage["role"];
 }) {
-  await chat(input.run, "developer", "orchestrator", "developer", "prompt", input.prompt, input.signal);
+  const extra = input.agentName ? { agent: input.agentName } : {};
+  await chat(input.run, "developer", "orchestrator", "developer", "prompt", input.prompt, input.signal, extra);
   const result = await runPiWithRetry({
     cwd: input.worktree,
     provider: input.run.developer.provider,
@@ -1031,8 +1040,27 @@ async function runDeveloperAgent(input: {
     }),
   }, { runId: input.run.id, round: input.run.round, label: input.activityPrefix ?? "开发 Agent", role: input.role ?? "developer", budget: input.budget });
   addUsage(input.usage, result.usage);
-  await chat(input.run, "developer", "developer", "orchestrator", "response", redactJobSecrets(result.text, input.credentials), input.signal);
+  await chat(input.run, "developer", "developer", "orchestrator", "response", redactJobSecrets(result.text, input.credentials), input.signal, extra);
   return result.text;
+}
+
+/**
+ * Item-3: stamp every task of a split plan with a deterministic codename. The
+ * single-task plan is left untouched (it is the developer agent, not a sub-agent).
+ * Idempotent: a restored checkpoint already carrying names keeps them, and a
+ * fresh assignment is reproducible from runId + task id.
+ */
+function assignPlanCodenames(runId: string, plan: DevelopmentPlan): DevelopmentPlan {
+  if (plan.tasks.length <= 1) return plan;
+  if (plan.tasks.every((task) => task.name)) return plan;
+  const names = assignSubAgentCodenames(runId, plan.tasks.map((task) => task.id));
+  plan.tasks.forEach((task, index) => { task.name = task.name ?? names[index]; });
+  return plan;
+}
+
+/** Item-3: event/chat label — codename when assigned, task title otherwise. */
+function subAgentLabel(task: SubAgentTask): string {
+  return task.name ? `${task.name}｜${task.title}` : task.title;
 }
 
 type SubAgentResult = {
@@ -1059,17 +1087,26 @@ async function runSubAgent(input: {
   input.task.status = "running";
   input.task.branch = branch;
   await mkdir(path.dirname(worktree), { recursive: true });
-  await postUpdate(input.run.id, { event: { round: input.run.round, source: "developer", type: "subagent.started", message: `Sub Agent「${input.task.title}」开始执行` } });
+  await postUpdate(input.run.id, {
+    event: {
+      round: input.run.round,
+      source: "developer",
+      type: "subagent.started",
+      message: `Sub Agent「${subAgentLabel(input.task)}」开始执行`,
+      meta: { taskId: input.task.id, codename: input.task.name, title: input.task.title },
+    },
+  });
   try {
     await serializeWorktreeMutation(() => git(input.project, ["worktree", "add", "-b", branch, worktree, input.mainBranch], input.signal));
     const prompt = [
       "You are a focused implementation sub-agent. Work only in the current Git worktree.",
       `Overall task: ${input.run.task}`,
+      input.task.name ? `Your codename: ${input.task.name}` : "",
       `Your assigned task: ${input.task.title}\n${input.task.description}`,
       input.task.files.length ? `Primary file ownership: ${input.task.files.join(", ")}` : "Inspect and limit changes to the smallest coherent scope.",
       "Implement only your assigned part and its focused tests. Do not push, deploy, read credentials, or modify unrelated areas.",
       "Other sub-agents may work in parallel. Avoid broad formatting and generated dependency updates unless explicitly required.",
-    ].join("\n\n");
+    ].filter(Boolean).join("\n\n");
     const summary = await runDeveloperAgent({
       run: input.run,
       worktree,
@@ -1077,7 +1114,8 @@ async function runSubAgent(input: {
       signal: input.signal,
       prompt,
       sessionSuffix: `sub-${input.task.id}`,
-      activityPrefix: `Sub Agent「${input.task.title}」`,
+      activityPrefix: `Sub Agent「${subAgentLabel(input.task)}」`,
+      agentName: input.task.name,
       usage: input.usage,
       budget: input.budget,
       role: "sub-agent",
@@ -1092,7 +1130,15 @@ async function runSubAgent(input: {
     input.task.status = "completed";
     input.task.summary = redactJobSecrets(summary, input.credentials).slice(0, 1_000) || (commit ? "Implementation committed" : "No code changes were required");
     input.task.durationMs = Date.now() - startedAt;
-    await postUpdate(input.run.id, { event: { round: input.run.round, source: "developer", type: "subagent.completed", message: `Sub Agent「${input.task.title}」完成` } });
+    await postUpdate(input.run.id, {
+      event: {
+        round: input.run.round,
+        source: "developer",
+        type: "subagent.completed",
+        message: `Sub Agent「${subAgentLabel(input.task)}」完成`,
+        meta: { taskId: input.task.id, codename: input.task.name, title: input.task.title },
+      },
+    });
     return { task: input.task, branch, worktree, commit };
   } catch (error) {
     const safeMessage = redactJobSecrets((error as Error).message, input.credentials);
@@ -1104,7 +1150,7 @@ async function runSubAgent(input: {
     // sub-agent worktree is force-removed.
     const captured = failureOutputForEvent(error);
     if (captured) {
-      const meta: Record<string, unknown> = { taskId: input.task.id, exitCode: captured.exitCode };
+      const meta: Record<string, unknown> = { taskId: input.task.id, codename: input.task.name, exitCode: captured.exitCode };
       if (captured.stdout) meta.stdoutTail = redactJobSecrets(captured.stdout, input.credentials);
       if (captured.stderr) meta.stderrTail = redactJobSecrets(captured.stderr, input.credentials);
       await postUpdate(input.run.id, {
@@ -1112,12 +1158,20 @@ async function runSubAgent(input: {
           round: input.run.round,
           source: "developer",
           type: "subagent.failure_output",
-          message: `Sub Agent「${input.task.title}」失败输出已保留（退出码 ${captured.exitCode}，每路最多 8 KB）`,
+          message: `Sub Agent「${subAgentLabel(input.task)}」失败输出已保留（退出码 ${captured.exitCode}，每路最多 8 KB）`,
           meta,
         },
       }).catch(() => undefined);
     }
-    await postUpdate(input.run.id, { event: { round: input.run.round, source: "developer", type: "subagent.failed", message: `Sub Agent「${input.task.title}」失败，将由集成 Agent 接管：${safeMessage.slice(0, 200)}` } });
+    await postUpdate(input.run.id, {
+      event: {
+        round: input.run.round,
+        source: "developer",
+        type: "subagent.failed",
+        message: `Sub Agent「${subAgentLabel(input.task)}」失败，将由集成 Agent 接管：${safeMessage.slice(0, 200)}`,
+        meta: { taskId: input.task.id, codename: input.task.name, title: input.task.title },
+      },
+    });
     return { task: input.task, branch, worktree, error: safeMessage };
   }
 }
@@ -1149,9 +1203,10 @@ async function captureFailedSubAgentArtifact(run: Run, mainWorktree: string, wor
         round: run.round,
         source: "developer",
         type: "subagent.failure_artifact",
-        message: `Sub Agent「${task.title}」未提交成果已保留为制品 ${artifact.id}（patch ${artifact.patchBytes} 字节 sha256=${artifact.patchSha256}；共 ${artifact.files.length} 个文件）`,
+        message: `Sub Agent「${subAgentLabel(task)}」未提交成果已保留为制品 ${artifact.id}（patch ${artifact.patchBytes} 字节 sha256=${artifact.patchSha256}；共 ${artifact.files.length} 个文件）`,
         meta: {
           taskId: task.id,
+          codename: task.name,
           artifactId: artifact.id,
           path: artifact.patchPath,
           bytes: artifact.patchBytes,
@@ -1170,8 +1225,8 @@ async function captureFailedSubAgentArtifact(run: Run, mainWorktree: string, wor
       round: run.round,
       source: "developer",
       type: "subagent.failure_artifact_failed",
-      message: `Sub Agent「${task.title}」未提交成果保存失败：${result.error}`,
-      meta: { taskId: task.id, error: result.error },
+      message: `Sub Agent「${subAgentLabel(task)}」未提交成果保存失败：${result.error}`,
+      meta: { taskId: task.id, codename: task.name, error: result.error },
     },
   }).catch(() => undefined);
 }
@@ -1279,7 +1334,7 @@ async function orchestrateSubAgents(input: {
             summary: result.task.summary,
             durationMs: result.task.durationMs,
           });
-          await postUpdate(input.run.id, { event: { round: input.run.round, source: "developer", type: "subagent.merged", message: `Sub Agent「${result.task.title}」已合并` } });
+          await postUpdate(input.run.id, { event: { round: input.run.round, source: "developer", type: "subagent.merged", message: `Sub Agent「${subAgentLabel(result.task)}」已合并`, meta: { taskId: result.task.id, codename: result.task.name, title: result.task.title } } });
         } finally {
           // AT-AGENT-008: retain the failed sub-agent's uncommitted work before
           // its worktree is force-removed.
@@ -1731,6 +1786,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
         // AT-REL-002: the developer stage already finished before the restart, so
         // no developer model call is repeated; continue with checks and review.
         plan = tracker.payload<DevelopmentPlan>(stages.planning) ?? plan ?? fallbackPlan(run.task);
+        assignPlanCodenames(run.id, plan);
         run.plan = plan;
         await update(run, "developing", "system", "checkpoint.development_restored", `第 ${round} 轮开发已由检查点确认完成，跳过重复的模型调用`, { plan });
         feedback = unresolvedFeedback(run.findings);
@@ -1738,6 +1794,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
       } else if (round === 1) {
         const storedPlan = tracker.isCompleted(stages.planning) ? tracker.payload<DevelopmentPlan>(stages.planning) : undefined;
         plan = storedPlan ?? await planDevelopment(run, worktree, input.credentials, controller.signal, usage, budget);
+        assignPlanCodenames(run.id, plan);
         run.plan = plan;
         if (storedPlan) {
           await postUpdate(run.id, {
@@ -1921,7 +1978,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
         return;
       }
       feedback = JSON.stringify(review.findings, null, 2);
-      await chat(run, "handoff", "reviewer", "developer", "feedback", feedback, controller.signal);
+      await chat(run, "handoff", "reviewer", "developer", "feedback", feedback, controller.signal, { findings: review.findings.map((item) => ({ ...item, resolved: false })) });
       await update(run, "developing", "reviewer", "review.changes_requested", `审核发现 ${review.findings.length} 个问题，退回 Developer`, { findings, summary: review.summary, usage: toRunUsage(usage) });
     }
     await update(run, "needs_human", "system", "run.needs_human", "达到最大审核轮次，需要人工处理", { findings, usage: toRunUsage(usage), usageRoles: run.usageRoles, modelCalls: run.modelCalls, durationMs: Date.now() - started });

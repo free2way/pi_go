@@ -41,6 +41,9 @@ const finding: Finding = {
   evidence: "refresh promise 被缓存，但第一版实现没有在 rejected path 中清理锁。",
   requiredChange: "使用 finally 清理 refreshLocks，并增加失败后可重试的测试。",
   resolved: false,
+  // Item-1: round markers let the topology popover join this finding to round 1.
+  firstSeenRound: 1,
+  lastSeenRound: 1,
 };
 
 export function baseDemoRun(input: { title: string; task: string; repository: string }, ownerId = "owner_demo"): Run {
@@ -101,6 +104,7 @@ export async function runDemo(store: RunStoreLike, runId: string, options: { del
     to: ChatParticipant,
     role: ChatRole,
     content: string,
+    findings?: Finding[],
   ) => {
     // Mirror `emit`'s guard so a cancellation during the preceding wait cannot
     // append a phantom agent message after `run.cancelled`.
@@ -113,7 +117,7 @@ export async function runDemo(store: RunStoreLike, runId: string, options: { del
       type: "chat.message",
       message: content.replace(/\s+/g, " ").slice(0, 110),
       at: new Date().toISOString(),
-      meta: { chat: { channel, from, to, role, content } },
+      meta: { chat: { channel, from, to, role, content, ...(findings?.length ? { findings } : {}) } },
     });
     await sleep(Math.max(1, Math.round(stepDelay * 0.38)));
   };
@@ -183,6 +187,7 @@ export async function runDemo(store: RunStoreLike, runId: string, options: { del
       "developer",
       "feedback",
       "审核结论：changes_requested（1 个高优先级问题）。\n\n[high] 失败请求可能污染并发锁\n文件：src/auth/session.ts:46\n证据：refresh promise 被缓存，但第一版实现没有在 rejected path 中清理锁，失败后锁会长期占用。\n需要修改：使用 finally 清理 refreshLocks，并增加失败后可重试的测试。",
+      [finding],
     );
     await emit("developing", "reviewer", "review.changes_requested", "审核发现 1 个高优先级问题，已退回 DeepSeek", {
       findings: [finding],

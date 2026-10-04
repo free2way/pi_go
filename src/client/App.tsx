@@ -59,7 +59,7 @@ import {
   Zap,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { chatChannelLabels, chatCounts, chatMessageView, chatMessagesFromEvents, chatParticipantLabels, chatTabs, filterChatMessages, reworkBranchRounds, type ChatTab } from "../shared/chat";
+import { chatChannelLabels, chatCounts, chatMessageView, chatMessagesFromEvents, chatParticipantLabels, chatTabs, filterChatMessages, isReviewMessage, messageFindings, reworkBranchDetails, reworkBranchRounds, type ChatTab, type ReworkBranchDetail } from "../shared/chat";
 import type { ChatMessage, ConfigStatus, CurrentUser, Finding, ModelCatalogResponse, Run, RunArtifact, RunEvent, RunMode, RunRoleUsage, RunState, Workspace } from "../shared/types";
 import { api } from "./api";
 import { HistoryPage } from "./HistoryPage";
@@ -127,6 +127,9 @@ const nodeTypes = { flowCard: FlowCard };
 function ReworkEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, markerEnd, style, data }: EdgeProps) {
   const label = typeof data?.label === "string" ? data.label : "";
   const centerY = typeof data?.centerY === "number" ? data.centerY : Math.max(sourceY, targetY) + 96;
+  const round = typeof data?.round === "number" ? data.round : undefined;
+  const active = data?.active === true;
+  const onSelect = typeof data?.onSelect === "function" ? (data.onSelect as (round: number) => void) : undefined;
   const [edgePath, labelX, labelY] = getSmoothStepPath({
     sourceX,
     sourceY,
@@ -142,12 +145,19 @@ function ReworkEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition, ta
       <BaseEdge id={id} path={edgePath} markerEnd={markerEnd} style={style} />
       {label && (
         <EdgeLabelRenderer>
-          <div
-            className="rework-label"
+          <button
+            type="button"
+            className={`rework-label ${active ? "is-active" : ""}`}
+            title={round === undefined ? undefined : `查看第 ${round} 轮返修原因`}
+            aria-pressed={active}
             style={{ transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)` }}
+            onClick={(event) => {
+              event.stopPropagation();
+              if (round !== undefined) onSelect?.(round);
+            }}
           >
             <CornerDownLeft size={11} />{label}
-          </div>
+          </button>
         </EdgeLabelRenderer>
       )}
     </>
@@ -156,7 +166,13 @@ function ReworkEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition, ta
 
 const edgeTypes = { rework: ReworkEdge };
 
-function flowForRun(run?: Run, events: RunEvent[] = []): { nodes: Node<FlowNodeData>[]; edges: Edge[] } {
+interface FlowOptions {
+  /** Currently inspected rework round; its branch label is highlighted. */
+  selectedReworkRound?: number | null;
+  onReworkSelect?: (round: number) => void;
+}
+
+function flowForRun(run?: Run, events: RunEvent[] = [], options: FlowOptions = {}): { nodes: Node<FlowNodeData>[]; edges: Edge[] } {
   const currentOrder = run ? stateOrder[run.state] : -1;
   const statusAt = (order: number): FlowNodeData["status"] => {
     if (!run) return "waiting";
@@ -238,8 +254,18 @@ function flowForRun(run?: Run, events: RunEvent[] = []): { nodes: Node<FlowNodeD
       sourceHandle: "bottom-source",
       targetHandle: "bottom-target",
       type: "rework",
-      data: { label: `round ${round} · 返修`, centerY: 208 + index * 54 },
-      style: { stroke: "#f3a65a", strokeWidth: 1.5, strokeDasharray: "5 4" },
+      data: {
+        label: `round ${round} · 返修`,
+        centerY: 208 + index * 54,
+        round,
+        active: options.selectedReworkRound === round,
+        onSelect: options.onReworkSelect,
+      },
+      style: {
+        stroke: options.selectedReworkRound === round ? "#ffd08a" : "#f3a65a",
+        strokeWidth: options.selectedReworkRound === round ? 2.2 : 1.5,
+        strokeDasharray: "5 4",
+      },
       markerEnd: { type: MarkerType.ArrowClosed, width: 15, height: 15, color: "#f3a65a" },
     });
   }
@@ -492,7 +518,12 @@ function SubAgentsPanel({ run }: { run: Run }) {
       {run.plan.tasks.map((task, index) => (
         <article className={`subagent-row subagent-${task.status}`} key={task.id}>
           <span className="subagent-index">{String(index + 1).padStart(2, "0")}</span>
-          <div><strong>{task.title}</strong><p>{task.summary || task.description}</p>{task.files.length > 0 && <code>{task.files.join(" · ")}</code>}</div>
+          <div>
+            {task.name && <span className="subagent-codename">{task.name}</span>}
+            <strong>{task.title}</strong>
+            <p>{task.summary || task.description}</p>
+            {task.files.length > 0 && <code>{task.files.join(" · ")}</code>}
+          </div>
           <em>{task.status}</em>
         </article>
       ))}
@@ -607,14 +638,20 @@ function participantInitials(participant: ChatMessage["from"]) {
   return "USR";
 }
 
-function ChatMessageItem({ message, run, expanded, onToggle }: {
+function ChatMessageItem({ message, run, expanded, onToggle, canJumpToRound, onJumpToRound }: {
   message: ChatMessage;
   run: Run;
   expanded: boolean;
-  onToggle: (id: string) => void;
+  onToggle: (id: string, next: boolean) => void;
+  canJumpToRound: boolean;
+  onJumpToRound: (round: number) => void;
 }) {
   const [copied, setCopied] = useState(false);
   const view = useMemo(() => chatMessageView(message, expanded), [message, expanded]);
+  const findings = useMemo(() => messageFindings(message), [message]);
+  // Real review hand-offs persist their findings as a JSON body; once rendered
+  // structurally that raw JSON is redundant (copy still yields the full body).
+  const structuredOnly = findings.length > 0 && message.content.trim().startsWith("[");
   const copy = async () => {
     try {
       await navigator.clipboard.writeText(view.full);
@@ -628,10 +665,10 @@ function ChatMessageItem({ message, run, expanded, onToggle }: {
   };
   return (
     <article className={`chat-message chat-${message.channel} role-${message.role}`}>
-      <span className="chat-avatar">{participantInitials(message.from)}</span>
+      <span className="chat-avatar">{message.agent ? message.agent.slice(0, 2) : participantInitials(message.from)}</span>
       <div className="chat-bubble">
         <div className="chat-meta">
-          <strong>{participantName(message.from, run)}</strong>
+          <strong>{message.agent ?? participantName(message.from, run)}</strong>
           <ArrowRight size={11} />
           <span>{participantName(message.to, run)}</span>
           <em className={`chat-channel-tag tag-${message.channel}`}>{chatChannelLabels[message.channel]}</em>
@@ -640,12 +677,32 @@ function ChatMessageItem({ message, run, expanded, onToggle }: {
           <button type="button" className="chat-copy" title="复制这条消息的完整内容" onClick={() => void copy()}>
             {copied ? <Check size={11} /> : <Copy size={11} />}{copied ? "已复制" : "复制"}
           </button>
+          {canJumpToRound && (
+            <button type="button" className="chat-copy" title={`跳到第 ${message.round} 轮工作流拓扑`} onClick={() => onJumpToRound(message.round)}>
+              <CornerDownLeft size={11} />跳到该轮拓扑
+            </button>
+          )}
         </div>
-        {view.monospace
+        {findings.length > 0 && (
+          <div className="chat-findings">
+            <div className="chat-findings-head">{findings.length} 项审核发现</div>
+            {findings.map((item, index) => (
+              <article className={`chat-finding sev-${item.severity}`} key={item.id ?? index}>
+                <div className="chat-finding-head">
+                  <span className={`fsev fsev-${item.severity}`}>{item.severity}</span>
+                  <strong>{item.title}</strong>
+                  <code>{item.file ?? "—"}{item.line ? `:${item.line}` : ""}</code>
+                </div>
+                {item.requiredChange && <p><ArrowUpRight size={11} />{item.requiredChange}</p>}
+              </article>
+            ))}
+          </div>
+        )}
+        {!structuredOnly && (view.monospace
           ? <pre className="chat-text chat-mono">{view.text}</pre>
-          : <p className="chat-text">{view.text}</p>}
-        {view.collapsible && (
-          <button type="button" className="chat-toggle" aria-expanded={view.expanded} onClick={() => onToggle(message.id)}>
+          : <p className="chat-text">{view.text}</p>)}
+        {!structuredOnly && view.collapsible && (
+          <button type="button" className="chat-toggle" aria-expanded={view.expanded} onClick={() => onToggle(message.id, !view.expanded)}>
             <ChevronDown size={12} className={view.expanded ? "chat-toggle-open" : ""} />
             {view.expanded ? "收起" : `展开完整内容（${(view.bytes / 1024).toFixed(1)} KB）`}
           </button>
@@ -655,31 +712,78 @@ function ChatMessageItem({ message, run, expanded, onToggle }: {
   );
 }
 
-function ChatLog({ messages, run, activeTab, onTabChange }: {
+function ReworkDetail({ detail, onJumpToChat, onClose }: {
+  detail: ReworkBranchDetail;
+  onJumpToChat: (round: number) => void;
+  onClose: () => void;
+}) {
+  const severities = (["critical", "high", "medium", "low"] as const).filter((severity) => detail.summary.bySeverity[severity] > 0);
+  const hidden = detail.summary.total - detail.summary.top.length;
+  return (
+    <aside className="rework-detail" role="dialog" aria-label={`第 ${detail.round} 轮返修`}>
+      <div className="rework-detail-head">
+        <strong>第 {detail.round} 轮返修</strong>
+        <button type="button" className="rework-close" title="关闭" onClick={onClose}><X size={13} /></button>
+      </div>
+      <p className="rework-reason">{detail.reason}</p>
+      <div className="rework-summary">
+        <span>共 {detail.summary.total} 项发现</span>
+        {severities.map((severity) => (
+          <em key={severity} className={`fsev fsev-${severity}`}>{severity} {detail.summary.bySeverity[severity]}</em>
+        ))}
+      </div>
+      {detail.summary.top.length > 0 ? (
+        <ul className="rework-findings">
+          {detail.summary.top.map((item, index) => (
+            <li key={item.id ?? index}>
+              <span className={`fsev fsev-${item.severity}`}>{item.severity}</span>
+              <span className="rework-finding-title">{item.title}</span>
+              <code>{item.file ?? "—"}{item.line ? `:${item.line}` : ""}</code>
+            </li>
+          ))}
+        </ul>
+      ) : <p className="rework-empty">本轮没有结构化发现记录。</p>}
+      {hidden > 0 && <p className="rework-more">另有 {hidden} 项未在此列出，详见协作对话日志。</p>}
+      <button type="button" className="button secondary" onClick={() => onJumpToChat(detail.round)}>
+        <CornerDownLeft size={13} />跳到该轮协作对话
+      </button>
+    </aside>
+  );
+}
+
+function ChatLog({ messages, run, activeTab, onTabChange, roundFilter, onClearRoundFilter, reworkRounds, onJumpToRound }: {
   messages: ChatMessage[];
   run: Run;
   activeTab: ChatTab;
   onTabChange: (tab: ChatTab) => void;
+  roundFilter: number | null;
+  onClearRoundFilter: () => void;
+  reworkRounds: ReadonlySet<number>;
+  onJumpToRound: (round: number) => void;
 }) {
   const counts = useMemo(() => chatCounts(messages), [messages]);
-  const visible = useMemo(() => filterChatMessages(messages, activeTab), [messages, activeTab]);
-  const [expandedIds, setExpandedIds] = useState<ReadonlySet<string>>(() => new Set<string>());
-  const toggle = (id: string) => {
-    setExpandedIds((current) => {
-      const next = new Set(current);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  };
+  const visible = useMemo(() => {
+    const filtered = filterChatMessages(messages, activeTab);
+    return roundFilter === null ? filtered : filtered.filter((message) => message.round === roundFilter);
+  }, [messages, activeTab, roundFilter]);
+  // Explicit per-message overrides; review messages expand by default so their
+  // structured findings and full prompt are visible without a click, while the
+  // operator can still collapse them (or open a long non-review message).
+  const [overrides, setOverrides] = useState<Record<string, boolean>>({});
+  const toggle = (id: string, next: boolean) => setOverrides((current) => ({ ...current, [id]: next }));
   return (
-    <section className="panel chat-panel">
+    <section className="panel chat-panel" id="chat-log">
       <div className="chat-head">
         <div className="chat-title">
           <span className="eyebrow">AGENT CONVERSATION</span>
           <h3><MessagesSquare size={15} />协作对话日志</h3>
         </div>
         <div className="chat-tabs" role="tablist" aria-label="对话筛选">
+          {roundFilter !== null && (
+            <button type="button" className="chat-round-filter" title="清除轮次筛选" onClick={onClearRoundFilter}>
+              仅看第 {roundFilter} 轮<X size={11} />
+            </button>
+          )}
           {chatTabs.map((tab) => (
             <button
               type="button"
@@ -697,7 +801,7 @@ function ChatLog({ messages, run, activeTab, onTabChange }: {
       </div>
       <div className="chat-body">
         {visible.length === 0 ? (
-          <EmptyPanel icon={MessagesSquare} text={activeTab === "all" ? "等待 Agent 对话" : "该分类暂无对话"} />
+          <EmptyPanel icon={MessagesSquare} text={roundFilter !== null ? `第 ${roundFilter} 轮暂无对话` : activeTab === "all" ? "等待 Agent 对话" : "该分类暂无对话"} />
         ) : (
           <div className="chat-stream">
             {visible.map((message) => (
@@ -705,8 +809,10 @@ function ChatLog({ messages, run, activeTab, onTabChange }: {
                 key={message.id}
                 message={message}
                 run={run}
-                expanded={expandedIds.has(message.id)}
+                expanded={overrides[message.id] ?? isReviewMessage(message)}
                 onToggle={toggle}
+                canJumpToRound={reworkRounds.has(message.round)}
+                onJumpToRound={onJumpToRound}
               />
             ))}
           </div>
@@ -813,6 +919,9 @@ export function App() {
   const [user, setUser] = useState<CurrentUser>();
   const [tab, setTab] = useState<Tab>("activity");
   const [chatTab, setChatTab] = useState<ChatTab>("all");
+  // Item-1: which rework branch's detail panel is open; Item-2: the chat round filter.
+  const [reworkRound, setReworkRound] = useState<number | null>(null);
+  const [chatRoundFilter, setChatRoundFilter] = useState<number | null>(null);
   const [view, setView] = useState<"run" | "workspaces" | "models" | "history">("run");
   const [createOpen, setCreateOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -850,11 +959,13 @@ export function App() {
   }, [refreshRuns]);
 
   useEffect(() => {
-    if (!selectedId) { setRun(undefined); setEvents([]); setArtifacts([]); return; }
+    if (!selectedId) { setRun(undefined); setEvents([]); setArtifacts([]); setReworkRound(null); setChatRoundFilter(null); return; }
     // Reset for the newly selected run before any snapshot/stream data merges in,
     // so seq numbers from different runs are never mixed.
     setEvents([]);
     setArtifacts([]);
+    setReworkRound(null);
+    setChatRoundFilter(null);
     // Stale-response guard: every in-flight request/stream for the previously
     // selected run is invalidated here, so a late api.run/SSE event cannot
     // overwrite the newly selected run.
@@ -898,9 +1009,31 @@ export function App() {
     return () => { active = false; };
   }, [selectedId, activeRun?.state]);
 
-  const flow = useMemo(() => flowForRun(activeRun, events), [activeRun, events]);
+  const handleReworkSelect = useCallback((round: number) => {
+    setReworkRound((current) => (current === round ? null : round));
+  }, []);
+  // Item-1: one detail entry per rendered branch, built from the run's events +
+  // findings (no new API).
+  const reworkDetails = useMemo(() => reworkBranchDetails(events, activeRun?.findings ?? []), [events, activeRun?.findings]);
+  const reworkRounds = useMemo(() => new Set(reworkDetails.map((detail) => detail.round)), [reworkDetails]);
+  const selectedRework = reworkRound === null ? undefined : reworkDetails.find((detail) => detail.round === reworkRound);
+  const flow = useMemo(
+    () => flowForRun(activeRun, events, { selectedReworkRound: reworkRound, onReworkSelect: handleReworkSelect }),
+    [activeRun, events, reworkRound, handleReworkSelect],
+  );
   const chatMessages = useMemo(() => chatMessagesFromEvents(events), [events]);
   const running = runs.filter((item) => !terminalStates.includes(item.state)).length;
+
+  const jumpToTopology = useCallback((round: number) => {
+    setReworkRound(round);
+    setChatRoundFilter(null);
+    document.getElementById("workflow-topology")?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, []);
+  const jumpToChat = useCallback((round: number) => {
+    setChatRoundFilter(round);
+    setReworkRound(null);
+    document.getElementById("chat-log")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, []);
 
   const handleCreated = (created: Run) => {
     setRuns((current) => [created, ...current]);
@@ -908,6 +1041,8 @@ export function App() {
     setRun(created);
     setEvents([]);
     setArtifacts([]);
+    setReworkRound(null);
+    setChatRoundFilter(null);
     setView("run");
   };
 
@@ -1045,7 +1180,7 @@ export function App() {
             </section>
 
             <div className="content-grid">
-              <section className="panel flow-panel">
+              <section className="panel flow-panel" id="workflow-topology">
                 <div className="panel-head"><div><span className="eyebrow">LIVE ORCHESTRATION</span><h3>工作流拓扑</h3></div><div className="live-indicator"><i />LIVE</div></div>
                 <div className="flow-wrap">
                   {/* Keyed by run id so each run mounts a fresh React Flow
@@ -1057,6 +1192,7 @@ export function App() {
                     <Controls showInteractive={false} />
                     <MiniMap pannable={false} zoomable={false} nodeColor={(node) => node.data.status === "active" ? "#e6ff62" : "#353b44"} maskColor="rgba(8,10,13,.76)" />
                   </ReactFlow>
+                  {selectedRework && <ReworkDetail detail={selectedRework} onJumpToChat={jumpToChat} onClose={() => setReworkRound(null)} />}
                 </div>
               </section>
 
@@ -1084,7 +1220,16 @@ export function App() {
               </section>
             </div>
 
-            <ChatLog messages={chatMessages} run={activeRun} activeTab={chatTab} onTabChange={setChatTab} />
+            <ChatLog
+              messages={chatMessages}
+              run={activeRun}
+              activeTab={chatTab}
+              onTabChange={setChatTab}
+              roundFilter={chatRoundFilter}
+              onClearRoundFilter={() => setChatRoundFilter(null)}
+              reworkRounds={reworkRounds}
+              onJumpToRound={jumpToTopology}
+            />
           </div>
         )}
       </main>

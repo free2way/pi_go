@@ -1,4 +1,4 @@
-import type { ChatChannel, ChatMessage, ChatParticipant, ChatRole, RunEvent } from "./types";
+import type { ChatChannel, ChatMessage, ChatParticipant, ChatRole, Finding, RunEvent } from "./types";
 
 export type ChatTab = "all" | ChatChannel;
 
@@ -33,6 +33,10 @@ export interface ChatPayload {
   to: ChatParticipant;
   role: ChatRole;
   content: string;
+  /** Item-2: structured review findings attached to a hand-off message. */
+  findings?: Finding[];
+  /** Item-3: codename of the sub-agent that produced the message. */
+  agent?: string;
 }
 
 /** Reads the structured chat payload attached to a `chat.message` event. */
@@ -89,6 +93,8 @@ export function chatMessagesFromEvents(events: RunEvent[]): ChatMessage[] {
       role: payload.role,
       content: payload.content,
       at: event.at,
+      findings: payload.findings?.length ? payload.findings : undefined,
+      agent: payload.agent,
     };
   });
 }
@@ -215,6 +221,111 @@ export function reworkRounds(events: RunEvent[]): number[] {
  */
 export function reworkBranchRounds(events: RunEvent[]): number[] {
   return reworkRounds(events);
+}
+
+const severityOrder: Record<Finding["severity"], number> = { critical: 0, high: 1, medium: 2, low: 3 };
+
+/** Severity + title ordering so a round's most important findings surface first. */
+export function compareFindingSeverity(a: Finding, b: Finding): number {
+  return severityOrder[a.severity] - severityOrder[b.severity] || a.title.localeCompare(b.title);
+}
+
+export interface FindingsSummary {
+  total: number;
+  bySeverity: Record<Finding["severity"], number>;
+  /** Highest-severity findings first, capped for compact rendering. */
+  top: Finding[];
+}
+
+/** Count + top-severity summary used by the rework branch popover. */
+export function summarizeFindings(findings: Finding[], limit = 3): FindingsSummary {
+  const bySeverity: Record<Finding["severity"], number> = { critical: 0, high: 0, medium: 0, low: 0 };
+  for (const finding of findings) bySeverity[finding.severity] += 1;
+  return {
+    total: findings.length,
+    bySeverity,
+    top: [...findings].sort(compareFindingSeverity).slice(0, limit),
+  };
+}
+
+/**
+ * Findings attributable to one review round. `firstSeenRound` is the stable
+ * marker; runs/findings persisted before that field existed fall back to
+ * `lastSeenRound`.
+ */
+export function findingsForRound(findings: Finding[], round: number): Finding[] {
+  const firstSeen = findings.filter((finding) => finding.firstSeenRound === round);
+  if (firstSeen.length > 0) return firstSeen;
+  return findings.filter((finding) => finding.lastSeenRound === round);
+}
+
+export interface ReworkBranchDetail {
+  round: number;
+  /** The `review.changes_requested` message for this round. */
+  reason: string;
+  at?: string;
+  findings: Finding[];
+  summary: FindingsSummary;
+}
+
+/**
+ * One entry per rendered rework branch: the reviewer's return message plus the
+ * findings for that round. Findings prefer the review event's own `meta.findings`
+ * when present, and otherwise join `run.findings` by round/first_seen_round.
+ */
+export function reworkBranchDetails(events: RunEvent[], findings: Finding[] = []): ReworkBranchDetail[] {
+  const byRound = new Map<number, RunEvent>();
+  for (const event of events) {
+    if (event.type === "review.changes_requested") byRound.set(event.round, event);
+  }
+  return [...byRound.values()]
+    .sort((a, b) => a.round - b.round)
+    .map((event) => {
+      const roundFindings = findingsForRound(findings, event.round);
+      const metaFindings = Array.isArray(event.meta?.findings) ? (event.meta.findings as Finding[]) : [];
+      const effective = roundFindings.length > 0 ? roundFindings : metaFindings;
+      return {
+        round: event.round,
+        reason: event.message,
+        at: event.at,
+        findings: effective,
+        summary: summarizeFindings(effective),
+      };
+    });
+}
+
+/** Review rounds and reviewer/hand-off messages carry the reviewer's structured output. */
+export function isReviewMessage(message: ChatMessage): boolean {
+  return message.channel === "handoff" || message.channel === "reviewer";
+}
+
+function isFindingLike(value: unknown): value is Finding {
+  if (!value || typeof value !== "object") return false;
+  const item = value as Record<string, unknown>;
+  return typeof item.title === "string" && typeof item.severity === "string" && item.severity in severityOrder;
+}
+
+/**
+ * Best-effort recovery of findings from a message body. Real runs persist the
+ * review hand-off as `JSON.stringify(findings, null, 2)`; this makes those older
+ * messages render structured without a migration or new API.
+ */
+export function parseFindings(content: string): Finding[] {
+  const trimmed = content.trim();
+  if (!trimmed.startsWith("[")) return [];
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(isFindingLike).map((item) => ({ ...item, requiredChange: item.requiredChange ?? "", evidence: item.evidence ?? "", resolved: item.resolved ?? false }));
+  } catch {
+    return [];
+  }
+}
+
+/** Structured findings for a chat message: attached payload first, JSON body second. */
+export function messageFindings(message: ChatMessage): Finding[] {
+  if (message.findings && message.findings.length > 0) return message.findings;
+  return parseFindings(message.content);
 }
 
 export interface CheckChatInput {

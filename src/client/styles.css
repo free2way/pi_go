@@ -137,7 +137,7 @@ button { color: inherit; }
 .eyebrow { color: #5e6873; font: 500 8px "DM Mono", monospace; letter-spacing: .13em; }
 .live-indicator { display: flex; gap: 6px; align-items: center; color: #758047; font: 500 8px "DM Mono", monospace; }
 .live-indicator i { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 7px rgba(223,248,84,.6); animation: pulse 1.6s infinite; }
-.flow-wrap { height: 468px; }
+.flow-wrap { height: 468px; position: relative; }
 .flow-card { position: relative; width: 176px; min-height: 73px; border: 1px solid #293039; background: #11151a; border-radius: 10px; display: grid; grid-template-columns: 34px 1fr 16px; align-items: center; gap: 8px; padding: 11px; box-shadow: 0 10px 26px rgba(0,0,0,.18); transition: .2s ease; }
 .flow-card.is-active { border-color: #69742f; background: #151a14; box-shadow: 0 0 0 1px rgba(223,248,84,.06), 0 14px 35px rgba(0,0,0,.32); }
 .flow-card.is-active::before { content: ""; position: absolute; inset: -1px auto -1px -1px; width: 2px; background: var(--accent); border-radius: 10px 0 0 10px; }
@@ -156,7 +156,9 @@ button { color: inherit; }
 .flow-meta { position: absolute; right: 8px; top: -9px; border: 1px solid #39432a; background: #151a12; color: #b9c967; border-radius: 4px; padding: 2px 5px; font: 8px "DM Mono", monospace; }
 .flow-handle { width: 6px !important; height: 6px !important; border: 1px solid #545e68 !important; background: #171b20 !important; }
 .flow-handle-bottom { top: auto !important; bottom: -3px !important; }
-.rework-label { position: absolute; display: inline-flex; align-items: center; gap: 4px; padding: 3px 7px; border-radius: 999px; background: #1b140d; border: 1px solid rgba(243,166,90,.42); color: #f0b57e; font: 600 9px "DM Mono", monospace; pointer-events: none; white-space: nowrap; box-shadow: 0 6px 16px rgba(0,0,0,.32); }
+.rework-label { position: absolute; display: inline-flex; align-items: center; gap: 4px; padding: 3px 7px; border-radius: 999px; background: #1b140d; border: 1px solid rgba(243,166,90,.42); color: #f0b57e; font: 600 9px "DM Mono", monospace; white-space: nowrap; box-shadow: 0 6px 16px rgba(0,0,0,.32); pointer-events: all; cursor: pointer; }
+.rework-label:hover { border-color: rgba(243,166,90,.75); color: #ffd7ac; }
+.rework-label.is-active { background: #2a1d10; border-color: #ffd08a; color: #ffe3bd; }
 .react-flow__edge-path { stroke: #39414a; }
 .react-flow__controls { border: 1px solid #252b32; border-radius: 7px; overflow: hidden; box-shadow: none; }
 .react-flow__controls button { background: #11151a; border-bottom-color: #252b32; fill: #75808a; }
@@ -195,6 +197,7 @@ button { color: inherit; }
 .subagent-row { display: grid; grid-template-columns: 25px 1fr auto; gap: 8px; align-items: start; border: 1px solid #252c33; background: #101419; border-radius: 8px; padding: 9px; }
 .subagent-index { width: 23px; height: 23px; display: grid; place-items: center; border-radius: 6px; background: #1a2026; color: #6e7882; font: 8px "DM Mono", monospace; }
 .subagent-row strong { display: block; font-size: 9px; }
+.subagent-codename { display: inline-block; margin-bottom: 3px; padding: 1px 6px; border-radius: 999px; background: rgba(223,248,84,.08); border: 1px solid rgba(223,248,84,.25); color: #c3d274; font: 600 8px "Manrope", sans-serif; }
 .subagent-row p { color: #68727c; font-size: 8px; line-height: 1.5; margin: 4px 0; }
 .subagent-row code { color: #53606b; font: 7px "DM Mono", monospace; }
 .subagent-row em { color: #6e7882; font: 7px "DM Mono", monospace; font-style: normal; text-transform: uppercase; }
@@ -537,3 +540,36 @@ button { color: inherit; }
   .history-row-head .history-chevron { grid-column: 4; grid-row: 1; }
   .history-summary { grid-column: 1 / -1; grid-row: 2; -webkit-line-clamp: 2; }
 }
+
+/* Item-1: clickable rework branch detail (anchored inside the topology panel). */
+.rework-detail { position: absolute; left: 12px; bottom: 12px; z-index: 6; width: min(340px, calc(100% - 24px)); display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid rgba(243,166,90,.42); border-radius: 10px; background: rgba(16,13,10,.96); box-shadow: 0 18px 44px rgba(0,0,0,.55); backdrop-filter: blur(4px); }
+.rework-detail-head { display: flex; align-items: center; justify-content: space-between; color: #f0b57e; font: 600 11px "Manrope", sans-serif; }
+.rework-close { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border: 1px solid #2b323a; border-radius: 6px; background: #151a1f; color: #8b96a0; cursor: pointer; }
+.rework-close:hover { color: #d7dee5; }
+.rework-reason { margin: 0; color: #cbb59c; font-size: 10px; line-height: 1.6; }
+.rework-summary { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; color: #8b96a0; font: 9px "DM Mono", monospace; }
+.rework-findings { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.rework-findings li { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px; align-items: center; border: 1px solid #252c33; background: #101419; border-radius: 7px; padding: 6px 8px; }
+.rework-finding-title { color: #c3cbd3; font-size: 10px; }
+.rework-findings code { grid-column: 2; color: #5f6973; font: 8px "DM Mono", monospace; }
+.rework-empty, .rework-more { margin: 0; color: #77818b; font-size: 9px; }
+.rework-detail .button { align-self: flex-start; }
+
+/* Item-2: structured review findings inside a chat message. */
+.fsev { display: inline-block; padding: 1px 6px; border-radius: 999px; border: 1px solid #2b323a; background: #151a1f; color: #8b96a0; font: 600 8px "DM Mono", monospace; text-transform: uppercase; }
+.fsev-critical { color: #ff9c9c; border-color: rgba(255,120,120,.45); background: rgba(255,120,120,.1); }
+.fsev-high { color: #f0b57e; border-color: rgba(243,166,90,.4); background: rgba(243,166,90,.09); }
+.fsev-medium { color: #dfd07f; border-color: rgba(223,208,127,.35); }
+.fsev-low { color: #9fb4c4; }
+.chat-findings { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.chat-findings-head { color: #8b96a0; font: 9px "DM Mono", monospace; text-transform: uppercase; }
+.chat-finding { border: 1px solid #22282f; border-left-width: 2px; background: #101419; border-radius: 7px; padding: 7px 9px; }
+.chat-finding.sev-critical { border-left-color: #ff7878; }
+.chat-finding.sev-high { border-left-color: #f3a65a; }
+.chat-finding.sev-medium { border-left-color: #dfd07f; }
+.chat-finding.sev-low { border-left-color: #9fb4c4; }
+.chat-finding-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.chat-finding-head strong { color: #c3cbd3; font-size: 10px; }
+.chat-finding-head code { color: #5f6973; font: 8px "DM Mono", monospace; }
+.chat-finding p { display: flex; align-items: flex-start; gap: 5px; margin: 6px 0 0; color: #98a2ac; font-size: 9px; line-height: 1.55; }
+.chat-round-filter { display: inline-flex; align-items: center; gap: 4px; color: #f0b57e !important; border-color: rgba(243,166,90,.4) !important; background: rgba(243,166,90,.08) !important; }

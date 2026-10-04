@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { ChatMessage, RunEvent } from "./types";
-import { checkChatMessage, chatCounts, chatMessageView, chatMessagesFromEvents, clipChatContent, filterChatMessages, reworkBranchRounds, reworkRounds, type ChatPayload } from "./chat";
+import type { ChatMessage, Finding, RunEvent } from "./types";
+import { checkChatMessage, chatCounts, chatMessageView, chatMessagesFromEvents, clipChatContent, filterChatMessages, findingsForRound, isReviewMessage, messageFindings, reworkBranchDetails, reworkBranchRounds, reworkRounds, summarizeFindings, type ChatPayload } from "./chat";
 
 const baseEvent = (overrides: Partial<RunEvent>): RunEvent => ({
   seq: 1,
@@ -230,5 +230,109 @@ describe("chatMessageView", () => {
     expect(chatMessageView(chatMessage({ role: "tool", content: "ls -la" }), false).monospace).toBe(true);
     expect(chatMessageView(chatMessage({ role: "response", content: "```ts\nconst a = 1;\n```" }), false).monospace).toBe(true);
     expect(chatMessageView(chatMessage({ role: "response", content: "all good" }), false).monospace).toBe(false);
+  });
+});
+
+const finding = (overrides: Partial<Finding> = {}): Finding => ({
+  id: "f1",
+  severity: "high",
+  file: "src/auth/session.ts",
+  line: 46,
+  title: "失败请求可能污染并发锁",
+  evidence: "evidence",
+  requiredChange: "用 finally 清理锁",
+  resolved: false,
+  ...overrides,
+});
+
+describe("findingsForRound", () => {
+  it("joins by first_seen_round, falling back to last_seen_round when unset", () => {
+    const items = [
+      finding({ id: "a", firstSeenRound: 1, lastSeenRound: 2 }),
+      finding({ id: "b", firstSeenRound: 2, lastSeenRound: 2 }),
+      finding({ id: "c", lastSeenRound: 1 }),
+    ];
+
+    expect(findingsForRound(items, 1).map((item) => item.id)).toEqual(["a"]);
+    expect(findingsForRound(items, 2).map((item) => item.id)).toEqual(["b"]);
+    // No first_seen_round anywhere for this round: legacy fallback applies.
+    expect(findingsForRound([finding({ id: "legacy", lastSeenRound: 3 })], 3).map((item) => item.id)).toEqual(["legacy"]);
+  });
+});
+
+describe("summarizeFindings", () => {
+  it("counts severities and orders the top findings by severity", () => {
+    const summary = summarizeFindings([
+      finding({ id: "low", severity: "low", title: "l" }),
+      finding({ id: "crit", severity: "critical", title: "c" }),
+      finding({ id: "high", severity: "high", title: "h" }),
+    ]);
+
+    expect(summary.total).toBe(3);
+    expect(summary.bySeverity).toEqual({ critical: 1, high: 1, medium: 0, low: 1 });
+    expect(summary.top.map((item) => item.id)).toEqual(["crit", "high", "low"]);
+  });
+
+  it("caps the top list without dropping the total", () => {
+    const summary = summarizeFindings([finding({ id: "1" }), finding({ id: "2" }), finding({ id: "3" }), finding({ id: "4" })], 2);
+    expect(summary.total).toBe(4);
+    expect(summary.top).toHaveLength(2);
+  });
+});
+
+describe("reworkBranchDetails", () => {
+  it("builds one detail per return round with reason and joined findings", () => {
+    const events: RunEvent[] = [
+      baseEvent({ seq: 1, round: 1, source: "reviewer", type: "review.changes_requested", message: "审核发现 1 个问题，退回 Developer" }),
+      baseEvent({ seq: 2, round: 2, source: "checks", type: "checks.returned", message: "检查失败" }),
+      baseEvent({ seq: 3, round: 2, source: "reviewer", type: "review.changes_requested", message: "第二轮仍有 1 个问题" }),
+    ];
+    const findings = [
+      finding({ id: "a", firstSeenRound: 1, lastSeenRound: 1, severity: "high" }),
+      finding({ id: "b", firstSeenRound: 2, lastSeenRound: 2, severity: "critical" }),
+    ];
+
+    const details = reworkBranchDetails(events, findings);
+
+    expect(details.map((detail) => detail.round)).toEqual([1, 2]);
+    expect(details[0].reason).toContain("退回 Developer");
+    expect(details[0].findings.map((item) => item.id)).toEqual(["a"]);
+    expect(details[1].summary.bySeverity.critical).toBe(1);
+    // checks.returned (no reviewer return) never becomes a branch.
+    expect(details).toHaveLength(2);
+  });
+
+  it("prefers findings carried on the event meta when the run has no round history", () => {
+    const events: RunEvent[] = [
+      baseEvent({ seq: 1, round: 1, source: "reviewer", type: "review.changes_requested", message: "changes", meta: { findings: [finding({ id: "meta", severity: "medium" })] } }),
+    ];
+    const details = reworkBranchDetails(events, []);
+    expect(details[0].findings.map((item) => item.id)).toEqual(["meta"]);
+    expect(details[0].summary.total).toBe(1);
+  });
+});
+
+describe("messageFindings", () => {
+  it("prefers structured findings attached to the message", () => {
+    const message = chatMessage({ findings: [finding({ id: "attached" })] });
+    expect(messageFindings(message).map((item) => item.id)).toEqual(["attached"]);
+  });
+
+  it("parses JSON findings persisted by the real worker", () => {
+    const message = chatMessage({ content: JSON.stringify([finding({ id: "json" })], null, 2) });
+    expect(messageFindings(message).map((item) => item.id)).toEqual(["json"]);
+  });
+
+  it("returns nothing for prose or malformed JSON", () => {
+    expect(messageFindings(chatMessage({ content: "审核结论：changes_requested" }))).toEqual([]);
+    expect(messageFindings(chatMessage({ content: "[not json" }))).toEqual([]);
+  });
+});
+
+describe("isReviewMessage", () => {
+  it("flags reviewer and hand-off messages only", () => {
+    expect(isReviewMessage(chatMessage({ channel: "handoff", role: "feedback" }))).toBe(true);
+    expect(isReviewMessage(chatMessage({ channel: "reviewer", role: "prompt" }))).toBe(true);
+    expect(isReviewMessage(chatMessage({ channel: "developer", role: "response" }))).toBe(false);
   });
 });

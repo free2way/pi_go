@@ -71,6 +71,14 @@ export interface ChatMessage {
   role: ChatRole;
   content: string;
   at: string;
+  /**
+   * Item-2 (additive): structured review findings carried by a review hand-off
+   * message. Present on messages produced after this field existed; older runs
+   * fall back to parsing JSON findings out of `content`.
+   */
+  findings?: Finding[];
+  /** Item-3 (additive): sub-agent codename when this message belongs to one. */
+  agent?: string;
 }
 
 /** The human action a stored requirement note came from. */
@@ -99,6 +107,11 @@ export interface SubAgentTask {
   branch?: string;
   summary?: string;
   durationMs?: number;
+  /**
+   * Item-3 (additive): stable, human-readable codename assigned deterministically
+   * from runId + task id. The `title` stays the authoritative task description.
+   */
+  name?: string;
 }
 
 export interface DevelopmentPlan {
