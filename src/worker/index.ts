@@ -1,17 +1,19 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
 import { timingSafeEqual } from "node:crypto";
-import { mkdir, readdir, realpath, rm, stat, statfs } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath, rm, stat, statfs } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
 import type { CheckResult, DevelopmentPlan, Finding, ProjectInfo, Run, RunEvent, RunState, SubAgentTask, WorkspaceVerifyResult } from "../shared/types.js";
 import { CheckpointTracker, memoryCheckpointClient, stages, type Checkpoint, type CheckpointClient, type StoredChecks, type StoredReview } from "./checkpoints.js";
 import { conflictFreeBatches, executionWaves, fallbackPlan, parseDevelopmentPlan } from "./orchestrator.js";
 import { UsageTracker, addUsage, assistantErrorFromEvent, assistantTextFromEvent, emptyUsage, toRunUsage, toolNameFromEvent, type UsageTotals } from "./pi-events.js";
+import { DockerApi } from "./docker-api.js";
 import { scrubEnvironment } from "./pi-env.js";
 import { apiKeyEnvName, classifyProviderError, providerErrorSummary } from "./provider-errors.js";
 import { sleep, withProviderRetry } from "./provider-retry.js";
 import { parseReview, type ReviewResult } from "./review-protocol.js";
+import { buildContainerSpec, hostPathFor, resolveSandboxMode } from "./sandbox.js";
 import { mergeFindings, unresolvedFeedback } from "./review-findings.js";
 import { WorkspacePathError, resolveInsideRoot, sanitizeRelativePath, sanitizeWorkspaceName, validateCloneUrl } from "./workspace-paths.js";
 
@@ -84,6 +86,99 @@ type JobInput = {
 };
 
 const workerId = process.env.PI_WORKER_ID || `worker-${process.pid}`;
+
+// SEC-004 / AT-SEC-007:每次 Agent 调用与检查命令都在独立容器中执行，只挂载本次
+// 运行的 worktree（及其仓库 .git 元数据）、只读模型定义与本次运行的 Pi 状态目录。
+const sandboxImage = process.env.PI_SANDBOX_IMAGE || "local/pigo-sandbox:0.1.0";
+/** Network used for agent calls (provider egress). Checks always run with none. */
+const agentNetwork = process.env.PI_SANDBOX_NETWORK || "pi-agent-network";
+const hostWorkspaceRoot = process.env.PI_HOST_WORKSPACE_ROOT || workspaceRoot;
+const docker = new DockerApi();
+let sandboxMode: "container" | "process" = "process";
+let sandboxReason: string | undefined = "not initialised";
+
+const imageForSandbox = sandboxImage;
+
+/** Environment handed to a sandboxed process: nothing but runtime basics and the role credential. */
+function sandboxEnvironment(extra: Record<string, string>) {
+  const passthrough = ["PATH", "HOME", "LANG", "LC_ALL", "TZ", "TERM", "OPENAI_BASE_URL"];
+  const env: Record<string, string> = {};
+  for (const name of passthrough) {
+    const value = process.env[name];
+    if (value !== undefined) env[name] = value;
+  }
+  env.HOME = "/home/node";
+  return { ...env, ...extra };
+}
+
+/** Resolves the repository that owns a git worktree (its `.git` points at `<repo>/.git/worktrees/<name>`). */
+async function repositoryForWorktree(worktree: string): Promise<string | undefined> {
+  try {
+    const content = await readFile(path.join(worktree, ".git"), "utf8");
+    const match = content.match(/^gitdir:\s*(.+)$/m);
+    if (!match) return undefined;
+    return path.dirname(path.dirname(path.dirname(match[1].trim())));
+  } catch {
+    return undefined;
+  }
+}
+
+interface SandboxRunInput {
+  argv: string[];
+  worktree: string;
+  repository?: string;
+  env: Record<string, string>;
+  network: string;
+  timeoutMs: number;
+  signal: AbortSignal;
+  onStdoutLine?: (line: string) => void;
+  label: string;
+}
+
+/** Runs one invocation inside its own container and always cleans it up. */
+async function runInSandbox(input: SandboxRunInput): Promise<CommandResult> {
+  // Kept next to (never inside) the worktree so sandbox state cannot leak into
+  // the diff or the committed tree.
+  const runStateDir = `${input.worktree}.state`;
+  await mkdir(runStateDir, { recursive: true });
+  const spec = buildContainerSpec({
+    image: imageForSandbox,
+    worktree: input.worktree,
+    hostWorktreePath: hostPathFor(input.worktree, workspaceRoot, hostWorkspaceRoot),
+    repositoryPath: input.repository,
+    hostRepositoryPath: input.repository ? hostPathFor(input.repository, workspaceRoot, hostWorkspaceRoot) : undefined,
+    modelsFile: "/home/node/.pi/agent/models.json",
+    hostModelsFile: process.env.PI_SANDBOX_MODELS_FILE || path.resolve("/app/pi-models.json"),
+    stateDir: "/home/node/.pi",
+    stateMount: "bind",
+    hostStateDir: hostPathFor(runStateDir, workspaceRoot, hostWorkspaceRoot),
+    env: input.env,
+    argv: input.argv,
+    network: input.network,
+    labels: { "pigo.label": input.label.slice(0, 60) },
+  });
+
+  const name = `pigo-task-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const containerId = await docker.createContainer(name, spec);
+  let stdout = "";
+  let stderr = "";
+  const logs = docker.logsFollow(containerId, (line) => {
+    stdout += `${line}
+`;
+    input.onStdoutLine?.(line);
+  }, input.signal).catch((error) => { stderr += String(error.message); });
+  const timer = setTimeout(() => { void docker.killContainer(containerId).catch(() => undefined); }, input.timeoutMs);
+  try {
+    await docker.startContainer(containerId);
+    const { StatusCode } = await docker.waitContainer(containerId);
+    await logs;
+    return { code: StatusCode, stdout, stderr };
+  } finally {
+    clearTimeout(timer);
+    await docker.removeContainer(containerId).catch(() => undefined);
+    await rm(runStateDir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
 
 async function internalRequest(pathName: string, init?: RequestInit) {
   const response = await fetch(`${callbackBase}/api/internal${pathName}`, {
@@ -385,12 +480,8 @@ async function runPi(input: {
   // the worker's own tokens and the other role's key are stripped.
   const childEnvironment = scrubEnvironment(process.env, [input.apiKeyEnvironmentName]);
   childEnvironment[input.apiKeyEnvironmentName] = input.apiKey;
-  const result = await command("pi", args, {
-    cwd: input.cwd,
-    env: childEnvironment,
-    signal: input.signal,
-    timeoutMs: Number(process.env.PI_RUN_TIMEOUT_SECONDS || 1800) * 1000,
-    onStdoutLine: (line) => {
+  const runTimeoutMs = Number(process.env.PI_RUN_TIMEOUT_SECONDS || 1800) * 1000;
+  const onStdoutLine = (line: string) => {
       const event = parsePiLine(line);
       if (!event) return;
       tracker.track(event);
@@ -403,8 +494,26 @@ async function runPi(input: {
       if (toolName) {
         activityQueue = activityQueue.then(() => input.onActivity(`Pi 正在调用 ${toolName}`)).catch(() => undefined);
       }
-    },
-  });
+  };
+  const result = sandboxMode === "container"
+    ? await runInSandbox({
+        argv: ["pi", ...args],
+        worktree: input.cwd,
+        repository: await repositoryForWorktree(input.cwd),
+        env: sandboxEnvironment({ [input.apiKeyEnvironmentName]: input.apiKey, ...(input.readOnly ? { PIGO_SANDBOX_READONLY: "1" } : {}) }),
+        network: agentNetwork,
+        timeoutMs: runTimeoutMs,
+        signal: input.signal,
+        onStdoutLine,
+        label: "pi-agent",
+      })
+    : await command("pi", args, {
+        cwd: input.cwd,
+        env: childEnvironment,
+        signal: input.signal,
+        timeoutMs: runTimeoutMs,
+        onStdoutLine,
+      });
   await activityQueue;
   if (result.code !== 0) throw new Error(result.stderr.trim() || `Pi exited with ${result.code}`);
   if (lastAssistantError) throw new Error(lastAssistantError);
@@ -695,12 +804,23 @@ async function runChecks(run: Run, worktree: string, commands: string[], signal:
     await update(run, "checking", "checks", "check.started", `执行检查：${checkCommand}`, { checks: [...results, current] });
     // SEC-004/010: check commands run with the worker's secrets stripped, so a
     // malicious check cannot read the internal callback token or provider keys.
-    const result = await command("/bin/sh", ["-lc", checkCommand], {
-      cwd: worktree,
-      signal,
-      timeoutMs: 600_000,
-      env: scrubEnvironment(process.env),
-    });
+    const result = sandboxMode === "container"
+      ? await runInSandbox({
+          argv: ["/bin/sh", "-lc", checkCommand],
+          worktree,
+          repository: await repositoryForWorktree(worktree),
+          env: sandboxEnvironment({}),
+          network: "none",
+          timeoutMs: 600_000,
+          signal,
+          label: "check",
+        })
+      : await command("/bin/sh", ["-lc", checkCommand], {
+          cwd: worktree,
+          signal,
+          timeoutMs: 600_000,
+          env: scrubEnvironment(process.env),
+        });
     results.push({
       ...current,
       status: result.code === 0 ? "passed" : "failed",
@@ -1178,6 +1298,11 @@ const server = createServer(async (request, response) => {
     return json(response, 500, { error: (error as Error).message });
   }
 });
+
+const resolvedSandbox = await resolveSandboxMode(process.env.PI_SANDBOX_MODE || "auto", () => docker.ping());
+sandboxMode = resolvedSandbox.mode;
+sandboxReason = resolvedSandbox.reason;
+process.stdout.write(`[sandbox] mode=${sandboxMode}${sandboxReason ? ` (${sandboxReason})` : ""} image=${imageForSandbox}\n`);
 
 server.listen(port, host, () => {
   process.stdout.write(`pigo-worker listening on http://${host}:${port}\n`);

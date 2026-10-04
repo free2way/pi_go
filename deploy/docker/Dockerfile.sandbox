@@ -1,0 +1,13 @@
+# SEC-004 / AT-SEC-007: per-invocation sandbox image.
+#
+# The worker starts one container per agent call and per check command from this
+# image. It matches the Pi runtime the worker itself runs on, so the same CLI and
+# toolchain are available, but no entrypoint is declared: the worker supplies the
+# exact argv and mounts only the run worktree, its repository git metadata, the
+# read-only model definition and a per-run state directory.
+FROM local/pi-coding-agent:1.0.0
+
+USER root
+RUN mkdir -p /home/node/.pi/agent && chown -R node:node /home/node
+USER node
+WORKDIR /workspace
