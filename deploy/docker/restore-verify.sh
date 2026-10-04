@@ -60,7 +60,12 @@ if [ -f "$TARGET/credentials.vault.json" ]; then
 import json, sys
 vault = json.load(open(sys.argv[1]))
 users = vault.get("users", vault)
-providers = sorted({key for record in users.values() if isinstance(record, dict) for key in record if key != "updatedAt"})
+providers = sorted({
+    key
+    for record in users.values()
+    if isinstance(record, dict)
+    for key in (record.get("providers") if isinstance(record.get("providers"), dict) else {})
+})
 print(f"credential ciphertext verified: {len(users)} owner(s), providers={providers}")
 PY
 fi

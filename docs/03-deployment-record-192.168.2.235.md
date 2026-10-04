@@ -117,3 +117,52 @@ docker compose --env-file .env down
 - 通过项：planner 单任务规划 ✅；第 1 轮检查失败 → 第 2 轮修复后检查全部通过 ✅；工具名展示 ✅；usage 采集（input 44,649 / output 15,974 / cacheRead 733,952）✅；错误降级路径 ✅。
 - 阻断项：审核阶段被上游代理限流（`pr.ai2note.com` → sub2api 返回 429：`no available OpenAI accounts supporting model: gpt-5.6-sol (pool=1, filtered: model_rate_limited=1)`）。属于代理账号额度问题，待账号恢复或补充后重跑即可完成全闭环。
 - 复核命令：`docker logs --tail 200 sub2api | grep -i rate` 可确认限流状态。
+
+## v0.4.0～v0.12.2 升级记录（2026-10-03/04，Asia/Shanghai）
+
+升级日期：2026-10-03 至 2026-10-04。生产容器始终为 `pi-agent-web-1` / `pi-agent-worker-1`（compose 项目 `pi-agent`），runtime 与 postgres 未重建。
+
+| 版本 | 主题 | 关键内容 |
+| --- | --- | --- |
+| v0.4.0～v0.7.0 | 工作区、真实运行、回调 | 工作区注册/校验/克隆、真实运行前置校验（脏工作区拒绝）、回调体积上限与截断、内网常量时间 token 比较 |
+| v0.8.0 | 人工介入（RUN-006） | `needs_human` 任务的人工指令入口：`POST /api/runs/:id/resume`、`POST /api/runs/:id/retry-review` |
+| v0.9.0 | 并行 Sub Agent 修复 | 子 Agent 分支前缀冲突（`pigo/<runId>/sub-*` 与运行分支互斥提交）导致的 7ms 立即失败 |
+| v0.10.0 | 模型与凭据（MODEL） | 按 provider 的 v2 加密凭据（v1 角色键一次性迁移，AAD `pigo:v2:<userId>:provider:<provider>`，掩码 `••••••last4`）、`GET /api/models` 目录与可用性、开发/审核分角色选模、入队前预检（422 `MODEL_NOT_FOUND`/`MODEL_NOT_ALLOWED`/`MODEL_UNAVAILABLE`）、provider 错误分类与建议、UI「模型与凭据」页 |
+| v0.11.x | 可靠性存储层（REL-001～004） | Run/Event/Agent/Check/Finding/Artifact/Checkpoint/Job 全部落 PostgreSQL（`runs.json` 一次性导入，原文件保留）；事件 seq 单调 + SSE 分页补拉/断点续传；内部更新投递幂等键；Worker 重启按检查点恢复（不重复已完成模型调用、不产生冲突 verdict）；任务队列持久化 + 心跳 + 超时重领 |
+| v0.12.x | 可靠性运维层（REL-005～007、010） | provider 429/5xx 有界指数退避（默认 3 次，2s×2 → 上限 30s）并留痕 `provider.retry`；健康详情 `/api/health/detail` 与告警（结构化日志 + 可选 `PI_ALERT_WEBHOOK`）；磁盘水位守卫（低水位告警、critical 时 507 `DISK_FULL` 停止接收新任务）；存储故障统一 503 `STORAGE_UNAVAILABLE` 且不伪装完成；每日备份与每周恢复校验脚本 |
+
+### 回滚标签（镜像）
+
+`local/pigo-web:0.1.0` / `local/pigo-worker:0.1.0` 每次升级前打标签，当前可用回滚点：web `prev11`～`prev14`、worker `prev7`～`prev10`（`prev14`/`prev10` 为 v0.12.1 之前的构建）。源码留档：`/app/pi-agent/source.prev12-*` ～ `source.prev15-*`。
+
+### 运维端点
+
+- `GET /api/health`：存活探针；数据库不可用时 503 `DATABASE_UNAVAILABLE`（限时 2.5s 探测，不会挂起）。
+- `GET /api/health/detail`：数据库、队列（待领取/因 Worker 中断重领）、Worker（含工作区磁盘水位）与当前告警；支持内网 token 或登录用户访问。
+
+### 备份与恢复（REL-007 / AT-REL-009）
+
+- 脚本：`deploy/docker/backup.sh`（数据库 `pg_dump -Fc`、凭据密文、compose/.env、脱敏环境变量、manifest：表行数 + run 文档 digest + 密文 sha256）、`deploy/docker/restore-verify.sh`（还原到 `pigo_restore_verify` 临时库并逐项比对，比对后自动删除临时库，生产库不受影响）。
+- 已安装 crontab（用户 `free2way`）：每日 03:30 备份（保留 14 天）、每周日 04:30 恢复校验；日志 `backups/backup.log`、`backups/restore-verify.log`。移除方式：`crontab -e` 删除这两行。
+- 2026-10-04 手动验证结果：`runs=3 events=536 agents=3 checks=5 findings=18 artifacts=3`，run 文档 digest 与备份 manifest 完全一致，凭据密文 sha256 一致 → `RESTORE VERIFIED OK`。
+
+### 数据迁移说明
+
+首次启动 v0.11.x 时把 `PI_DATA_FILE`（`/app/data/runs.json`）中的历史运行导入 PostgreSQL：`importedRuns=3 importedEvents=536 skippedRuns=0`；无 `ownerId` 的两条历史运行按唯一用户的 `legacy_owner_id` 归属。原 `runs.json` 不再作为目标存储，但文件保留以便回滚。
+
+### 已知限制
+
+- Web 进程内存中只保留运行摘要缓存，事件一律走数据库；多实例部署需要额外的缓存失效机制（当前为单实例）。
+- 存储完全不可用期间，Worker 无法写入终态：任务保持在已领取状态并重试，恢复后由重领继续；绝不会出现“未完成却显示完成”。
+- 恢复依赖既有 worktree；若 worktree 已被清理，任务会明确转人工而不是重复执行。
+
+### 可靠性验收证据（192.168.2.235 上的隔离 e2e，v0.11.1～v0.12.1 镜像 + 假 Pi 运行时）
+
+- AT-REL-001：Run 执行中重启 Web → 运行继续，事件 seq 连续（1..27），页面恢复后读到最新状态。
+- AT-REL-002/003（E2E-06）：检查阶段重启 Worker → `run.recovered`/`checkpoint.development_restored` 事件；开发模型调用次数不变（每个文件 1 行）、每轮审核调用恰好 1 次、checkpoint `planning/dev:1/checks:1/review:1/dev:2/checks:2/review:2` 全部 completed、任务队列 attempts=2 终态 done。
+- AT-REL-004：同一 `deliveryId` 重复投递内部更新 → 事件仅新增 1 条，seq 不重复累计。
+- AT-REL-006：Provider 持续 429 → 2 次退避重试（间隔约 0.5s 起）后转 `needs_human`，附分类与建议，无无限循环。
+- AT-REL-007：存储中断（暂停数据库）→ 运行不进入 completed，落 `run.storage_error` 并转 `needs_human`，恢复后可从人工入口重试。
+- AT-REL-008：客户端落后 → 分页补拉（1,2,3 / 4,5,6），带 `Last-Event-ID` 重连从下一条继续（seq 28）。
+- AT-REL-009：见上文备份/恢复验证。
+- AT-REL-010：磁盘 critical（阈值 `PI_MIN_FREE_DISK_MB`）→ 新建任务返回 507 `DISK_FULL`，`/api/health/detail` 暴露 critical 水位与告警。
