@@ -56,10 +56,17 @@ export class IdentityService {
     return row?.legacy_owner_id ?? undefined;
   }
 
-  /** AUD-02: admins may claim any workspace path and see the global project list. */
+  /**
+   * AUD-02: admins may claim any workspace path and see the global project list.
+   *
+   * Requiring `role === "admin"` *and* `status !== "disabled"` means disabling an
+   * admin revokes the gates on the very next request; already-issued sessions do
+   * not keep admin powers. A missing/other status is treated as active for
+   * backward compatibility with users created before statuses were enforced.
+   */
   async isAdmin(userId: string): Promise<boolean> {
-    const row = (await this.db.query("SELECT role FROM users WHERE id = $1", [userId])).rows[0] as { role: string } | undefined;
-    return row?.role === "admin";
+    const row = (await this.db.query("SELECT role, status FROM users WHERE id = $1", [userId])).rows[0] as { role: string; status: string } | undefined;
+    return row?.role === "admin" && row.status !== "disabled";
   }
 
   async resolve(input: IdentityInput): Promise<UserRecord> {

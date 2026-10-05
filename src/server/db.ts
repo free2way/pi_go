@@ -390,6 +390,27 @@ export const databaseMigrations: Migration[] = [
       CREATE INDEX idx_user_audit_actor ON user_audit(actor_id, created_at);
     `,
   },
+  {
+    // Sprint 4: lightweight, owner-scoped saved model combinations. Additive;
+    // no data is seeded and existing rows are untouched.
+    id: 11,
+    name: "model-templates",
+    sql: `
+      CREATE TABLE model_templates (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        developer_model_json TEXT NOT NULL,
+        reviewer_model_json TEXT NOT NULL,
+        budget_json TEXT,
+        max_parallel INTEGER,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (owner_id, name)
+      );
+      CREATE INDEX idx_model_templates_owner ON model_templates(owner_id, updated_at);
+    `,
+  },
 ];
 
 export async function runMigrations(db: Db) {

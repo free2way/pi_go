@@ -1,4 +1,5 @@
-import type { AgileProject, AgileRelease, AgileSprint, AgileStory, StoryDetail, StoryPriority, StoryStatus } from "../shared/agile";
+import type { AgileMetricsResponse } from "../shared/agile-metrics";
+import type { AgileProject, AgileRelease, AgileSprint, AgileStory, ModelTemplate, StoryDetail, StoryPriority, StoryStatus } from "../shared/agile";
 import type { ConfigStatus, CredentialStatus, CurrentUser, ModelCatalogResponse, ModelSelection, Run, RunArtifact, RunEvent, RunRoundsResponse, RunState, Workspace, AccountDetail, AccountSummary, AccountWorkspaceOption, WorkspacePermission } from "../shared/types";
 
 /** A3: read-only deployment status returned by `GET /api/deployments`. */
@@ -196,6 +197,10 @@ export const api = {
     sprintId?: string | null;
     workspaceId?: string | null;
     status?: StoryStatus;
+    developerModel?: ModelSelection | null;
+    reviewerModel?: ModelSelection | null;
+    budget?: { maxTokens: number; maxCostUsd: number; maxModelCalls: number; maxDurationSeconds: number } | null;
+    maxParallel?: number | null;
   }) => request<AgileStory>("/api/stories", { method: "POST", body: JSON.stringify(body) }),
   story: (id: string) => request<StoryDetail>(`/api/stories/${id}`),
   patchStory: (id: string, body: { status?: StoryStatus; sprintId?: string | null; acceptanceCriteria?: string[]; definitionOfDone?: string[]; priority?: StoryPriority; estimate?: number | null; description?: string; title?: string }) =>
@@ -215,6 +220,19 @@ export const api = {
     request<AgileRelease>("/api/releases", { method: "POST", body: JSON.stringify(body) }),
   patchRelease: (id: string, body: { name?: string; version?: string; notes?: string; status?: "planned" | "in_progress" | "released" | "cancelled"; storyIds?: string[] }) =>
     request<AgileRelease>(`/api/releases/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  /** Sprint 4: read-only sprint metrics + project rollup. */
+  agileMetrics: (params: { projectId?: string; sprintId?: string } = {}) => {
+    const search = new URLSearchParams();
+    if (params.projectId) search.set("projectId", params.projectId);
+    if (params.sprintId) search.set("sprintId", params.sprintId);
+    const suffix = search.toString();
+    return request<AgileMetricsResponse>(`/api/agile/metrics${suffix ? `?${suffix}` : ""}`);
+  },
+  // Sprint 4: owner-scoped saved model combinations ("模板").
+  templates: () => request<{ templates: ModelTemplate[] }>("/api/templates"),
+  createTemplate: (body: { name: string; developerModel: ModelSelection; reviewerModel: ModelSelection; budget?: ModelTemplate["budget"]; maxParallel?: number | null }) =>
+    request<ModelTemplate>("/api/templates", { method: "POST", body: JSON.stringify(body) }),
+  deleteTemplate: (id: string) => request<void>(`/api/templates/${id}`, { method: "DELETE" }),
   // 账户管理（仅管理员）: role/status + workspace grants.
   accounts: () => request<{ accounts: AccountSummary[] }>("/api/accounts"),
   account: (id: string) => request<AccountDetail>(`/api/accounts/${encodeURIComponent(id)}`),

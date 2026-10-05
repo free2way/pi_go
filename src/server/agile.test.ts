@@ -159,6 +159,41 @@ describe("AgileService releases", () => {
   });
 });
 
+describe("AgileService templates", () => {
+  it("creates, lists, scopes and deletes owner-scoped model templates", async () => {
+    const { service } = await seed();
+    const template = await service.createTemplate("user_a", {
+      name: "快速组合",
+      developerModel: { provider: "deepseek", model: "flash" },
+      reviewerModel: { provider: "openai-proxy", model: "gpt" },
+      budget: { maxTokens: 1000, maxCostUsd: 1, maxModelCalls: 5, maxDurationSeconds: 60 },
+      maxParallel: 2,
+    });
+    expect(template).toMatchObject({ name: "快速组合", maxParallel: 2, ownerId: "user_a" });
+    expect(template.developerModel).toEqual({ provider: "deepseek", model: "flash" });
+    expect(template.budget).toEqual({ maxTokens: 1000, maxCostUsd: 1, maxModelCalls: 5, maxDurationSeconds: 60 });
+
+    expect(await service.listTemplates(["user_a"])).toHaveLength(1);
+    expect(await service.listTemplates(["user_b"])).toHaveLength(0);
+
+    await service.deleteTemplate(["user_a"], template.id);
+    expect(await service.listTemplates(["user_a"])).toHaveLength(0);
+    await expect(service.deleteTemplate(["user_a"], template.id)).rejects.toMatchObject({ code: "TEMPLATE_NOT_FOUND", status: 404 });
+  });
+
+  it("rejects a duplicate template name for the same owner but allows another owner to reuse it", async () => {
+    const { service } = await seed();
+    const input = {
+      name: "省钱",
+      developerModel: { provider: "deepseek", model: "flash" },
+      reviewerModel: { provider: "anthropic", model: "sonnet" },
+    };
+    await service.createTemplate("user_a", input);
+    await expect(service.createTemplate("user_a", input)).rejects.toMatchObject({ code: "TEMPLATE_NAME_TAKEN", status: 409 });
+    await expect(service.createTemplate("user_b", input)).resolves.toMatchObject({ name: "省钱", ownerId: "user_b" });
+  });
+});
+
 describe("AgileService run linkage and reconciliation", () => {
   it("links several runs to one story and summarizes them in the detail", async () => {
     const { db, service, project } = await seed();
@@ -188,6 +223,9 @@ describe("AgileService run linkage and reconciliation", () => {
     await service.linkRun(story.id, "run_1");
 
     expect((await service.getStory(["user_a"], story.id)).status).toBe("in_progress");
+
+    await replaceRun(db, makeRun("run_1", "reviewing", { updatedAt: "2026-01-01T12:00:00.000Z" }));
+    expect((await service.getStory(["user_a"], story.id)).status).toBe("in_review");
 
     await replaceRun(db, makeRun("run_1", "completed", { updatedAt: "2026-01-02T00:00:00.000Z" }));
     expect((await service.getStory(["user_a"], story.id)).status).toBe("awaiting_acceptance");

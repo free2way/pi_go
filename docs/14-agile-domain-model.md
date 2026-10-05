@@ -28,16 +28,17 @@
 
 | 最新运行 | 故事状态 |
 | --- | --- |
-| `queued` / `preparing` / `developing` / `checking` / `reviewing` | `in_progress` |
+| `reviewing`（未终态） | `in_review`（看板「审核中」列自动填充） |
+| `queued` / `preparing` / `developing` / `checking` | `in_progress` |
 | `needs_human` | `blocked`（原因取 `run.summary`） |
 | `completed`（无验收快照） | `awaiting_acceptance` |
 | `completed` 且 `run.acceptance` 存在 | `done` |
 | `failed` / `cancelled` | `blocked`（原因取 `run.summary`） |
 | 无关联运行 | 不改写（保留人工设置的 `backlog` / `ready` / `in_review`） |
 
-优先级细节：`needs_human` / `failed` / `cancelled` **优先于** `acceptance`。重新打开（reopen）的运行会保留旧的验收快照但状态回到 `needs_human`，此时应判为 `blocked` 而不是 `done`。
+优先级细节：`needs_human` / `failed` / `cancelled` **优先于** `acceptance`。重新打开（reopen）的运行会保留旧的验收快照但状态回到 `needs_human`，此时应判为 `blocked` 而不是 `done`。`done` / `awaiting_acceptance` / `blocked` 的优先级同样高于 `in_review`。
 
-`in_review` 是人工可设置的状态：按需求地把「正在审核」的运行映射为 `in_progress`，所以看板的「审核中」列只会由人工显式设置填充。
+`in_review` 由「正在审核」的运行自动推导，也可人工显式设置；看板的「审核中」列由自动推导与人工设置共同填充。
 
 **回写触发点**（均为服务器端持久化副作用，纯函数逻辑可单测）：
 - `GET /api/stories/:id` 读取时（`AgileService.getStory` → `reconcileStory`）；
@@ -88,5 +89,5 @@
 ## 6. 未纳入本批次 / 已知边界
 
 - `maxParallel` 作为故事与运行上的元数据保存，未改变编排器自身的并发策略（本批次不改造 orchestrator）。
-- `in_review` 无自动推导来源（见上），需要人工设置。
 - 发布（Release）仅做规划记录与故事关联，不触发部署；真正发布仍走既有的 `POST /api/runs/:id/publish` 流程。
+- 度量与模型组合模板见 `docs/16-agile-metrics-and-templates.md`。

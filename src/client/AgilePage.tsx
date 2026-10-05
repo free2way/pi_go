@@ -1,7 +1,8 @@
-import { ClipboardList, ListChecks, LoaderCircle, Plus, Rocket, Trash2, X } from "lucide-react";
+import { BarChart3, ClipboardList, ListChecks, LoaderCircle, Plus, Rocket, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { STORY_PRIORITIES, STORY_STATUS_LABELS, type AgileProject, type AgileRelease, type AgileSprint, type AgileStory, type StoryDetail, type StoryPriority, type StoryStatus } from "../shared/agile";
-import type { ConfigStatus, RunState, Workspace } from "../shared/types";
+import { applyModelTemplate, STORY_PRIORITIES, STORY_STATUSES, STORY_STATUS_LABELS, type AgileProject, type AgileRelease, type AgileSprint, type AgileStory, type ModelTemplate, type StoryDetail, type StoryPriority, type StoryStatus } from "../shared/agile";
+import type { AgileMetricsResponse } from "../shared/agile-metrics";
+import type { ConfigStatus, ModelCatalogResponse, RunState, Workspace } from "../shared/types";
 import { api } from "./api";
 import { columnPoints, estimateLabel, groupStoriesByColumn, priorityLabel, splitLines, storyReference } from "./agile-view";
 
@@ -23,6 +24,20 @@ const releaseStatusLabels: Record<AgileRelease["status"], string> = { planned: "
 const formatTime = (value: string) =>
   new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(value));
 
+/** Compact human duration for cycle times (seconds in). */
+function formatDuration(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "0";
+  if (seconds >= 86_400) return `${(seconds / 86_400).toFixed(1)} 天`;
+  if (seconds >= 3_600) return `${(seconds / 3_600).toFixed(1)} 小时`;
+  if (seconds >= 60) return `${Math.round(seconds / 60)} 分`;
+  return `${Math.round(seconds)} 秒`;
+}
+
+function parseModel(value: string): { provider: string; model: string } | undefined {
+  const [provider, model] = value.split("::");
+  return provider && model ? { provider, model } : undefined;
+}
+
 /** Sprint 3 batch 1: project/story planning on top of the existing run engine. */
 export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpenRun: (runId: string) => void }) {
   const [projects, setProjects] = useState<AgileProject[]>([]);
@@ -37,7 +52,12 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
-  const [panel, setPanel] = useState<"none" | "project" | "sprint" | "story">("none");
+  const [panel, setPanel] = useState<"none" | "project" | "sprint" | "story" | "metrics">("none");
+  const [templates, setTemplates] = useState<ModelTemplate[]>([]);
+  const [models, setModels] = useState<ModelCatalogResponse>();
+  const [metrics, setMetrics] = useState<AgileMetricsResponse>();
+  const [metricsLoading, setMetricsLoading] = useState(false);
+  const [metricsSprintId, setMetricsSprintId] = useState("");
 
   // new-project form
   const [projectName, setProjectName] = useState("");
@@ -54,6 +74,14 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
   const [storyEstimate, setStoryEstimate] = useState("");
   const [storyWorkspace, setStoryWorkspace] = useState("");
   const [storySprint, setStorySprint] = useState("");
+  const [storyTemplate, setStoryTemplate] = useState("");
+  const [storyDeveloper, setStoryDeveloper] = useState("");
+  const [storyReviewer, setStoryReviewer] = useState("");
+  const [storyMaxParallel, setStoryMaxParallel] = useState("");
+  const [budgetTokens, setBudgetTokens] = useState("");
+  const [budgetCost, setBudgetCost] = useState("");
+  const [budgetCalls, setBudgetCalls] = useState("");
+  const [budgetSeconds, setBudgetSeconds] = useState("");
 
   const selectedProject = projects.find((project) => project.id === projectId);
 
@@ -81,7 +109,12 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
     }
   }, []);
 
-  useEffect(() => { void loadProjects(); void api.workspaces().then((result) => setWorkspaces(result.workspaces)).catch(() => undefined); }, [loadProjects]);
+  useEffect(() => {
+    void loadProjects();
+    void api.workspaces().then((result) => setWorkspaces(result.workspaces)).catch(() => undefined);
+    void api.templates().then((result) => setTemplates(result.templates)).catch(() => undefined);
+    void api.models().then(setModels).catch(() => undefined);
+  }, [loadProjects]);
   useEffect(() => {
     setSelectedId("");
     setDetail(undefined);
@@ -98,6 +131,19 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
     return () => { cancelled = true; };
   }, [selectedId]);
 
+  // Sprint 4: 度量 panel data. Re-fetched when the panel opens or the sprint
+  // picker changes; read-only and scoped to the current project.
+  useEffect(() => {
+    if (panel !== "metrics" || !projectId) return;
+    let cancelled = false;
+    setMetricsLoading(true);
+    void api.agileMetrics({ projectId, sprintId: metricsSprintId || undefined })
+      .then((result) => { if (!cancelled) setMetrics(result); })
+      .catch((cause) => { if (!cancelled) setError((cause as Error).message || "加载度量失败"); })
+      .finally(() => { if (!cancelled) setMetricsLoading(false); });
+    return () => { cancelled = true; };
+  }, [panel, projectId, metricsSprintId]);
+
   const visibleStories = useMemo(
     () => stories.filter((story) => {
       if (sprintFilter === "all") return true;
@@ -108,6 +154,12 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
   );
   const columns = useMemo(() => groupStoriesByColumn(visibleStories), [visibleStories]);
   const sprintLabel = useCallback((id: string | null) => sprints.find((sprint) => sprint.id === id)?.name ?? "未分配", [sprints]);
+  const metricsView = useMemo(() => {
+    if (!metrics) return undefined;
+    return metricsSprintId
+      ? metrics.sprints.find((sprint) => sprint.sprintId === metricsSprintId)
+      : metrics.projects.find((project) => project.projectId === projectId);
+  }, [metrics, metricsSprintId, projectId]);
 
   const createProject = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -145,11 +197,28 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
     }
   };
 
+  const applyStoryTemplate = (id: string) => {
+    setStoryTemplate(id);
+    const template = templates.find((item) => item.id === id);
+    if (!template) return;
+    setStoryDeveloper(`${template.developerModel.provider}::${template.developerModel.model}`);
+    setStoryReviewer(`${template.reviewerModel.provider}::${template.reviewerModel.model}`);
+    const applied = applyModelTemplate(template);
+    if (applied.budget) {
+      setBudgetTokens(String(applied.budget.maxTokens));
+      setBudgetCost(String(applied.budget.maxCostUsd));
+      setBudgetCalls(String(applied.budget.maxModelCalls));
+      setBudgetSeconds(String(applied.budget.maxDurationSeconds));
+    }
+    if (applied.maxParallel !== undefined) setStoryMaxParallel(String(applied.maxParallel));
+  };
+
   const createStory = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!projectId) { setError("请先创建或选择项目"); return; }
     setBusy("story");
     setError("");
+    const budgetGiven = [budgetTokens, budgetCost, budgetCalls, budgetSeconds].some((value) => value.trim() !== "");
     try {
       const story = await api.createStory({
         projectId,
@@ -161,6 +230,12 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
         estimate: storyEstimate ? Number(storyEstimate) : null,
         sprintId: storySprint || null,
         workspaceId: storyWorkspace || null,
+        developerModel: parseModel(storyDeveloper) ?? null,
+        reviewerModel: parseModel(storyReviewer) ?? null,
+        ...(budgetGiven
+          ? { budget: { maxTokens: Number(budgetTokens) || 0, maxCostUsd: Number(budgetCost) || 0, maxModelCalls: Number(budgetCalls) || 0, maxDurationSeconds: Number(budgetSeconds) || 0 } }
+          : {}),
+        ...(storyMaxParallel.trim() ? { maxParallel: Number(storyMaxParallel) } : {}),
       });
       setStories((current) => [story, ...current]);
       setStoryTitle("");
@@ -168,6 +243,11 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
       setStoryCriteria("");
       setStoryDod("");
       setStoryEstimate("");
+      setStoryMaxParallel("");
+      setBudgetTokens("");
+      setBudgetCost("");
+      setBudgetCalls("");
+      setBudgetSeconds("");
       setPanel("none");
       setSelectedId(story.id);
     } catch (cause) {
@@ -246,6 +326,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
           <button className="button secondary" onClick={() => { setPanel(panel === "project" ? "none" : "project"); setError(""); }}><Plus size={15} />新建项目</button>
           <button className="button secondary" disabled={!projectId} onClick={() => { setPanel(panel === "sprint" ? "none" : "sprint"); setError(""); }}><Plus size={15} />新建冲刺</button>
           <button className="button secondary" disabled={!projectId} onClick={() => { setPanel(panel === "story" ? "none" : "story"); setError(""); }}><Plus size={15} />新建故事</button>
+          <button className={`button secondary ${panel === "metrics" ? "active" : ""}`} disabled={!projectId} onClick={() => { setPanel(panel === "metrics" ? "none" : "metrics"); setError(""); }}><BarChart3 size={15} />度量</button>
         </div>
       </section>
 
@@ -311,6 +392,43 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
                   {sprints.map((sprint) => <option key={sprint.id} value={sprint.id}>{sprint.name}</option>)}
                 </select>
               </label>
+            </div>
+            <div className="agile-form-row">
+              <label>模板
+                <select value={storyTemplate} onChange={(event) => applyStoryTemplate(event.target.value)}>
+                  <option value="">不使用</option>
+                  {templates.map((template) => (
+                    <option key={template.id} value={template.id}>{template.name} · {template.developerModel.model} / {template.reviewerModel.model}</option>
+                  ))}
+                </select>
+              </label>
+              <label>最大并行
+                <input inputMode="numeric" value={storyMaxParallel} onChange={(event) => setStoryMaxParallel(event.target.value)} placeholder="默认" />
+              </label>
+            </div>
+            <div className="agile-form-row">
+              <label>开发模型
+                <select value={storyDeveloper} onChange={(event) => setStoryDeveloper(event.target.value)}>
+                  <option value="">默认</option>
+                  {(models?.models ?? []).filter((entry) => entry.roles.includes("developer")).map((entry) => (
+                    <option key={`${entry.provider}::${entry.model}`} value={`${entry.provider}::${entry.model}`}>{entry.label} · {entry.model}</option>
+                  ))}
+                </select>
+              </label>
+              <label>审核模型
+                <select value={storyReviewer} onChange={(event) => setStoryReviewer(event.target.value)}>
+                  <option value="">默认</option>
+                  {(models?.models ?? []).filter((entry) => entry.roles.includes("reviewer")).map((entry) => (
+                    <option key={`${entry.provider}::${entry.model}`} value={`${entry.provider}::${entry.model}`}>{entry.label} · {entry.model}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <div className="agile-form-row agile-budget-row">
+              <label>预算 Token<input inputMode="numeric" value={budgetTokens} onChange={(event) => setBudgetTokens(event.target.value)} placeholder="不限" /></label>
+              <label>预算成本（$）<input inputMode="decimal" value={budgetCost} onChange={(event) => setBudgetCost(event.target.value)} placeholder="不限" /></label>
+              <label>模型调用<input inputMode="numeric" value={budgetCalls} onChange={(event) => setBudgetCalls(event.target.value)} placeholder="不限" /></label>
+              <label>时长（秒）<input inputMode="numeric" value={budgetSeconds} onChange={(event) => setBudgetSeconds(event.target.value)} placeholder="不限" /></label>
             </div>
             <div className="ws-form-actions">
               <button type="button" className="button secondary" onClick={() => setPanel("none")}>取消</button>
@@ -415,6 +533,73 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
             </section>
           </div>
         </>
+      )}
+
+      {panel === "metrics" && (
+        <section className="panel agile-metrics">
+          <div className="panel-head"><div><span className="eyebrow">SPRINT METRICS</span><h3>度量</h3></div><BarChart3 size={15} /></div>
+          <div className="agile-metrics-body">
+            <div className="agile-toolbar">
+              <label>冲刺
+                <select value={metricsSprintId} onChange={(event) => setMetricsSprintId(event.target.value)}>
+                  <option value="">项目汇总</option>
+                  {sprints.map((sprint) => <option key={sprint.id} value={sprint.id}>{sprint.name}</option>)}
+                </select>
+              </label>
+              <span className="agile-hint">只读聚合：完成故事的成本/周期、返工率、审核发现与运行结果。</span>
+            </div>
+            {metricsLoading && <div className="ws-empty"><LoaderCircle className="spin" size={18} /><span>正在计算度量…</span></div>}
+            {!metricsLoading && !metricsView && <div className="agile-hint">该范围下还没有故事。</div>}
+            {!metricsLoading && metricsView && (
+              <>
+                <div className="metrics-grid agile-metrics-grid">
+                  <div className="metric"><span>完成故事</span><strong>{metricsView.stories.completed}/{metricsView.stories.total}</strong><small>完成 = 已验收</small></div>
+                  <div className="metric"><span>返工率</span><strong>{(metricsView.rework.rate * 100).toFixed(0)}%</strong><small>{metricsView.rework.reworked}/{metricsView.rework.completed} 有返修</small></div>
+                  <div className="metric"><span>成本 / 完成故事</span><strong>${metricsView.costPerCompletedStory.toFixed(3)}</strong><small>合计 ${metricsView.usage.cost.toFixed(3)}</small></div>
+                  <div className="metric"><span>周期 中位 / P90</span><strong>{formatDuration(metricsView.cycleTime.medianSeconds)} / {formatDuration(metricsView.cycleTime.p90Seconds)}</strong><small>{metricsView.cycleTime.samples} 个样本</small></div>
+                </div>
+                <div className="agile-metrics-cols">
+                  <div>
+                    <h4>故事状态</h4>
+                    {STORY_STATUSES.map((status) => (
+                      <div className="agile-metrics-row" key={status}><span>{STORY_STATUS_LABELS[status]}</span><strong>{metricsView.stories.byStatus[status]}</strong></div>
+                    ))}
+                  </div>
+                  <div>
+                    <h4>运行结果</h4>
+                    <div className="agile-metrics-row"><span>已完成</span><strong>{metricsView.runOutcomes.completed}</strong></div>
+                    <div className="agile-metrics-row"><span>需要人工</span><strong>{metricsView.runOutcomes.needs_human}</strong></div>
+                    <div className="agile-metrics-row"><span>已取消</span><strong>{metricsView.runOutcomes.cancelled}</strong></div>
+                    <div className="agile-metrics-row"><span>失败</span><strong>{metricsView.runOutcomes.failed}</strong></div>
+                  </div>
+                  <div>
+                    <h4>用量与审核</h4>
+                    <div className="agile-metrics-row"><span>模型调用</span><strong>{metricsView.usage.modelCalls}</strong></div>
+                    <div className="agile-metrics-row"><span>Token 输入/输出</span><strong>{metricsView.usage.inputTokens} / {metricsView.usage.outputTokens}</strong></div>
+                    <div className="agile-metrics-row"><span>缓存读取</span><strong>{metricsView.usage.cacheReadTokens}</strong></div>
+                    <div className="agile-metrics-row"><span>发现 已解决/合计</span><strong>{metricsView.reviewFindings.resolved}/{metricsView.reviewFindings.total}</strong></div>
+                    <div className="agile-metrics-row"><span>未收敛事件</span><strong>{metricsView.reviewFindings.notConverging}</strong></div>
+                  </div>
+                </div>
+                {!metricsSprintId && metrics && metrics.sprints.length > 1 && (
+                  <div className="agile-metrics-sprints">
+                    <h4>各冲刺</h4>
+                    <div className="agile-metrics-row agile-metrics-head"><span>冲刺</span><strong>完成/总数</strong><strong>周期中位</strong><strong>返工率</strong><strong>成本</strong></div>
+                    {metrics.sprints.map((sprint) => (
+                      <button type="button" className="agile-metrics-row" key={sprint.sprintId} onClick={() => setMetricsSprintId(sprint.sprintId)}>
+                        <span>{sprint.name}</span>
+                        <strong>{sprint.stories.completed}/{sprint.stories.total}</strong>
+                        <strong>{formatDuration(sprint.cycleTime.medianSeconds)}</strong>
+                        <strong>{(sprint.rework.rate * 100).toFixed(0)}%</strong>
+                        <strong>${sprint.usage.cost.toFixed(3)}</strong>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        </section>
       )}
 
       {detail && (

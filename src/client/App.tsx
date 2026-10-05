@@ -64,7 +64,8 @@ import { chatChannelLabels, chatCounts, chatMessageView, chatMessagesFromEvents,
 import { describeMergeRestore, mergeRestoreFields } from "../shared/merge";
 import { branchStatus, currentRoundStatus, roundStatuses, roundStatusMeta, roundStatusTooltip, type RoundStatus } from "../shared/round-status";
 import type { ChatMessage, ConfigStatus, CurrentUser, Finding, ModelCatalogResponse, RoundSummary, Run, RunArtifact, RunEvent, RunMode, RunRoleUsage, RunState, Workspace } from "../shared/types";
-import { api, type DeploymentStatus } from "./api";
+import type { ModelTemplate } from "../shared/agile";
+import { api } from "./api";
 import { AgilePage } from "./AgilePage";
 import { HistoryPage } from "./HistoryPage";
 import { runStateLabels, requirementSummary } from "./requirement-history";
@@ -413,11 +414,13 @@ function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, onGoWor
   const [models, setModels] = useState<ModelCatalogResponse>();
   const [developerModelId, setDeveloperModelId] = useState("");
   const [reviewerModelId, setReviewerModelId] = useState("");
+  const [templates, setTemplates] = useState<ModelTemplate[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
     if (!open || !config?.realRunsAvailable) return;
+    void api.templates().then((result) => setTemplates(result.templates)).catch(() => undefined);
     void Promise.all([api.workspaces(), api.models()]).then(([workspaceResult, modelResult]) => {
       const active = workspaceResult.workspaces.filter((item) => item.status === "active");
       setWorkspaces(active);
@@ -508,6 +511,27 @@ function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, onGoWor
                   </option>
                 ))}
               </select></label>
+              {templates.length > 0 && (
+                <label>模板
+                  <select value="" onChange={(event) => {
+                    const template = templates.find((item) => item.id === event.target.value);
+                    if (!template || !models) return;
+                    const match = (selection: { provider: string; model: string }, role: "developer" | "reviewer") =>
+                      models.models.find((entry) => entry.roles.includes(role) && entry.provider === selection.provider && entry.model === selection.model)?.id;
+                    const developer = match(template.developerModel, "developer");
+                    const reviewer = match(template.reviewerModel, "reviewer");
+                    if (developer) setDeveloperModelId(developer);
+                    if (reviewer) setReviewerModelId(reviewer);
+                  }}>
+                    <option value="">选择模板填入模型…</option>
+                    {templates.map((template) => (
+                      <option value={template.id} key={template.id}>
+                        {template.name} · {template.developerModel.model} / {template.reviewerModel.model}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
               <label>开发模型<select value={developerModelId} onChange={(event) => setDeveloperModelId(event.target.value)}>
                 {(models?.models ?? []).filter((entry) => entry.roles.includes("developer")).map((entry) => (
                   <option value={entry.id} key={entry.id} disabled={!entry.available}>{entry.label} · {entry.model}{entry.available ? "" : "（缺凭据）"}</option>
@@ -830,47 +854,6 @@ function ReleasePanel({ run, user, configured, onUpdated }: {
     </section>
   );
 }
-
-/**
- * A3: compact read-only deployment panel. Every unknown state is shown as such;
- * a missing deploy log is reported instead of pretending there were no deploys.
- */
-function DeploymentPanel({ onOpenSystemStatus }: { onOpenSystemStatus?: () => void }) {
-  const [status, setStatus] = useState<DeploymentStatus>();
-  const [error, setError] = useState("");
-  useEffect(() => {
-    void api.deployments().then(setStatus).catch((cause) => setError((cause as Error).message));
-  }, []);
-  const unknown = <span className="deploy-unknown">未知</span>;
-  return (
-    <div className="deployments-card">
-      <div className="providers-title">
-        <span>DEPLOYMENTS</span>
-        {onOpenSystemStatus
-          ? <button type="button" className="deploy-open" title="打开系统状态" onClick={onOpenSystemStatus}>系统状态<Activity size={12} /></button>
-          : <Activity size={13} />}
-      </div>
-      {error ? <div className="form-error">部署状态不可用：{error}</div> : null}
-      <div className="deploy-row"><span>Web</span><strong>{status?.web.version ?? unknown}</strong></div>
-      <div className="deploy-row"><span>Worker</span><strong>{status?.worker.version ?? unknown}</strong></div>
-      <div className="deploy-row"><span>回滚标签</span><strong>{status?.rollbackTags.length ? status.rollbackTags.join("、") : unknown}</strong></div>
-      <div className="deploy-row"><span>部署日志</span><strong>{status ? (status.log.available ? `${status.records.length} 条` : "不可用") : unknown}</strong></div>
-      {status?.records.length ? (
-        <ul className="deploy-records">
-          {status.records.slice(0, 3).map((record, index) => (
-            <li key={`${record.raw}-${index}`}>
-              <code>{record.version ?? "—"}</code>
-              <span>{record.role ?? record.status ?? "记录"}</span>
-              <small>{record.at ?? ""}</small>
-            </li>
-          ))}
-        </ul>
-      ) : null}
-      {status && !status.log.available ? <small className="deploy-hint">部署日志不可用（{status.log.path}）</small> : null}
-    </div>
-  );
-}
-
 
 function ChecksPanel({ run }: { run: Run }) {
   return (
@@ -1521,6 +1504,9 @@ export function App() {
     <div className="app-shell">
       <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
         <div className="sidebar-top"><Logo /><button className="icon-button mobile-only" onClick={() => setSidebarOpen(false)}><X size={18} /></button></div>
+        {/* UI: compact top block (create + nav + routing) scrolls on its own so the
+            runs list below can claim the remaining sidebar height. */}
+        <div className="sidebar-nav-scroll">
         <button className="new-run" onClick={() => setCreateOpen(true)}><Plus size={17} />新建任务<span>⌘ K</span></button>
         <nav className="primary-nav">
           <button type="button" className={view === "run" ? "active" : ""} onClick={() => setView("run")}><GitBranch size={16} />工作流</button>
@@ -1532,7 +1518,18 @@ export function App() {
           <button type="button" className={view === "system" ? "active" : ""} onClick={() => setView("system")}><Activity size={16} />系统状态</button>
           {/* 账户管理: admin-only; non-admins never see the entry (direct navigation shows the explicit 仅管理员可见 state). */}
           {user?.isAdmin && <button type="button" className={view === "accounts" ? "active" : ""} onClick={() => setView("accounts")}><Users size={16} />账户管理</button>}
-        </nav>
+          </nav>
+          {config && <div className="providers-card" id="models">
+            <div className="providers-title"><span>AGENT ROUTING</span><Zap size={13} /></div>
+            <ProviderStatus label="开发" provider={config.developer.provider} model={config.developer.model} ready={config.developer.credentialConfigured} icon={Code2} />
+            <ProviderStatus label="审核" provider={config.reviewer.provider} model={config.reviewer.model} ready={config.reviewer.credentialConfigured} icon={ShieldCheck} />
+            <button className="manage-credentials" type="button" onClick={() => setView("models")}><KeyRound size={13} />配置或轮换个人 Key</button>
+            <div className={`credential-warning ${config.realRunsAvailable ? "runner-ready" : ""}`}><AlertTriangle size={13} />{config.realRunsAvailable ? "真实执行已启用" : "真实执行尚未启用"}</div>
+          </div>}
+        </div>
+        {/* 最近任务: bottom region, grows to fill the remaining sidebar height. The
+            section head stays pinned; only .run-list scrolls. */}
+        <section className="sidebar-runs" aria-label="最近任务">
         <div className="sidebar-section-head"><span>最近任务</span><span className="sidebar-head-actions"><Search size={14} /><button className="sidebar-cleanup" type="button" title="清理 7 天前已结束的任务" onClick={() => void handleCleanup()}><Trash2 size={13} /></button></span></div>
         {batchSelected.size > 0 && (
           <div className="batch-bar">
@@ -1565,14 +1562,7 @@ export function App() {
           ))}
           {!runs.length && !loading && <div className="sidebar-empty">还没有任务</div>}
         </div>
-        {config && <div className="providers-card" id="models">
-          <div className="providers-title"><span>AGENT ROUTING</span><Zap size={13} /></div>
-          <ProviderStatus label="开发" provider={config.developer.provider} model={config.developer.model} ready={config.developer.credentialConfigured} icon={Code2} />
-          <ProviderStatus label="审核" provider={config.reviewer.provider} model={config.reviewer.model} ready={config.reviewer.credentialConfigured} icon={ShieldCheck} />
-          <button className="manage-credentials" type="button" onClick={() => setView("models")}><KeyRound size={13} />配置或轮换个人 Key</button>
-          <div className={`credential-warning ${config.realRunsAvailable ? "runner-ready" : ""}`}><AlertTriangle size={13} />{config.realRunsAvailable ? "真实执行已启用" : "真实执行尚未启用"}</div>
-        </div>}
-        <DeploymentPanel onOpenSystemStatus={() => setView("system")} />
+        </section>
         <div className="account-footer"><div><span className="system-dot" /><strong>{user?.email || "正在验证账户"}</strong><small>Pi {config?.piVersion || "—"}</small></div><a href="/cdn-cgi/access/logout" title="退出登录"><LogOut size={15} /></a></div>
       </aside>
 

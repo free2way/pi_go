@@ -111,3 +111,12 @@ export const storySubmitSchema = z.object({
   checks: z.array(z.string().trim().min(1).max(500)).max(8).optional(),
   idempotencyKey: z.string().trim().min(8).max(120).optional(),
 }).strict();
+
+/** Sprint 4: saved model combination. `budget`/`maxParallel` are optional. */
+export const templateCreateSchema = z.object({
+  name,
+  developerModel: model,
+  reviewerModel: model,
+  budget: budget.nullable().optional(),
+  maxParallel: z.number().int().min(1).max(32).nullable().optional(),
+}).strict();

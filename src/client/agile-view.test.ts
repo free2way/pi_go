@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { AgileStory } from "../shared/agile";
+import { deriveStoryStatus, type AgileStory } from "../shared/agile";
 import { columnPoints, estimateLabel, groupStoriesByColumn, priorityLabel, splitLines, storyReference } from "./agile-view";
 
 function story(overrides: Partial<AgileStory>): AgileStory {
@@ -45,6 +45,14 @@ describe("groupStoriesByColumn", () => {
     const groups = groupStoriesByColumn([story({ status: "ready", estimate: 3 }), story({ status: "ready", estimate: 5 })]);
     expect(columnPoints(groups[0])).toBe(8);
     expect(columnPoints(groups[1])).toBe(0);
+  });
+
+  it("populates 审核中 from a story whose latest run is reviewing", () => {
+    const derived = deriveStoryStatus({ state: "reviewing", summary: "", acceptance: undefined });
+    expect(derived?.status).toBe("in_review");
+    const reviewColumn = groupStoriesByColumn([story({ status: derived!.status })]).find((group) => group.id === "in_review")!;
+    expect(reviewColumn.stories).toHaveLength(1);
+    expect(groupStoriesByColumn([story({ status: derived!.status })]).find((group) => group.id === "in_progress")!.stories).toHaveLength(0);
   });
 });
 

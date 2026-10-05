@@ -42,7 +42,8 @@ import { buildMergeRequestPayload, mergeRequestUnavailable, patchFileName, resol
 import { planReopen, reopenEventMeta } from "./run-reopen.js";
 import { isActiveRelease, planReleaseStart, sameReleaseAttempt } from "./run-release.js";
 import { AgileError, AgileService } from "./agile.js";
-import { projectCreateSchema, projectPatchSchema, releaseCreateSchema, releasePatchSchema, sprintCreateSchema, sprintPatchSchema, storyCreateSchema, storyPatchSchema, storySubmitSchema } from "./agile-schemas.js";
+import { readAgileMetrics } from "./agile-metrics.js";
+import { projectCreateSchema, projectPatchSchema, releaseCreateSchema, releasePatchSchema, sprintCreateSchema, sprintPatchSchema, storyCreateSchema, storyPatchSchema, storySubmitSchema, templateCreateSchema } from "./agile-schemas.js";
 import { executeRelease } from "./release-execution.js";
 import type { RunStoreLike } from "./store.js";
 import { WorkspaceError, WorkspaceService } from "./workspaces.js";
@@ -529,7 +530,7 @@ app.get("/api/health", async (_request, reply) => {
   try {
     await pingDatabase();
     alerts.clear("database_unavailable");
-    return { status: "ok", service: "pigo-web", version: "0.25.0", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.25.1", db: "ok" };
   } catch (error) {
     // AT-REL-005: fail loudly instead of pretending the service is healthy.
     alerts.raise({
@@ -538,7 +539,7 @@ app.get("/api/health", async (_request, reply) => {
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
       details: { error: (error as Error).message.slice(0, 200) },
     });
-    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.25.0", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.25.1", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
   }
 });
 
@@ -553,7 +554,7 @@ interface StorageStatus {
 app.get("/api/health/detail", async (request, reply) => {
   const internal = safeTokenMatch(request.headers.authorization);
   if (!internal && !auth.user(request)) return reply.code(401).send({ error: "Unauthorized" });
-  const health: Record<string, unknown> = { version: "0.25.0", at: new Date().toISOString() };
+  const health: Record<string, unknown> = { version: "0.25.1", at: new Date().toISOString() };
   try {
     await pingDatabase();
     health.database = { status: "ok" };
@@ -1292,6 +1293,51 @@ app.patch<{ Params: { id: string } }>("/api/releases/:id", async (request, reply
 app.delete<{ Params: { id: string } }>("/api/releases/:id", async (request, reply) => {
   try {
     await agile.deleteRelease(ownerKeysFor(request), request.params.id, await identities.isAdmin(auth.user(request).id));
+    return reply.code(204).send();
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
+/**
+ * Sprint 4 core: read-only, owner-scoped sprint metrics + project rollup.
+ * Optional `?projectId=` / `?sprintId=` narrow the scope; empty scopes return
+ * explicit zeros (never a 500). The heavy lifting is `readAgileMetrics`.
+ */
+app.get<{ Querystring: { projectId?: string; sprintId?: string } }>("/api/agile/metrics", async (request, reply) => {
+  try {
+    return await readAgileMetrics(db, ownerKeysFor(request), {
+      projectId: request.query.projectId,
+      sprintId: request.query.sprintId,
+    });
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
+// Sprint 4: owner-scoped saved model combinations ("模板"). Lightweight CRUD;
+// nothing is seeded, and the same name may be reused by a different owner.
+app.get("/api/templates", async (request, reply) => {
+  try {
+    return { templates: await agile.listTemplates(ownerKeysFor(request)) };
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
+app.post("/api/templates", async (request, reply) => {
+  const parsed = templateCreateSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
+  try {
+    return reply.code(201).send(await agile.createTemplate(auth.user(request).id, parsed.data));
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
+app.delete<{ Params: { id: string } }>("/api/templates/:id", async (request, reply) => {
+  try {
+    await agile.deleteTemplate(ownerKeysFor(request), request.params.id, await identities.isAdmin(auth.user(request).id));
     return reply.code(204).send();
   } catch (error) {
     return agileErrorReply(reply, error);

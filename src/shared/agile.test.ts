@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Run } from "./types.js";
 import {
   BOARD_COLUMNS,
+  applyModelTemplate,
   boardColumnFor,
   buildStoryRunInput,
   composeStoryTask,
@@ -68,12 +69,22 @@ describe("deriveStoryStatus", () => {
     expect(deriveStoryStatus(null)).toBeUndefined();
   });
 
-  it.each(["queued", "preparing", "developing", "checking", "reviewing"] as const)(
+  it.each(["queued", "preparing", "developing", "checking"] as const)(
     "maps an active run (%s) to in_progress",
     (state) => {
       expect(deriveStoryStatus(run(state))).toEqual({ status: "in_progress" });
     },
   );
+
+  it("maps an active reviewing run to in_review", () => {
+    expect(deriveStoryStatus(run("reviewing"))).toEqual({ status: "in_review" });
+  });
+
+  it("keeps done/awaiting_acceptance/blocked precedence over in_review", () => {
+    const accepted = run("reviewing", { acceptance: { acceptedAt: "2026-01-02T00:00:00.000Z", acceptedBy: "u", note: null, acknowledgedOpenFindings: false, findings: { resolved: { count: 0, ids: [] }, remaining: { count: 0, items: [] } }, diff: { artifactId: null, sha256: null, bytes: null }, checks: { total: 0, passed: 0, failed: 0 }, usage: { inputTokens: 0, outputTokens: 0, estimatedCost: 0, modelCalls: 0 } } });
+    expect(deriveStoryStatus(accepted)).toEqual({ status: "done" });
+    expect(deriveStoryStatus(run("needs_human"))).toMatchObject({ status: "blocked" });
+  });
 
   it("maps a completed run to awaiting_acceptance", () => {
     expect(deriveStoryStatus(run("completed"))).toEqual({ status: "awaiting_acceptance" });
@@ -157,6 +168,33 @@ describe("buildStoryRunInput", () => {
 
   it("composeStoryTask trims blank list items", () => {
     expect(composeStoryTask(story({ acceptanceCriteria: ["  ", "有效标准"], definitionOfDone: [] }))).toContain("1. 有效标准");
+  });
+});
+
+describe("applyModelTemplate", () => {
+  it("shapes the fields a template fills, omitting unset budget/parallel", () => {
+    expect(
+      applyModelTemplate({
+        developerModel: { provider: "deepseek", model: "flash" },
+        reviewerModel: { provider: "openai-proxy", model: "gpt" },
+        budget: null,
+        maxParallel: null,
+      }),
+    ).toEqual({
+      developerModel: { provider: "deepseek", model: "flash" },
+      reviewerModel: { provider: "openai-proxy", model: "gpt" },
+    });
+  });
+
+  it("includes budget and parallel when the template pins them", () => {
+    const application = applyModelTemplate({
+      developerModel: { provider: "a", model: "m" },
+      reviewerModel: { provider: "b", model: "n" },
+      budget: { maxTokens: 10, maxCostUsd: 0.5, maxModelCalls: 2, maxDurationSeconds: 30 },
+      maxParallel: 3,
+    });
+    expect(application.budget).toEqual({ maxTokens: 10, maxCostUsd: 0.5, maxModelCalls: 2, maxDurationSeconds: 30 });
+    expect(application.maxParallel).toBe(3);
   });
 });
 

@@ -102,3 +102,37 @@ describe("identity service", () => {
     expect(await identities.userCount()).toBe(1);
   });
 });
+
+describe("identity admin gate", () => {
+  async function user(db: Db, id: string, role: string, status: string) {
+    const now = new Date().toISOString();
+    await db.query(
+      "INSERT INTO users (id, email, role, status, legacy_owner_id, created_at, updated_at) VALUES ($1, $2, $3, $4, NULL, $5, $6)",
+      [id, `${id}@example.com`, role, status, now, now],
+    );
+  }
+
+  it("grants admin to an active admin", async () => {
+    const db = await createTestDb();
+    await user(db, "admin_active", "admin", "active");
+    expect(await new IdentityService(db).isAdmin("admin_active")).toBe(true);
+  });
+
+  it("revokes admin the moment the admin is disabled", async () => {
+    const db = await createTestDb();
+    await user(db, "admin_off", "admin", "disabled");
+    expect(await new IdentityService(db).isAdmin("admin_off")).toBe(false);
+  });
+
+  it("treats a missing/other status as active for backward compatibility", async () => {
+    const db = await createTestDb();
+    await user(db, "admin_legacy", "admin", "invited");
+    expect(await new IdentityService(db).isAdmin("admin_legacy")).toBe(true);
+  });
+
+  it("never grants admin to a non-admin user", async () => {
+    const db = await createTestDb();
+    await user(db, "plain_user", "user", "active");
+    expect(await new IdentityService(db).isAdmin("plain_user")).toBe(false);
+  });
+});

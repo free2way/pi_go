@@ -6,6 +6,7 @@ import {
   type AgileRelease,
   type AgileSprint,
   type AgileStory,
+  type ModelTemplate,
   type ReleaseStatus,
   type RunBudget,
   type SprintStatus,
@@ -84,6 +85,18 @@ type ReleaseRow = {
   updated_at: string;
 };
 
+type TemplateRow = {
+  id: string;
+  owner_id: string;
+  name: string;
+  developer_model_json: string;
+  reviewer_model_json: string;
+  budget_json: string | null;
+  max_parallel: number | null;
+  created_at: string;
+  updated_at: string;
+};
+
 function parseJson<T>(value: string | null, fallback: T): T {
   if (!value) return fallback;
   try {
@@ -158,6 +171,20 @@ function toRelease(row: ReleaseRow): AgileRelease {
   };
 }
 
+function toTemplate(row: TemplateRow): ModelTemplate {
+  return {
+    id: row.id,
+    ownerId: row.owner_id,
+    name: row.name,
+    developerModel: parseJson<ModelSelection>(row.developer_model_json, { provider: "", model: "" }),
+    reviewerModel: parseJson<ModelSelection>(row.reviewer_model_json, { provider: "", model: "" }),
+    budget: parseJson<RunBudget | null>(row.budget_json, null),
+    maxParallel: row.max_parallel === null || row.max_parallel === undefined ? null : Number(row.max_parallel),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 export interface CreateProjectInput {
   name: string;
   key: string;
@@ -209,6 +236,14 @@ export interface CreateReleaseInput {
 }
 
 export type UpdateReleaseInput = Partial<Omit<CreateReleaseInput, "projectId">>;
+
+export interface CreateTemplateInput {
+  name: string;
+  developerModel: ModelSelection;
+  reviewerModel: ModelSelection;
+  budget?: RunBudget | null;
+  maxParallel?: number | null;
+}
 
 /**
  * Owner-scoped store for the agile planning model. Every read/write is scoped to
@@ -597,6 +632,49 @@ export class AgileService {
       )).rows[0]) as unknown as ReleaseRow | undefined;
     if (!row) throw new AgileError("RELEASE_NOT_FOUND", "发布不存在", 404);
     return row;
+  }
+
+  // ---------------------------------------------------------------- templates
+
+  async listTemplates(ownerKeys: string[]): Promise<ModelTemplate[]> {
+    if (ownerKeys.length === 0) return [];
+    const rows = (await this.db.query(
+      `SELECT * FROM model_templates WHERE owner_id IN (${placeholders(ownerKeys, 1)}) ORDER BY updated_at DESC`,
+      ownerKeys,
+    )).rows as unknown as TemplateRow[];
+    return rows.map(toTemplate);
+  }
+
+  /** Owner-scoped create; a duplicate name for the same owner is a 409. */
+  async createTemplate(ownerId: string, input: CreateTemplateInput): Promise<ModelTemplate> {
+    const name = input.name.trim();
+    const existing = await this.db.query("SELECT id FROM model_templates WHERE owner_id = $1 AND name = $2", [ownerId, name]);
+    if (existing.rows.length > 0) throw new AgileError("TEMPLATE_NAME_TAKEN", `模板名称 ${name} 已存在`, 409);
+    const now = this.now();
+    const id = newId("tmpl");
+    try {
+      await this.db.query(
+        `INSERT INTO model_templates (id, owner_id, name, developer_model_json, reviewer_model_json, budget_json, max_parallel, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [id, ownerId, name, JSON.stringify(input.developerModel), JSON.stringify(input.reviewerModel), input.budget ? JSON.stringify(input.budget) : null, input.maxParallel ?? null, now, now],
+      );
+    } catch (error) {
+      // A concurrent create can still hit the unique index; surface it as 409.
+      if ((error as { code?: string }).code === "23505") throw new AgileError("TEMPLATE_NAME_TAKEN", `模板名称 ${name} 已存在`, 409);
+      throw error;
+    }
+    return toTemplate((await this.db.query("SELECT * FROM model_templates WHERE id = $1", [id])).rows[0] as unknown as TemplateRow);
+  }
+
+  async deleteTemplate(ownerKeys: string[], id: string, isAdmin = false): Promise<void> {
+    const row = (isAdmin || ownerKeys.length === 0
+      ? (await this.db.query("SELECT id FROM model_templates WHERE id = $1", [id])).rows[0]
+      : (await this.db.query(
+        `SELECT id FROM model_templates WHERE id = $1 AND owner_id IN (${placeholders(ownerKeys, 2)})`,
+        [id, ...ownerKeys],
+      )).rows[0]) as { id: string } | undefined;
+    if (!row) throw new AgileError("TEMPLATE_NOT_FOUND", "模板不存在", 404);
+    await this.db.query("DELETE FROM model_templates WHERE id = $1", [id]);
   }
 }
 

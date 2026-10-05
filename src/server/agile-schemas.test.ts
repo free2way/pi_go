@@ -8,6 +8,7 @@ import {
   storyCreateSchema,
   storyPatchSchema,
   storySubmitSchema,
+  templateCreateSchema,
 } from "./agile-schemas.js";
 
 describe("agile schemas — projects", () => {
@@ -78,5 +79,28 @@ describe("agile schemas — story submission", () => {
   it("rejects an unknown mode and a too-short idempotency key", () => {
     expect(storySubmitSchema.safeParse({ mode: "production" }).success).toBe(false);
     expect(storySubmitSchema.safeParse({ idempotencyKey: "short" }).success).toBe(false);
+  });
+});
+
+describe("agile schemas — model templates", () => {
+  const models = { developerModel: { provider: "deepseek", model: "flash" }, reviewerModel: { provider: "openai-proxy", model: "gpt" } };
+
+  it("accepts a minimal template and one with budget + parallel", () => {
+    const minimal = templateCreateSchema.safeParse({ name: "  快速  ", ...models });
+    expect(minimal.success).toBe(true);
+    if (minimal.success) expect(minimal.data.name).toBe("快速");
+    expect(templateCreateSchema.safeParse({
+      name: "省钱",
+      ...models,
+      budget: { maxTokens: 1000, maxCostUsd: 1, maxModelCalls: 5, maxDurationSeconds: 60 },
+      maxParallel: 2,
+    }).success).toBe(true);
+  });
+
+  it("rejects a missing model, an out-of-range parallel and unknown fields", () => {
+    expect(templateCreateSchema.safeParse({ name: "x", developerModel: models.developerModel }).success).toBe(false);
+    expect(templateCreateSchema.safeParse({ name: "x", ...models, maxParallel: 0 }).success).toBe(false);
+    expect(templateCreateSchema.safeParse({ name: "x", ...models, ownerId: "someone-else" }).success).toBe(false);
+    expect(templateCreateSchema.safeParse({ name: "", ...models }).success).toBe(false);
   });
 });

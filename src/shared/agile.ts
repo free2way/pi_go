@@ -144,6 +144,48 @@ export interface AgileRelease {
   updatedAt: string;
 }
 
+/**
+ * Sprint 4: a saved model combination reusable when creating a run or a story.
+ * Lightweight and owner-scoped; `budget`/`maxParallel` are optional so a
+ * template may only pin the two models.
+ */
+export interface ModelTemplate {
+  id: string;
+  ownerId: string;
+  name: string;
+  developerModel: ModelSelection;
+  reviewerModel: ModelSelection;
+  budget: RunBudget | null;
+  maxParallel: number | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** The subset of fields a template fills into the run/story forms. */
+export interface TemplateApplication {
+  developerModel: ModelSelection;
+  reviewerModel: ModelSelection;
+  budget?: RunBudget;
+  maxParallel?: number;
+}
+
+/**
+ * Pure shaping of the payload the UI writes into a form when a template is
+ * picked: unset budget/parallel stay omitted so they never overwrite a value the
+ * operator already typed (the picker only fills fields, it never submits).
+ */
+export function applyModelTemplate(
+  template: Pick<ModelTemplate, "developerModel" | "reviewerModel" | "budget" | "maxParallel">,
+): TemplateApplication {
+  return {
+    developerModel: template.developerModel,
+    reviewerModel: template.reviewerModel,
+    ...(template.budget ? { budget: template.budget } : {}),
+    ...(template.maxParallel !== null ? { maxParallel: template.maxParallel } : {}),
+  };
+}
+
+
 /** One linked run, flattened to the counters the story detail renders. */
 export interface StoryRunSummary {
   runId: string;
@@ -166,8 +208,8 @@ export type BoardColumnId = "todo" | "in_progress" | "in_review" | "awaiting_acc
 /**
  * Sprint board columns. `todo` intentionally folds `backlog` + `ready` together:
  * on the board both mean "not started yet", while the story lists still show the
- * fine-grained status. `in_review` is only reachable by an explicit status set
- * (the reconciler maps an active `reviewing` run to `in_progress`).
+ * fine-grained status. `in_review` is fed by the reconciler mapping an active
+ * `reviewing` run to `in_review` (see `deriveStoryStatus`).
  */
 export const BOARD_COLUMNS: Array<{ id: BoardColumnId; label: string; statuses: StoryStatus[] }> = [
   { id: "todo", label: "待办", statuses: ["backlog", "ready"] },
@@ -198,8 +240,8 @@ export interface StoryStatusDerivation {
  * Precedence (documented in docs/14-agile-domain-model.md): a run that needs a
  * human, failed or was cancelled is `blocked` even if it carries an old
  * acceptance snapshot (a reopened run keeps `acceptance`); otherwise an accepted
- * run is `done`, a finished run awaits acceptance, and every active state is
- * `in_progress`.
+ * run is `done`, a finished run awaits acceptance, an active `reviewing` run is
+ * `in_review`, and every other active state is `in_progress`.
  */
 export function deriveStoryStatus(
   run: Pick<Run, "state" | "summary" | "acceptance"> | undefined | null,
@@ -218,7 +260,8 @@ export function deriveStoryStatus(
   }
   if (run.acceptance) return { status: "done" };
   if (run.state === "completed") return { status: "awaiting_acceptance" };
-  // queued / preparing / developing / checking / reviewing
+  if (run.state === "reviewing") return { status: "in_review" };
+  // queued / preparing / developing / checking
   return { status: "in_progress" };
 }
 
