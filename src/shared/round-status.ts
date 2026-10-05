@@ -215,3 +215,31 @@ export function roundStatuses(events: RunEvent[], run?: Run): RoundStatus[] {
 export function currentRoundStatus(statuses: RoundStatus[]): RoundStatus | undefined {
   return statuses.length ? statuses[statuses.length - 1] : undefined;
 }
+
+/** Badge payload for a `rework-<round>` branch. */
+export interface BranchStatus {
+  /** Status of the round the branch leads into; absent when there are no rounds. */
+  status?: RoundStatus;
+  /** Tooltip matching `status` (counts of the round whose status is shown). */
+  tooltip?: string;
+}
+
+/**
+ * Status for a `rework-<returnRound>` branch badge.
+ *
+ * A branch leaves the returned round and feeds the repair round it opens, so the
+ * badge follows the *target* round — normally `returnRound + 1` — instead of the
+ * returned round's terminal `已退回返修`. Sparse rounds resolve to the next
+ * greater round present; when no later round exists yet the latest/current
+ * status is reused so an in-flight repair shows 开发中/检查中/审核中. The returned
+ * `tooltip` always describes the round whose status is shown.
+ */
+export function branchStatus(statuses: RoundStatus[], returnRound: number): BranchStatus {
+  let target: RoundStatus | undefined;
+  for (const status of statuses) {
+    if (status.round <= returnRound) continue;
+    if (!target || status.round < target.round) target = status;
+  }
+  const resolved = target ?? currentRoundStatus(statuses);
+  return resolved ? { status: resolved, tooltip: roundStatusTooltip(resolved) } : {};
+}

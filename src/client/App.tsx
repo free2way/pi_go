@@ -60,7 +60,7 @@ import {
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { chatChannelLabels, chatCounts, chatMessageView, chatMessagesFromEvents, chatParticipantLabels, chatTabs, filterChatMessages, isReviewMessage, messageFindings, reworkBranchDetails, reworkBranchRounds, type ChatTab, type ReworkBranchDetail } from "../shared/chat";
 import { describeMergeRestore, mergeRestoreFields } from "../shared/merge";
-import { currentRoundStatus, roundStatuses, roundStatusMeta, roundStatusTooltip, type RoundStatus } from "../shared/round-status";
+import { branchStatus, currentRoundStatus, roundStatuses, roundStatusMeta, roundStatusTooltip, type RoundStatus } from "../shared/round-status";
 import type { ChatMessage, ConfigStatus, CurrentUser, Finding, ModelCatalogResponse, Run, RunArtifact, RunEvent, RunMode, RunRoleUsage, RunState, Workspace } from "../shared/types";
 import { api, type DeploymentStatus } from "./api";
 import { HistoryPage } from "./HistoryPage";
@@ -156,6 +156,7 @@ function ReworkEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition, ta
   const active = data?.active === true;
   const onSelect = typeof data?.onSelect === "function" ? (data.onSelect as (round: number) => void) : undefined;
   const roundStatus = data?.roundStatus as RoundStatus | undefined;
+  const roundStatusTip = typeof data?.roundStatusTooltip === "string" ? data.roundStatusTooltip : undefined;
   const [edgePath, labelX, labelY] = getSmoothStepPath({
     sourceX,
     sourceY,
@@ -168,7 +169,7 @@ function ReworkEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition, ta
   });
   const title = round === undefined
     ? undefined
-    : `${roundStatus ? `${roundStatusMeta[roundStatus.status].label} · ${roundStatusTooltip(roundStatus)}\n` : ""}查看第 ${round} 轮返修原因`;
+    : `${roundStatus ? `${roundStatusMeta[roundStatus.status].label} · ${roundStatusTip ?? roundStatusTooltip(roundStatus)}\n` : ""}查看第 ${round} 轮返修原因`;
   return (
     <>
       <BaseEdge id={id} path={edgePath} markerEnd={markerEnd} style={style} />
@@ -208,7 +209,6 @@ function flowForRun(run?: Run, events: RunEvent[] = [], options: FlowOptions = {
   // and on every rework branch. Later rounds override earlier ones, so the
   // current marker reads the highest round present.
   const statuses = roundStatuses(events, run);
-  const statusByRound = new Map(statuses.map((status) => [status.round, status]));
   const currentStatus = currentRoundStatus(statuses);
   const statusAt = (order: number): FlowNodeData["status"] => {
     if (!run) return "waiting";
@@ -284,6 +284,10 @@ function flowForRun(run?: Run, events: RunEvent[] = [], options: FlowOptions = {
   // returns qualify — checks failures advance the round without the reviewer.
   const returns = reworkBranchRounds(events);
   for (const [index, round] of returns.entries()) {
+    // The branch badge follows the round the branch leads into (the repair it
+    // opens), not the returned round's terminal `已退回返修`; clicks still open the
+    // returned round's ReworkDetail via `round`/`onSelect`.
+    const branch = branchStatus(statuses, round);
     edges.push({
       id: `rework-${round}`,
       source: "reviewer",
@@ -295,7 +299,8 @@ function flowForRun(run?: Run, events: RunEvent[] = [], options: FlowOptions = {
         label: `round ${round} · 返修`,
         centerY: 208 + index * 54,
         round,
-        roundStatus: statusByRound.get(round),
+        roundStatus: branch.status,
+        roundStatusTooltip: branch.tooltip,
         active: options.selectedReworkRound === round,
         onSelect: options.onReworkSelect,
       },

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Finding, Run, RunEvent } from "./types";
-import { currentRoundStatus, roundStatuses, roundStatusTooltip } from "./round-status";
+import { branchStatus, currentRoundStatus, roundStatuses, roundStatusTooltip } from "./round-status";
 
 const baseEvent = (overrides: Partial<RunEvent>): RunEvent => ({
   seq: 1,
@@ -259,5 +259,69 @@ describe("roundStatusTooltip", () => {
     ];
 
     expect(roundStatusTooltip(roundStatuses(events)[0])).toBe("检查 通过 2/失败 0 · 发现 1 项（已解决 0）");
+  });
+});
+
+describe("branchStatus", () => {
+  it("maps a rework branch to the next round's live status, not the returned round's", () => {
+    const statuses = roundStatuses([
+      baseEvent({ seq: 1, round: 1, source: "reviewer", type: "review.changes_requested" }),
+      baseEvent({ seq: 2, round: 2, type: "round.started" }),
+      baseEvent({ seq: 3, round: 2, source: "developer", type: "agent.repair_started" }),
+    ]);
+
+    const branch = branchStatus(statuses, 1);
+
+    expect(branch.status?.round).toBe(2);
+    expect(branch.status?.status).toBe("developing");
+  });
+
+  it("picks the nearest greater round when rounds are sparse", () => {
+    const statuses = roundStatuses([
+      baseEvent({ seq: 1, round: 1, source: "reviewer", type: "review.changes_requested" }),
+      baseEvent({ seq: 2, round: 3, source: "reviewer", type: "review.started" }),
+    ]);
+
+    expect(branchStatus(statuses, 1).status?.round).toBe(3);
+    expect(branchStatus(statuses, 1).status?.status).toBe("reviewing");
+  });
+
+  it("does not jump past an intermediate round to the latest one", () => {
+    const statuses = roundStatuses([
+      baseEvent({ seq: 1, round: 1, source: "reviewer", type: "review.changes_requested" }),
+      baseEvent({ seq: 2, round: 2, source: "checks", type: "checks.started" }),
+      baseEvent({ seq: 3, round: 3, source: "reviewer", type: "review.approved" }),
+    ]);
+
+    expect(branchStatus(statuses, 1).status?.round).toBe(2);
+  });
+
+  it("falls back to the latest current status when no later round exists yet", () => {
+    const statuses = roundStatuses([
+      baseEvent({ seq: 1, round: 1, source: "reviewer", type: "review.changes_requested" }),
+      baseEvent({ seq: 2, round: 2, source: "checks", type: "checks.started" }),
+    ]);
+
+    const branch = branchStatus(statuses, 2);
+
+    expect(branch.status?.round).toBe(2);
+    expect(branch.status?.status).toBe("checking");
+  });
+
+  it("returns the tooltip of the round whose status is shown", () => {
+    const statuses = roundStatuses([
+      baseEvent({ seq: 1, round: 1, source: "reviewer", type: "review.changes_requested", meta: { findings: [finding()] } }),
+      baseEvent({ seq: 2, round: 2, source: "checks", type: "checks.passed", meta: { checks: [{ status: "passed" }, { status: "failed" }] } }),
+    ]);
+
+    const branch = branchStatus(statuses, 1);
+
+    expect(branch.tooltip).toBe("检查 通过 1/失败 1 · 发现 0 项（已解决 0）");
+    expect(branch.tooltip).toBe(roundStatusTooltip(statuses[1]));
+  });
+
+  it("returns an empty payload for empty input", () => {
+    expect(branchStatus([], 1)).toEqual({});
+    expect(branchStatus([], 1).status).toBeUndefined();
   });
 });
