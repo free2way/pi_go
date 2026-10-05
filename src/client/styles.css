@@ -145,7 +145,7 @@ button { color: inherit; }
 .eyebrow { color: #5e6873; font: 500 8px "DM Mono", monospace; letter-spacing: .13em; }
 .live-indicator { display: flex; gap: 6px; align-items: center; color: #758047; font: 500 8px "DM Mono", monospace; }
 .live-indicator i { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 7px rgba(223,248,84,.6); animation: pulse 1.6s infinite; }
-.flow-wrap { height: 468px; position: relative; }
+.flow-wrap { height: 560px; position: relative; }
 .flow-card { position: relative; width: 176px; min-height: 73px; border: 1px solid #293039; background: #11151a; border-radius: 10px; display: grid; grid-template-columns: 34px 1fr 16px; align-items: center; gap: 8px; padding: 11px; box-shadow: 0 10px 26px rgba(0,0,0,.18); transition: .2s ease; }
 .flow-card.is-active { border-color: #69742f; background: #151a14; box-shadow: 0 0 0 1px rgba(223,248,84,.06), 0 14px 35px rgba(0,0,0,.32); }
 .flow-card.is-active::before { content: ""; position: absolute; inset: -1px auto -1px -1px; width: 2px; background: var(--accent); border-radius: 10px 0 0 10px; }
@@ -164,9 +164,10 @@ button { color: inherit; }
 .flow-meta { position: absolute; right: 8px; top: -9px; border: 1px solid #39432a; background: #151a12; color: #b9c967; border-radius: 4px; padding: 2px 5px; font: 8px "DM Mono", monospace; }
 .flow-handle { width: 6px !important; height: 6px !important; border: 1px solid #545e68 !important; background: #171b20 !important; }
 .flow-handle-bottom { top: auto !important; bottom: -3px !important; }
-.rework-label { position: absolute; display: inline-flex; align-items: center; gap: 4px; padding: 3px 7px; border-radius: 999px; background: #1b140d; border: 1px solid rgba(243,166,90,.42); color: #f0b57e; font: 600 9px "DM Mono", monospace; white-space: nowrap; box-shadow: 0 6px 16px rgba(0,0,0,.32); pointer-events: all; cursor: pointer; }
-.rework-label:hover { border-color: rgba(243,166,90,.75); color: #ffd7ac; }
-.rework-label.is-active { background: #2a1d10; border-color: #ffd08a; color: #ffe3bd; }
+.flow-handle-top { bottom: auto !important; top: -3px !important; }
+.rework-label { position: absolute; display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px; border-radius: 999px; background: #1b140d; border: 1px solid rgba(243,166,90,.42); color: #f0b57e; font: 600 10px "DM Mono", monospace; white-space: nowrap; box-shadow: 0 6px 16px rgba(0,0,0,.32); pointer-events: all; cursor: pointer; transition: border-color .15s ease, color .15s ease, background .15s ease, box-shadow .15s ease; }
+.rework-label:hover { border-color: rgba(243,166,90,.75); color: #ffd7ac; box-shadow: 0 6px 16px rgba(0,0,0,.32), 0 0 0 3px rgba(243,166,90,.08); }
+.rework-label.is-active { background: #2a1d10; border-color: #ffd08a; color: #ffe3bd; box-shadow: 0 6px 16px rgba(0,0,0,.32), 0 0 0 3px rgba(243,166,90,.16); }
 /* Round workflow status badge — shared by the pipeline round marker and the
    rework branch labels. Colours: 通过=green, 退回返修=amber, 进行中=blue,
    中止/超时=red, 已规划=grey. Typography follows the panel scale. */
@@ -339,7 +340,7 @@ button { color: inherit; }
   .metrics-grid { grid-template-columns: 1fr 1fr; }
   .metric { min-height: 90px; padding: 12px; }
   .content-grid { grid-template-columns: minmax(0, 1fr); }
-  .flow-wrap { height: 420px; }
+  .flow-wrap { height: 480px; }
   .flow-card { width: 158px; }
   .run-item-delete { opacity: 1; }
   .demo-chip { display: none; }

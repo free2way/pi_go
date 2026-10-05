@@ -9,7 +9,6 @@ import {
   MiniMap,
   Position,
   ReactFlow,
-  getSmoothStepPath,
   type Edge,
   type EdgeProps,
   type Node,
@@ -69,6 +68,7 @@ import { batchCleanupConfirmMessage, cleanupFinishedConfirmMessage, cleanupStora
 import { MAX_BUFFERED_EVENTS, mergeRunEvents, shouldAcceptRun } from "./run-events";
 import { createRunSelectionGuard, eventsForRun, isRunSelected, pickSelectedRun } from "./run-selection";
 import { reworkBranchDetailsFromSummaries, resolveReworkRounds, resolveRoundStatuses } from "./rounds-view";
+import { reworkBranchLayout, reworkBranchPath, type ReworkSide } from "./rework-layout";
 import { ModelsPage } from "./ModelsPage";
 import { SystemStatusPage } from "./SystemStatusPage";
 import { WorkspacesPage } from "./WorkspacesPage";
@@ -142,32 +142,36 @@ function FlowCard({ data }: NodeProps<Node<FlowNodeData>>) {
       <Handle type="source" position={Position.Right} id="main-source" className="flow-handle" />
       <Handle type="target" position={Position.Bottom} id="bottom-target" className="flow-handle flow-handle-bottom" style={{ left: "30%" }} />
       <Handle type="source" position={Position.Bottom} id="bottom-source" className="flow-handle flow-handle-bottom" style={{ left: "70%" }} />
+      {/* Top handles feed the above-the-pipeline rework arches. */}
+      <Handle type="target" position={Position.Top} id="top-target" className="flow-handle flow-handle-top" style={{ left: "30%" }} />
+      <Handle type="source" position={Position.Top} id="top-source" className="flow-handle flow-handle-top" style={{ left: "70%" }} />
     </div>
   );
 }
 
 const nodeTypes = { flowCard: FlowCard };
 
-// Renders a rework branch that dips below the main pipeline instead of
-// travelling back along the original path.
-function ReworkEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, markerEnd, style, data }: EdgeProps) {
+// Renders a rework branch that dips above or below the main pipeline instead of
+// travelling back along the original path. `data.side` selects the direction
+// (and therefore which pair of handles the edge uses); `data.offset` is the
+// dip magnitude produced by `reworkBranchLayout`.
+function ReworkEdge({ id, sourceX, sourceY, targetX, targetY, markerEnd, style, data }: EdgeProps) {
   const label = typeof data?.label === "string" ? data.label : "";
-  const centerY = typeof data?.centerY === "number" ? data.centerY : Math.max(sourceY, targetY) + 96;
+  const side: ReworkSide = data?.side === "above" ? "above" : "below";
+  const offset = typeof data?.offset === "number" ? data.offset : 96;
+  // The apex rail sits one `offset` beyond the outermost handle on the chosen
+  // side, so it follows the assigned side without the caller knowing card sizes.
+  const railY = side === "above"
+    ? Math.min(sourceY, targetY) - offset
+    : Math.max(sourceY, targetY) + offset;
+  const edgePath = reworkBranchPath(sourceX, sourceY, targetX, targetY, railY, side);
+  const labelX = (sourceX + targetX) / 2;
+  const labelY = railY;
   const round = typeof data?.round === "number" ? data.round : undefined;
   const active = data?.active === true;
   const onSelect = typeof data?.onSelect === "function" ? (data.onSelect as (round: number) => void) : undefined;
   const roundStatus = data?.roundStatus as RoundStatus | undefined;
   const roundStatusTip = typeof data?.roundStatusTooltip === "string" ? data.roundStatusTooltip : undefined;
-  const [edgePath, labelX, labelY] = getSmoothStepPath({
-    sourceX,
-    sourceY,
-    targetX,
-    targetY,
-    sourcePosition,
-    targetPosition,
-    borderRadius: 16,
-    centerY,
-  });
   const title = round === undefined
     ? undefined
     : `${roundStatus ? `${roundStatusMeta[roundStatus.status].label} · ${roundStatusTip ?? roundStatusTooltip(roundStatus)}\n` : ""}查看第 ${round} 轮返修原因`;
@@ -289,35 +293,40 @@ function flowForRun(run?: Run, events: RunEvent[] = [], options: FlowOptions = {
     { id: "check-review", source: "checks", target: "reviewer", sourceHandle: "main-source", targetHandle: "main-target", ...edgeDefaults },
     { id: "review-done", source: "reviewer", target: "complete", sourceHandle: "main-source", targetHandle: "main-target", ...edgeDefaults },
   ];
-  // Each return round is drawn as its own branch below the pipeline rather
-  // than as a reverse traversal over the original edges. Only real review
-  // returns qualify — checks failures advance the round without the reviewer.
+  // Each return round is drawn as its own branch rather than as a reverse
+  // traversal over the original edges. Only real review returns qualify — checks
+  // failures advance the round without the reviewer. `reworkBranchLayout`
+  // alternates the branches above/below the pipeline and staggers same-side
+  // dips so they never overlap; the edge uses the matching top/bottom handles.
   const eventReturns = reworkBranchRounds(events);
   const returns = resolveReworkRounds(options.roundSummaries, eventReturns);
-  for (const [index, round] of returns.entries()) {
+  for (const { round, side, offset } of reworkBranchLayout(returns)) {
     // The branch badge follows the round the branch leads into (the repair it
     // opens), not the returned round's terminal `已退回返修`; clicks still open the
     // returned round's ReworkDetail via `round`/`onSelect`.
     const branch = branchStatus(statuses, round);
+    const active = options.selectedReworkRound === round;
     edges.push({
       id: `rework-${round}`,
       source: "reviewer",
       target: "developer",
-      sourceHandle: "bottom-source",
-      targetHandle: "bottom-target",
+      sourceHandle: side === "above" ? "top-source" : "bottom-source",
+      targetHandle: side === "above" ? "top-target" : "bottom-target",
       type: "rework",
       data: {
         label: `round ${round} · 返修`,
-        centerY: 208 + index * 54,
+        side,
+        offset,
         round,
         roundStatus: branch.status,
         roundStatusTooltip: branch.tooltip,
-        active: options.selectedReworkRound === round,
+        active,
         onSelect: options.onReworkSelect,
       },
       style: {
-        stroke: options.selectedReworkRound === round ? "#ffd08a" : "#f3a65a",
-        strokeWidth: options.selectedReworkRound === round ? 2.2 : 1.5,
+        stroke: active ? "#ffd08a" : "#f3a65a",
+        // Branch strokes stay a touch thinner than the main pipeline (1.5).
+        strokeWidth: active ? 2 : 1.2,
         strokeDasharray: "5 4",
       },
       markerEnd: { type: MarkerType.ArrowClosed, width: 15, height: 15, color: "#f3a65a" },
@@ -1478,7 +1487,10 @@ export function App() {
                       instance: `fitView` only runs on mount, so reusing the
                       instance across a run switch could leave the new topology
                       panned/zoomed off-screen (a blank canvas). */}
-                  <ReactFlow key={activeRun.id} nodes={flow.nodes} edges={flow.edges} nodeTypes={nodeTypes} edgeTypes={edgeTypes} fitView minZoom={0.6} maxZoom={1.4} nodesDraggable={false} nodesConnectable={false} elementsSelectable={false} proOptions={{ hideAttribution: true }}>
+                  {/* `fitViewOptions.padding` leaves room around the node box so
+                      the above/below rework arches are not clipped; `fitView`
+                      still runs on mount for every run thanks to the key. */}
+                  <ReactFlow key={activeRun.id} nodes={flow.nodes} edges={flow.edges} nodeTypes={nodeTypes} edgeTypes={edgeTypes} fitView fitViewOptions={{ padding: 0.18 }} minZoom={0.6} maxZoom={1.4} nodesDraggable={false} nodesConnectable={false} elementsSelectable={false} proOptions={{ hideAttribution: true }}>
                     <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#252a31" />
                     <Controls showInteractive={false} />
                     <MiniMap pannable={false} zoomable={false} nodeColor={(node) => node.data.status === "active" ? "#e6ff62" : "#353b44"} maskColor="rgba(8,10,13,.76)" />
