@@ -539,7 +539,7 @@ app.get("/api/health", async (_request, reply) => {
   try {
     await pingDatabase();
     alerts.clear("database_unavailable");
-    return { status: "ok", service: "pigo-web", version: "0.23.1", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.23.2", db: "ok" };
   } catch (error) {
     // AT-REL-005: fail loudly instead of pretending the service is healthy.
     alerts.raise({
@@ -548,7 +548,7 @@ app.get("/api/health", async (_request, reply) => {
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
       details: { error: (error as Error).message.slice(0, 200) },
     });
-    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.23.1", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.23.2", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
   }
 });
 
@@ -563,7 +563,7 @@ interface StorageStatus {
 app.get("/api/health/detail", async (request, reply) => {
   const internal = safeTokenMatch(request.headers.authorization);
   if (!internal && !auth.user(request)) return reply.code(401).send({ error: "Unauthorized" });
-  const health: Record<string, unknown> = { version: "0.23.1", at: new Date().toISOString() };
+  const health: Record<string, unknown> = { version: "0.23.2", at: new Date().toISOString() };
   try {
     await pingDatabase();
     health.database = { status: "ok" };
@@ -1024,7 +1024,7 @@ app.get<{ Params: { id: string } }>("/api/runs/:id/patch", async (request, reply
  * When the feature is not configured the route refuses clearly with 409
  * MERGE_REQUEST_NOT_CONFIGURED (it is never silently skipped).
  */
-app.post<{ Params: { id: string } }>("/api/runs/:id/merge-request", async (request, reply) => {
+app.post<{ Params: { id: string } }>("/api/runs/:id/merge-request", { bodyLimit: 1024 * 1024 }, async (request, reply) => {
   const actionLimit = runActions.check(auth.user(request).id);
   if (!actionLimit.allowed) return tooManyRequests(reply, actionLimit.retryAfterMs);
   const run = store.getRun(request.params.id, ownerKeysFor(request));
@@ -1392,7 +1392,7 @@ async function acceptanceSnapshotFor(run: Run, input: {
   });
 }
 
-app.post<{ Params: { id: string } }>("/api/runs/:id/approve", async (request, reply) => {
+app.post<{ Params: { id: string } }>("/api/runs/:id/approve", { bodyLimit: 1024 * 1024 }, async (request, reply) => {
   const actionLimit = runActions.check(auth.user(request).id);
   if (!actionLimit.allowed) return tooManyRequests(reply, actionLimit.retryAfterMs);
   const parsed = approveSchema.safeParse(request.body ?? {});
@@ -1524,7 +1524,7 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/approve", async (request, re
   return { ...updated, acceptedOpenFindings: plan.openFindings, acceptance, ...(merge ? { merge } : {}), ...(deploy ? { deploy } : {}) };
 });
 
-app.post<{ Params: { id: string } }>("/api/runs/:id/reject", async (request, reply) => {
+app.post<{ Params: { id: string } }>("/api/runs/:id/reject", { bodyLimit: 1024 * 1024 }, async (request, reply) => {
   const actionLimit = runActions.check(auth.user(request).id);
   if (!actionLimit.allowed) return tooManyRequests(reply, actionLimit.retryAfterMs);
   const parsed = rejectSchema.safeParse(request.body ?? {});
@@ -1573,7 +1573,7 @@ const reopenSchema = z.object({
   confirm: z.boolean().optional(),
 });
 
-app.post<{ Params: { id: string } }>("/api/runs/:id/reopen", async (request, reply) => {
+app.post<{ Params: { id: string } }>("/api/runs/:id/reopen", { bodyLimit: 1024 * 1024 }, async (request, reply) => {
   const actionLimit = runActions.check(auth.user(request).id);
   if (!actionLimit.allowed) return tooManyRequests(reply, actionLimit.retryAfterMs);
   const parsed = reopenSchema.safeParse(request.body ?? {});
@@ -1702,7 +1702,7 @@ const batchSchema = z.object({
   deleteRunDirectory: z.boolean().default(true),
 });
 
-app.post("/api/runs/batch", async (request, reply) => {
+app.post("/api/runs/batch", { bodyLimit: 1024 * 1024 }, async (request, reply) => {
   const actionLimit = runActions.check(auth.user(request).id);
   if (!actionLimit.allowed) return tooManyRequests(reply, actionLimit.retryAfterMs);
   const parsed = batchSchema.safeParse(request.body ?? {});
@@ -1953,13 +1953,13 @@ async function dispatchFollowupJob(
   }
 }
 
-app.post<{ Params: { id: string } }>("/api/runs/:id/resume", async (request, reply) => {
+app.post<{ Params: { id: string } }>("/api/runs/:id/resume", { bodyLimit: 1024 * 1024 }, async (request, reply) => {
   const parsed = resumeSchema.safeParse(request.body ?? {});
   if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
   return dispatchFollowupJob(request, reply, { kind: "resume", instruction: parsed.data.instruction });
 });
 
-app.post<{ Params: { id: string } }>("/api/runs/:id/retry-review", async (request, reply) => {
+app.post<{ Params: { id: string } }>("/api/runs/:id/retry-review", { bodyLimit: 1024 * 1024 }, async (request, reply) => {
   return dispatchFollowupJob(request, reply, { kind: "retry-review" });
 });
 
