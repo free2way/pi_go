@@ -45,7 +45,7 @@ import { captureSnapshotHash } from "./snapshot-hash.js";
 import { startRunDeadline } from "./run-deadline.js";
 import { detectProjectPlugins, pluginArguments, pluginMounts, selectPlugins, verifyPluginPins, type PluginDenial } from "./plugin-policy.js";
 import { buildPluginPolicy } from "./plugin-registry.js";
-import { CliSessionManager, SessionAccumulator, planPiSession, type PiSessionRole } from "./pi-session.js";
+import { CliSessionManager, SessionAccumulator, planPiSession, sessionReuseEnabled, type PiSessionRole } from "./pi-session.js";
 
 const port = Number(process.env.PORT || 3200);
 const host = process.env.HOST || "localhost";
@@ -175,6 +175,11 @@ const requirePluginPin = process.env.PI_PLUGIN_REQUIRE_PIN === "true";
 const pluginContainerBase = process.env.PI_PLUGIN_CONTAINER_DIR || "/opt/pigo/plugins";
 /** Sprint 2: single CLI-backed Pi session manager (adds instrumentation only). */
 const cliSessionManager = new CliSessionManager();
+/**
+ * Sprint 2 A/B switch, read once here so the decision is a plain boolean at the
+ * call site (never an env lookup deep inside `runPiWithRetry`). Default on.
+ */
+const sessionReuse = sessionReuseEnabled();
 
 const reportedPluginEvents = new Set<string>();
 async function reportPluginPolicy(runId: string, round: number, enabled: string[], denials: PluginDenial[]) {
@@ -975,7 +980,7 @@ async function runPiWithRetry(
   context: { runId: string; round: number; label: string; role: PiSessionRole; sessionKey?: string; retry?: boolean; budget?: RunBudgetContext; sessions?: SessionAccumulator },
 ) {
   const budget = context.budget;
-  const plan = planPiSession({ role: context.role, run: context.runId, round: context.round, retry: context.retry, key: context.sessionKey });
+  const plan = planPiSession({ role: context.role, run: context.runId, round: context.round, retry: context.retry, key: context.sessionKey, reuse: sessionReuse });
   // Sprint 2: the CLI session manager wraps the existing invocation (same
   // session id, same retry/budget behaviour) and reports per-session metrics.
   const call = await cliSessionManager.execute({

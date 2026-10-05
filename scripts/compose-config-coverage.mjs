@@ -84,6 +84,8 @@ export const CRITICAL_ENV = {
     "PI_PROVIDER_BACKOFF_MS",
     "PI_PROVIDER_MAX_BACKOFF_MS",
     "PI_PLANNER_THINKING",
+    // Sprint 2 session-reuse A/B switch (default on)
+    "PI_SESSION_REUSE",
     "PI_CALLBACK_MAX_BYTES",
     "PI_WORKSPACE_LOCK_STALE_SECONDS",
     // identity / sandbox plumbing

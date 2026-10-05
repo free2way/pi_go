@@ -21,6 +21,10 @@ import type { PiUsage } from "./pi-events.js";
  * | integrator  | `<run>-integrator`    | round > 1                    |
  * | sub-agent   | `<run>-sub-<taskId>`  | round > 1                    |
  * | reviewer    | none (`--no-session`) | never (fresh per round)      |
+ *
+ * Sprint 2 A/B switch: `PI_SESSION_REUSE=off|0|false|no` (default on) makes the
+ * stateful roles above use a per-round session id (`<run>-<key>-r<round>`), i.e.
+ * no cross-round continuity, without touching planner/reviewer semantics.
  */
 export type PiSessionRole = "planner" | "developer" | "sub-agent" | "integrator" | "reviewer";
 
@@ -43,6 +47,14 @@ export interface PiSessionPlanInput {
    * `sub-<taskId>`.
    */
   key?: string;
+  /**
+   * Sprint 2 A/B switch (`PI_SESSION_REUSE`, default on). When `false`, a
+   * stateful role gets a *per-round* session id instead of one id reused across
+   * repair rounds, so every round starts fresh. Planner/reviewer are unaffected
+   * (they are already stateless / per-round). Defaults to `true`, which is the
+   * historical behaviour.
+   */
+  reuse?: boolean;
 }
 
 export interface PiSessionPlan {
@@ -78,9 +90,25 @@ export function planPiSession(input: PiSessionPlanInput): PiSessionPlan {
     return { role: input.role, round, metricsId: `${prefix}-review-r${round}${suffix}`, resume: false, fresh: true };
   }
   const key = input.key && input.key.trim() ? input.key.trim() : input.role;
+  if (input.reuse === false) {
+    // A/B arm: no cross-round continuity. A per-round id guarantees Pi creates
+    // a brand-new session each round instead of continuing the previous one.
+    const sessionId = `${prefix}-${key}-r${round}${input.retry ? "-retry" : ""}`;
+    return { role: input.role, round, sessionId, metricsId: sessionId, resume: false, fresh: true };
+  }
   const sessionId = `${prefix}-${key}`;
   const resume = round > 1 && !input.retry;
   return { role: input.role, round, sessionId, metricsId: sessionId, resume, fresh: !resume };
+}
+
+/**
+ * Strict `PI_SESSION_REUSE` parsing: only `off`, `0`, `false` and `no`
+ * (case-insensitive, trimmed) disable developer/integrator session reuse;
+ * anything else — including unset — leaves the default (reuse) on.
+ */
+export function sessionReuseEnabled(value: string | undefined = process.env.PI_SESSION_REUSE): boolean {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  return !["off", "0", "false", "no"].includes(normalized);
 }
 
 /** True when the role keeps a Pi session across repair rounds. */
@@ -100,6 +128,14 @@ export interface SessionMetrics {
   cacheReadTokens: number;
   cacheWriteTokens: number;
   modelCalls: number;
+  /**
+   * Sprint 2: provider-reported cost for this invocation (from Pi's
+   * `usage.cost.total`). It is emitted on the `session.metrics` event so the
+   * read-only reuse report can attribute cost to a round/role; it is *not*
+   * persisted in `RunSessionSummary` (that stays a token-only view and the run's
+   * `usage.estimatedCost` remains the single authoritative total).
+   */
+  estimatedCost: number;
 }
 
 function nonNegativeInt(value: number): number {
@@ -129,6 +165,7 @@ export function buildSessionMetrics(
     cacheReadTokens: nonNegativeInt(usage.cacheRead),
     cacheWriteTokens: nonNegativeInt(usage.cacheWrite),
     modelCalls: nonNegativeInt(modelCalls),
+    estimatedCost: Number.isFinite(usage.cost) && usage.cost > 0 ? usage.cost : 0,
   };
 }
 

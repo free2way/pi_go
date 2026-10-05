@@ -8,6 +8,7 @@ import {
   isStatefulPiSessionRole,
   mergeSessionMetrics,
   planPiSession,
+  sessionReuseEnabled,
   type PiSessionPlan,
   type SessionMetrics,
 } from "./pi-session.js";
@@ -72,6 +73,61 @@ describe("planPiSession (Sprint 2)", () => {
   });
 });
 
+describe("PI_SESSION_REUSE switch (Sprint 2 A/B)", () => {
+  it("keeps the historical reuse behaviour when `reuse` is omitted (default on)", () => {
+    const r1 = planPiSession({ role: "developer", run: "run_abc", round: 1 });
+    const r2 = planPiSession({ role: "developer", run: "run_abc", round: 2 });
+    expect(r1.sessionId).toBe("run-abc-developer");
+    expect(r2.sessionId).toBe("run-abc-developer");
+    expect(r2.resume).toBe(true);
+  });
+
+  it("creates a fresh per-round developer/integrator session when reuse is off", () => {
+    const r1 = planPiSession({ role: "developer", run: "run_abc", round: 1, reuse: false });
+    const r2 = planPiSession({ role: "developer", run: "run_abc", round: 2, reuse: false });
+    expect(r1.sessionId).toBe("run-abc-developer-r1");
+    expect(r2.sessionId).toBe("run-abc-developer-r2");
+    expect(r1.sessionId).not.toBe(r2.sessionId);
+    expect(r1.resume).toBe(false);
+    expect(r2.resume).toBe(false);
+    expect(r2.fresh).toBe(true);
+    expect(r2.metricsId).toBe("run-abc-developer-r2");
+
+    const integrator = planPiSession({ role: "integrator", run: "run_abc", round: 2, reuse: false });
+    expect(integrator.sessionId).toBe("run-abc-integrator-r2");
+  });
+
+  it("gives each sub-agent task its own fresh per-round session when reuse is off", () => {
+    const sub = planPiSession({ role: "sub-agent", run: "run_abc", round: 3, key: "sub-t1", reuse: false });
+    expect(sub.sessionId).toBe("run-abc-sub-t1-r3");
+    expect(sub.resume).toBe(false);
+  });
+
+  it("leaves planner/reviewer semantics unchanged when reuse is off", () => {
+    const planner = planPiSession({ role: "planner", run: "run_abc", round: 2, reuse: false });
+    expect(planner.sessionId).toBeUndefined();
+    expect(planner.metricsId).toBe("run-abc-plan");
+
+    const reviewer = planPiSession({ role: "reviewer", run: "run_abc", round: 2, reuse: false });
+    expect(reviewer.sessionId).toBeUndefined();
+    expect(reviewer.metricsId).toBe("run-abc-review-r2");
+  });
+});
+
+describe("sessionReuseEnabled (strict PI_SESSION_REUSE parsing)", () => {
+  it("disables only on off/0/false/no (case-insensitive, trimmed)", () => {
+    for (const value of ["off", "OFF", " off ", "0", "false", "False", "no", "NO"]) {
+      expect(sessionReuseEnabled(value)).toBe(false);
+    }
+  });
+
+  it("stays enabled for unset and any other value (default on)", () => {
+    for (const value of [undefined, "", "on", "1", "true", "yes", "offf"]) {
+      expect(sessionReuseEnabled(value)).toBe(true);
+    }
+  });
+});
+
 describe("buildSessionMetrics", () => {
   it("reflects the invocation usage without inventing numbers", () => {
     const plan = planPiSession({ role: "developer", run: "run_abc", round: 2 });
@@ -87,7 +143,14 @@ describe("buildSessionMetrics", () => {
       cacheReadTokens: 6,
       cacheWriteTokens: 1,
       modelCalls: 2,
+      estimatedCost: 0,
     });
+  });
+
+  it("carries the provider-reported cost when one is present (Sprint 2 report)", () => {
+    const plan = planPiSession({ role: "reviewer", run: "run_abc", round: 1 });
+    const metrics = buildSessionMetrics(plan, 10, { ...usage({ input: 1, output: 1 }), cost: 0.0123 }, 1);
+    expect(metrics.estimatedCost).toBe(0.0123);
   });
 });
 
@@ -103,6 +166,7 @@ describe("mergeSessionMetrics", () => {
     cacheReadTokens: 0,
     cacheWriteTokens: 0,
     modelCalls: 0,
+    estimatedCost: 0,
     ...over,
   });
 
