@@ -6,7 +6,6 @@ import {
   EdgeLabelRenderer,
   Handle,
   MarkerType,
-  MiniMap,
   Position,
   ReactFlow,
   type Edge,
@@ -1683,7 +1682,6 @@ export function App() {
                   <ReactFlow key={activeRun.id} nodes={flow.nodes} edges={flow.edges} nodeTypes={nodeTypes} edgeTypes={edgeTypes} fitView fitViewOptions={{ padding: 0.18 }} minZoom={0.6} maxZoom={1.4} nodesDraggable={false} nodesConnectable={false} elementsSelectable={false} proOptions={{ hideAttribution: true }}>
                     <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#252a31" />
                     <Controls showInteractive={false} />
-                    <MiniMap pannable={false} zoomable={false} nodeColor={(node) => node.data.status === "active" ? "#e6ff62" : "#353b44"} maskColor="rgba(8,10,13,.76)" />
                   </ReactFlow>
                   {selectedRework && <ReworkDetail detail={selectedRework} onJumpToChat={jumpToChat} onClose={() => setReworkRound(null)} />}
                 </div>
