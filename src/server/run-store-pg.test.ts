@@ -217,6 +217,22 @@ describe("PostgresRunStore", () => {
     expect(Number(count.total)).toBe(1);
   });
 
+  it("persists the content stable_key for findings, even without a stored fingerprint", async () => {
+    const db = await createTestDb();
+    const store = new PostgresRunStore(db);
+    await store.init();
+    const run = makeRun();
+    await store.createRun(run, event(run.id, "run.created"));
+
+    const finding = { id: "F1", severity: "high" as const, file: "./src/Auth/Session.ts", line: 3, title: "-  Refresh   Race Condition. ", evidence: "x", requiredChange: "y", resolved: false };
+    await store.updateRun(run.id, { findings: [finding] });
+
+    const row = (await db.query("SELECT stable_key, fingerprint FROM run_findings WHERE run_id = $1", [run.id])).rows[0];
+    expect(String(row.stable_key)).toBe("src/auth/session.ts|refresh race condition");
+    // No fingerprint was supplied, so the column keeps the computed key too.
+    expect(row.fingerprint).toBeNull();
+  });
+
   it("rejects illegal state transitions and keeps the cache consistent (AUD-15)", async () => {
     const db = await createTestDb();
     const store = new PostgresRunStore(db);

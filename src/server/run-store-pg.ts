@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Run, RunEvent } from "../shared/types.js";
+import { findingFingerprint } from "../shared/finding-fingerprint.js";
 import type { Db } from "./db.js";
 import { mergeHumanNotes } from "./run-notes.js";
 import type {
@@ -843,18 +844,22 @@ export class PostgresRunStore implements RunStoreLike {
     }
     await tx.query("DELETE FROM run_findings WHERE run_id = $1", [run.id]);
     for (const finding of run.findings ?? []) {
-      // AUD-11: findings are upserted by their stable identity, so a reviewer that
-      // repeats an id (or reuses it across rounds) can never hit a primary key
-      // conflict; observation history is preserved instead.
+      // AUD-11 / incident run_e7c565d6335a4bc7: findings are upserted by their
+      // stable identity, so a reviewer that repeats an id (or reuses it across
+      // rounds) can never hit a primary key conflict; observation history is
+      // preserved instead. `stable_key` is the content fingerprint shared with
+      // the worker, so cross-round grouping matches on both sides.
+      const stableKey = finding.fingerprint ?? findingFingerprint(finding);
       await tx.query(
-        `INSERT INTO run_findings (run_id, finding_id, severity, file, line, title, resolved, fingerprint, first_seen_round, last_seen_round, observations, consecutive_rounds)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        `INSERT INTO run_findings (run_id, finding_id, severity, file, line, title, resolved, fingerprint, first_seen_round, last_seen_round, observations, consecutive_rounds, stable_key)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
          ON CONFLICT (run_id, finding_id) DO UPDATE SET
            severity = $3, file = $4, line = $5, title = $6, resolved = $7,
            fingerprint = COALESCE($8, run_findings.fingerprint),
            first_seen_round = COALESCE(run_findings.first_seen_round, $9),
            last_seen_round = COALESCE($10, run_findings.last_seen_round),
-           observations = $11, consecutive_rounds = $12`,
+           observations = $11, consecutive_rounds = $12,
+           stable_key = COALESCE($13, run_findings.stable_key)`,
         [
           run.id,
           finding.id,
@@ -868,6 +873,7 @@ export class PostgresRunStore implements RunStoreLike {
           finding.lastSeenRound ?? null,
           finding.observations ?? 1,
           finding.consecutiveRounds ?? 0,
+          stableKey,
         ],
       );
     }

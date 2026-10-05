@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
+import { findingFingerprint } from "../shared/finding-fingerprint.js";
 
 export type QueryResult = { rows: Record<string, unknown>[] };
 
@@ -443,6 +444,23 @@ export const databaseMigrations: Migration[] = [
       CREATE INDEX idx_agile_release_audit_release ON agile_release_audit(release_id, created_at);
     `,
   },
+  {
+    // Incident run_e7c565d6335a4bc7: cross-round finding identity must not depend
+    // on the model-provided id. `stable_key` is the content fingerprint
+    // (`<normalized file>|<normalized title>`, see src/shared/finding-fingerprint)
+    // so a reworded/re-id'd repeat is recognised as the SAME finding.
+    //
+    // Legacy rows are back-filled in JS after the migration (`findings` come from
+    // the run document, and pg-mem — used by the tests — supports neither
+    // `trim`/`btrim` nor `regexp_replace`, so a faithful SQL normalization is not
+    // portable). A NULL key is always valid and is recomputed on read.
+    id: 13,
+    name: "finding-stable-key",
+    sql: `
+      ALTER TABLE run_findings ADD COLUMN stable_key TEXT;
+      CREATE INDEX idx_run_findings_stable ON run_findings(run_id, stable_key);
+    `,
+  },
 ];
 
 export async function runMigrations(db: Db) {
@@ -474,6 +492,27 @@ export async function runMigrations(db: Db) {
       ]);
     });
   }
+  await backfillFindingStableKeys(db);
+}
+
+/**
+ * Best-effort back-fill of `run_findings.stable_key` for legacy rows written
+ * before the content fingerprint existed. Rows that already carry a key are left
+ * untouched, and a row whose key cannot be derived (empty title/file) still gets
+ * a deterministic placeholder key. Idempotent: only NULL keys are updated.
+ */
+export async function backfillFindingStableKeys(db: Db) {
+  const rows = (
+    await db.query("SELECT run_id, finding_id, file, title FROM run_findings WHERE stable_key IS NULL")
+  ).rows as Array<{ run_id: string; finding_id: string; file: string | null; title: string | null }>;
+  for (const row of rows) {
+    await db.query("UPDATE run_findings SET stable_key = $1 WHERE run_id = $2 AND finding_id = $3", [
+      findingFingerprint({ file: row.file, title: row.title }),
+      row.run_id,
+      row.finding_id,
+    ]);
+  }
+  return rows.length;
 }
 
 export function newId(prefix: string) {

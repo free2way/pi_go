@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { databaseMigrations, newId, runMigrations } from "./db.js";
+import { backfillFindingStableKeys, databaseMigrations, newId, runMigrations } from "./db.js";
 import { createTestDb } from "./test-db.js";
 
 describe("database", () => {
@@ -20,5 +20,19 @@ describe("database", () => {
   it("generates prefixed ids", () => {
     expect(newId("ws")).toMatch(/^ws_[a-f0-9]{20}$/);
     expect(newId("ws")).not.toBe(newId("ws"));
+  });
+
+  it("adds run_findings.stable_key and back-fills legacy NULL rows", async () => {
+    const db = await createTestDb();
+    await db.query(
+      "INSERT INTO run_findings (run_id, finding_id, severity, file, line, title, resolved, stable_key) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+      ["run_legacy", "F1", "high", "./src/Auth/Session.ts", 3, "-  Refresh  Race. ", 0, null],
+    );
+    const updated = await backfillFindingStableKeys(db);
+    expect(updated).toBe(1);
+    const row = (await db.query("SELECT stable_key FROM run_findings WHERE run_id = 'run_legacy'")).rows[0];
+    expect(String(row.stable_key)).toBe("src/auth/session.ts|refresh race");
+    // Idempotent: nothing left to back-fill.
+    expect(await backfillFindingStableKeys(db)).toBe(0);
   });
 });

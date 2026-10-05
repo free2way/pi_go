@@ -20,7 +20,8 @@ import { runHardenedGit } from "./git-hardening.js";
 import { apiKeyEnvName, classifyProviderError, providerErrorSummary } from "./provider-errors.js";
 import { sleep } from "./provider-retry.js";
 import { parseReview, type ReviewResult } from "./review-protocol.js";
-import { convergenceGuardEnabled, convergenceStop } from "./review-convergence.js";
+import { convergenceGuardEnabled, convergenceStop, reviewStallRounds } from "./review-convergence.js";
+import { buildReviewDiff } from "./review-input.js";
 import { blockingFindings, deferredFindings, deferredMessage, isDeferral, resolveReviewScope, shouldAcceptRound } from "./review-scope.js";
 import { buildContainerSpec, hostPathFor, resolveSandboxMode } from "./sandbox.js";
 import { mergeFindings, repeatedSevereFindings, severeRepeatThreshold, unresolvedFeedback } from "./review-findings.js";
@@ -78,6 +79,9 @@ const criticalFreeDiskMb = Math.max(32, Number(process.env.PI_CRITICAL_FREE_DISK
 // critical/high finding count has not decreased for two consecutive rounds,
 // before it burns another repair round. Default on; `off` disables it.
 const reviewConvergenceGuardEnabled = convergenceGuardEnabled();
+// incident run_e7c565d6335a4bc7: also stop when the SAME batch of blocking
+// findings (stable key) is re-reported for PI_REVIEW_STALL_ROUNDS rounds.
+const reviewStallRoundsThreshold = reviewStallRounds();
 
 export type StorageStatus = {
   state: "ok" | "low" | "critical";
@@ -1528,14 +1532,21 @@ async function performReview(input: {
   budget?: RunBudgetContext;
   sessions?: SessionAccumulator;
 }): Promise<ReviewOutcome> {
+  // COST/latency (incident run_e7c565d6335a4bc7): the diff handed to the reviewer
+  // is budget-trimmed (lockfiles/build outputs excluded, per-file and total byte
+  // caps) and always carries a manifest of everything excluded or trimmed, so the
+  // reviewer sees what it is NOT being shown instead of silently losing context.
+  const reviewInput = buildReviewDiff(input.diff);
   const reviewPrompt = [
     "You are an independent read-only code reviewer. Do not modify files.",
     `Original task: ${input.run.task}`,
     "Review the current repository and the diff below for correctness, missing requirements, security, regressions, and test quality.",
+    "The diff may be budget-trimmed: a trailing [PiGO review input manifest] lists every excluded or trimmed file with +A/-B stats and the reason.",
+    "Lockfiles (package-lock.json/yarn.lock/pnpm-lock.yaml/*.lock) and build outputs (dist/, build/, node_modules/) are excluded unless the original task explicitly targets them. Flag out-of-scope changes (e.g. docs or lockfile edits unrelated to the task) as findings.",
     "Return JSON only with this exact shape:",
     '{"verdict":"approved|changes_requested","summary":"...","findings":[{"id":"...","severity":"critical|high|medium|low","file":null,"line":null,"title":"...","evidence":"...","requiredChange":"..."}]}',
     "Use changes_requested only for actionable defects. approved must not contain critical/high/medium findings.",
-    `Diff:\n${input.diff.slice(0, 90_000)}`,
+    `Diff:\n${reviewInput.text}`,
   ].join("\n\n");
   let firstReview: { text: string; usage: UsageTotals };
   await chat(input.run, "reviewer", "orchestrator", "reviewer", "prompt", reviewPrompt, input.signal);
@@ -2124,6 +2135,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
         findings,
         currentRound: round,
         enabled: reviewConvergenceGuardEnabled,
+        requiredUnresolvedRounds: reviewStallRoundsThreshold,
       });
       if (convergence.stop) {
         await update(run, "needs_human", "reviewer", "review.not_converging", convergence.message, {
@@ -2132,7 +2144,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
           checkSnapshot,
           reviewSnapshot,
           checkPassed: checked.passed,
-          summary: "审核未收敛，已停止自动返修并转人工处理",
+          summary: convergence.message ? convergence.message.slice(0, 300) : "审核未收敛，已停止自动返修并转人工处理",
           usage: toRunUsage(usage),
           durationMs: Date.now() - started,
         }, { diffArtifact: reviewDiffArtifact, meta: convergence.meta });

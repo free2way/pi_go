@@ -1,16 +1,12 @@
-import { createHash } from "node:crypto";
 import type { Finding } from "../shared/types.js";
+import { findingFingerprint } from "../shared/finding-fingerprint.js";
 
-/**
- * AUD-11 / GAP-03: stable identity for a reported problem. Reviewers often reuse
- * an id (or drop it) across rounds, so identity must not depend on the model's
- * id choice alone: severity-independent fingerprint of file + normalized title.
- */
-export function findingFingerprint(finding: Pick<Finding, "file" | "title" | "requiredChange">) {
-  const title = finding.title.toLowerCase().replace(/\s+/g, " ").trim();
-  const required = finding.requiredChange.toLowerCase().replace(/\s+/g, " ").trim().slice(0, 200);
-  return createHash("sha256").update(`${finding.file ?? ""}\n${title}\n${required}`).digest("hex").slice(0, 32);
-}
+// AUD-11 / GAP-03 / incident run_e7c565d6335a4bc7: identity is the content-based
+// stable key (file + normalized title), so a reviewer that renames the id or
+// rewords the title across rounds still increments the SAME finding's streak.
+// The pure implementation lives in `src/shared` so the server persists the very
+// same key into `run_findings.stable_key`.
+export { findingFingerprint };
 
 export interface MergeOptions {
   /** Round the incoming review belongs to (used for observation history). */
@@ -22,8 +18,10 @@ export interface MergeOptions {
 /**
  * AUD-11: merges a new review into the existing finding list.
  *
- * - A problem that was already reported keeps its identity (matched by id or
- *   fingerprint): severity/evidence are refreshed and the round counters grow.
+ * - A problem that was already reported keeps its identity. Matching is by the
+ *   content-based stable key FIRST (file + normalized title), with the
+ *   model-provided id only as a fallback, so a reworded or re-id'd repeat
+ *   increments the same finding's streak instead of creating a new row.
  * - Previously reported problems are NOT silently marked resolved. They stay
  *   open until a review approves the snapshot, which is the only signal that the
  *   reviewer considers them addressed.
@@ -37,12 +35,18 @@ export function mergeFindings(
   const round = options.round ?? 1;
   const merged = previous.map((item) => ({ ...item }));
   const byId = new Map(merged.map((item, index) => [item.id, index]));
-  const byFingerprint = new Map(merged.map((item, index) => [item.fingerprint ?? findingFingerprint(item), index]));
+  // Index by the content key recomputed on read (so a legacy/older-stored
+  // fingerprint still matches) and, additionally, by whatever key was persisted.
+  const byFingerprint = new Map<string, number>();
+  merged.forEach((item, index) => {
+    byFingerprint.set(findingFingerprint(item), index);
+    if (item.fingerprint && !byFingerprint.has(item.fingerprint)) byFingerprint.set(item.fingerprint, index);
+  });
   const matched = new Set<number>();
 
   for (const raw of incoming) {
     const fingerprint = findingFingerprint(raw);
-    const existingIndex = byId.get(raw.id) ?? byFingerprint.get(fingerprint);
+    const existingIndex = byFingerprint.get(fingerprint) ?? byId.get(raw.id);
     const observed: Finding = {
       ...raw,
       resolved: false,
@@ -70,7 +74,9 @@ export function mergeFindings(
       file: raw.file,
       line: raw.line,
       resolved: false,
-      fingerprint: current.fingerprint ?? fingerprint,
+      // Identity is content-based; refresh it to the key of the current
+      // observation (equal for a correctly re-worded repeat).
+      fingerprint,
       firstSeenRound: current.firstSeenRound ?? current.lastSeenRound ?? round,
       lastSeenRound: round,
       observations: (current.observations ?? 1) + 1,
@@ -78,7 +84,7 @@ export function mergeFindings(
     };
     matched.add(existingIndex);
     byId.set(current.id, existingIndex);
-    byFingerprint.set(current.fingerprint ?? fingerprint, existingIndex);
+    byFingerprint.set(fingerprint, existingIndex);
   }
 
   if (options.approved) {
@@ -87,7 +93,7 @@ export function mergeFindings(
     const reportedFingerprints = new Set(incoming.map((item) => findingFingerprint(item)));
     const reportedIds = new Set(incoming.map((item) => item.id));
     return merged.map((item) => {
-      const reportedNow = reportedIds.has(item.id) || reportedFingerprints.has(item.fingerprint ?? findingFingerprint(item));
+      const reportedNow = reportedIds.has(item.id) || reportedFingerprints.has(findingFingerprint(item));
       if (reportedNow) return item;
       return { ...item, resolved: true, consecutiveRounds: 0 };
     });

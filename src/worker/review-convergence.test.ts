@@ -6,11 +6,18 @@ import {
   convergenceHistory,
   convergenceStop,
   convergenceVerdict,
+  defaultReviewStallRounds,
   requiredStalledRounds,
+  reviewStallRounds,
 } from "./review-convergence.js";
 
 function incoming(id: string, severity: Finding["severity"]): Omit<Finding, "resolved"> {
   return { id, severity, file: null, line: null, title: id, evidence: "evidence", requiredChange: "change" };
+}
+
+/** A reworded/re-id'd version of the same defect (same file + normalized title). */
+function repeated(id: string, severity: Finding["severity"] = "high"): Omit<Finding, "resolved"> {
+  return { id, severity, file: "src/agile/story.ts", line: 12, title: "- 解除阻塞后没有恢复之前状态。", evidence: "e", requiredChange: "c" };
 }
 
 /** Builds merged findings across review rounds, the same way the worker does. */
@@ -137,5 +144,96 @@ describe("convergenceVerdict / convergenceStop (early stop before another repair
     expect((stop.meta.perRound as unknown[])).toHaveLength(3);
 
     expect(convergenceStop({ findings, currentRound: 3, enabled: false })).toEqual({ stop: false });
+  });
+});
+
+describe("reviewStallRounds (PI_REVIEW_STALL_ROUNDS)", () => {
+  it("defaults to 3 and only accepts integers >= 2", () => {
+    expect(defaultReviewStallRounds).toBe(3);
+    expect(reviewStallRounds(undefined)).toBe(3);
+    expect(reviewStallRounds("")).toBe(3);
+    expect(reviewStallRounds("  ")).toBe(3);
+    expect(reviewStallRounds("3")).toBe(3);
+    expect(reviewStallRounds("2")).toBe(2);
+    expect(reviewStallRounds("10")).toBe(10);
+    expect(reviewStallRounds("1")).toBe(3);
+    expect(reviewStallRounds("0")).toBe(3);
+    expect(reviewStallRounds("-2")).toBe(3);
+    expect(reviewStallRounds("2.5")).toBe(3);
+    expect(reviewStallRounds("nope")).toBe(3);
+  });
+});
+
+describe("unresolved-blocking convergence rule (same batch persisting)", () => {
+  /** Same blocking defect reworded/re-id'd across rounds, the incident's shape. */
+  function persistingRounds(rounds: number): Finding[] {
+    let findings: Finding[] = [];
+    for (let round = 1; round <= rounds; round += 1) {
+      findings = mergeFindings(findings, [repeated(`reviewer-id-r${round}`)], { round });
+    }
+    return findings;
+  }
+
+  it("escalates at round 3 when the same blocking finding persists (stable key)", () => {
+    const findings = persistingRounds(3);
+    // The repeated-severe rule already fires here; the convergence guard must too.
+    const stop = convergenceStop({ findings, currentRound: 3 });
+    expect(stop.stop).toBe(true);
+    if (!stop.stop) throw new Error("expected a stop");
+    expect(stop.meta.stallRule).toBe("unresolved-blocking");
+    expect(stop.meta.unresolvedStalledRounds).toBe(3);
+    expect(stop.meta.currentUnresolvedBlocking).toBe(1);
+    expect(stop.meta.persistingBlockingKeys).toEqual(["src/agile/story.ts|解除阻塞后没有恢复之前状态"]);
+    expect(stop.message).toContain("同一批阻断问题连续 3 轮未减少");
+    expect(stop.message).toContain("src/agile/story.ts|解除阻塞后没有恢复之前状态");
+    const perRound = stop.meta.perRound as Array<{ unresolvedBlocking: number }>;
+    expect(perRound.map((entry) => entry.unresolvedBlocking)).toEqual([1, 1, 1]);
+  });
+
+  it("does not escalate at round 2 with the default threshold of 3", () => {
+    expect(convergenceStop({ findings: persistingRounds(2), currentRound: 2 }).stop).toBe(false);
+  });
+
+  it("honours a lower PI_REVIEW_STALL_ROUNDS override", () => {
+    const stop = convergenceStop({ findings: persistingRounds(2), currentRound: 2, requiredUnresolvedRounds: 2 });
+    expect(stop.stop).toBe(true);
+    if (!stop.stop) throw new Error("expected a stop");
+    expect(stop.meta.stallRule).toBe("unresolved-blocking");
+    expect(stop.meta.unresolvedStalledRounds).toBe(2);
+  });
+
+  it("does not escalate while the blocking batch is decreasing", () => {
+    // 3 blockers, then 2, then 1 (each round re-reports a shrinking subset).
+    let findings: Finding[] = [];
+    const set = [["a", "b", "c"], ["a", "b"], ["a"]];
+    set.forEach((ids, index) => {
+      findings = mergeFindings(
+        findings,
+        ids.map((id, position) => ({
+          id: `blocker-${id}`,
+          severity: "high" as const,
+          file: "src/agile/story.ts",
+          line: position + 1,
+          title: `defect ${id}`,
+          evidence: "e",
+          requiredChange: "c",
+        })),
+        { round: index + 1 },
+      );
+    });
+    expect(convergenceStop({ findings, currentRound: 3 }).stop).toBe(false);
+  });
+
+  it("does not escalate when a new round raises fewer NEW blockers (existing rule intact)", () => {
+    // A fresh problem each round but strictly fewer of them: new-count rule sees progress.
+    const rounds: Array<Array<Finding["severity"]>> = [["high"], ["high"], []];
+    const findings = reviewRounds(rounds);
+    const verdict = convergenceVerdict(convergenceHistory(findings, 3));
+    expect(verdict.stalled).toBe(false);
+  });
+
+  it("never escalates when the guard is disabled, even with persisted blockers", () => {
+    const findings = persistingRounds(5);
+    expect(convergenceStop({ findings, currentRound: 5, enabled: false })).toEqual({ stop: false });
   });
 });

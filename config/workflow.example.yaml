@@ -60,6 +60,16 @@ loop:
   onLimit: needs_human
   approvalRequiresChecksPassing: true
 
+release:
+  # Review completion never publishes by itself. An administrator must first
+  # merge the reviewed commit and then confirm an environment-specific release.
+  requireAdmin: true
+  requireExplicitConfirmation: true
+  requireMergedCommit: true
+  hook: ${PI_POST_MERGE_DEPLOY_HOOK}
+  webhookAuthentication: bearer+hmac-sha256
+  idempotency: run+commit+environment
+
 limits:
   runTimeoutSeconds: ${PI_RUN_TIMEOUT_SECONDS}
   maxChangedFiles: 100

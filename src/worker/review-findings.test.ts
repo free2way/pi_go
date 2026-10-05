@@ -76,6 +76,44 @@ describe("mergeFindings", () => {
     expect(findings[0].resolved).toBe(false);
     expect(findings[0].consecutiveRounds).toBe(0);
   });
+
+  it("merges a reworded, re-id'd repeat into one streak (incident run_e7c565d6335a4bc7)", () => {
+    // Same defect as production: different ids, different casing/whitespace and
+    // list-marker rewordings across rounds 2-6.
+    let findings = mergeFindings([], [incoming({ id: "story-unblock-state-not-restored", title: "解除阻塞后没有恢复之前状态" })], { round: 2 });
+    findings = mergeFindings(findings, [incoming({ id: "F1", title: "- 解除阻塞后没有恢复之前状态。" })], { round: 3 });
+    findings = mergeFindings(findings, [incoming({ id: "STORY-BLOCK-001", title: "1. 解除阻塞后没有恢复之前状态" })], { round: 4 });
+    expect(findings).toHaveLength(1);
+    expect(findings[0].observations).toBe(3);
+    expect(findings[0].consecutiveRounds).toBe(3);
+    expect(findings[0].firstSeenRound).toBe(2);
+    expect(findings[0].lastSeenRound).toBe(4);
+    // Identity is content-based, independent of which id the model chose.
+    expect(findings[0].fingerprint).toBe("src/auth/session.ts|解除阻塞后没有恢复之前状态");
+  });
+
+  it("keeps genuinely different titles or files separate", () => {
+    let findings = mergeFindings([], [incoming({ id: "a", title: "Race condition" })], { round: 1 });
+    findings = mergeFindings(findings, [incoming({ id: "b", title: "Memory leak" })], { round: 2 });
+    findings = mergeFindings(findings, [incoming({ id: "c", title: "Race condition", file: "src/other.ts" })], { round: 3 });
+    expect(findings).toHaveLength(3);
+  });
+
+  it("keeps a single streak when the file is missing (placeholder key)", () => {
+    let findings = mergeFindings([], [incoming({ id: "a", file: null, title: "No file reported" })], { round: 1 });
+    findings = mergeFindings(findings, [incoming({ id: "b", file: "", title: "  no   FILE reported. " })], { round: 2 });
+    expect(findings).toHaveLength(1);
+    expect(findings[0].consecutiveRounds).toBe(2);
+    expect(findings[0].fingerprint).toBe("<no-file>|no file reported");
+  });
+
+  it("recomputes a legacy (hashed) fingerprint on read instead of duplicating", () => {
+    const legacyCurve: Finding[] = [finding({ id: "legacy", fingerprint: "0123456789abcdef0123456789abcdef" })];
+    const merged = mergeFindings(legacyCurve, [incoming({ id: "legacy-renamed" })], { round: 2 });
+    expect(merged).toHaveLength(1);
+    expect(merged[0].consecutiveRounds).toBe(2);
+    expect(merged[0].fingerprint).toBe("src/auth/session.ts|refresh race condition");
+  });
 });
 
 describe("repeatedSevereFindings (AT-REVIEW-010)", () => {
@@ -103,6 +141,15 @@ describe("repeatedSevereFindings (AT-REVIEW-010)", () => {
     findings = mergeFindings(findings, [incoming({ severity: "medium" })], { round: 2 });
     findings = mergeFindings(findings, [incoming({ severity: "medium" })], { round: 3 });
     expect(repeatedSevereFindings(findings)).toEqual([]);
+  });
+
+  it("fires for the same defect reworded and re-id'd across rounds (stable fingerprint)", () => {
+    let findings = mergeFindings([], [incoming({ severity: "critical", id: "story-unblock-state-not-restored" })], { round: 1 });
+    findings = mergeFindings(findings, [incoming({ severity: "high", id: "F1", title: "- Refresh   race condition." })], { round: 2 });
+    expect(repeatedSevereFindings(findings)).toEqual([]);
+    findings = mergeFindings(findings, [incoming({ severity: "high", id: "STORY-BLOCK-001", title: "refresh race condition。" })], { round: 3 });
+    expect(repeatedSevereFindings(findings)).toHaveLength(1);
+    expect(repeatedSevereFindings(findings)[0].consecutiveRounds).toBe(3);
   });
 });
 
