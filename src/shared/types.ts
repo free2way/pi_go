@@ -11,6 +11,20 @@ export type RunState =
 
 export type RunMode = "demo" | "real";
 
+/**
+ * Per-run review scope for the repair loop.
+ *
+ * - `"all"` (default, and the behaviour of every pre-existing run): every
+ *   unresolved medium/high/critical finding keeps blocking the review verdict
+ *   and completion.
+ * - `"blocking"`: medium/low findings are still recorded on the run (and stay in
+ *   the acceptance snapshot's remaining list) but no longer block the verdict or
+ *   completion, so a large-scope loop can converge on the critical/high work
+ *   instead of looping to the round cap. Critical/high findings block exactly as
+ *   before.
+ */
+export type ReviewScope = "all" | "blocking";
+
 export interface Finding {
   id: string;
   severity: "critical" | "high" | "medium" | "low";
@@ -245,6 +259,19 @@ export interface Run {
   reopenedBy?: string;
   /** B2: durable snapshot of what the operator accepted. */
   acceptance?: AcceptanceSnapshot;
+  /**
+   * REL-PUBLISH: durable, run-scoped code release. Development completion and
+   * release are deliberately separate: a run may be `completed` while its
+   * reviewed commit is still waiting to be merged or published.
+   */
+  release?: RunReleaseRecord;
+  /**
+   * Per-run review scope chosen by the operator when continuing a run. Additive
+   * and backward compatible: runs written before this field exist are treated as
+   * `"all"` (see `resolveReviewScope`), so no migration is required — the value
+   * travels inside the run document and is read by the worker's review gate.
+   */
+  reviewScope?: ReviewScope;
 }
 
 /** A2: recorded outcome of merging a run branch into the workspace default branch. */
@@ -254,6 +281,30 @@ export interface RunMergeRecord {
   targetBranch: string;
   mergedAt: string;
   mergedBy: string;
+}
+
+export type RunReleaseStatus = "publishing" | "triggered" | "succeeded" | "failed";
+
+/**
+ * Durable result of an explicit administrator release request. `deliveryId`
+ * stays stable across retries so a webhook can make delivery idempotent.
+ */
+export interface RunReleaseRecord {
+  deliveryId: string;
+  status: RunReleaseStatus;
+  environment: string;
+  commit: string;
+  targetBranch: string;
+  requestedAt: string;
+  requestedBy: string;
+  startedAt: string;
+  finishedAt?: string;
+  attempt: number;
+  kind: "webhook" | "command";
+  detail?: string;
+  httpStatus?: number;
+  deploymentId?: string;
+  url?: string;
 }
 
 /** B1: lifecycle of the durable merge marker between the two phases. */
@@ -377,12 +428,16 @@ export interface ConfigStatus {
   assertedProviders?: string[];
   /** A1: true when `PI_MERGE_REQUEST_*` is configured, so the UI can enable MR. */
   mergeRequestConfigured?: boolean;
+  /** Explicit release action is available; no hook URL or secret is exposed. */
+  releaseConfigured?: boolean;
 }
 
 export interface CurrentUser {
   id: string;
   email: string;
   legacyOwnerId?: string;
+  /** Server-derived role hint used only to hide privileged controls in the UI. */
+  isAdmin?: boolean;
 }
 
 /**

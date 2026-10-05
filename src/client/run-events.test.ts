@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Run, RunEvent } from "../shared/types";
-import { mergeRunEvents, shouldAcceptRun } from "./run-events";
+import { deferredNonBlockingNotice, mergeRunEvents, shouldAcceptRun } from "./run-events";
 
 function event(seq: number): RunEvent {
   return { seq, runId: "run_1", round: 1, source: "system", type: `e${seq}`, message: `${seq}`, at: new Date(seq).toISOString() };
@@ -64,5 +64,30 @@ describe("mergeRunEvents (AUD-17)", () => {
     expect(shouldAcceptRun(current, run({ lastSeq: 10, updatedAt: "2026-01-01T00:00:09.000Z" }))).toBe(false);
     expect(shouldAcceptRun(undefined, current)).toBe(true);
     expect(shouldAcceptRun(current, run({ id: "run_2" }))).toBe(true);
+  });
+});
+
+describe("deferredNonBlockingNotice (reviewScope: blocking)", () => {
+  function deferred(seq: number, meta: Record<string, unknown>, message = "deferred"): RunEvent {
+    return { seq, runId: "run_1", round: 3, source: "reviewer", type: "review.nonblocking_deferred", message, at: new Date(seq).toISOString(), meta };
+  }
+
+  it("returns undefined when the run never deferred anything", () => {
+    expect(deferredNonBlockingNotice([event(1), event(2)])).toBeUndefined();
+  });
+
+  it("reads count/ids/round from the latest deferral event", () => {
+    const notice = deferredNonBlockingNotice([
+      deferred(1, { round: 2, count: 1, ids: ["a"] }, "old"),
+      deferred(2, { round: 4, count: 2, ids: ["b", "c"] }, "latest"),
+    ]);
+    expect(notice).toEqual({ round: 4, count: 2, ids: ["b", "c"], message: "latest" });
+  });
+
+  it("falls back to the ids length when count is missing and ignores non-string ids", () => {
+    const notice = deferredNonBlockingNotice([deferred(1, { ids: ["b", 7, "c"] })]);
+    expect(notice?.count).toBe(2);
+    expect(notice?.ids).toEqual(["b", "c"]);
+    expect(notice?.round).toBe(3);
   });
 });

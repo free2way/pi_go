@@ -3,12 +3,11 @@ import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { execFile } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { internalUpdateRejection } from "../shared/run-state.js";
-import type { ConfigStatus, CurrentUser, ModelCatalogResponse, Run, RunEvent, Workspace } from "../shared/types.js";
+import type { ConfigStatus, CurrentUser, ModelCatalogResponse, ReviewScope, Run, RunEvent, RunReleaseRecord, Workspace } from "../shared/types.js";
 import { AlertManager, createAlertSink } from "./alerts.js";
 import { Authenticator } from "./auth.js";
 import { CredentialVault } from "./credential-vault.js";
@@ -35,10 +34,12 @@ import { batchItemFailure, batchItemSuccess, parseBatchRunIds, summarizeBatch, M
 import { buildDeploymentStatus, parseDeployLog, resolveDeployLogPath, type DeploymentStatus } from "./deployments.js";
 import { FAILURE_SCAN_LIMIT, USAGE_RUN_SCAN_LIMIT, buildSystemStatus, utcDayStart, type DeploymentInfo, type FailureEventRow, type StateCountRow, type SystemStatusInput, type TodayRunRow } from "./system-status.js";
 import { mergeConflictReply, mergeRestoreFields, type MergeResult } from "../shared/merge.js";
-import { buildDeployHookPayload, planMergeGate, planPostMergeDeploy, type MergeRecord, type PostMergeDeployPlan } from "./run-merge.js";
+import { buildDeployHookPayload, planMergeGate, planPostMergeDeploy, type MergeRecord } from "./run-merge.js";
 import { coordinateApprovedMerge, replayPendingMerge } from "./merge-approval.js";
 import { buildMergeRequestPayload, mergeRequestUnavailable, patchFileName, resolveMergeRequestConfig, selectPatch, type PatchSelection } from "./run-patch.js";
 import { planReopen, reopenEventMeta } from "./run-reopen.js";
+import { isActiveRelease, planReleaseStart, sameReleaseAttempt } from "./run-release.js";
+import { executeRelease } from "./release-execution.js";
 import type { RunStoreLike } from "./store.js";
 import { WorkspaceError, WorkspaceService } from "./workspaces.js";
 
@@ -57,6 +58,7 @@ const demoMode = process.env.PI_DEMO_MODE !== "false";
 const realRunsEnabled = process.env.PI_REAL_RUNS_ENABLED === "true";
 const workerUrl = process.env.PI_WORKER_URL || "http://worker:3200";
 const internalToken = process.env.PI_INTERNAL_TOKEN || "";
+const releaseWebhookToken = process.env.PI_POST_MERGE_DEPLOY_TOKEN || "";
 const dataFile = process.env.PI_DATA_FILE || path.resolve("data/runs.json");
 const vaultFile = process.env.PI_VAULT_FILE || path.resolve("data/credentials.v1.json");
 const publicOrigin = process.env.PI_PUBLIC_ORIGIN || "";
@@ -396,55 +398,20 @@ async function resolveRunPatch(run: Run): Promise<RunPatchResolution> {
   return { ok: true, selection };
 }
 
-/**
- * A2: calls the optional post-merge deploy hook. Never silently skipped: an
- * unset hook, an unsupported value, a failed webhook and a failed command all
- * produce an explicit, recorded outcome.
- */
-async function runPostMergeDeploy(plan: PostMergeDeployPlan, payload: Record<string, unknown>): Promise<{
-  configured: boolean;
-  kind: "webhook" | "command" | "none";
-  status: "ok" | "failed" | "not_configured" | "unsupported";
-  detail: string;
-}> {
-  if (!plan.configured) return { configured: false, kind: "none", status: "not_configured", detail: plan.reason };
-  if (plan.kind === "unsupported") return { configured: true, kind: "none", status: "unsupported", detail: plan.reason };
-  if (plan.kind === "webhook") {
-    try {
-      const response = await fetch(plan.url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(30_000),
-      });
-      return response.ok
-        ? { configured: true, kind: "webhook", status: "ok", detail: `HTTP ${response.status}` }
-        : { configured: true, kind: "webhook", status: "failed", detail: `HTTP ${response.status}` };
-    } catch (error) {
-      return { configured: true, kind: "webhook", status: "failed", detail: (error as Error).message.slice(0, 200) };
-    }
-  }
-  // Operator-configured command. Bounded and run with a scrubbed environment;
-  // run metadata is passed on stdin, never interpolated into the command.
-  return new Promise((resolve) => {
-    const child = execFile("/bin/sh", ["-c", plan.command], { timeout: 60_000, maxBuffer: 1_000_000, env: { PATH: process.env.PATH ?? "" } }, (error, stdout, stderr) => {
-      if (error) return resolve({ configured: true, kind: "command", status: "failed", detail: `${(error as Error).message.slice(0, 160)} ${String(stderr).slice(0, 200)}`.trim() });
-      resolve({ configured: true, kind: "command", status: "ok", detail: String(stdout).trim().slice(0, 200) || `exit 0` });
-    });
-    child.stdin?.end(JSON.stringify(payload));
-  });
-}
-
 function tooManyRequests(reply: FastifyReply, retryAfterMs: number) {
   reply.header("Retry-After", String(Math.max(1, Math.ceil(retryAfterMs / 1000))));
   return reply.code(429).send({ error: "请求过于频繁，请稍后再试", code: "RATE_LIMITED" });
 }
 
-function safeTokenMatch(value: string | undefined) {
-  if (!value || !internalToken) return false;
+function safeSecretMatch(value: string | undefined, secret: string) {
+  if (!value || !secret) return false;
   const actual = Buffer.from(value.replace(/^Bearer\s+/i, ""));
-  const expected = Buffer.from(internalToken);
+  const expected = Buffer.from(secret);
   return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+function safeTokenMatch(value: string | undefined) {
+  return safeSecretMatch(value, internalToken);
 }
 
 async function workerRequest<T>(pathName: string, init?: RequestInit, timeoutMs = 15_000): Promise<T> {
@@ -540,7 +507,7 @@ app.get("/api/health", async (_request, reply) => {
   try {
     await pingDatabase();
     alerts.clear("database_unavailable");
-    return { status: "ok", service: "pigo-web", version: "0.23.6", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.24.0", db: "ok" };
   } catch (error) {
     // AT-REL-005: fail loudly instead of pretending the service is healthy.
     alerts.raise({
@@ -549,7 +516,7 @@ app.get("/api/health", async (_request, reply) => {
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
       details: { error: (error as Error).message.slice(0, 200) },
     });
-    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.23.6", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.24.0", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
   }
 });
 
@@ -564,7 +531,7 @@ interface StorageStatus {
 app.get("/api/health/detail", async (request, reply) => {
   const internal = safeTokenMatch(request.headers.authorization);
   if (!internal && !auth.user(request)) return reply.code(401).send({ error: "Unauthorized" });
-  const health: Record<string, unknown> = { version: "0.23.6", at: new Date().toISOString() };
+  const health: Record<string, unknown> = { version: "0.24.0", at: new Date().toISOString() };
   try {
     await pingDatabase();
     health.database = { status: "ok" };
@@ -605,7 +572,10 @@ app.get("/api/health/detail", async (request, reply) => {
   health.alerts = alerts.activeKeys;
   return health;
 });
-app.get("/api/me", async (request) => auth.user(request));
+app.get("/api/me", async (request): Promise<CurrentUser> => {
+  const user = auth.user(request);
+  return { ...user, isAdmin: await identities.isAdmin(user.id) };
+});
 app.get("/api/credentials/status", async (request) => vault.status(vaultKeyFor(request)));
 
 app.put("/api/credentials", async (request, reply) => {
@@ -676,6 +646,7 @@ app.get("/api/models", async (request): Promise<ModelCatalogResponse> => {
 app.get("/api/config/status", async (request): Promise<ConfigStatus> => {
   const credentials = vault.status(vaultKeyFor(request));
   const configured = new Set(credentials.providers.map((item) => item.provider));
+  const releasePlan = planPostMergeDeploy(process.env.PI_POST_MERGE_DEPLOY_HOOK);
   // AUD-09 / AT-MODEL-006/007: execution availability is decoupled from the
   // default provider/credential pairing. As long as at least one provider is
   // configured the user may enter the real-run form; the actual per-role model
@@ -691,6 +662,9 @@ app.get("/api/config/status", async (request): Promise<ConfigStatus> => {
     assertedProviders: credentials.providers.filter((item) => item.verification === "operator_asserted").map((item) => item.provider),
     // A1: only presence is exposed; the URL/token never reach the browser.
     mergeRequestConfigured: mergeRequestConfig.configured,
+    releaseConfigured: releasePlan.configured
+      && releasePlan.kind !== "unsupported"
+      && (releasePlan.kind !== "webhook" || Boolean(releaseWebhookToken && publicOrigin)),
   };
 });
 
@@ -1271,6 +1245,7 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/cancel", async (request, rep
 app.delete<{ Params: { id: string } }>("/api/runs/:id", async (request, reply) => {
   const run = store.getRun(request.params.id, ownerKeysFor(request));
   if (!run) return reply.code(404).send({ error: "Run not found" });
+  if (isActiveRelease(run)) return reply.code(409).send({ error: "发布仍在进行，不能删除任务", code: "RELEASE_IN_PROGRESS" });
   if (!["completed", "failed", "cancelled", "needs_human"].includes(run.state)) {
     return reply.code(409).send({ error: `Cannot delete a run in ${run.state}; cancel it first` });
   }
@@ -1286,6 +1261,9 @@ const approveSchema = z.object({
   mode: z.enum(["continue", "accept"]).optional(),
   note: z.string().trim().max(2_000).optional(),
   acknowledgeOpenFindings: z.boolean().optional(),
+  // Review scope for the continued round: "blocking" records medium/low findings
+  // without letting them block completion; absent keeps the run's current value.
+  reviewScope: z.enum(["all", "blocking"]).optional(),
   // A2: admin option — merge the run branch into the workspace default branch
   // before completing. Absent/`false` keeps the plain accept behavior unchanged.
   mergeIntoWorkspace: z.boolean().optional(),
@@ -1308,7 +1286,7 @@ type ContinueResult =
 
 async function startContinue(
   run: Run,
-  options: { note?: string; plan: Extract<ApprovePlan, { decision: "continue" }>; userId: string; vaultKey: string },
+  options: { note?: string; plan: Extract<ApprovePlan, { decision: "continue" }>; userId: string; vaultKey: string; reviewScope?: ReviewScope },
 ): Promise<ContinueResult> {
   if (run.mode !== "real") return { ok: false, status: 409, code: "RUN_NOT_RESUMABLE", error: "只有真实任务支持「继续开发」" };
   if (!realRunsEnabled || !internalToken) return { ok: false, status: 503, code: "REAL_RUNNER_NOT_AVAILABLE", error: "Real agent execution is disabled" };
@@ -1336,6 +1314,9 @@ async function startContinue(
       ...(options.note
         ? { humanNotes: appendHumanNote(run.humanNotes, { at: now, kind: "approve_continue", note: options.note, by: options.userId }) }
         : {}),
+      // Review scope: only written when the operator chose one; absent keeps the
+      // run's existing value (default "all").
+      ...(options.reviewScope ? { reviewScope: options.reviewScope } : {}),
     });
   } catch (error) {
     const conflict = conflictReplyFor(error);
@@ -1349,7 +1330,10 @@ async function startContinue(
     type: "run.approved",
     message: summary,
     at: now,
-    meta: approveEventMeta(options.plan, options.userId),
+    meta: {
+      ...approveEventMeta(options.plan, options.userId),
+      ...(options.reviewScope ? { reviewScope: options.reviewScope } : {}),
+    },
   });
 
   try {
@@ -1377,7 +1361,7 @@ async function dispatchContinueJob(
   request: FastifyRequest<{ Params: { id: string } }>,
   reply: FastifyReply,
   run: Run,
-  options: { note?: string; plan: Extract<ApprovePlan, { decision: "continue" }>; userId: string },
+  options: { note?: string; plan: Extract<ApprovePlan, { decision: "continue" }>; userId: string; reviewScope?: ReviewScope },
 ) {
   const openFindings = options.plan.openFindings;
   const result = await startContinue(run, { ...options, vaultKey: vaultKeyFor(request) });
@@ -1406,6 +1390,51 @@ async function acceptanceSnapshotFor(run: Run, input: {
   });
 }
 
+const completedMergeSchema = z.object({ confirm: z.literal(true), note: z.string().trim().max(2_000).optional() });
+const releaseSchema = z.object({
+  environment: z.string().trim().min(1).max(64).regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/),
+  confirm: z.literal(true),
+  retry: z.boolean().optional(),
+});
+const releaseResultSchema = z.object({
+  deliveryId: z.string().trim().min(8).max(120),
+  status: z.enum(["succeeded", "failed"]),
+  detail: z.string().trim().max(500).optional(),
+  deploymentId: z.string().trim().max(200).optional(),
+  url: z.string().url().max(1_000).optional(),
+});
+
+async function mergeCompletedRun(request: FastifyRequest, run: Run, userId: string, note?: string) {
+  const now = new Date().toISOString();
+  const acceptance = await acceptanceSnapshotFor(run, {
+    acceptedAt: now,
+    acceptedBy: userId,
+    note,
+    acknowledgedOpenFindings: false,
+  });
+  const targetBranch = run.workspaceId
+    ? await workspaces.get(ownerKeysFor(request), run.workspaceId, { isAdmin: true }).then((workspace) => workspace.defaultBranch ?? undefined).catch(() => undefined)
+    : undefined;
+  return coordinateApprovedMerge(store, {
+    run,
+    token: newId("mergetok"),
+    targetBranch: targetBranch ?? null,
+    startedAt: now,
+    approval: {
+      acceptedAt: now,
+      acceptedBy: userId,
+      summary: note ? `管理员批准合并：${note}` : "管理员批准合并审核通过的代码",
+      note: note ?? null,
+      acceptance,
+    },
+    callWorker: (branch) =>
+      workerRequest<MergeResult>(`/runs/${encodeURIComponent(run.id)}/merge`, {
+        method: "POST",
+        body: JSON.stringify({ ownerId: run.ownerId, repository: run.repository, branch: run.branch, targetBranch: branch ?? undefined, message: note }),
+      }),
+  });
+}
+
 app.post<{ Params: { id: string } }>("/api/runs/:id/approve", { bodyLimit: 1024 * 1024 }, async (request, reply) => {
   const actionLimit = runActions.check(auth.user(request).id);
   if (!actionLimit.allowed) return tooManyRequests(reply, actionLimit.retryAfterMs);
@@ -1427,7 +1456,7 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/approve", { bodyLimit: 1024 
     return reply.code(plan.status).send({ error: plan.message, code: plan.code, openFindings: plan.openFindings });
   }
   if (plan.decision === "continue") {
-    return dispatchContinueJob(request, reply, run, { note, plan, userId: user.id });
+    return dispatchContinueJob(request, reply, run, { note, plan, userId: user.id, reviewScope: parsed.data.reviewScope });
   }
 
   const now = new Date().toISOString();
@@ -1519,23 +1548,201 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/approve", { bodyLimit: 1024 
     meta: { ...approveEventMeta(plan, user.id), acceptance, ...(merge ? { merge } : {}) },
   });
 
-  // A2: post-merge deploy hook. An unset hook is reported explicitly, never
-  // silently skipped.
-  let deploy: Awaited<ReturnType<typeof runPostMergeDeploy>> | undefined;
-  if (merge) {
-    const deployPlan = planPostMergeDeploy(process.env.PI_POST_MERGE_DEPLOY_HOOK);
-    deploy = await runPostMergeDeploy(deployPlan, buildDeployHookPayload({ run, merge }));
+  // Publishing is deliberately not implicit here. A separate administrator
+  // action records a durable release attempt before invoking any external hook.
+  return { ...updated, acceptedOpenFindings: plan.openFindings, acceptance, ...(merge ? { merge } : {}) };
+});
+
+/**
+ * REL-PUBLISH: explicit merge gate for a normally completed run. This avoids
+ * forcing a successful run through `reopen -> needs_human` merely to merge it.
+ */
+app.post<{ Params: { id: string } }>("/api/runs/:id/merge", { bodyLimit: 1024 * 1024 }, async (request, reply) => {
+  const actionLimit = runActions.check(auth.user(request).id);
+  if (!actionLimit.allowed) return tooManyRequests(reply, actionLimit.retryAfterMs);
+  const parsed = completedMergeSchema.safeParse(request.body ?? {});
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
+  const run = store.getRun(request.params.id, ownerKeysFor(request));
+  if (!run) return reply.code(404).send({ error: "Run not found" });
+  const user = auth.user(request);
+  if (!(await identities.isAdmin(user.id))) return reply.code(403).send({ error: "仅管理员可以合并审核通过的代码", code: "ADMIN_REQUIRED" });
+  if (run.state !== "completed") return reply.code(409).send({ error: "只有审核完成的任务可以进入合并步骤", code: "RUN_NOT_MERGE_READY" });
+  if (run.mode !== "real") return reply.code(409).send({ error: "演示任务没有可合并的真实工作区", code: "REAL_RUN_REQUIRED" });
+  if (run.merge) return run;
+
+  const outcome = await mergeCompletedRun(request, run, user.id, parsed.data.note?.trim());
+  if (outcome.kind === "conflict") return reply.code(outcome.status).send({ error: outcome.message, code: outcome.code });
+  if (outcome.kind === "worker-error") {
+    const restore = mergeRestoreFields(outcome);
+    return reply.code(outcome.status).send({
+      error: outcome.error,
+      code: outcome.code,
+      ...(outcome.conflictingPaths ? { conflictingPaths: outcome.conflictingPaths } : {}),
+      ...restore,
+    });
+  }
+  if (outcome.kind === "record-failed") {
+    return reply.code(outcome.status).send({ error: outcome.error, code: outcome.code, merge: outcome.merge });
+  }
+  return outcome.run;
+});
+
+/**
+ * REL-PUBLISH: explicit, durable release. The `publishing` record is committed
+ * before the hook call; retries reuse its delivery id so the receiver can
+ * safely de-duplicate a request whose original response was lost.
+ */
+app.post<{ Params: { id: string } }>("/api/runs/:id/publish", { bodyLimit: 1024 * 1024 }, async (request, reply) => {
+  const actionLimit = runActions.check(auth.user(request).id);
+  if (!actionLimit.allowed) return tooManyRequests(reply, actionLimit.retryAfterMs);
+  const parsed = releaseSchema.safeParse(request.body ?? {});
+  if (!parsed.success) return reply.code(400).send({ error: "发布需要有效环境名和 confirm=true", code: "RELEASE_CONFIRM_REQUIRED", details: parsed.error.issues });
+  const run = store.getRun(request.params.id, ownerKeysFor(request));
+  if (!run) return reply.code(404).send({ error: "Run not found" });
+  const user = auth.user(request);
+  if (!(await identities.isAdmin(user.id))) return reply.code(403).send({ error: "仅管理员可以发布代码", code: "ADMIN_REQUIRED" });
+
+  const deployPlan = planPostMergeDeploy(process.env.PI_POST_MERGE_DEPLOY_HOOK);
+  if (!deployPlan.configured) return reply.code(409).send({ error: deployPlan.reason, code: "RELEASE_NOT_CONFIGURED" });
+  if (deployPlan.kind === "unsupported") return reply.code(409).send({ error: deployPlan.reason, code: "RELEASE_CONFIG_INVALID" });
+  if (deployPlan.kind === "webhook" && !releaseWebhookToken) {
+    return reply.code(409).send({ error: "Webhook 发布必须配置 PI_POST_MERGE_DEPLOY_TOKEN", code: "RELEASE_AUTH_NOT_CONFIGURED" });
+  }
+  if (deployPlan.kind === "webhook" && !publicOrigin) {
+    return reply.code(409).send({ error: "Webhook 发布必须配置 PI_PUBLIC_ORIGIN 以接收异步结果回调", code: "RELEASE_CALLBACK_NOT_CONFIGURED" });
+  }
+
+  const decision = planReleaseStart({
+    run,
+    environment: parsed.data.environment,
+    requestedBy: user.id,
+    now: new Date().toISOString(),
+    kind: deployPlan.kind,
+    retry: parsed.data.retry,
+  });
+  if (decision.kind === "conflict") return reply.code(decision.status).send({ error: decision.message, code: decision.code });
+  if (decision.kind === "already-succeeded") return run;
+
+  const previous = run.release;
+  const claim = await store.updateRunGuarded(run.id, (current) => {
+    if (current.state !== "completed" || current.merge?.commit !== run.merge?.commit) {
+      return { allow: false as const, code: "RELEASE_STATE_CHANGED", message: "任务或合并 commit 已变化，请刷新后重试" };
+    }
+    if (!previous && current.release) return { allow: false as const, code: "RELEASE_IN_PROGRESS", message: "已有其他发布请求" };
+    if (previous && (
+      current.release?.deliveryId !== previous.deliveryId
+      || current.release?.attempt !== previous.attempt
+      || current.release?.status !== previous.status
+    )) return { allow: false as const, code: "RELEASE_IN_PROGRESS", message: "发布状态已由其他请求更新" };
+    return { allow: true as const };
+  }, { release: decision.release });
+  if (!claim.ok) return reply.code(409).send({ error: claim.message, code: claim.code });
+
+  await store.appendEvent({
+    runId: run.id,
+    round: run.round,
+    source: "system",
+    type: "run.release_started",
+    message: `开始发布 ${decision.release.commit.slice(0, 10)} 到 ${decision.release.environment}`,
+    at: decision.release.startedAt,
+    meta: { ...decision.release },
+  }, { deliveryId: `release-start:${decision.release.deliveryId}:${decision.release.attempt}` }).catch(() => undefined);
+
+  const callbackUrl = publicOrigin
+    ? `${publicOrigin.replace(/\/$/, "")}/api/internal/runs/${encodeURIComponent(run.id)}/release-result`
+    : undefined;
+  const execution = await executeRelease(
+    deployPlan,
+    buildDeployHookPayload({ run, merge: run.merge!, release: decision.release, callbackUrl }),
+    { deliveryId: decision.release.deliveryId, webhookToken: releaseWebhookToken || undefined },
+  );
+  const finishedAt = new Date().toISOString();
+  const release: RunReleaseRecord = {
+    ...decision.release,
+    status: execution.status === "succeeded" ? "succeeded" : execution.status === "triggered" ? "triggered" : "failed",
+    detail: execution.detail,
+    ...(execution.httpStatus === undefined ? {} : { httpStatus: execution.httpStatus }),
+    ...(execution.status === "triggered" ? {} : { finishedAt }),
+  };
+  const finalized = await store.updateRunGuarded(run.id, (current) => sameReleaseAttempt(current, decision.release)
+    ? { allow: true as const }
+    : { allow: false as const, code: "RELEASE_STATE_CHANGED", message: "发布执行完成，但记录已被其他请求更新" }, { release });
+  if (!finalized.ok) {
+    // A fast asynchronous publisher may POST its callback before the original
+    // HTTP 202 response reaches us. Never overwrite or report that valid final
+    // result as a failure merely because the callback won the CAS race.
+    const latest = store.getRun(run.id);
+    if (latest?.release?.deliveryId === release.deliveryId
+      && (latest.release.status === "succeeded" || latest.release.status === "failed")) return latest;
+    return reply.code(503).send({ error: finalized.message, code: finalized.code, deliveryId: release.deliveryId });
+  }
+
+  await store.appendEvent({
+    runId: run.id,
+    round: run.round,
+    source: "system",
+    type: release.status === "failed" ? "run.release_failed" : release.status === "triggered" ? "run.release_triggered" : "run.release_succeeded",
+    message: release.status === "failed"
+      ? `发布失败：${release.detail ?? "未知原因"}`
+      : release.status === "triggered"
+        ? "部署系统已接收发布请求，等待最终结果"
+        : `代码已发布到 ${release.environment}`,
+    at: finishedAt,
+    meta: { ...release },
+  }, { deliveryId: `release-result:${release.deliveryId}:${release.attempt}` }).catch(() => undefined);
+  return finalized.run;
+});
+
+/** Authenticated final-status callback for asynchronous (HTTP 202) publishers. */
+app.post<{ Params: { id: string } }>("/api/internal/runs/:id/release-result", async (request, reply) => {
+  const authorized = safeSecretMatch(request.headers.authorization, releaseWebhookToken) || safeTokenMatch(request.headers.authorization);
+  if (!authorized) return reply.code(401).send({ error: "Unauthorized" });
+  const parsed = releaseResultSchema.safeParse(request.body ?? {});
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid release result", details: parsed.error.issues });
+  const run = store.getRun(request.params.id);
+  if (!run) return reply.code(404).send({ error: "Run not found" });
+  const current = run.release;
+  if (!current || current.deliveryId !== parsed.data.deliveryId) {
+    return reply.code(409).send({ error: "Release delivery id does not match", code: "RELEASE_DELIVERY_MISMATCH" });
+  }
+  if (current.status === parsed.data.status) {
     await store.appendEvent({
       runId: run.id,
       round: run.round,
       source: "system",
-      type: "run.post_merge_deploy",
-      message: deploy.status === "ok" ? `合并后部署钩子已执行（${deploy.kind}）` : `合并后部署钩子未执行：${deploy.detail}`,
-      at: new Date().toISOString(),
-      meta: { ...deploy },
-    });
+      type: current.status === "succeeded" ? "run.release_succeeded" : "run.release_failed",
+      message: current.status === "succeeded" ? `代码已发布到 ${current.environment}` : `发布失败：${current.detail ?? "未知原因"}`,
+      at: current.finishedAt ?? new Date().toISOString(),
+      meta: { ...current },
+    }, { deliveryId: `release-callback:${current.deliveryId}` });
+    return { ok: true, release: current };
   }
-  return { ...updated, acceptedOpenFindings: plan.openFindings, acceptance, ...(merge ? { merge } : {}), ...(deploy ? { deploy } : {}) };
+  if (current.status !== "triggered" && current.status !== "publishing") {
+    return reply.code(409).send({ error: `Release is already ${current.status}`, code: "RELEASE_ALREADY_FINAL" });
+  }
+  const release: RunReleaseRecord = {
+    ...current,
+    status: parsed.data.status,
+    finishedAt: new Date().toISOString(),
+    detail: parsed.data.detail,
+    ...(parsed.data.deploymentId ? { deploymentId: parsed.data.deploymentId } : {}),
+    ...(parsed.data.url ? { url: parsed.data.url } : {}),
+  };
+  const result = await store.updateRunGuarded(run.id, (latest) => latest.release?.deliveryId === current.deliveryId
+    && (latest.release.status === "triggered" || latest.release.status === "publishing")
+    ? { allow: true as const }
+    : { allow: false as const, code: "RELEASE_STATE_CHANGED", message: "发布状态已变化" }, { release });
+  if (!result.ok) return reply.code(409).send({ error: result.message, code: result.code });
+  await store.appendEvent({
+    runId: run.id,
+    round: run.round,
+    source: "system",
+    type: release.status === "succeeded" ? "run.release_succeeded" : "run.release_failed",
+    message: release.status === "succeeded" ? `代码已发布到 ${release.environment}` : `发布失败：${release.detail ?? "未知原因"}`,
+    at: release.finishedAt!,
+    meta: { ...release },
+  }, { deliveryId: `release-callback:${release.deliveryId}` });
+  return { ok: true, release };
 });
 
 app.post<{ Params: { id: string } }>("/api/runs/:id/reject", { bodyLimit: 1024 * 1024 }, async (request, reply) => {
@@ -1599,6 +1806,11 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/reopen", { bodyLimit: 1024 *
   // Admins may reopen a run they do not own.
   if (!run && isAdminUser) run = store.getRun(request.params.id);
   if (!run) return reply.code(404).send({ error: "Run not found" });
+
+  if (isActiveRelease(run)) return reply.code(409).send({ error: "发布仍在进行，不能重新打开任务", code: "RELEASE_IN_PROGRESS" });
+  if (run.merge || run.release) {
+    return reply.code(409).send({ error: "已进入合并/发布链路的任务不可重新开发；请基于新需求创建新的 Run", code: "RELEASED_RUN_IMMUTABLE" });
+  }
 
   const plan = planReopen({ state: run.state, isAdmin: isAdminUser, isOwner, confirm: parsed.data.confirm });
   if (!plan.allowed) return reply.code(plan.status).send({ error: plan.message, code: plan.code });
@@ -1668,6 +1880,7 @@ app.post("/api/runs/cleanup", async (request, reply) => {
   const cutoff = parsed.data.olderThanDays === undefined ? undefined : Date.now() - parsed.data.olderThanDays * 86_400_000;
   const matched = candidates.filter((run) => {
     if (!TERMINAL_RUN_STATES.has(run.state)) return false;
+    if (isActiveRelease(run)) return false;
     if (allowedStates.size > 0 && !allowedStates.has(run.state)) return false;
     if (idFilter && !idFilter.has(run.id)) return false;
     if (cutoff !== undefined && new Date(run.updatedAt).getTime() > cutoff) return false;
@@ -1736,6 +1949,10 @@ app.post("/api/runs/batch", { bodyLimit: 1024 * 1024 }, async (request, reply) =
     if (parsed.data.action === "cleanup") {
       if (!TERMINAL_RUN_STATES.has(run.state)) {
         outcomes.push(batchItemFailure(id, 409, "RUN_ACTIVE", `无法清理状态为 ${run.state} 的任务`));
+        continue;
+      }
+      if (isActiveRelease(run)) {
+        outcomes.push(batchItemFailure(id, 409, "RELEASE_IN_PROGRESS", "发布仍在进行，不能清理任务"));
         continue;
       }
       try {

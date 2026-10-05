@@ -59,4 +59,20 @@ describe("buildMergeRecord / buildDeployHookPayload", () => {
     expect(payload).toMatchObject({ event: "run.merged", runId: "run_1", targetBranch: "main", commit: "c", strategy: "fast-forward" });
     expect(JSON.stringify(payload)).not.toMatch(/token|key|secret|password/i);
   });
+
+  it("builds an environment-specific release payload with callback metadata", () => {
+    const payload = buildDeployHookPayload({
+      run: { id: "run_1", title: "t", repository: "repo", branch: "pigo/run_1", baseSha: "base" },
+      merge: buildMergeRecord({ commit: "c", strategy: "fast-forward", targetBranch: "main", mergedAt: "now", mergedBy: "admin" }),
+      release: { deliveryId: "release_1", environment: "production", attempt: 2, requestedBy: "admin" },
+      callbackUrl: "https://pigo.example/api/internal/runs/run_1/release-result",
+    });
+    expect(payload).toMatchObject({
+      event: "run.release_requested",
+      deliveryId: "release_1",
+      environment: "production",
+      attempt: 2,
+      callbackUrl: "https://pigo.example/api/internal/runs/run_1/release-result",
+    });
+  });
 });

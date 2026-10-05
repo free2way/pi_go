@@ -19,7 +19,9 @@ import { scrubEnvironment } from "./pi-env.js";
 import { runHardenedGit } from "./git-hardening.js";
 import { apiKeyEnvName, classifyProviderError, providerErrorSummary } from "./provider-errors.js";
 import { sleep } from "./provider-retry.js";
-import { blockingSeverities, parseReview, type ReviewResult } from "./review-protocol.js";
+import { parseReview, type ReviewResult } from "./review-protocol.js";
+import { convergenceGuardEnabled, convergenceStop } from "./review-convergence.js";
+import { blockingFindings, deferredFindings, deferredMessage, isDeferral, resolveReviewScope, shouldAcceptRound } from "./review-scope.js";
 import { buildContainerSpec, hostPathFor, resolveSandboxMode } from "./sandbox.js";
 import { mergeFindings, repeatedSevereFindings, severeRepeatThreshold, unresolvedFeedback } from "./review-findings.js";
 import {
@@ -70,6 +72,10 @@ const minFreeDiskMb = Math.max(64, Number(process.env.PI_MIN_FREE_DISK_MB || 204
 // Critical is a quarter of the configured minimum (2048 MB -> 512 MB by default),
 // so raising PI_MIN_FREE_DISK_MB also scales the hard stop threshold.
 const criticalFreeDiskMb = Math.max(32, Number(process.env.PI_CRITICAL_FREE_DISK_MB || Math.round(minFreeDiskMb / 4)));
+// Convergence guard (incident run_e2eabf51532448b3): stop a review loop whose NEW
+// critical/high finding count has not decreased for two consecutive rounds,
+// before it burns another repair round. Default on; `off` disables it.
+const reviewConvergenceGuardEnabled = convergenceGuardEnabled();
 
 export type StorageStatus = {
   state: "ok" | "low" | "critical";
@@ -574,11 +580,11 @@ async function postUpdate(runId: string, input: {
   }
 }
 
-async function update(run: Run, state: RunState, source: RunEvent["source"], type: string, message: string, patch: Partial<Run> = {}, options: { diffArtifact?: DiffArtifactRef } = {}) {
+async function update(run: Run, state: RunState, source: RunEvent["source"], type: string, message: string, patch: Partial<Run> = {}, options: { diffArtifact?: DiffArtifactRef; meta?: Record<string, unknown> } = {}) {
   Object.assign(run, patch, { state });
   await postUpdate(run.id, {
     patch: { state, ...patch },
-    event: { round: run.round, source, type, message },
+    event: { round: run.round, source, type, message, ...(options.meta ? { meta: options.meta } : {}) },
   }, { ...options, ownerId: run.ownerId, round: run.round });
 }
 
@@ -1603,8 +1609,9 @@ async function executeRetryReview(input: {
   if (outcome.stopped) return;
   const review = outcome.review;
   const findings = mergeFindings(run.findings ?? [], review.findings, { approved: review.verdict === "approved" });
-  if (review.verdict === "approved") {
-    const blocking = findings.filter((finding) => !finding.resolved && blockingSeverities.includes(finding.severity));
+  const scope = resolveReviewScope(run);
+  const blocking = blockingFindings(findings, scope);
+  if (shouldAcceptRound({ verdict: review.verdict, scope, blocking })) {
     if (blocking.length > 0) {
       await update(run, "needs_human", "system", "run.completion_blocked", `完成守卫拒绝：审核结论为通过但仍存在 ${blocking.length} 个阻断级问题`, {
         findings,
@@ -1616,6 +1623,18 @@ async function executeRetryReview(input: {
         durationMs: Date.now() - input.started,
       }, { diffArtifact: retryDiffArtifact });
       return;
+    }
+    const deferred = deferredFindings(findings, scope);
+    if (isDeferral(scope, deferred)) {
+      await postUpdate(run.id, {
+        event: {
+          round: run.round,
+          source: "reviewer",
+          type: "review.nonblocking_deferred",
+          message: deferredMessage(run.round, deferred),
+          meta: { round: run.round, scope, count: deferred.length, ids: deferred.map((finding) => finding.id) },
+        },
+      });
     }
     await update(run, "completed", "reviewer", "review.approved", "独立审核通过，代码保留在任务 worktree", {
       findings,
@@ -1926,6 +1945,8 @@ async function executeJob(input: JobInput, controller: AbortController) {
         await tracker.complete(stages.review(round), { ...review, round, snapshotHash: reviewSnapshot });
       }
       findings = mergeFindings(findings, review.findings, { round, approved: review.verdict === "approved" });
+      const scope = resolveReviewScope(run);
+      const blocking = blockingFindings(findings, scope);
       // AT-REVIEW-010 / REVIEW-007: stop auto-repairing when the same severe
       // finding persists across the policy threshold of consecutive rounds,
       // instead of starting yet another repair round.
@@ -1952,11 +1973,12 @@ async function executeJob(input: JobInput, controller: AbortController) {
         );
         return;
       }
-      if (review.verdict === "approved") {
+      if (shouldAcceptRound({ verdict: review.verdict, scope, blocking })) {
         // AUD-03/AUD-04: independent completion guard. The review verdict alone
         // never completes a run: the checks for this snapshot must have passed
-        // and no blocking finding may remain open.
-        const blocking = findings.filter((finding) => !finding.resolved && blockingSeverities.includes(finding.severity));
+        // and no blocking finding may remain open. Under scope "blocking" the
+        // blocking set is critical/high only, so a changes_requested review whose
+        // remaining findings are medium/low becomes an approval-with-notes.
         const snapshotConsistent = !run.checkSnapshot || !reviewSnapshot || run.checkSnapshot === reviewSnapshot;
         if (blocking.length > 0 || !checked.passed || !snapshotConsistent) {
           const reasons = [
@@ -1976,6 +1998,21 @@ async function executeJob(input: JobInput, controller: AbortController) {
           }, { diffArtifact: reviewDiffArtifact });
           return;
         }
+        const deferred = deferredFindings(findings, scope);
+        if (isDeferral(scope, deferred)) {
+          // The non-blocking findings stay on the run (and in the acceptance
+          // snapshot's remaining list); this event keeps them visible instead of
+          // silently dropped.
+          await postUpdate(run.id, {
+            event: {
+              round,
+              source: "reviewer",
+              type: "review.nonblocking_deferred",
+              message: deferredMessage(round, deferred),
+              meta: { round, scope, count: deferred.length, ids: deferred.map((finding) => finding.id) },
+            },
+          });
+        }
         await update(run, "completed", "reviewer", "review.approved", "独立审核通过，代码保留在任务 worktree", {
           findings,
           diff: latestDiff,
@@ -1983,6 +2020,28 @@ async function executeJob(input: JobInput, controller: AbortController) {
           usage: toRunUsage(usage),
           durationMs: Date.now() - started,
         }, { diffArtifact: reviewDiffArtifact });
+        return;
+      }
+      // Convergence guard (incident run_e2eabf51532448b3): fire BEFORE another
+      // repair round starts when the reviewer keeps raising NEW severe findings.
+      // Runs after the repeated-severe/budget/deadline guards and the completion
+      // path, so it never overrides a stronger terminal reason.
+      const convergence = convergenceStop({
+        findings,
+        currentRound: round,
+        enabled: reviewConvergenceGuardEnabled,
+      });
+      if (convergence.stop) {
+        await update(run, "needs_human", "reviewer", "review.not_converging", convergence.message, {
+          findings,
+          diff: latestDiff,
+          checkSnapshot,
+          reviewSnapshot,
+          checkPassed: checked.passed,
+          summary: "审核未收敛，已停止自动返修并转人工处理",
+          usage: toRunUsage(usage),
+          durationMs: Date.now() - started,
+        }, { diffArtifact: reviewDiffArtifact, meta: convergence.meta });
         return;
       }
       feedback = JSON.stringify(review.findings, null, 2);

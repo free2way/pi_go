@@ -1,4 +1,4 @@
-import type { Run, RunMergeRecord } from "../shared/types.js";
+import type { Run, RunMergeRecord, RunReleaseRecord } from "../shared/types.js";
 import type { MergeStrategy } from "../shared/merge.js";
 
 /**
@@ -70,9 +70,11 @@ export function planPostMergeDeploy(hook: string | undefined | null): PostMergeD
 export function buildDeployHookPayload(input: {
   run: Pick<Run, "id" | "title" | "repository" | "branch" | "baseSha">;
   merge: MergeRecord;
+  release?: Pick<RunReleaseRecord, "deliveryId" | "environment" | "attempt" | "requestedBy">;
+  callbackUrl?: string;
 }) {
   return {
-    event: "run.merged",
+    event: input.release ? "run.release_requested" : "run.merged",
     runId: input.run.id,
     title: input.run.title,
     repository: input.run.repository,
@@ -82,5 +84,14 @@ export function buildDeployHookPayload(input: {
     commit: input.merge.commit,
     strategy: input.merge.strategy,
     mergedAt: input.merge.mergedAt,
+    ...(input.release
+      ? {
+          deliveryId: input.release.deliveryId,
+          environment: input.release.environment,
+          attempt: input.release.attempt,
+          requestedBy: input.release.requestedBy,
+        }
+      : {}),
+    ...(input.callbackUrl ? { callbackUrl: input.callbackUrl } : {}),
   };
 }

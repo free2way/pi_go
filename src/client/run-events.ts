@@ -30,3 +30,26 @@ export function shouldAcceptRun(current: Run | undefined, next: Run): boolean {
   if (next.lastSeq !== current.lastSeq) return next.lastSeq > current.lastSeq;
   return next.updatedAt >= current.updatedAt;
 }
+
+/**
+ * Latest `review.nonblocking_deferred` notice for the run detail. Under
+ * `reviewScope: "blocking"` the worker accepts a round whose only remaining
+ * findings are medium/low; this keeps those deferred findings visible instead of
+ * silent. Returns `undefined` when the run never deferred anything.
+ */
+export interface DeferredNonBlockingNotice {
+  round: number;
+  count: number;
+  ids: string[];
+  message: string;
+}
+
+export function deferredNonBlockingNotice(events: RunEvent[]): DeferredNonBlockingNotice | undefined {
+  const latest = [...events].reverse().find((event) => event.type === "review.nonblocking_deferred");
+  if (!latest) return undefined;
+  const meta = latest.meta ?? {};
+  const ids = Array.isArray(meta.ids) ? meta.ids.filter((id): id is string => typeof id === "string") : [];
+  const count = typeof meta.count === "number" && Number.isFinite(meta.count) ? meta.count : ids.length;
+  const round = typeof meta.round === "number" && Number.isFinite(meta.round) ? meta.round : latest.round;
+  return { round, count, ids, message: latest.message };
+}

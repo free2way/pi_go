@@ -47,6 +47,7 @@ import {
   Play,
   Plus,
   RotateCcw,
+  Rocket,
   Search,
   ShieldCheck,
   Sparkles,
@@ -65,7 +66,7 @@ import { api, type DeploymentStatus } from "./api";
 import { HistoryPage } from "./HistoryPage";
 import { runStateLabels, requirementSummary } from "./requirement-history";
 import { batchCleanupConfirmMessage, cleanupFinishedConfirmMessage, cleanupStorageDetailLines, summarizeCleanupStorage } from "./run-cleanup-view";
-import { MAX_BUFFERED_EVENTS, mergeRunEvents, shouldAcceptRun } from "./run-events";
+import { MAX_BUFFERED_EVENTS, deferredNonBlockingNotice, mergeRunEvents, shouldAcceptRun } from "./run-events";
 import { createRunSelectionGuard, eventsForRun, isRunSelected, pickSelectedRun } from "./run-selection";
 import { reworkBranchDetailsFromSummaries, resolveReworkRounds, resolveRoundStatuses } from "./rounds-view";
 import { reworkBranchLayout, reworkBranchPath, type ReworkSide } from "./rework-layout";
@@ -77,7 +78,7 @@ type Tab = "activity" | "agents" | "review" | "diff" | "checks" | "budget";
 type FlowNodeData = {
   label: string;
   caption: string;
-  kind: "task" | "developer" | "checks" | "reviewer" | "complete";
+  kind: "task" | "developer" | "checks" | "reviewer" | "complete" | "release";
   status: "waiting" | "active" | "done" | "warning";
   meta?: string;
   /** Live workflow status of the round this node represents. */
@@ -104,6 +105,7 @@ const iconForKind = {
   checks: ListChecks,
   reviewer: ShieldCheck,
   complete: CheckCircle2,
+  release: Rocket,
 };
 
 /**
@@ -281,6 +283,29 @@ function flowForRun(run?: Run, events: RunEvent[] = [], options: FlowOptions = {
         status: statusAt(4),
       },
     },
+    {
+      id: "release",
+      type: "flowCard",
+      position: { x: 1161, y: 72 },
+      data: {
+        label: run?.release?.status === "succeeded" ? "发布成功" : "代码发布",
+        caption: run?.release
+          ? `${run.release.environment} · ${run.release.status}`
+          : run?.merge
+            ? "等待发布审批"
+            : "等待合并",
+        kind: "release",
+        status: !run || run.state !== "completed" || !run.merge
+          ? "waiting"
+          : run.release?.status === "succeeded"
+            ? "done"
+            : run.release?.status === "failed"
+              ? "warning"
+              : run.release?.status === "publishing" || run.release?.status === "triggered"
+                ? "active"
+                : "waiting",
+      },
+    },
   ];
   const edgeDefaults = {
     type: "smoothstep",
@@ -292,6 +317,7 @@ function flowForRun(run?: Run, events: RunEvent[] = [], options: FlowOptions = {
     { id: "dev-check", source: "developer", target: "checks", sourceHandle: "main-source", targetHandle: "main-target", ...edgeDefaults },
     { id: "check-review", source: "checks", target: "reviewer", sourceHandle: "main-source", targetHandle: "main-target", ...edgeDefaults },
     { id: "review-done", source: "reviewer", target: "complete", sourceHandle: "main-source", targetHandle: "main-target", ...edgeDefaults },
+    { id: "done-release", source: "complete", target: "release", sourceHandle: "main-source", targetHandle: "main-target", ...edgeDefaults },
   ];
   // Each return round is drawn as its own branch rather than as a reverse
   // traversal over the original edges. Only real review returns qualify — checks
@@ -684,6 +710,123 @@ function AcceptancePanel({ run }: { run: Run }) {
 }
 
 /**
+ * A one-line run-detail notice for `review.nonblocking_deferred`: under
+ * `reviewScope: "blocking"` the worker accepted a round whose only remaining
+ * findings were medium/low. The findings stay on the run and in the acceptance
+ * snapshot's "remaining" list; this line makes the deferral explicit.
+ */
+function DeferredNonBlockingNotice({ events }: { events: RunEvent[] }) {
+  const notice = useMemo(() => deferredNonBlockingNotice(events), [events]);
+  if (!notice) return null;
+  const ids = notice.ids.slice(0, 8).join("、");
+  return (
+    <div className="review-scope-note">
+      第 {notice.round} 轮按「只修阻断项」范围受理：{notice.count} 个非阻断问题（medium/low）已记录但不阻断完成
+      {notice.ids.length > 0 ? `（${ids}${notice.ids.length > 8 ? "…" : ""}）` : ""}
+    </div>
+  );
+}
+
+/** Explicit administrator gate between reviewed code, local merge and release. */
+function ReleasePanel({ run, user, configured, onUpdated }: {
+  run: Run;
+  user?: CurrentUser;
+  configured?: boolean;
+  onUpdated: (run: Run) => void;
+}) {
+  const [environment, setEnvironment] = useState("production");
+  const [busy, setBusy] = useState<"" | "merge" | "publish">("");
+  const [error, setError] = useState("");
+  const [, setReleaseClock] = useState(0);
+  useEffect(() => {
+    if (run.release?.status !== "publishing" && run.release?.status !== "triggered") return;
+    const remaining = 2 * 60_000 - (Date.now() - Date.parse(run.release.startedAt));
+    if (!Number.isFinite(remaining) || remaining <= 0) return;
+    const timer = window.setTimeout(() => setReleaseClock((value) => value + 1), remaining + 50);
+    return () => window.clearTimeout(timer);
+  }, [run.release?.status, run.release?.startedAt]);
+  if (run.state !== "completed" || run.mode !== "real") return null;
+
+  const release = run.release;
+  const stalePublishing = (release?.status === "publishing" || release?.status === "triggered")
+    && Date.now() - Date.parse(release.startedAt) >= 2 * 60_000;
+  const canRetry = release?.status === "failed" || stalePublishing;
+  const inProgress = (release?.status === "publishing" || release?.status === "triggered") && !stalePublishing;
+  const merge = async () => {
+    if (!window.confirm(`确认把任务「${run.title}」审核通过的 commit 合并到工作区默认分支？\n\n此操作不会自动发布。`)) return;
+    setBusy("merge");
+    setError("");
+    try {
+      onUpdated(await api.mergeRun(run.id, { confirm: true }));
+    } catch (cause) {
+      setError((cause as Error).message);
+    } finally {
+      setBusy("");
+    }
+  };
+  const publish = async () => {
+    const target = release?.environment ?? environment.trim();
+    if (!target) return setError("请输入发布环境");
+    if (!window.confirm(`确认发布任务「${run.title}」？\n\ncommit：${run.merge?.commit.slice(0, 12)}\n环境：${target}\n\n发布与合并是独立动作，失败后可使用同一幂等标识重试。`)) return;
+    setBusy("publish");
+    setError("");
+    try {
+      onUpdated(await api.publishRun(run.id, { environment: target, confirm: true, ...(canRetry ? { retry: true } : {}) }));
+    } catch (cause) {
+      setError((cause as Error).message);
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const statusLabel = !release
+    ? run.merge ? "已合并，等待发布审批" : "等待合并审批"
+    : release.status === "succeeded"
+      ? "发布成功"
+      : release.status === "failed"
+        ? "发布失败"
+        : release.status === "triggered"
+          ? "已触发，等待部署回调"
+          : "发布中";
+
+  return (
+    <section className="panel release-panel">
+      <div className="panel-head">
+        <div><span className="eyebrow">CODE RELEASE</span><h3>代码发布</h3></div>
+        <span className={`release-status release-${release?.status ?? (run.merge ? "ready" : "waiting")}`}>{statusLabel}</span>
+      </div>
+      <div className="release-grid">
+        <div><span>审核快照</span><strong>{run.reviewSnapshot?.slice(0, 12) ?? run.baseSha?.slice(0, 12) ?? "未知"}</strong></div>
+        <div><span>合并结果</span><strong>{run.merge ? `${run.merge.commit.slice(0, 12)} → ${run.merge.targetBranch}` : "未合并"}</strong></div>
+        <div><span>发布环境</span><strong>{release?.environment ?? environment}</strong></div>
+        <div><span>幂等标识</span><strong>{release?.deliveryId ?? "发布时生成"}</strong></div>
+      </div>
+      {release?.detail ? <p className="release-detail">{release.detail}</p> : null}
+      {release?.url ? <a className="release-link" href={release.url} target="_blank" rel="noreferrer">查看部署详情 <ArrowUpRight size={13} /></a> : null}
+      {error ? <div className="form-error">{error}</div> : null}
+      {user?.isAdmin ? (
+        <div className="release-actions">
+          {!run.merge ? (
+            <button type="button" className="button secondary" disabled={Boolean(busy)} onClick={() => void merge()}>
+              {busy === "merge" ? <LoaderCircle className="spin" size={14} /> : <GitBranch size={14} />}合并审核代码
+            </button>
+          ) : null}
+          {run.merge && release?.status !== "succeeded" ? (
+            <>
+              {!release ? <input aria-label="发布环境" value={environment} maxLength={64} onChange={(event) => setEnvironment(event.target.value)} disabled={Boolean(busy)} /> : null}
+              <button type="button" className="button primary" disabled={Boolean(busy) || inProgress || configured === false} onClick={() => void publish()}>
+                {busy === "publish" || inProgress ? <LoaderCircle className="spin" size={14} /> : <Rocket size={14} />}{canRetry ? "重试发布" : inProgress ? "发布处理中" : "确认发布"}
+              </button>
+            </>
+          ) : null}
+          {configured === false ? <small className="release-config-hint">发布钩子或 webhook 凭据尚未配置。</small> : null}
+        </div>
+      ) : <small className="release-config-hint">只有管理员可以执行合并和发布。</small>}
+    </section>
+  );
+}
+
+/**
  * A3: compact read-only deployment panel. Every unknown state is shown as such;
  * a missing deploy log is reported instead of pretending there were no deploys.
  */
@@ -1002,6 +1145,9 @@ function HumanInterventionPanel({ run, events, onUpdated }: { run: Run; events: 
   const [mergeNotice, setMergeNotice] = useState("");
   // A2: admin-only merge on accept; the server enforces the admin check.
   const [mergeIntoWorkspace, setMergeIntoWorkspace] = useState(false);
+  // Convergence guardrail: the operator can narrow the continued round to the
+  // blocking (critical/high) findings so medium/low notes no longer loop.
+  const [reviewScope, setReviewScope] = useState<"all" | "blocking">(run.reviewScope === "blocking" ? "blocking" : "all");
   const unresolved = run.findings.filter((item) => !item.resolved).length;
   // R: the latest merge failure's restore state, so the line survives a reload
   // (the worker records `run.merge_failed` with `restored`/`restoreError`).
@@ -1030,7 +1176,7 @@ function HumanInterventionPanel({ run, events, onUpdated }: { run: Run; events: 
         onUpdated(await api.retryReviewRun(run.id));
       } else if (kind === "continue") {
         // "继续开发" never warns: it sends the run back for another round.
-        onUpdated(await api.approveRun(run.id, { mode: "continue", note: instruction.trim() || undefined }));
+        onUpdated(await api.approveRun(run.id, { mode: "continue", note: instruction.trim() || undefined, reviewScope }));
       } else if (kind === "approve") {
         onUpdated(await api.approveRun(run.id, {
           mode: "accept",
@@ -1069,6 +1215,12 @@ function HumanInterventionPanel({ run, events, onUpdated }: { run: Run; events: 
       <label className="merge-option">
         <input type="checkbox" checked={mergeIntoWorkspace} onChange={(event) => setMergeIntoWorkspace(event.target.checked)} disabled={Boolean(busy)} />
         审批通过后合并到工作区默认分支（仅管理员；冲突会被拒绝且不修改工作区）
+      </label>
+      <label className="review-scope-option">「继续开发」的审核范围
+        <select value={reviewScope} onChange={(event) => setReviewScope(event.target.value === "blocking" ? "blocking" : "all")} disabled={Boolean(busy)}>
+          <option value="all">修复全部问题</option>
+          <option value="blocking">只修阻断项(critical/high)</option>
+        </select>
       </label>
       {restoreNotice && <div className={`merge-notice ${restoreFailed ? "merge-notice-warn" : ""}`}>{restoreNotice}</div>}
       {error && <div className="form-error">{error}</div>}
@@ -1451,13 +1603,15 @@ export function App() {
               </div>
               <div className="run-round">
                 <span>REVIEW ROUND</span><strong>{activeRun.round}<em>/ {activeRun.maxRounds}</em></strong>
-                {activeRun.state === "completed" && (
+                {activeRun.state === "completed" && !activeRun.merge && !activeRun.release && (
                   <button type="button" className="button secondary reopen-button" onClick={() => void handleReopen(activeRun)}>
                     <RotateCcw size={14} />重新打开
                   </button>
                 )}
               </div>
             </section>
+
+            <DeferredNonBlockingNotice events={events} />
 
             {activeRun.state === "needs_human" && (
               <HumanInterventionPanel
@@ -1471,6 +1625,16 @@ export function App() {
             )}
 
             <AcceptancePanel run={activeRun} />
+            <ReleasePanel
+              key={activeRun.id}
+              run={activeRun}
+              user={user}
+              configured={config?.releaseConfigured}
+              onUpdated={(next) => {
+                setRun(next);
+                setRuns((current) => current.map((item) => (item.id === next.id ? next : item)));
+              }}
+            />
 
             <section className="metrics-grid">
               <div className="metric"><span><Activity size={14} />状态</span><strong>{runStateLabels[activeRun.state]}</strong><small>{running} 个任务运行中</small></div>

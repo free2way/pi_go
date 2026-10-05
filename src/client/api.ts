@@ -158,8 +158,12 @@ export const api = {
   createRun: (body: { title: string; task: string; repository?: string; workspaceId?: string; mode: "demo" | "real"; checks?: string[]; developerModel?: ModelSelection; reviewerModel?: ModelSelection }) =>
     request<Run>("/api/runs", { method: "POST", body: JSON.stringify(body) }),
   cancelRun: (id: string) => request<Run>(`/api/runs/${id}/cancel`, { method: "POST" }),
-  approveRun: (id: string, body: { mode?: "continue" | "accept"; note?: string; acknowledgeOpenFindings?: boolean; mergeIntoWorkspace?: boolean } = {}) =>
+  approveRun: (id: string, body: { mode?: "continue" | "accept"; note?: string; acknowledgeOpenFindings?: boolean; mergeIntoWorkspace?: boolean; reviewScope?: "all" | "blocking" } = {}) =>
     request<Run>(`/api/runs/${id}/approve`, { method: "POST", body: JSON.stringify(body) }),
+  mergeRun: (id: string, body: { confirm: true; note?: string }) =>
+    request<Run>(`/api/runs/${id}/merge`, { method: "POST", body: JSON.stringify(body) }),
+  publishRun: (id: string, body: { environment: string; confirm: true; retry?: boolean }) =>
+    request<Run>(`/api/runs/${id}/publish`, { method: "POST", body: JSON.stringify(body) }),
   rejectRun: (id: string, body: { reason?: string } = {}) =>
     request<Run>(`/api/runs/${id}/reject`, { method: "POST", body: JSON.stringify(body) }),
   cleanupRuns: (body: { runIds?: string[]; states?: Run["state"][]; olderThanDays?: number; scope?: "own" | "all"; dryRun?: boolean; deleteRunDirectory?: boolean } = {}) =>
