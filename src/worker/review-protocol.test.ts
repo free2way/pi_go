@@ -42,6 +42,15 @@ describe("review protocol", () => {
     });
   });
 
+  it("extracts a balanced JSON object from harmless explanatory prose", () => {
+    const review = parseReview([
+      "I completed the review. Here is the requested result:",
+      JSON.stringify({ verdict: "approved", summary: "brace in string: {ok}", findings: [] }),
+      "End of response.",
+    ].join("\n"));
+    expect(review).toMatchObject({ verdict: "approved", summary: "brace in string: {ok}" });
+  });
+
   it("rejects invalid verdicts and non-array findings", () => {
     expect(() => parseReview(JSON.stringify({ verdict: "maybe", findings: [] }))).toThrow();
     expect(() => parseReview(JSON.stringify({ verdict: "approved" }))).toThrow();

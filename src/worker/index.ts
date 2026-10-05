@@ -23,7 +23,7 @@ import { parseReview, type ReviewResult } from "./review-protocol.js";
 import { convergenceGuardEnabled, convergenceStop, reviewStallRounds } from "./review-convergence.js";
 import { buildReviewDiff } from "./review-input.js";
 import { blockingFindings, deferredFindings, deferredMessage, isDeferral, resolveReviewScope, shouldAcceptRound } from "./review-scope.js";
-import { buildContainerSpec, hostPathFor, resolveSandboxMode } from "./sandbox.js";
+import { buildContainerSpec, hostPathFor, resolveSandboxMode, sandboxStateDirectory } from "./sandbox.js";
 import { mergeFindings, repeatedSevereFindings, severeRepeatThreshold, unresolvedFeedback } from "./review-findings.js";
 import {
   buildSnapshotDivergenceFinding,
@@ -47,6 +47,12 @@ import { startRunDeadline } from "./run-deadline.js";
 import { detectProjectPlugins, pluginArguments, pluginMounts, selectPlugins, verifyPluginPins, type PluginDenial } from "./plugin-policy.js";
 import { buildPluginPolicy } from "./plugin-registry.js";
 import { CliSessionManager, SessionAccumulator, planPiSession, sessionReuseEnabled, type PiSessionRole } from "./pi-session.js";
+import {
+  defaultReviewerThinking,
+  parseThinkingLevel,
+  reviewerRetryMaxElapsedMs,
+  shouldRetryProviderAttempt,
+} from "./review-performance.js";
 
 const port = Number(process.env.PORT || 3200);
 const host = process.env.HOST || "localhost";
@@ -82,6 +88,8 @@ const reviewConvergenceGuardEnabled = convergenceGuardEnabled();
 // incident run_e7c565d6335a4bc7: also stop when the SAME batch of blocking
 // findings (stable key) is re-reported for PI_REVIEW_STALL_ROUNDS rounds.
 const reviewStallRoundsThreshold = reviewStallRounds();
+const reviewerThinking = parseThinkingLevel(process.env.PI_REVIEWER_THINKING, defaultReviewerThinking);
+const reviewerRetryMaxElapsed = reviewerRetryMaxElapsedMs();
 
 export type StorageStatus = {
   state: "ok" | "low" | "critical";
@@ -267,13 +275,15 @@ interface SandboxRunInput {
   pluginMounts?: Array<{ hostPath: string; containerPath: string }>;
   /** GAP-03: mount the worktree read-only (reviewer snapshot). */
   readOnly?: boolean;
+  /** Optional Pi state location; must be outside `worktree`. */
+  statePath?: string;
 }
 
 /** Runs one invocation inside its own container and always cleans it up. */
 async function runInSandbox(input: SandboxRunInput): Promise<CommandResult> {
   // Kept next to (never inside) the worktree so sandbox state cannot leak into
   // the diff or the committed tree.
-  const runStateDir = `${input.worktree}.state`;
+  const runStateDir = sandboxStateDirectory(input.worktree, input.statePath);
   // The state directory (and its agent subdirectory) must exist and be owned by
   // the container user before the container starts: the bind for the read-only
   // model definition would otherwise create it as root and Pi could not write
@@ -862,6 +872,8 @@ async function runPi(input: {
   readOnly?: boolean;
   /** Reasoning effort for Pi (planner uses a cheaper level, COST-006). */
   thinking?: "low" | "medium" | "high";
+  /** Explicit state location for nested sub-agent worktrees. */
+  statePath?: string;
   apiKey: string;
   apiKeyEnvironmentName: string;
   signal: AbortSignal;
@@ -935,6 +947,7 @@ async function runPi(input: {
         onStdoutLine,
         label: "pi-agent",
         ...(mounts.length > 0 ? { pluginMounts: mounts } : {}),
+        ...(input.statePath ? { statePath: input.statePath } : {}),
       })
     : await command("pi", args, {
         cwd: input.cwd,
@@ -993,6 +1006,9 @@ async function runPiWithRetry(
     onActivity: input.onActivity,
     invoke: async (sessionId) => {
       let modelCalls = 0;
+      const safeProviderMessage = (message: string) => input.apiKey
+        ? message.replaceAll(input.apiKey, "[redacted]")
+        : message;
       // NEW-08/AUD-10: every provider attempt (including failed retries) is
       // reserved and accounted; the hard model-call limit stops the retry loop.
       const outcome = await runProviderOperation(() => {
@@ -1003,13 +1019,49 @@ async function runPiWithRetry(
         budget: budget
           ? { reserve: () => budget.reserve(context.role), recordUnknown: () => budget.recordUnknown() }
           : undefined,
-        onRetry: async ({ attempt, delayMs, kind, message }) => {
+        shouldRetry: ({ elapsedMs }) => shouldRetryProviderAttempt({
+          role: context.role,
+          elapsedMs,
+          reviewerMaxElapsedMs: reviewerRetryMaxElapsed,
+        }),
+        onAttemptFailure: async ({ attempt, elapsedMs, kind, message, willRetry }) => {
+          const safeMessage = safeProviderMessage(message);
+          const lateReviewerFailure = context.role === "reviewer"
+            && Number.isFinite(reviewerRetryMaxElapsed)
+            && elapsedMs > reviewerRetryMaxElapsed;
+          await postUpdate(context.runId, {
+            event: {
+              round: context.round,
+              source: "system",
+              type: "provider.attempt_failed",
+              message: lateReviewerFailure
+                ? `${context.label} 第 ${attempt} 次调用运行 ${(elapsedMs / 1000).toFixed(1)}s 后失败；为避免从零重复长审核，已停止自动重试：${safeMessage.slice(0, 160)}`
+                : `${context.label} 第 ${attempt} 次调用在 ${(elapsedMs / 1000).toFixed(1)}s 后失败（${kind}）${willRetry ? "，准备重试" : "，不再重试"}`,
+              meta: {
+                attempt,
+                durationMs: elapsedMs,
+                kind,
+                willRetry,
+                role: context.role,
+                provider: input.provider,
+                model: input.model,
+                thinking: input.thinking ?? "high",
+                promptBytes: Buffer.byteLength(input.prompt),
+                lateReviewerFailure,
+                ...(Number.isFinite(reviewerRetryMaxElapsed) ? { reviewerRetryMaxElapsedMs: reviewerRetryMaxElapsed } : {}),
+              },
+            },
+          }).catch(() => undefined);
+        },
+        onRetry: async ({ attempt, delayMs, kind, message, elapsedMs }) => {
+          const safeMessage = safeProviderMessage(message);
           await postUpdate(context.runId, {
             event: {
               round: context.round,
               source: "system",
               type: "provider.retry",
-              message: `${context.label} 调用遇到${kind}错误，约 ${Math.max(1, Math.round(delayMs / 1000))} 秒后重试（第 ${attempt} 次）：${message.slice(0, 200)}`,
+              message: `${context.label} 调用遇到${kind}错误，约 ${Math.max(1, Math.round(delayMs / 1000))} 秒后重试（第 ${attempt} 次）：${safeMessage.slice(0, 200)}`,
+              meta: { attempt, delayMs, durationMs: elapsedMs, kind, role: context.role, provider: input.provider, model: input.model },
             },
           }).catch(() => undefined);
         },
@@ -1028,7 +1080,13 @@ async function runPiWithRetry(
           source: "system",
           type: "session.metrics",
           message: `会话 ${metrics.sessionId}（${plan.role} · 第 ${plan.round} 轮 · ${plan.resume ? "复用" : "新建"}）：${metrics.modelCalls} 次调用，${(metrics.durationMs / 1000).toFixed(1)}s`,
-          meta: { ...metrics },
+          meta: {
+            ...metrics,
+            provider: input.provider,
+            model: input.model,
+            thinking: input.thinking ?? "high",
+            promptBytes: Buffer.byteLength(input.prompt),
+          },
         },
       }).catch(() => undefined);
     },
@@ -1088,6 +1146,8 @@ async function runDeveloperAgent(input: {
   budget?: RunBudgetContext;
   role?: PiSessionRole;
   sessions?: SessionAccumulator;
+  /** Pi state outside a nested sub-agent worktree. */
+  statePath?: string;
 }) {
   const extra = input.agentName ? { agent: input.agentName } : {};
   await chat(input.run, "developer", "orchestrator", "developer", "prompt", input.prompt, input.signal, extra);
@@ -1107,6 +1167,7 @@ async function runDeveloperAgent(input: {
         message: input.activityPrefix ? `${input.activityPrefix}：${message}` : message,
       },
     }),
+    ...(input.statePath ? { statePath: input.statePath } : {}),
   }, { runId: input.run.id, round: input.run.round, label: input.activityPrefix ?? "开发 Agent", role: input.role ?? "developer", sessionKey: input.sessionSuffix, budget: input.budget, sessions: input.sessions });
   addUsage(input.usage, result.usage);
   await chat(input.run, "developer", "developer", "orchestrator", "response", redactJobSecrets(result.text, input.credentials), input.signal, extra);
@@ -1190,6 +1251,9 @@ async function runSubAgent(input: {
       budget: input.budget,
       role: "sub-agent",
       sessions: input.sessions,
+      // Keep Pi state under the run's sibling state tree. `${worktree}.state`
+      // would be inside the main run repository for nested sub-agent worktrees.
+      statePath: path.join(`${input.project}.state`, "subagents", input.task.id),
     });
     const changed = await git(worktree, ["status", "--porcelain"], input.signal);
     let commit: string | undefined;
@@ -1249,6 +1313,9 @@ async function runSubAgent(input: {
 
 async function removeSubAgentWorktree(project: string, worktree: string) {
   await serializeWorktreeMutation(() => git(project, ["worktree", "remove", "--force", worktree])).catch(() => undefined);
+  // v0.26.1 compatibility: remove the legacy Pi state sibling that older
+  // workers created inside the main run repository (`subagents/<id>.state`).
+  await rm(`${worktree}.state`, { recursive: true, force: true }).catch(() => undefined);
 }
 
 /**
@@ -1540,7 +1607,8 @@ async function performReview(input: {
   const reviewPrompt = [
     "You are an independent read-only code reviewer. Do not modify files.",
     `Original task: ${input.run.task}`,
-    "Review the current repository and the diff below for correctness, missing requirements, security, regressions, and test quality.",
+    "Review the diff below for correctness, missing requirements, security, regressions, and test quality.",
+    "Work diff-first: inspect changed files, their direct dependencies, and related tests. Do not inventory or scan the whole repository without a concrete concern from the diff. Aim for at most 12 targeted tool calls; exceed that only when you can name the risk being verified.",
     "The diff may be budget-trimmed: a trailing [PiGO review input manifest] lists every excluded or trimmed file with +A/-B stats and the reason.",
     "Lockfiles (package-lock.json/yarn.lock/pnpm-lock.yaml/*.lock) and build outputs (dist/, build/, node_modules/) are excluded unless the original task explicitly targets them. Flag out-of-scope changes (e.g. docs or lockfile edits unrelated to the task) as findings.",
     "Return JSON only with this exact shape:",
@@ -1548,6 +1616,26 @@ async function performReview(input: {
     "Use changes_requested only for actionable defects. approved must not contain critical/high/medium findings.",
     `Diff:\n${reviewInput.text}`,
   ].join("\n\n");
+  await postUpdate(input.run.id, {
+    event: {
+      round: input.round,
+      source: "reviewer",
+      type: "review.input_prepared",
+      message: `审核输入 ${reviewInput.originalBytes} → ${Buffer.byteLength(reviewInput.text)} 字节（thinking=${reviewerThinking}）`,
+      meta: {
+        originalDiffBytes: reviewInput.originalBytes,
+        includedDiffBytes: reviewInput.includedBytes,
+        emittedDiffBytes: Buffer.byteLength(reviewInput.text),
+        promptBytes: Buffer.byteLength(reviewPrompt),
+        fileCount: reviewInput.files.length,
+        includedFiles: reviewInput.files.filter((file) => file.included).length,
+        excludedFiles: reviewInput.files.filter((file) => !file.included).length,
+        trimmedFiles: reviewInput.files.filter((file) => file.trimmed).length,
+        trimmed: reviewInput.trimmed,
+        thinking: reviewerThinking,
+      },
+    },
+  }).catch(() => undefined);
   let firstReview: { text: string; usage: UsageTotals };
   await chat(input.run, "reviewer", "orchestrator", "reviewer", "prompt", reviewPrompt, input.signal);
   try {
@@ -1557,6 +1645,7 @@ async function performReview(input: {
       model: input.run.reviewer.model,
       prompt: reviewPrompt,
       readOnly: true,
+      thinking: reviewerThinking,
       apiKey: input.credentials.reviewer,
       apiKeyEnvironmentName: apiKeyEnvName(input.run.reviewer.provider),
       signal: input.signal,
@@ -1582,12 +1671,21 @@ async function performReview(input: {
     await postUpdate(input.run.id, { event: { round: input.round, source: "reviewer", type: "review.retry", message: `审核输出无法解析（${reason}），已要求 Reviewer 重新输出` } });
     let retryReview: { text: string; usage: UsageTotals };
     try {
+      const protocolRepairPrompt = [
+        "You are repairing the format of a completed code-review response. Do not inspect the repository and do not perform a new review.",
+        `The previous response was rejected: ${reason}.`,
+        "Return JSON only with this exact shape:",
+        '{"verdict":"approved|changes_requested","summary":"...","findings":[{"id":"...","severity":"critical|high|medium|low","file":null,"line":null,"title":"...","evidence":"...","requiredChange":"..."}]}',
+        "Preserve the previous response's substantive verdict and findings; only repair its protocol shape.",
+        `Previous response:\n${redactJobSecrets(firstReview.text, input.credentials).slice(0, 64_000)}`,
+      ].join("\n\n");
       retryReview = await runPiWithRetry({
         cwd: input.snapshotPath,
         provider: input.run.reviewer.provider,
         model: input.run.reviewer.model,
-        prompt: `${reviewPrompt}\n\n上一次回复被拒绝：不是合法的协议 JSON。只输出 JSON 对象本身，不要 markdown 代码块，不要任何解释。`,
+        prompt: protocolRepairPrompt,
         readOnly: true,
+        thinking: "low",
         apiKey: input.credentials.reviewer,
         apiKeyEnvironmentName: apiKeyEnvName(input.run.reviewer.provider),
         signal: input.signal,

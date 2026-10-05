@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildContainerSpec, hostPathFor, resolveSandboxMode } from "./sandbox.js";
+import { buildContainerSpec, hostPathFor, resolveSandboxMode, sandboxStateDirectory } from "./sandbox.js";
 
 const base = {
   image: "local/pigo-sandbox:0.1.0",
@@ -81,6 +81,15 @@ describe("hostPathFor", () => {
 
   it("rejects paths outside the container root", () => {
     expect(() => hostPathFor("/etc/passwd", "/workspace", "/host/workspace")).toThrow(/escapes/);
+  });
+});
+
+describe("sandboxStateDirectory", () => {
+  it("keeps explicit sub-agent state outside its code worktree", () => {
+    const worktree = "/workspace/runs/run-1/subagents/api";
+    expect(sandboxStateDirectory(worktree, "/workspace/runs/run-1.state/subagents/api"))
+      .toBe("/workspace/runs/run-1.state/subagents/api");
+    expect(() => sandboxStateDirectory(worktree, `${worktree}/.pi`)).toThrow(/outside worktree/);
   });
 });
 

@@ -36,7 +36,7 @@ reviewer:
   # Deployment default only; a validated per-run selection overrides it.
   provider: ${PI_REVIEWER_PROVIDER}
   model: ${PI_REVIEWER_MODEL}
-  thinkingLevel: high
+  thinkingLevel: medium
   # The reviewer runs against a disposable snapshot, so even a shell command
   # cannot mutate the developer's working tree.
   isolation: disposable-snapshot

@@ -20,6 +20,15 @@ export const defaultRetryPolicy: RetryPolicy = {
 
 export const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+export interface ProviderAttemptFailure {
+  attempt: number;
+  kind: ProviderErrorKind;
+  message: string;
+  error: unknown;
+  elapsedMs: number;
+  willRetry: boolean;
+}
+
 /**
  * REL-005 / AT-REL-006: transient provider failures (429, 5xx, timeouts) are
  * retried with bounded exponential backoff; permanent credential/model errors
@@ -30,14 +39,16 @@ export async function withProviderRetry<T>(
   options: {
     policy?: Partial<RetryPolicy>;
     signal?: AbortSignal;
-    onRetry?: (info: { attempt: number; delayMs: number; kind: ProviderErrorKind; message: string }) => void | Promise<void>;
+    onRetry?: (info: { attempt: number; delayMs: number; kind: ProviderErrorKind; message: string; elapsedMs: number }) => void | Promise<void>;
     /**
      * NEW-08: called before each provider attempt (first try included). Throwing
      * here aborts the loop, which is how a hard model-call cap refuses a retry.
      */
     beforeAttempt?: (attempt: number) => void | Promise<void>;
     /** NEW-08: called for every failed attempt, whether or not it is retried. */
-    onAttemptFailure?: (info: { attempt: number; kind: ProviderErrorKind; message: string; error: unknown }) => void | Promise<void>;
+    onAttemptFailure?: (info: ProviderAttemptFailure) => void | Promise<void>;
+    /** Optional role-aware guard for expensive retries (e.g. a late reviewer stream failure). */
+    shouldRetry?: (info: Omit<ProviderAttemptFailure, "willRetry">) => boolean | Promise<boolean>;
   } = {},
 ): Promise<T> {
   const policy: RetryPolicy = { ...defaultRetryPolicy, ...options.policy };
@@ -47,17 +58,21 @@ export async function withProviderRetry<T>(
     // Deliberately outside the try: a budget error must stop retries, not be
     // reclassified as a retryable provider error.
     await options.beforeAttempt?.(attempt);
+    const attemptStartedAt = Date.now();
     try {
       return await operation();
     } catch (error) {
       lastError = error;
       const message = (error as Error)?.message ?? String(error);
       const kind = classifyProviderError(message);
-      await options.onAttemptFailure?.({ attempt, kind, message, error });
-      const canRetry = attempt < attempts && policy.retryable.includes(kind) && !options.signal?.aborted;
+      const elapsedMs = Date.now() - attemptStartedAt;
+      let canRetry = attempt < attempts && policy.retryable.includes(kind) && !options.signal?.aborted;
+      const failure = { attempt, kind, message, error, elapsedMs };
+      if (canRetry && options.shouldRetry) canRetry = await options.shouldRetry(failure);
+      await options.onAttemptFailure?.({ ...failure, willRetry: canRetry });
       if (!canRetry) break;
       const delayMs = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** (attempt - 1));
-      await options.onRetry?.({ attempt, delayMs, kind, message });
+      await options.onRetry?.({ attempt, delayMs, kind, message, elapsedMs });
       await sleep(delayMs);
     }
   }

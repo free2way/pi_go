@@ -210,6 +210,15 @@ services:
       PI_PROVIDER_MAX_BACKOFF_MS: ${PI_PROVIDER_MAX_BACKOFF_MS:-30000}
       # COST-006: planner reasoning effort.
       PI_PLANNER_THINKING: ${PI_PLANNER_THINKING:-low}
+      # Reviewer performance: medium by default; late stream failures are not
+      # replayed from zero after the configured elapsed threshold.
+      PI_REVIEWER_THINKING: ${PI_REVIEWER_THINKING:-medium}
+      PI_REVIEW_RETRY_MAX_ELAPSED_SECONDS: ${PI_REVIEW_RETRY_MAX_ELAPSED_SECONDS:-120}
+      # Review convergence and deterministic diff-input budgets.
+      PI_REVIEW_CONVERGENCE_GUARD: ${PI_REVIEW_CONVERGENCE_GUARD:-on}
+      PI_REVIEW_STALL_ROUNDS: ${PI_REVIEW_STALL_ROUNDS:-3}
+      PI_REVIEW_FILE_DIFF_BYTES: ${PI_REVIEW_FILE_DIFF_BYTES:-40000}
+      PI_REVIEW_TOTAL_DIFF_BYTES: ${PI_REVIEW_TOTAL_DIFF_BYTES:-200000}
       # Sprint 2 A/B: `off` makes developer/integrator/sub-agent sessions fresh
       # each repair round instead of reusing one `--session-id` (default on).
       PI_SESSION_REUSE: ${PI_SESSION_REUSE:-on}

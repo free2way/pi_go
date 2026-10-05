@@ -106,6 +106,21 @@ export function hostPathFor(containerPath: string, containerRoot: string, hostRo
   return path.join(hostRoot, relative);
 }
 
+/**
+ * Pi state must live outside the code worktree. For a nested sub-agent worktree,
+ * its historical sibling `<subagent>.state` was still inside the main run tree
+ * and `git add -N .` treated the runtime files as source changes.
+ */
+export function sandboxStateDirectory(worktree: string, override?: string): string {
+  const resolvedWorktree = path.resolve(worktree);
+  const state = override?.trim() ? path.resolve(override) : `${resolvedWorktree}.state`;
+  const relative = path.relative(resolvedWorktree, state);
+  if (relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))) {
+    throw new Error(`Sandbox state directory must be outside worktree: ${state}`);
+  }
+  return state;
+}
+
 export interface SandboxAvailability {
   available: boolean;
   reason?: string;

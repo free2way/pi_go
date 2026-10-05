@@ -15,6 +15,50 @@ function cleanJson(text: string) {
   return text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
 }
 
+/**
+ * Review models occasionally wrap an otherwise valid object in one explanatory
+ * sentence. Extract the first balanced JSON object locally so formatting noise
+ * does not trigger another multi-minute model call. Quoted braces and escapes are
+ * handled; schema validation still happens below.
+ */
+function parseJsonObject(text: string): Record<string, unknown> {
+  const cleaned = cleanJson(text);
+  try {
+    return JSON.parse(cleaned) as Record<string, unknown>;
+  } catch {
+    // Fall through to balanced-object extraction.
+  }
+  for (let start = cleaned.indexOf("{"); start >= 0; start = cleaned.indexOf("{", start + 1)) {
+    let depth = 0;
+    let quoted = false;
+    let escaped = false;
+    for (let index = start; index < cleaned.length; index += 1) {
+      const character = cleaned[index];
+      if (quoted) {
+        if (escaped) escaped = false;
+        else if (character === "\\") escaped = true;
+        else if (character === '"') quoted = false;
+        continue;
+      }
+      if (character === '"') quoted = true;
+      else if (character === "{") depth += 1;
+      else if (character === "}") {
+        depth -= 1;
+        if (depth !== 0) continue;
+        try {
+          const candidate = JSON.parse(cleaned.slice(start, index + 1));
+          if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
+            return candidate as Record<string, unknown>;
+          }
+        } catch {
+          break;
+        }
+      }
+    }
+  }
+  throw new SyntaxError("Reviewer response did not contain a valid JSON object");
+}
+
 function normalizeFinding(raw: unknown, round: number, index: number): Omit<Finding, "resolved"> {
   const item = (raw ?? {}) as Record<string, unknown>;
   const severity = severities.includes(item.severity as (typeof severities)[number])
@@ -32,7 +76,7 @@ function normalizeFinding(raw: unknown, round: number, index: number): Omit<Find
 }
 
 export function parseReview(text: string, round = 1): ReviewResult {
-  const parsed = JSON.parse(cleanJson(text)) as Record<string, unknown>;
+  const parsed = parseJsonObject(text);
   if (parsed.verdict !== "approved" && parsed.verdict !== "changes_requested") {
     throw new Error("Reviewer returned an invalid verdict");
   }

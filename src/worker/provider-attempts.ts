@@ -1,4 +1,4 @@
-import { withProviderRetry, type RetryPolicy } from "./provider-retry.js";
+import { withProviderRetry, type ProviderAttemptFailure, type RetryPolicy } from "./provider-retry.js";
 import type { ProviderErrorKind } from "./provider-errors.js";
 
 /** Minimal budget surface a provider attempt must account against (NEW-08). */
@@ -11,7 +11,9 @@ export interface RunProviderOperationOptions<T> {
   budget?: AttemptBudget;
   policy?: Partial<RetryPolicy>;
   signal?: AbortSignal;
-  onRetry?: (info: { attempt: number; delayMs: number; kind: ProviderErrorKind; message: string }) => void | Promise<void>;
+  onRetry?: (info: { attempt: number; delayMs: number; kind: ProviderErrorKind; message: string; elapsedMs: number }) => void | Promise<void>;
+  onAttemptFailure?: (info: ProviderAttemptFailure) => void | Promise<void>;
+  shouldRetry?: (info: Omit<ProviderAttemptFailure, "willRetry">) => boolean | Promise<boolean>;
   /** Called once after the retry loop returns a successful result. */
   onSuccess?: (result: T) => void | Promise<void>;
 }
@@ -31,9 +33,13 @@ export async function runProviderOperation<T>(
     policy: options.policy,
     signal: options.signal,
     onRetry: options.onRetry,
+    shouldRetry: options.shouldRetry,
     // A BudgetExceededError here escapes the retry loop: the cap is hard.
     beforeAttempt: () => options.budget?.reserve(),
-    onAttemptFailure: () => options.budget?.recordUnknown(),
+    onAttemptFailure: async (info) => {
+      options.budget?.recordUnknown();
+      await options.onAttemptFailure?.(info);
+    },
   });
   await options.onSuccess?.(result);
   return result;

@@ -78,4 +78,21 @@ describe("withProviderRetry", () => {
     })).rejects.toThrow(/budget exhausted/);
     expect(calls).toBe(1);
   });
+
+  it("lets a caller stop an otherwise retryable late failure and reports its duration", async () => {
+    let calls = 0;
+    const failures: Array<{ elapsedMs: number; willRetry: boolean }> = [];
+    await expect(withProviderRetry(async () => {
+      calls += 1;
+      throw new Error("upstream response stream was interrupted");
+    }, {
+      policy: { attempts: 3, baseDelayMs: 1 },
+      shouldRetry: ({ elapsedMs }) => elapsedMs < 0,
+      onAttemptFailure: ({ elapsedMs, willRetry }) => { failures.push({ elapsedMs, willRetry }); },
+    })).rejects.toThrow(/interrupted/);
+    expect(calls).toBe(1);
+    expect(failures).toHaveLength(1);
+    expect(failures[0].elapsedMs).toBeGreaterThanOrEqual(0);
+    expect(failures[0].willRetry).toBe(false);
+  });
 });
