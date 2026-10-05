@@ -7,6 +7,7 @@ import {
   type AgileSprint,
   type AgileStory,
   type ModelTemplate,
+  type ReleaseDeployRecord,
   type ReleaseStatus,
   type RunBudget,
   type SprintStatus,
@@ -17,6 +18,7 @@ import {
 } from "../shared/agile.js";
 import type { ModelSelection, Run } from "../shared/types.js";
 import { newId, type Db } from "./db.js";
+import { type ReleasePublishStory } from "./release-publish.js";
 
 export class AgileError extends Error {
   constructor(
@@ -68,6 +70,10 @@ type StoryRow = {
   sprint_id: string | null;
   workspace_id: string | null;
   status: string;
+  blocked_reason: string | null;
+  blocked_at: string | null;
+  blocked_by: string | null;
+  status_before_block: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -81,6 +87,9 @@ type ReleaseRow = {
   notes: string;
   status: string;
   story_ids_json: string;
+  released_at: string | null;
+  released_by: string | null;
+  deploy_json: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -151,6 +160,9 @@ function toStory(row: StoryRow): AgileStory {
     status: row.status as StoryStatus,
     sprintId: row.sprint_id,
     workspaceId: row.workspace_id,
+    blockedReason: row.blocked_reason ?? null,
+    blockedAt: row.blocked_at ?? null,
+    blockedBy: row.blocked_by ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -166,6 +178,9 @@ function toRelease(row: ReleaseRow): AgileRelease {
     notes: row.notes,
     status: row.status as ReleaseStatus,
     storyIds: parseJson<string[]>(row.story_ids_json, []),
+    releasedAt: row.released_at ?? null,
+    releasedBy: row.released_by ?? null,
+    deploy: parseJson<ReleaseDeployRecord | null>(row.deploy_json, null),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -344,7 +359,7 @@ export class AgileService {
       `SELECT * FROM agile_stories WHERE ${clauses.join(" AND ")} ORDER BY updated_at DESC`,
       params,
     )).rows as unknown as StoryRow[];
-    return rows.map(toStory);
+    return Promise.all(rows.map((row) => this.withEffectiveBlockReason(toStory(row))));
   }
 
   /** Reads the story, reconciling its status from its latest linked run first. */
@@ -352,7 +367,21 @@ export class AgileService {
     await this.requireStory(ownerKeys, id, isAdmin);
     await this.reconcileStory(id);
     const row = (await this.db.query("SELECT * FROM agile_stories WHERE id = $1", [id])).rows[0] as unknown as StoryRow;
-    return { ...toStory(row), runs: await this.listStoryRuns(id) };
+    const story = await this.withEffectiveBlockReason(toStory(row));
+    return { ...story, runs: await this.listStoryRuns(id) };
+  }
+
+  /**
+   * Effective block reason shown on the board/detail: a manual block keeps its
+   * stored reason, a run-derived block (needs_human/failed/cancelled) falls back
+   * to the latest run's summary. The stored `blocked_reason` column always stays
+   * manual-only — this only decorates the read model.
+   */
+  private async withEffectiveBlockReason(story: AgileStory): Promise<AgileStory> {
+    if (story.status !== "blocked" || story.blockedReason) return story;
+    const latest = latestLinkedRun(await this.listStoryRunsDetailed(story.id));
+    const derived = deriveStoryStatus(latest?.run);
+    return derived?.reason ? { ...story, blockedReason: derived.reason } : story;
   }
 
   async createStory(ownerId: string, input: CreateStoryInput): Promise<AgileStory> {
@@ -470,10 +499,10 @@ export class AgileService {
    * `shared/agile.ts`; this method is only the persistence side effect.
    */
   async reconcileStory(storyId: string): Promise<{ status: StoryStatus; changed: boolean } | undefined> {
-    const row = (await this.db.query("SELECT status FROM agile_stories WHERE id = $1", [storyId])).rows[0] as { status: string } | undefined;
+    const row = (await this.db.query("SELECT status, blocked_reason FROM agile_stories WHERE id = $1", [storyId])).rows[0] as { status: string; blocked_reason: string | null } | undefined;
     if (!row) return undefined;
     const latest = latestLinkedRun(await this.listStoryRunsDetailed(storyId));
-    const derived = deriveStoryStatus(latest?.run);
+    const derived = deriveStoryStatus(latest?.run, { blockedReason: row.blocked_reason });
     if (!derived) return { status: row.status as StoryStatus, changed: false };
     const changed = derived.status !== row.status;
     if (changed) {
@@ -500,6 +529,53 @@ export class AgileService {
   /** Marks a story in progress right after a run was linked to it. */
   async markStoryInProgress(storyId: string): Promise<void> {
     await this.db.query("UPDATE agile_stories SET status = 'in_progress', updated_at = $1 WHERE id = $2", [this.now(), storyId]);
+  }
+
+  // -------------------------------------------------------- manual blocking
+
+  /**
+   * Manual Kanban block. Overrides the derived in-progress/review status until
+   * unblocked; a delivered (`done`) story cannot be blocked. The pre-block
+   * planning status is remembered so unblocking restores it when no run exists.
+   */
+  async blockStory(ownerKeys: string[], id: string, reason: string, blockedBy: string, isAdmin = false): Promise<StoryDetail> {
+    const existing = await this.requireStory(ownerKeys, id, isAdmin);
+    if (existing.status === "done") throw new AgileError("STORY_DONE", "已完成的故事不能标记阻塞", 409);
+    const now = this.now();
+    const baseline = existing.status !== "blocked" ? existing.status : existing.status_before_block;
+    await this.db.query(
+      `UPDATE agile_stories SET blocked_reason = $1, blocked_at = $2, blocked_by = $3, status_before_block = $4, status = 'blocked', updated_at = $5
+       WHERE id = $6`,
+      [reason.trim(), now, blockedBy, baseline, now, id],
+    );
+    return this.getStory(ownerKeys, id, isAdmin);
+  }
+
+  /**
+   * Clears a manual block. Refuses while a linked run is itself parked
+   * (`needs_human`/failed/cancelled) — those must be resolved on the run, so the
+   * caller gets 409 `BLOCKED_BY_RUN` naming the run. Otherwise the status is
+   * re-derived from the run, falling back to the remembered pre-block status.
+   */
+  async unblockStory(ownerKeys: string[], id: string, isAdmin = false): Promise<StoryDetail> {
+    const existing = await this.requireStory(ownerKeys, id, isAdmin);
+    const latest = latestLinkedRun(await this.listStoryRunsDetailed(id));
+    const derived = deriveStoryStatus(latest?.run);
+    if (derived?.status === "blocked") {
+      throw new AgileError(
+        "BLOCKED_BY_RUN",
+        `该故事仍被运行 ${latest!.run.id} 阻塞（${derived.reason ?? "需要人工处理"}）；请先处理该运行`,
+        409,
+      );
+    }
+    if (!existing.blocked_reason && existing.status !== "blocked") return this.getStory(ownerKeys, id, isAdmin);
+    const restored = derived?.status ?? (existing.status_before_block as StoryStatus | null) ?? "backlog";
+    await this.db.query(
+      `UPDATE agile_stories SET blocked_reason = NULL, blocked_at = NULL, blocked_by = NULL, status_before_block = NULL, status = $1, updated_at = $2
+       WHERE id = $3`,
+      [restored, this.now(), id],
+    );
+    return this.getStory(ownerKeys, id, isAdmin);
   }
 
   // ------------------------------------------------------------------- sprints
@@ -600,7 +676,8 @@ export class AgileService {
   }
 
   async updateRelease(ownerKeys: string[], id: string, patch: UpdateReleaseInput, isAdmin = false): Promise<AgileRelease> {
-    await this.requireRelease(ownerKeys, id, isAdmin);
+    const existing = await this.requireRelease(ownerKeys, id, isAdmin);
+    if (existing.status === "released") throw new AgileError("RELEASE_RELEASED", "已发布的版本不可再编辑", 409);
     const assignments: string[] = [];
     const params: unknown[] = [];
     const set = (column: string, value: unknown) => {
@@ -621,6 +698,66 @@ export class AgileService {
   async deleteRelease(ownerKeys: string[], id: string, isAdmin = false): Promise<void> {
     await this.requireRelease(ownerKeys, id, isAdmin);
     await this.db.query("DELETE FROM agile_releases WHERE id = $1", [id]);
+  }
+
+  /** Owner-scoped release read used by the publish route (404 when not visible). */
+  async getRelease(ownerKeys: string[], id: string, isAdmin = false): Promise<AgileRelease> {
+    return toRelease(await this.requireRelease(ownerKeys, id, isAdmin));
+  }
+
+  /**
+   * Resolves the release's story ids against the caller's stories, reconciling
+   * each to its derived status/reason. Foreign/unknown ids are skipped, so a
+   * stale id can never pull in another owner's story. An empty result is the
+   * `RELEASE_EMPTY` condition the publish guard reports.
+   */
+  async collectReleaseStories(ownerKeys: string[], release: AgileRelease, isAdmin = false): Promise<ReleasePublishStory[]> {
+    const stories: ReleasePublishStory[] = [];
+    for (const storyId of [...new Set(release.storyIds)]) {
+      let story: StoryDetail;
+      try {
+        story = await this.getStory(ownerKeys, storyId, isAdmin);
+      } catch {
+        continue;
+      }
+      const latest = latestLinkedRun(await this.listStoryRunsDetailed(storyId));
+      stories.push({
+        storyId: story.id,
+        title: story.title,
+        status: story.status,
+        ...(story.status === "blocked" && story.blockedReason ? { reason: story.blockedReason } : {}),
+        runState: latest?.run.state ?? null,
+      });
+    }
+    return stories;
+  }
+
+  /**
+   * Persists an approved publish: status `released` + `released_at/by`, the
+   * deploy-hook outcome, and an append-only audit row. The hook itself is run by
+   * the route (transport reused from `executeRelease`); this only records it.
+   */
+  async publishRelease(
+    ownerKeys: string[],
+    id: string,
+    input: { releasedBy: string; releasedAt: string; note?: string; deploy: ReleaseDeployRecord; stories: ReleasePublishStory[] },
+    isAdmin = false,
+  ): Promise<AgileRelease> {
+    const existing = await this.requireRelease(ownerKeys, id, isAdmin);
+    if (existing.status === "released") throw new AgileError("RELEASE_RELEASED", "发布已发布，不可重复发布", 409);
+    const now = this.now();
+    await this.db.withTransaction(async (tx) => {
+      await tx.query(
+        `UPDATE agile_releases SET status = 'released', released_at = $1, released_by = $2, deploy_json = $3, updated_at = $4 WHERE id = $5`,
+        [input.releasedAt, input.releasedBy, JSON.stringify(input.deploy), now, id],
+      );
+      await tx.query(
+        `INSERT INTO agile_release_audit (id, release_id, owner_id, action, actor_id, note, status, deploy_json, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [newId("relaudit"), id, existing.owner_id, "release.published", input.releasedBy, input.note?.trim() || null, "released", JSON.stringify(input.deploy), now],
+      );
+    });
+    return this.getRelease(ownerKeys, id, isAdmin);
   }
 
   private async requireRelease(ownerKeys: string[], id: string, isAdmin = false): Promise<ReleaseRow> {

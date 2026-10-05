@@ -1,6 +1,6 @@
 import { BarChart3, ClipboardList, Copy, Download, LayoutTemplate, ListChecks, LoaderCircle, Pencil, Plus, Rocket, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { applyModelTemplate, RELEASE_STATUSES, STORY_PRIORITIES, STORY_STATUSES, STORY_STATUS_LABELS, type AgileProject, type AgileRelease, type AgileSprint, type AgileStory, type ModelTemplate, type ReleaseStatus, type StoryDetail, type StoryPriority, type StoryStatus } from "../shared/agile";
+import { applyModelTemplate, RELEASE_STATUSES, STORY_PRIORITIES, STORY_STATUSES, STORY_STATUS_LABELS, type AgileProject, type AgileRelease, type AgileSprint, type AgileStory, type ModelTemplate, type ReleaseDeployRecord, type ReleaseStatus, type StoryDetail, type StoryPriority, type StoryStatus } from "../shared/agile";
 import type { AgileMetricsResponse, ReleaseRetrospective, ReleaseSummary } from "../shared/agile-metrics";
 import type { ConfigStatus, ModelCatalogResponse, RunState, Workspace } from "../shared/types";
 import { api } from "./api";
@@ -21,6 +21,12 @@ const runStateLabels: Record<RunState, string> = {
 
 const sprintStatusLabels: Record<AgileSprint["status"], string> = { planned: "已计划", active: "进行中", closed: "已关闭" };
 const releaseStatusLabels: Record<AgileRelease["status"], string> = { planned: "已计划", in_progress: "进行中", released: "已发布", cancelled: "已取消" };
+const deployStatusLabels: Record<ReleaseDeployRecord["status"], string> = {
+  not_configured: "未配置部署钩子",
+  unsupported: "部署钩子类型不支持",
+  ok: "部署已触发",
+  failed: "部署失败",
+};
 
 const formatTime = (value: string) =>
   new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(value));
@@ -83,6 +89,15 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
   const [releaseNotes, setReleaseNotes] = useState("");
   const [releaseStatus, setReleaseStatus] = useState<ReleaseStatus>("planned");
   const [releaseStoryIds, setReleaseStoryIds] = useState<string[]>([]);
+
+  // 发布动作: the confirmation dialog holds the release being published plus the
+  // guard result (blocked stories) from the dry-run preview.
+  const [publishTarget, setPublishTarget] = useState<AgileRelease>();
+  const [publishBlocked, setPublishBlocked] = useState<Array<{ storyId: string; title: string; reason: string }>>([]);
+  const [publishReady, setPublishReady] = useState(false);
+  const [publishNote, setPublishNote] = useState("");
+  const [publishBusy, setPublishBusy] = useState(false);
+  const [publishError, setPublishError] = useState("");
 
   // new-project form
   const [projectName, setProjectName] = useState("");
@@ -153,6 +168,10 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
     setReleaseNotes("");
     setReleaseStatus("planned");
     setReleaseStoryIds([]);
+    setPublishTarget(undefined);
+    setPublishBlocked([]);
+    setPublishReady(false);
+    setPublishError("");
     if (projectId) void loadProjectData(projectId);
     else { setStories([]); setSprints([]); setReleases([]); }
   }, [projectId, loadProjectData]);
@@ -487,6 +506,83 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
     setReleaseStoryIds((current) => (current.includes(storyId) ? current.filter((id) => id !== storyId) : [...current, storyId]));
   };
 
+  // ------------------------------------------------- publish action (Sprint 5)
+  const openPublish = async (release: AgileRelease) => {
+    setPublishTarget(release);
+    setPublishBlocked([]);
+    setPublishReady(false);
+    setPublishNote("");
+    setPublishError("");
+    setPublishBusy(true);
+    try {
+      const preview = await api.publishRelease(release.id, {});
+      setPublishTarget(preview.release);
+      setPublishReady(true);
+    } catch (cause) {
+      const error = cause as { message?: string; body?: { blocked?: Array<{ storyId: string; title: string; reason: string }> } };
+      setPublishBlocked(error.body?.blocked ?? []);
+      setPublishError(error.message || "无法发布");
+    } finally {
+      setPublishBusy(false);
+    }
+  };
+
+  const closePublish = () => {
+    setPublishTarget(undefined);
+    setPublishBlocked([]);
+    setPublishReady(false);
+    setPublishError("");
+  };
+
+  const confirmPublish = async () => {
+    if (!publishTarget) return;
+    setPublishBusy(true);
+    setPublishError("");
+    try {
+      const result = await api.publishRelease(publishTarget.id, { confirm: true, ...(publishNote.trim() ? { note: publishNote.trim() } : {}) });
+      setReleases((current) => current.map((item) => (item.id === result.release.id ? result.release : item)));
+      closePublish();
+    } catch (cause) {
+      const error = cause as { message?: string; body?: { blocked?: Array<{ storyId: string; title: string; reason: string }> } };
+      setPublishBlocked(error.body?.blocked ?? []);
+      setPublishError(error.message || "发布失败");
+    } finally {
+      setPublishBusy(false);
+    }
+  };
+
+  // ------------------------------------------------ Kanban blocked-management
+  const blockStory = async (story: AgileStory) => {
+    const reason = window.prompt(`标记「${story.title}」为阻塞，请填写原因：`, "");
+    if (reason === null) return;
+    if (!reason.trim()) { setError("标记阻塞需要填写原因"); return; }
+    setBusy(`block:${story.id}`);
+    setError("");
+    try {
+      const updated = await api.blockStory(story.id, reason.trim());
+      setStories((current) => current.map((item) => (item.id === updated.id ? updated : item)));
+      setDetail((current) => (current && current.id === updated.id ? updated : current));
+    } catch (cause) {
+      setError(agileFormErrorMessage(cause, "标记阻塞失败"));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const unblockStory = async (story: AgileStory) => {
+    setBusy(`unblock:${story.id}`);
+    setError("");
+    try {
+      const updated = await api.unblockStory(story.id);
+      setStories((current) => current.map((item) => (item.id === updated.id ? updated : item)));
+      setDetail((current) => (current && current.id === updated.id ? updated : current));
+    } catch (cause) {
+      setError(agileFormErrorMessage(cause, "解除阻塞失败"));
+    } finally {
+      setBusy("");
+    }
+  };
+
   // 「导出回顾 (JSON)」: downloads the retrospective payload and best-effort
   // copies it to the clipboard. No secrets are present in these datasets.
   const exportRetrospective = async () => {
@@ -681,14 +777,26 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
                 <div className="agile-column" key={column.id}>
                   <header><span>{column.label}</span><em>{column.stories.length}{columnPoints(column) > 0 ? ` · ${columnPoints(column)} 点` : ""}</em></header>
                   {column.stories.map((story) => (
-                    <button type="button" key={story.id} className={`agile-card ${selectedId === story.id ? "selected" : ""}`} onClick={() => setSelectedId(story.id)}>
-                      <strong>{story.title}</strong>
-                      <span className="agile-card-meta">
-                        <em className={`agile-priority priority-${story.priority}`}>{priorityLabel(story.priority)}</em>
-                        <small>{estimateLabel(story.estimate)}</small>
-                      </span>
-                      <small className="agile-card-sprint">{sprintLabel(story.sprintId)}</small>
-                    </button>
+                    <div key={story.id} className={`agile-card ${selectedId === story.id ? "selected" : ""}`}>
+                      <button type="button" className="agile-card-main" onClick={() => setSelectedId(story.id)}>
+                        <strong>{story.title}</strong>
+                        <span className="agile-card-meta">
+                          <em className={`agile-priority priority-${story.priority}`}>{priorityLabel(story.priority)}</em>
+                          <small>{estimateLabel(story.estimate)}</small>
+                        </span>
+                        <small className="agile-card-sprint">{sprintLabel(story.sprintId)}</small>
+                      </button>
+                      {story.status === "blocked" && (
+                        <span className="agile-blocked-badge" title={story.blockedReason ?? "阻塞"}>
+                          阻塞{story.blockedReason ? `：${story.blockedReason}` : ""}
+                        </span>
+                      )}
+                      <div className="agile-card-actions">
+                        {story.status !== "blocked"
+                          ? <button type="button" disabled={busy === `block:${story.id}`} onClick={() => void blockStory(story)}>标记阻塞</button>
+                          : <button type="button" disabled={busy === `unblock:${story.id}`} onClick={() => void unblockStory(story)}>解除阻塞</button>}
+                      </div>
+                    </div>
                   ))}
                   {column.stories.length === 0 && <div className="agile-column-empty">暂无</div>}
                 </div>
@@ -890,6 +998,15 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
               <span className="agile-hint">只读汇总：故事结果、成本/Token、模型组合、合并与部署记录，以及周期/返工回顾。</span>
             </div>
             {releaseExportNote && <div className="agile-hint">{releaseExportNote}</div>}
+            {releaseSummary && (
+              <div className="agile-metrics-sprints">
+                <h4>发布状态</h4>
+                <div className="agile-metrics-row">
+                  <span>{releaseStatusLabels[releaseSummary.status]}{releaseSummary.releasedAt ? ` · ${formatTime(releaseSummary.releasedAt)} 由 ${releaseSummary.releasedBy ?? "未知"}` : " · 尚未发布"}</span>
+                  <strong>{releaseSummary.deploy ? `部署 ${deployStatusLabels[releaseSummary.deploy.status]}${releaseSummary.deploy.detail ? `（${releaseSummary.deploy.detail}）` : ""}` : "无部署记录"}</strong>
+                </div>
+              </div>
+            )}
             {releaseLoading && <div className="ws-empty"><LoaderCircle className="spin" size={18} /><span>正在计算发布汇总…</span></div>}
             {!releaseLoading && releases.length === 0 && <div className="agile-hint">当前项目还没有发布记录。</div>}
             {!releaseLoading && releaseSummary && releaseRetrospective && (
@@ -1054,13 +1171,40 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
                 <div className={`agile-release-row ${releaseManageId === release.id ? "selected" : ""}`} key={release.id}>
                   <code>{release.version}</code>
                   <span>{release.name}</span>
-                  <small>{releaseStatusLabels[release.status]} · {release.storyIds.length} 个故事</small>
-                  <button type="button" onClick={() => editRelease(release)}><Pencil size={12} />编辑</button>
+                  <small>{releaseStatusLabels[release.status]} · {release.storyIds.length} 个故事{release.deploy ? ` · 部署 ${deployStatusLabels[release.deploy.status]}` : ""}</small>
+                  <button type="button" disabled={release.status === "released"} onClick={() => void openPublish(release)}><Rocket size={12} />{release.status === "released" ? "已发布" : "发布"}</button>
+                  <button type="button" disabled={release.status === "released"} onClick={() => editRelease(release)}><Pencil size={12} />编辑</button>
                   <button type="button" className="danger" disabled={busy === `delete-release:${release.id}`} onClick={() => void removeRelease(release)}><Trash2 size={12} />删除</button>
                 </div>
               ))}
               {releases.length === 0 && <div className="agile-hint">还没有发布记录。填写上方表单创建第一个发布。</div>}
             </div>
+          </div>
+        </section>
+      )}
+
+      {publishTarget && (
+        <section className="panel agile-publish-confirm">
+          <div className="panel-head">
+            <div><span className="eyebrow">PUBLISH RELEASE</span><h3>发布「{publishTarget.version} · {publishTarget.name}」</h3></div>
+            <button className="icon-button" type="button" onClick={closePublish}><X size={16} /></button>
+          </div>
+          <p className="ws-form-help">发布将把该版本标记为「已发布」且不可再编辑。若配置了 <code>PI_POST_MERGE_DEPLOY_HOOK</code>，确认后会立即触发部署钩子；失败也会如实记录，不会静默跳过。</p>
+          {publishError && <div className="form-error">{publishError}</div>}
+          {publishBlocked.length > 0 && (
+            <div className="agile-blocked-list">
+              <strong>以下故事仍处于阻塞，需先解除阻塞：</strong>
+              <ul>{publishBlocked.map((item) => <li key={item.storyId}>{item.title} — {item.reason}</li>)}</ul>
+            </div>
+          )}
+          {publishBusy && <div className="ws-empty"><LoaderCircle className="spin" size={18} /><span>正在校验发布…</span></div>}
+          {!publishBusy && publishReady && <div className="agile-hint">发布前校验通过，可确认发布。</div>}
+          <label>发布备注<textarea rows={2} value={publishNote} onChange={(event) => setPublishNote(event.target.value)} placeholder="本次发布说明（可选）" /></label>
+          <div className="ws-form-actions">
+            <button type="button" className="button secondary" onClick={closePublish}>取消</button>
+            <button type="button" className="button primary" disabled={publishBusy || !publishReady} onClick={() => void confirmPublish()}>
+              {publishBusy ? <LoaderCircle className="spin" size={15} /> : <Rocket size={15} />}确认发布
+            </button>
           </div>
         </section>
       )}
@@ -1100,7 +1244,10 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
           </div>
 
           <div className="agile-detail-actions">
-            {detail.status !== "ready" && <button type="button" className="button secondary" disabled={busy === `status:${detail.id}`} onClick={() => void patchStatus(detail, "ready")}>标为就绪</button>}
+            {detail.status !== "ready" && detail.status !== "blocked" && <button type="button" className="button secondary" disabled={busy === `status:${detail.id}`} onClick={() => void patchStatus(detail, "ready")}>标为就绪</button>}
+            {detail.status !== "blocked"
+              ? <button type="button" className="button secondary" disabled={busy === `block:${detail.id}`} onClick={() => void blockStory(detail)}>标记阻塞</button>
+              : <button type="button" className="button secondary" disabled={busy === `unblock:${detail.id}`} onClick={() => void unblockStory(detail)}>解除阻塞</button>}
             <button type="button" className="button primary" disabled={detail.status !== "ready" || busy === `submit:${detail.id}`} onClick={() => void submit(detail)}>
               {busy === `submit:${detail.id}` ? <LoaderCircle className="spin" size={15} /> : <Rocket size={15} />}提交为运行
             </button>

@@ -432,3 +432,51 @@ v0.15.2 → v0.16.x（隔离 e2e 验证）→ 生产 v0.18.0 → v0.19.0 → v0.
 - Cloudflare One-time PIN 由操作者配置（不在本仓库范围内）。
 
 
+
+## 2026-10-05 v0.24.0 → v0.25.4 部署记录（合并条目）
+
+本条目把 v0.24.0 之后到当前版本（仓库 `package.json` 为 `0.25.4`）之间的 Web/Worker
+重发布合并记录。生产主机仍为 `192.168.2.235`，Compose 项目 `pi-agent`；PostgreSQL 与 Pi
+Runtime 未重建（与 v0.24.0 记录一致）。
+
+### 版本序列
+
+| 版本 | 说明 |
+| --- | --- |
+| `v0.24.0` | 发布工作流升级（已在上文单独记录）。 |
+| `v0.25.0` | 该区间的第一个补丁版本。 |
+| `v0.25.1` | 后续补丁版本。 |
+| `v0.25.2` | 后续补丁版本。 |
+| `v0.25.3` | 后续补丁版本。 |
+| `v0.25.4` | 当前版本（仓库 `package.json`）。 |
+
+仓库内**没有**逐次部署的镜像 digest、时间戳与门禁计数记录，因此上表不臆造这些字段；
+v0.24.0 是仓库里最后一次记录了完整门禁计数的版本（73 个测试文件 / 593 项测试通过，
+typecheck、lint、build 全通过，详见上文 v0.24.0 小节）。其后各次部署的 `typecheck` /
+`npm test` / `npm run lint` / `npm run build` 计数未在仓库中留存，无法据实补写。
+
+### 能力批次（按部署顺序，与仓库文档对应）
+
+仓库未记录「补丁版本号 ↔ 能力」的一一绑定；以下按能力出现的先后列出，并给出可核对的文档证据：
+
+1. **RPC 探测结论 + 会话指标**：pinned Pi CLI 无 server/RPC 模式，改为记录每次调用的
+   `session.metrics` 与 `run.sessions` 汇总（`docs/13-sprint2-session-and-rpc-findings.md`）。
+2. **复用报告 + A/B 开关**：只读复用报告 `npm run report:sessions`（纯聚合逻辑在
+   `scripts/session-reuse-lib.mjs`）与 `PI_SESSION_REUSE` 开关（同上文档 §5）。
+3. **敏捷领域 + 账户管理**：项目/用户故事/冲刺/发布规划层（`docs/14-agile-domain-model.md`）
+   与管理员账户管理页面（`docs/15-account-management.md`）。
+4. **度量 + 模板**：`GET /api/agile/metrics`、`/api/templates` 模型组合模板
+   （`docs/16-agile-metrics-and-templates.md`）。
+5. **侧边栏 / 布局调整**：侧边栏入口与页面布局调整（`src/client/App.tsx`，参见
+   `docs/11-system-status-dashboard.md` 对侧边栏入口的说明）。
+6. **发布汇总 + 恢复停机待办**：`/api/agile/releases/:id/summary`、`/retrospective` 与
+   kill-recovery 平台的恢复停机顺序（`docs/17-release-retrospective-and-recovery-stops.md`）。
+7. **敏捷 UI 缺口 + PiGO Node 设计**：敏捷界面补齐与 PiGO Node 设计草案
+   （`docs/18-pigo-node-design.md`，设计稿，未落地代码）。
+
+### 回滚标签约定
+
+每次部署在本地镜像上打一个 `prevN` 回滚标签（Web 与 Worker 各自独立计数），指向本次部署
+**之前**的镜像；`N` 随每次部署递增。当前约定值：Web `prev54`、Worker `prev50`。
+与 v0.24.0 记录中的 `prev47` / `prev43`（Web/Worker）相比，说明其后 Web 又部署了 7 次、
+Worker 又部署了 7 次。回滚时将该标签重新 tag 为当前镜像再重启即可。

@@ -278,3 +278,115 @@ describe("AgileService run linkage and reconciliation", () => {
     await expect(service.getStory(["user_b"], story.id)).rejects.toMatchObject({ code: "STORY_NOT_FOUND" });
   });
 });
+
+const acceptance: NonNullable<Run["acceptance"]> = {
+  acceptedAt: "2026-01-03T00:00:00.000Z",
+  acceptedBy: "user_a",
+  note: null,
+  acknowledgedOpenFindings: false,
+  findings: { resolved: { count: 0, ids: [] }, remaining: { count: 0, items: [] } },
+  diff: { artifactId: null, sha256: null, bytes: null },
+  checks: { total: 0, passed: 0, failed: 0 },
+  usage: { inputTokens: 0, outputTokens: 0, estimatedCost: 0, modelCalls: 0 },
+};
+
+describe("AgileService manual blocking", () => {
+  it("blocks a run-less story and restores the pre-block status on unblock", async () => {
+    const { service, project } = await seed();
+    const story = await service.createStory("user_a", { projectId: project.id, title: "故事", status: "ready" });
+
+    const blocked = await service.blockStory(["user_a"], story.id, "等待上游接口", "user_a");
+    expect(blocked).toMatchObject({ status: "blocked", blockedReason: "等待上游接口", blockedBy: "user_a" });
+    expect(blocked.blockedAt).toBeTruthy();
+
+    const unblocked = await service.unblockStory(["user_a"], story.id);
+    expect(unblocked).toMatchObject({ status: "ready", blockedReason: null, blockedBy: null });
+  });
+
+  it("lets a manual block win over a derived in-progress status", async () => {
+    const { db, service, project } = await seed();
+    const story = await service.createStory("user_a", { projectId: project.id, title: "故事" });
+    await insertRun(db, makeRun("run_1", "developing"));
+    await service.linkRun(story.id, "run_1");
+    expect((await service.getStory(["user_a"], story.id)).status).toBe("in_progress");
+
+    await service.blockStory(["user_a"], story.id, "暂停开发", "user_a");
+    expect((await service.getStory(["user_a"], story.id)).status).toBe("blocked");
+    expect((await service.listStories(["user_a"])).find((entry) => entry.id === story.id)?.blockedReason).toBe("暂停开发");
+
+    // Unblocking re-derives from the still-active run.
+    expect((await service.unblockStory(["user_a"], story.id)).status).toBe("in_progress");
+  });
+
+  it("refuses to unblock while a linked run is parked, naming the run", async () => {
+    const { db, service, project } = await seed();
+    const story = await service.createStory("user_a", { projectId: project.id, title: "故事" });
+    await insertRun(db, makeRun("run_parked", "needs_human", { summary: "预算超限" }));
+    await service.linkRun(story.id, "run_parked");
+    await service.reconcileRun("run_parked");
+
+    await expect(service.unblockStory(["user_a"], story.id)).rejects.toMatchObject({ code: "BLOCKED_BY_RUN", status: 409 });
+    await expect(service.unblockStory(["user_a"], story.id)).rejects.toThrow(/run_parked/);
+    // The run-derived reason is surfaced without a stored manual block.
+    const listed = (await service.listStories(["user_a"])).find((entry) => entry.id === story.id);
+    expect(listed?.status).toBe("blocked");
+    expect(listed?.blockedReason).toBe("预算超限");
+  });
+
+  it("refuses to manually block a delivered (done) story", async () => {
+    const { db, service, project } = await seed();
+    const story = await service.createStory("user_a", { projectId: project.id, title: "故事" });
+    await insertRun(db, makeRun("run_1", "completed", { acceptance }));
+    await service.linkRun(story.id, "run_1");
+    expect((await service.getStory(["user_a"], story.id)).status).toBe("done");
+
+    await expect(service.blockStory(["user_a"], story.id, "手动原因", "user_a")).rejects.toMatchObject({ code: "STORY_DONE", status: 409 });
+  });
+});
+
+describe("AgileService release publish", () => {
+  it("records releasedAt/By, the deploy outcome and an audit row", async () => {
+    const { db, service, project } = await seed();
+    const story = await service.createStory("user_a", { projectId: project.id, title: "故事", status: "done" });
+    const release = await service.createRelease("user_a", { projectId: project.id, name: "v1.0", version: "1.0.0", storyIds: [story.id] });
+    const stories = await service.collectReleaseStories(["user_a"], release);
+    expect(stories).toHaveLength(1);
+
+    const published = await service.publishRelease(["user_a"], release.id, {
+      releasedBy: "user_a",
+      releasedAt: "2026-01-02T00:00:00.000Z",
+      note: "首次发布",
+      deploy: { status: "ok", detail: "HTTP 200", at: "2026-01-02T00:00:00.000Z" },
+      stories,
+    });
+    expect(published).toMatchObject({ status: "released", releasedAt: "2026-01-02T00:00:00.000Z", releasedBy: "user_a" });
+    expect(published.deploy).toMatchObject({ status: "ok", detail: "HTTP 200" });
+
+    const audit = await db.query("SELECT action, actor_id, note, status FROM agile_release_audit WHERE release_id = $1", [release.id]);
+    expect(audit.rows).toHaveLength(1);
+    expect(audit.rows[0]).toMatchObject({ action: "release.published", actor_id: "user_a", note: "首次发布", status: "released" });
+  });
+
+  it("treats released as terminal for edits and re-publish", async () => {
+    const { service, project } = await seed();
+    const story = await service.createStory("user_a", { projectId: project.id, title: "故事", status: "done" });
+    const release = await service.createRelease("user_a", { projectId: project.id, name: "v1.0", version: "1.0.0", storyIds: [story.id] });
+    const stories = await service.collectReleaseStories(["user_a"], release);
+    const input = { releasedBy: "user_a", releasedAt: "2026-01-02T00:00:00.000Z", deploy: { status: "not_configured" as const, detail: "未配置", at: "2026-01-02T00:00:00.000Z" }, stories };
+    await service.publishRelease(["user_a"], release.id, input);
+
+    await expect(service.updateRelease(["user_a"], release.id, { name: "改名" })).rejects.toMatchObject({ code: "RELEASE_RELEASED", status: 409 });
+    await expect(service.publishRelease(["user_a"], release.id, input)).rejects.toMatchObject({ code: "RELEASE_RELEASED", status: 409 });
+  });
+
+  it("skips foreign story ids and reports a blocked story with its reason", async () => {
+    const { service, project } = await seed();
+    const blocked = await service.createStory("user_a", { projectId: project.id, title: "阻塞故事" });
+    await service.blockStory(["user_a"], blocked.id, "等待上游", "user_a");
+    const release = await service.createRelease("user_a", { projectId: project.id, name: "v1.0", version: "1.0.0", storyIds: [blocked.id, "story_foreign"] });
+
+    const stories = await service.collectReleaseStories(["user_a"], release);
+    expect(stories.map((entry) => entry.storyId)).toEqual([blocked.id]);
+    expect(stories[0]).toMatchObject({ status: "blocked", reason: "等待上游" });
+  });
+});

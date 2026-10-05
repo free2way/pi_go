@@ -1,5 +1,5 @@
 import type { AgileMetricsResponse, ReleaseRetrospective, ReleaseSummary } from "../shared/agile-metrics";
-import type { AgileProject, AgileRelease, AgileSprint, AgileStory, ModelTemplate, StoryDetail, StoryPriority, StoryStatus } from "../shared/agile";
+import type { AgileProject, AgileRelease, AgileSprint, AgileStory, ReleaseDeployRecord, ModelTemplate, StoryDetail, StoryPriority, StoryStatus } from "../shared/agile";
 import type { ConfigStatus, CredentialStatus, CurrentUser, ModelCatalogResponse, ModelSelection, Run, RunArtifact, RunEvent, RunRoundsResponse, RunState, Workspace, AccountDetail, AccountSummary, AccountWorkspaceOption, WorkspacePermission } from "../shared/types";
 
 /** A3: read-only deployment status returned by `GET /api/deployments`. */
@@ -208,6 +208,12 @@ export const api = {
   deleteStory: (id: string) => request<void>(`/api/stories/${id}`, { method: "DELETE" }),
   submitStory: (id: string, body: { mode: "demo" | "real"; workspaceId?: string; checks?: string[] } = { mode: "real" }) =>
     request<{ run: Run; story: StoryDetail }>(`/api/stories/${id}/runs`, { method: "POST", body: JSON.stringify(body) }),
+  /** Kanban manual block with a required reason. */
+  blockStory: (id: string, reason: string) =>
+    request<StoryDetail>(`/api/stories/${encodeURIComponent(id)}/block`, { method: "POST", body: JSON.stringify({ reason }) }),
+  /** Clears a manual block; 409 BLOCKED_BY_RUN while a linked run is parked. */
+  unblockStory: (id: string) =>
+    request<StoryDetail>(`/api/stories/${encodeURIComponent(id)}/unblock`, { method: "POST", body: JSON.stringify({}) }),
   sprints: (projectId?: string) =>
     request<{ sprints: AgileSprint[] }>(`/api/sprints${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ""}`),
   createSprint: (body: { projectId: string; name: string; goal?: string; startDate?: string | null; endDate?: string | null }) =>
@@ -221,6 +227,15 @@ export const api = {
   patchRelease: (id: string, body: { name?: string; version?: string; notes?: string; status?: "planned" | "in_progress" | "released" | "cancelled"; storyIds?: string[] }) =>
     request<AgileRelease>(`/api/releases/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   deleteRelease: (id: string) => request<void>(`/api/releases/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  /** Sprint 5: explicit release publish. Without `confirm` the server returns a
+   * dry-run preview (guards + blocked stories) for the confirmation dialog. */
+  publishRelease: (id: string, body: { confirm?: boolean; note?: string } = {}) =>
+    request<{
+      published: boolean;
+      release: AgileRelease;
+      stories?: Array<{ storyId: string; title: string; status: StoryStatus; reason?: string; runState?: string | null }>;
+      deploy?: ReleaseDeployRecord;
+    }>(`/api/agile/releases/${encodeURIComponent(id)}/publish`, { method: "POST", body: JSON.stringify(body) }),
   /** Sprint 4: read-only sprint metrics + project rollup. */
   agileMetrics: (params: { projectId?: string; sprintId?: string } = {}) => {
     const search = new URLSearchParams();

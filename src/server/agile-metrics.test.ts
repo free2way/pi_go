@@ -178,6 +178,42 @@ describe("readReleaseSummary / readReleaseRetrospective", () => {
     expect(retro!.costPerCompletedStory).toBe(0.5);
   });
 
+  it("carries the publish record (releasedAt/By + deploy) into the summary and retrospective", async () => {
+    const db = await createTestDb();
+    const service = new AgileService(db);
+    const project = await service.createProject("user_a", { name: "认证服务", key: "AUTH" });
+    const story = await service.createStory("user_a", { projectId: project.id, title: "完成的", status: "done" });
+    const release = await service.createRelease("user_a", { projectId: project.id, name: "结账发布", version: "v1.0.0", storyIds: [story.id] });
+    const stories = await service.collectReleaseStories(["user_a"], release);
+    await service.publishRelease(["user_a"], release.id, {
+      releasedBy: "user_a",
+      releasedAt: "2026-01-03T00:00:00.000Z",
+      deploy: { status: "failed", detail: "HTTP 503", at: "2026-01-03T00:00:01.000Z" },
+      stories,
+    });
+
+    const summary = await readReleaseSummary(db, ["user_a"], release.id);
+    expect(summary).toMatchObject({ status: "released", releasedAt: "2026-01-03T00:00:00.000Z", releasedBy: "user_a" });
+    expect(summary!.deploy).toMatchObject({ status: "failed", detail: "HTTP 503" });
+    const retro = await readReleaseRetrospective(db, ["user_a"], release.id);
+    expect(retro).toMatchObject({ releasedAt: "2026-01-03T00:00:00.000Z", releasedBy: "user_a", deploy: { status: "failed", detail: "HTTP 503" } });
+  });
+
+  it("surfaces a manual block reason on the release story outcome", async () => {
+    const db = await createTestDb();
+    const service = new AgileService(db);
+    const project = await service.createProject("user_a", { name: "认证服务", key: "AUTH" });
+    const story = await service.createStory("user_a", { projectId: project.id, title: "阻塞的" });
+    await service.blockStory(["user_a"], story.id, "等待上游接口", "user_a");
+    const release = await service.createRelease("user_a", { projectId: project.id, name: "结账发布", version: "v1.0.0", storyIds: [story.id] });
+
+    const summary = await readReleaseSummary(db, ["user_a"], release.id);
+    expect(summary!.totals.blocked).toBe(1);
+    expect(summary!.stories[0]).toMatchObject({ status: "blocked", blockedReason: "等待上游接口" });
+    const retro = await readReleaseRetrospective(db, ["user_a"], release.id);
+    expect(retro!.blockedStories[0]).toMatchObject({ reason: "等待上游接口" });
+  });
+
   it("returns undefined for an unknown release and never leaks another owner's release", async () => {
     const db = await createTestDb();
     const service = new AgileService(db);

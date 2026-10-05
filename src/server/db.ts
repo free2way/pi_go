@@ -411,6 +411,38 @@ export const databaseMigrations: Migration[] = [
       CREATE INDEX idx_model_templates_owner ON model_templates(owner_id, updated_at);
     `,
   },
+  {
+    // Kanban blocked-management + release publish action (Sprint 5, additive).
+    // `blocked_reason/at/by` hold the *manual* block; `status_before_block`
+    // preserves the pre-block planning status so unblocking restores it when no
+    // run is linked. `released_at/by` + `deploy_json` record an explicit publish
+    // and its deploy-hook outcome; `agile_release_audit` is the append-only trail.
+    id: 12,
+    name: "story-manual-block-and-release-publish",
+    sql: `
+      ALTER TABLE agile_stories ADD COLUMN blocked_reason TEXT;
+      ALTER TABLE agile_stories ADD COLUMN blocked_at TEXT;
+      ALTER TABLE agile_stories ADD COLUMN blocked_by TEXT;
+      ALTER TABLE agile_stories ADD COLUMN status_before_block TEXT;
+
+      ALTER TABLE agile_releases ADD COLUMN released_at TEXT;
+      ALTER TABLE agile_releases ADD COLUMN released_by TEXT;
+      ALTER TABLE agile_releases ADD COLUMN deploy_json TEXT;
+
+      CREATE TABLE agile_release_audit (
+        id TEXT PRIMARY KEY,
+        release_id TEXT NOT NULL REFERENCES agile_releases(id),
+        owner_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        actor_id TEXT NOT NULL,
+        note TEXT,
+        status TEXT NOT NULL,
+        deploy_json TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX idx_agile_release_audit_release ON agile_release_audit(release_id, created_at);
+    `,
+  },
 ];
 
 export async function runMigrations(db: Db) {

@@ -679,7 +679,7 @@ button { color: inherit; }
 .agile-column > header { display: flex; justify-content: space-between; align-items: baseline; padding-bottom: 6px; border-bottom: 1px solid var(--line-soft); }
 .agile-column > header span { font-size: 10px; color: #a7b0b8; font-weight: 600; }
 .agile-column > header em { font-style: normal; color: #5f6973; font: 9px "DM Mono", monospace; }
-.agile-card { display: flex; flex-direction: column; gap: 6px; text-align: left; border: 1px solid var(--line-soft); background: #0d1115; border-radius: 9px; padding: 9px 10px; cursor: pointer; color: inherit; }
+.agile-card { display: flex; flex-direction: column; gap: 6px; text-align: left; border: 1px solid var(--line-soft); background: #0d1115; border-radius: 9px; padding: 9px 10px; color: inherit; }
 .agile-card:hover { border-color: #3a444e; }
 .agile-card.selected { border-color: #59652c; box-shadow: 0 0 0 2px rgba(223,248,84,.05); }
 .agile-card strong { font-size: 10px; font-weight: 600; line-height: 1.4; }
@@ -781,6 +781,18 @@ button.agile-metrics-row:hover strong { color: #c3d274; }
 .ws-form .agile-check input[type="checkbox"] { width: auto; margin: 0; flex: 0 0 auto; accent-color: #c3d274; }
 .agile-check > span { display: flex; flex-direction: column; gap: 1px; }
 .agile-check small { color: #5f6973; font: 9px "DM Mono", monospace; }
+
+/* Sprint 5: Kanban blocked-management + release publish confirmation. */
+.agile-card-main { display: flex; flex-direction: column; gap: 6px; text-align: left; border: 0; background: transparent; padding: 0; color: inherit; cursor: pointer; width: 100%; }
+.agile-card-actions { display: flex; gap: 5px; flex-wrap: wrap; }
+.agile-card-actions button { border: 1px solid #2b323a; background: #151a1f; color: #8b96a0; border-radius: 4px; font: 500 9px "DM Mono", monospace; padding: 2px 6px; cursor: pointer; }
+.agile-card-actions button:hover:not(:disabled) { color: #c3d274; border-color: rgba(223,248,84,.35); }
+.agile-card-actions button:disabled { opacity: .5; cursor: not-allowed; }
+.agile-blocked-badge { display: inline-block; padding: 2px 6px; border-radius: 5px; border: 1px solid rgba(224,106,106,.32); background: rgba(224,106,106,.08); color: #e78b8b; font-size: 9px; line-height: 1.4; }
+.agile-blocked-list { margin: 8px 0; border: 1px solid rgba(224,106,106,.28); background: rgba(224,106,106,.06); border-radius: 8px; padding: 9px 11px; color: #d99a9a; font-size: var(--panel-fs-sm); }
+.agile-blocked-list strong { display: block; margin-bottom: 5px; color: #e7a6a6; }
+.agile-blocked-list ul { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 3px; }
+.agile-publish-confirm { margin-top: 16px; }
 
 /* 账户管理（仅管理员）: user table + grants editor. */
 .accounts-page { max-width: 1240px; margin: 0 auto; padding: 28px 30px 42px; }

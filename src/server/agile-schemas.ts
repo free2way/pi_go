@@ -112,6 +112,19 @@ export const storySubmitSchema = z.object({
   idempotencyKey: z.string().trim().min(8).max(120).optional(),
 }).strict();
 
+/** Kanban manual block: a required, human reason. */
+export const storyBlockSchema = z.object({
+  reason: z.string().trim().min(1).max(500),
+}).strict();
+
+/** Release publish action. `confirm` gates the mutation; without it the route
+ * returns a dry-run preview (guards + blocked stories) so the UI can render the
+ * confirmation dialog before committing. */
+export const releasePublishSchema = z.object({
+  confirm: z.boolean().optional(),
+  note: text.optional(),
+}).strict();
+
 /** Sprint 4: saved model combination. `budget`/`maxParallel` are optional. */
 export const templateCreateSchema = z.object({
   name,

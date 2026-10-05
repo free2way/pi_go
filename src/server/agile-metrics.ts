@@ -14,6 +14,7 @@ import {
 } from "../shared/agile-metrics.js";
 import type { Run, RunState } from "../shared/types.js";
 import type { ReleaseStatus, StoryStatus } from "../shared/agile.js";
+import type { ReleaseDeployRecord } from "../shared/agile.js";
 import type { Db } from "./db.js";
 
 /**
@@ -30,7 +31,7 @@ export interface MetricsFilter {
   sprintId?: string;
 }
 
-type StoryRow = { id: string; title: string; project_id: string; sprint_id: string | null; status: string };
+type StoryRow = { id: string; title: string; project_id: string; sprint_id: string | null; status: string; blocked_reason?: string | null };
 type LinkedRunRow = {
   story_id: string;
   linked_at: string;
@@ -94,7 +95,7 @@ export async function readAgileMetrics(
 
   const scope = storyScope(ownerKeys, filter);
   const storyRows = (await db.query(
-    `SELECT s.id, s.title, s.project_id, s.sprint_id, s.status FROM agile_stories s
+    `SELECT s.id, s.title, s.project_id, s.sprint_id, s.status, s.blocked_reason FROM agile_stories s
      WHERE ${scope.clauses.join(" AND ")} ORDER BY s.updated_at DESC`,
     scope.params,
   )).rows as unknown as StoryRow[];
@@ -105,6 +106,7 @@ export async function readAgileMetrics(
     projectId: row.project_id,
     sprintId: row.sprint_id,
     status: row.status as StoryStatus,
+    blockedReason: row.blocked_reason ?? null,
   }));
   const storyIds = new Set(stories.map((story) => story.id));
 
@@ -214,6 +216,9 @@ type ReleaseRow = {
   version: string;
   status: string;
   story_ids_json: string;
+  released_at: string | null;
+  released_by: string | null;
+  deploy_json: string | null;
 };
 
 export interface ReleaseDataset {
@@ -233,10 +238,21 @@ function parseStoryIds(value: string): string[] {
   }
 }
 
+/** Parses `deploy_json` defensively; a malformed value is treated as not recorded. */
+function parseDeployRecord(value: string | null): ReleaseDeployRecord | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as ReleaseDeployRecord;
+    return parsed && typeof parsed.status === "string" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function readReleaseDataset(db: Db, ownerKeys: string[], releaseId: string): Promise<ReleaseDataset | undefined> {
   if (ownerKeys.length === 0) return undefined;
   const releaseRow = (await db.query(
-    `SELECT id, project_id, name, version, status, story_ids_json FROM agile_releases
+    `SELECT id, project_id, name, version, status, story_ids_json, released_at, released_by, deploy_json FROM agile_releases
      WHERE id = $1 AND owner_id IN (${placeholders(ownerKeys.length, 2)})`,
     [releaseId, ...ownerKeys],
   )).rows[0] as unknown as ReleaseRow | undefined;
@@ -248,6 +264,9 @@ export async function readReleaseDataset(db: Db, ownerKeys: string[], releaseId:
     name: releaseRow.name,
     version: releaseRow.version,
     status: releaseRow.status as ReleaseStatus,
+    releasedAt: releaseRow.released_at ?? null,
+    releasedBy: releaseRow.released_by ?? null,
+    deploy: parseDeployRecord(releaseRow.deploy_json),
   };
 
   // Only story ids that actually belong to the caller are kept, so a stale or
@@ -259,7 +278,7 @@ export async function readReleaseDataset(db: Db, ownerKeys: string[], releaseId:
   if (storyIds.length === 0) return { release, stories, runs, events };
 
   const storyRows = (await db.query(
-    `SELECT id, title, project_id, sprint_id, status FROM agile_stories
+    `SELECT id, title, project_id, sprint_id, status, blocked_reason FROM agile_stories
      WHERE id IN (${placeholders(storyIds.length, 1)}) AND owner_id IN (${placeholders(ownerKeys.length, storyIds.length + 1)})`,
     [...storyIds, ...ownerKeys],
   )).rows as unknown as StoryRow[];
@@ -270,6 +289,7 @@ export async function readReleaseDataset(db: Db, ownerKeys: string[], releaseId:
       projectId: row.project_id,
       sprintId: row.sprint_id,
       status: row.status as StoryStatus,
+      blockedReason: row.blocked_reason ?? null,
     });
   }
   const ownedStoryIds = stories.map((story) => story.id);

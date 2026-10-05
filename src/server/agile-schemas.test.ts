@@ -3,8 +3,10 @@ import {
   projectCreateSchema,
   projectPatchSchema,
   releaseCreateSchema,
+  releasePublishSchema,
   sprintCreateSchema,
   sprintPatchSchema,
+  storyBlockSchema,
   storyCreateSchema,
   storyPatchSchema,
   storySubmitSchema,
@@ -79,6 +81,23 @@ describe("agile schemas — story submission", () => {
   it("rejects an unknown mode and a too-short idempotency key", () => {
     expect(storySubmitSchema.safeParse({ mode: "production" }).success).toBe(false);
     expect(storySubmitSchema.safeParse({ idempotencyKey: "short" }).success).toBe(false);
+  });
+});
+
+describe("agile schemas — blocked-management and release publish", () => {
+  it("requires a non-empty manual block reason", () => {
+    const parsed = storyBlockSchema.safeParse({ reason: "  等待上游接口  " });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) expect(parsed.data.reason).toBe("等待上游接口");
+    expect(storyBlockSchema.safeParse({ reason: "   " }).success).toBe(false);
+    expect(storyBlockSchema.safeParse({}).success).toBe(false);
+  });
+
+  it("accepts an optional confirm/note and rejects unknown fields", () => {
+    expect(releasePublishSchema.safeParse({}).success).toBe(true);
+    expect(releasePublishSchema.safeParse({ confirm: true, note: "首次发布" }).success).toBe(true);
+    expect(releasePublishSchema.safeParse({ confirm: "yes" }).success).toBe(false);
+    expect(releasePublishSchema.safeParse({ confirmed: true }).success).toBe(false);
   });
 });
 

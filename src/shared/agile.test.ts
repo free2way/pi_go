@@ -111,6 +111,30 @@ describe("deriveStoryStatus", () => {
     const reopened = run("needs_human", { acceptance: {} as Run["acceptance"], summary: "重新打开" });
     expect(deriveStoryStatus(reopened)).toEqual({ status: "blocked", reason: "重新打开" });
   });
+
+  it("lets a manual block win over the derived active statuses", () => {
+    expect(deriveStoryStatus(run("developing"), { blockedReason: "等待上游接口" })).toEqual({ status: "blocked", reason: "等待上游接口" });
+    expect(deriveStoryStatus(run("reviewing"), { blockedReason: "审核人休假" })).toEqual({ status: "blocked", reason: "审核人休假" });
+    expect(deriveStoryStatus(run("completed"), { blockedReason: "等待验收资源" })).toEqual({ status: "blocked", reason: "等待验收资源" });
+  });
+
+  it("keeps the run-derived blocked reason over a manual block", () => {
+    expect(deriveStoryStatus(run("needs_human", { summary: "预算超限" }), { blockedReason: "手动原因" })).toEqual({
+      status: "blocked",
+      reason: "预算超限",
+    });
+  });
+
+  it("never lets a manual block un-done a delivered story", () => {
+    const accepted = run("completed", { acceptance: { acceptedAt: "2026-01-02T00:00:00.000Z", acceptedBy: "u", note: null, acknowledgedOpenFindings: false, findings: { resolved: { count: 0, ids: [] }, remaining: { count: 0, items: [] } }, diff: { artifactId: null, sha256: null, bytes: null }, checks: { total: 0, passed: 0, failed: 0 }, usage: { inputTokens: 0, outputTokens: 0, estimatedCost: 0, modelCalls: 0 } } });
+    expect(deriveStoryStatus(accepted, { blockedReason: "手动原因" })).toEqual({ status: "done" });
+  });
+
+  it("blocks a run-less story on a manual reason only, treating blanks as absent", () => {
+    expect(deriveStoryStatus(undefined, { blockedReason: "等待设计稿" })).toEqual({ status: "blocked", reason: "等待设计稿" });
+    expect(deriveStoryStatus(undefined, { blockedReason: "   " })).toBeUndefined();
+    expect(deriveStoryStatus(undefined, { blockedReason: null })).toBeUndefined();
+  });
 });
 
 describe("story board mapping", () => {

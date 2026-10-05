@@ -1,5 +1,5 @@
 import type { ModelSelection, Run, RunEvent, RunMergeRecord, RunReleaseRecord, RunReleaseStatus, RunState } from "./types.js";
-import { deriveStoryStatus, latestLinkedRun, STORY_STATUSES, type ReleaseStatus, type StoryStatus } from "./agile.js";
+import { deriveStoryStatus, latestLinkedRun, STORY_STATUSES, type ReleaseDeployRecord, type ReleaseStatus, type StoryStatus } from "./agile.js";
 
 /**
  * Sprint 4 core — pure metrics model for the agile board.
@@ -107,6 +107,8 @@ export interface MetricStory {
   projectId: string;
   sprintId: string | null;
   status: StoryStatus;
+  /** Manual block reason (Kanban blocked-management); run-derived reason is read from the run. */
+  blockedReason?: string | null;
 }
 
 /** One story↔run link: the run document plus when it was linked. */
@@ -200,7 +202,7 @@ export function shapeMetrics(stories: MetricStory[], runs: MetricRun[], events: 
   for (const story of stories) {
     const links = runsByStory.get(story.id) ?? [];
     const latest = latestLinkedRun(links.map((link) => ({ run: link.run, linkedAt: link.linkedAt })));
-    const status = deriveStoryStatus(latest?.run)?.status ?? story.status;
+    const status = deriveStoryStatus(latest?.run, { blockedReason: story.blockedReason })?.status ?? story.status;
     byStatus[status] = (byStatus[status] ?? 0) + 1;
 
     let storyCost = 0;
@@ -324,6 +326,11 @@ export interface ReleaseIdentity {
   name: string;
   version: string;
   status: ReleaseStatus;
+  /** Set once the release was published through the publish action. */
+  releasedAt?: string | null;
+  releasedBy?: string | null;
+  /** Post-publish deploy-hook outcome; `null`/absent before publish. */
+  deploy?: ReleaseDeployRecord | null;
 }
 
 /** Latest-run snapshot shown next to a release story. */
@@ -415,6 +422,9 @@ export interface ReleaseSummary {
   name: string;
   version: string;
   status: ReleaseStatus;
+  releasedAt: string | null;
+  releasedBy: string | null;
+  deploy: ReleaseDeployRecord | null;
   generatedAt: string;
   stories: ReleaseStoryOutcome[];
   totals: ReleaseTotals;
@@ -446,6 +456,9 @@ export interface ReleaseRetrospective {
   projectId: string;
   name: string;
   version: string;
+  releasedAt: string | null;
+  releasedBy: string | null;
+  deploy: ReleaseDeployRecord | null;
   generatedAt: string;
   totals: ReleaseTotals;
   cycleTime: CycleTimeStats;
@@ -485,7 +498,7 @@ function toReleaseStoryOutcome(
   eventsByRun: Map<string, MetricEvent[]>,
 ): { outcome: ReleaseStoryOutcome; firstRunAt: number | null; comboRuns: Map<string, number>; notConvergingRunIds: string[] } {
   const latest = latestLinkedRun(links.map((link) => ({ run: link.run, linkedAt: link.linkedAt })));
-  const derived = deriveStoryStatus(latest?.run);
+  const derived = deriveStoryStatus(latest?.run, { blockedReason: story.blockedReason });
   const status = derived?.status ?? story.status;
 
   let cost = 0;
@@ -726,6 +739,9 @@ export function shapeReleaseSummary(input: ReleaseShapeInput): ReleaseSummary {
     name: input.release.name,
     version: input.release.version,
     status: input.release.status,
+    releasedAt: input.release.releasedAt ?? null,
+    releasedBy: input.release.releasedBy ?? null,
+    deploy: input.release.deploy ?? null,
     generatedAt: input.generatedAt,
     stories: analysis.outcomes,
     totals: analysis.totals,
@@ -744,6 +760,9 @@ export function shapeReleaseRetrospective(input: ReleaseShapeInput): ReleaseRetr
     projectId: input.release.projectId,
     name: input.release.name,
     version: input.release.version,
+    releasedAt: input.release.releasedAt ?? null,
+    releasedBy: input.release.releasedBy ?? null,
+    deploy: input.release.deploy ?? null,
     generatedAt: input.generatedAt,
     totals: analysis.totals,
     cycleTime: analysis.core.cycleTime,

@@ -43,8 +43,9 @@ import { planReopen, reopenEventMeta } from "./run-reopen.js";
 import { isActiveRelease, planReleaseStart, sameReleaseAttempt } from "./run-release.js";
 import { AgileError, AgileService } from "./agile.js";
 import { readAgileMetrics, readReleaseRetrospective, readReleaseSummary } from "./agile-metrics.js";
-import { projectCreateSchema, projectPatchSchema, releaseCreateSchema, releasePatchSchema, sprintCreateSchema, sprintPatchSchema, storyCreateSchema, storyPatchSchema, storySubmitSchema, templateCreateSchema } from "./agile-schemas.js";
+import { projectCreateSchema, projectPatchSchema, releaseCreateSchema, releasePatchSchema, releasePublishSchema, sprintCreateSchema, sprintPatchSchema, storyBlockSchema, storyCreateSchema, storyPatchSchema, storySubmitSchema, templateCreateSchema } from "./agile-schemas.js";
 import { executeRelease } from "./release-execution.js";
+import { buildReleaseDeployPayload, planReleasePublish, shapeReleaseDeployOutcome } from "./release-publish.js";
 import type { RunStoreLike } from "./store.js";
 import { WorkspaceError, WorkspaceService } from "./workspaces.js";
 
@@ -530,7 +531,7 @@ app.get("/api/health", async (_request, reply) => {
   try {
     await pingDatabase();
     alerts.clear("database_unavailable");
-    return { status: "ok", service: "pigo-web", version: "0.25.4", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.25.5", db: "ok" };
   } catch (error) {
     // AT-REL-005: fail loudly instead of pretending the service is healthy.
     alerts.raise({
@@ -539,7 +540,7 @@ app.get("/api/health", async (_request, reply) => {
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
       details: { error: (error as Error).message.slice(0, 200) },
     });
-    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.25.4", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.25.5", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
   }
 });
 
@@ -554,7 +555,7 @@ interface StorageStatus {
 app.get("/api/health/detail", async (request, reply) => {
   const internal = safeTokenMatch(request.headers.authorization);
   if (!internal && !auth.user(request)) return reply.code(401).send({ error: "Unauthorized" });
-  const health: Record<string, unknown> = { version: "0.25.4", at: new Date().toISOString() };
+  const health: Record<string, unknown> = { version: "0.25.5", at: new Date().toISOString() };
   try {
     await pingDatabase();
     health.database = { status: "ok" };
@@ -1155,6 +1156,29 @@ app.delete<{ Params: { id: string } }>("/api/stories/:id", async (request, reply
   }
 });
 
+// Kanban blocked-management: manual block/unblock on a story. A manual block
+// wins over the derived in-progress/review status until unblocked; a run that is
+// still parked cannot be unblocked from here (409 BLOCKED_BY_RUN).
+app.post<{ Params: { id: string } }>("/api/stories/:id/block", async (request, reply) => {
+  const parsed = storyBlockSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "标记阻塞需要填写原因", code: "BLOCK_REASON_REQUIRED", details: parsed.error.issues });
+  const user = auth.user(request);
+  try {
+    return await agile.blockStory(ownerKeysFor(request), request.params.id, parsed.data.reason, user.id, await identities.isAdmin(user.id));
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
+app.post<{ Params: { id: string } }>("/api/stories/:id/unblock", async (request, reply) => {
+  const user = auth.user(request);
+  try {
+    return await agile.unblockStory(ownerKeysFor(request), request.params.id, await identities.isAdmin(user.id));
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
 // Submit a story as a run. Only a `ready` story may be submitted; the run's
 // task carries the description + acceptance criteria + definition of done.
 app.post<{ Params: { id: string } }>("/api/stories/:id/runs", async (request, reply) => {
@@ -1294,6 +1318,57 @@ app.delete<{ Params: { id: string } }>("/api/releases/:id", async (request, repl
   try {
     await agile.deleteRelease(ownerKeysFor(request), request.params.id, await identities.isAdmin(auth.user(request).id));
     return reply.code(204).send();
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
+/**
+ * Release publish action (Sprint 5). Owner-scoped. Guards: the release must have
+ * ≥1 story and none of its (reconciled) stories may be blocked — those answer
+ * 409 RELEASE_EMPTY / RELEASE_BLOCKED. Without `confirm` this is a dry-run
+ * preview so the UI can render the confirmation dialog; with `confirm` the
+ * release is marked `released` and, when PI_POST_MERGE_DEPLOY_HOOK is configured,
+ * the same deploy transport as run publish (`executeRelease`) is invoked and its
+ * outcome recorded on the release + audit row (never silently skipped).
+ */
+app.post<{ Params: { id: string } }>("/api/agile/releases/:id/publish", { bodyLimit: 1024 * 1024 }, async (request, reply) => {
+  const parsed = releasePublishSchema.safeParse(request.body ?? {});
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
+  const user = auth.user(request);
+  const isAdmin = await identities.isAdmin(user.id);
+  try {
+    const release = await agile.getRelease(ownerKeysFor(request), request.params.id, isAdmin);
+    if (release.status === "released") return reply.code(409).send({ error: "发布已发布，不可重复发布", code: "RELEASE_RELEASED" });
+    const stories = await agile.collectReleaseStories(ownerKeysFor(request), release, isAdmin);
+    const plan = planReleasePublish({ stories, label: `发布「${release.version} ${release.name}」` });
+    if (plan.kind !== "ready") {
+      return reply.code(plan.status).send({
+        error: plan.message,
+        code: plan.code,
+        ...(plan.kind === "blocked" ? { blocked: plan.blocked } : {}),
+      });
+    }
+    if (!parsed.data.confirm) return { published: false, release, stories };
+
+    const deployPlan = planPostMergeDeploy(process.env.PI_POST_MERGE_DEPLOY_HOOK);
+    if (deployPlan.configured && deployPlan.kind === "webhook" && !releaseWebhookToken) {
+      return reply.code(409).send({ error: "Webhook 发布必须配置 PI_POST_MERGE_DEPLOY_TOKEN", code: "RELEASE_AUTH_NOT_CONFIGURED" });
+    }
+    const releasedAt = new Date().toISOString();
+    const execution = await executeRelease(
+      deployPlan,
+      buildReleaseDeployPayload({ release, stories, releasedAt, releasedBy: user.id, note: parsed.data.note }),
+      { deliveryId: `release-publish:${release.id}`, webhookToken: releaseWebhookToken || undefined },
+    );
+    const deploy = shapeReleaseDeployOutcome(deployPlan, execution, new Date().toISOString());
+    const published = await agile.publishRelease(
+      ownerKeysFor(request),
+      release.id,
+      { releasedBy: user.id, releasedAt, note: parsed.data.note, deploy, stories },
+      isAdmin,
+    );
+    return { published: true, release: published, deploy };
   } catch (error) {
     return agileErrorReply(reply, error);
   }

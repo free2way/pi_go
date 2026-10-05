@@ -85,6 +85,19 @@ export const RELEASE_STATUS_LABELS: Record<ReleaseStatus, string> = {
 
 export type RunBudget = NonNullable<Run["budget"]>;
 
+/**
+ * Outcome of the post-publish deploy hook. `not_configured`/`unsupported` mirror
+ * `planPostMergeDeploy`; `ok` covers an accepted (2xx/202) request, `failed` any
+ * non-2xx or transport error. A configured-but-failing hook is always recorded,
+ * never silently skipped.
+ */
+export type ReleaseDeployStatus = "not_configured" | "unsupported" | "ok" | "failed";
+export interface ReleaseDeployRecord {
+  status: ReleaseDeployStatus;
+  detail: string;
+  at: string;
+}
+
 export interface AgileProject {
   id: string;
   ownerId: string;
@@ -114,6 +127,14 @@ export interface AgileStory {
   /** `null` = backlog (not committed to a sprint). */
   sprintId: string | null;
   workspaceId: string | null;
+  /**
+   * Manual block metadata (Kanban blocked-management). `null`/absent unless an
+   * operator blocked the story; a run-derived block keeps its reason in the run
+   * summary and leaves these fields untouched.
+   */
+  blockedReason?: string | null;
+  blockedAt?: string | null;
+  blockedBy?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -140,6 +161,11 @@ export interface AgileRelease {
   notes: string;
   status: ReleaseStatus;
   storyIds: string[];
+  /** Set when the release was published (status `released`); else `null`. */
+  releasedAt?: string | null;
+  releasedBy?: string | null;
+  /** Deploy hook outcome recorded at publish time; `null` before publish. */
+  deploy?: ReleaseDeployRecord | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -232,21 +258,27 @@ export interface StoryStatusDerivation {
 }
 
 /**
- * Pure reconciler: derive a story status from its latest linked run.
+ * Pure reconciler: derive a story status from its latest linked run, overlaid
+ * with an optional *manual* block (Kanban blocked-management).
  *
- * Returns `undefined` when no run is linked, so manual planning state
- * (`backlog`/`ready`) is never clobbered.
+ * Returns `undefined` when neither a run is linked nor a manual block is set, so
+ * manual planning state (`backlog`/`ready`) is never clobbered.
  *
  * Precedence (documented in docs/14-agile-domain-model.md): a run that needs a
- * human, failed or was cancelled is `blocked` even if it carries an old
- * acceptance snapshot (a reopened run keeps `acceptance`); otherwise an accepted
- * run is `done`, a finished run awaits acceptance, an active `reviewing` run is
- * `in_review`, and every other active state is `in_progress`.
+ * human, failed or was cancelled is `blocked` with the *run's* reason even if it
+ * carries an old acceptance snapshot (a reopened run keeps `acceptance`) and
+ * even if a manual block is set; an accepted run is `done` (a manual block never
+ * un-dones a delivered story); otherwise a manual block wins over the derived
+ * active statuses (`in_progress`/`in_review`/`awaiting_acceptance`) and shows the
+ * manual reason; then a finished run awaits acceptance, an active `reviewing`
+ * run is `in_review`, and every other active state is `in_progress`.
  */
 export function deriveStoryStatus(
   run: Pick<Run, "state" | "summary" | "acceptance"> | undefined | null,
+  manual?: { blockedReason?: string | null } | null,
 ): StoryStatusDerivation | undefined {
-  if (!run) return undefined;
+  const manualReason = manual?.blockedReason?.trim() || undefined;
+  if (!run) return manualReason ? { status: "blocked", reason: manualReason } : undefined;
   const reason = run.summary?.trim() || undefined;
   switch (run.state) {
     case "needs_human":
@@ -259,6 +291,7 @@ export function deriveStoryStatus(
       break;
   }
   if (run.acceptance) return { status: "done" };
+  if (manualReason) return { status: "blocked", reason: manualReason };
   if (run.state === "completed") return { status: "awaiting_acceptance" };
   if (run.state === "reviewing") return { status: "in_review" };
   // queued / preparing / developing / checking
