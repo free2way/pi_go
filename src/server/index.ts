@@ -6,7 +6,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import { internalUpdateRejection } from "../shared/run-state.js";
+import { internalUpdateRejection, releasesStoryBlocks, storyBlockReleaseNote } from "../shared/run-state.js";
 import { buildStoryRunInput, type RunBudget, type StoryDetail } from "../shared/agile.js";
 import type { ConfigStatus, CurrentUser, ModelCatalogResponse, ReviewScope, Run, RunEvent, RunReleaseRecord, Workspace } from "../shared/types.js";
 import { AccountError, AccountService, accountAdminGate } from "./accounts.js";
@@ -533,7 +533,7 @@ app.get("/api/health", async (_request, reply) => {
   try {
     await pingDatabase();
     alerts.clear("database_unavailable");
-    return { status: "ok", service: "pigo-web", version: "0.26.0", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.26.1", db: "ok" };
   } catch (error) {
     // AT-REL-005: fail loudly instead of pretending the service is healthy.
     alerts.raise({
@@ -542,7 +542,7 @@ app.get("/api/health", async (_request, reply) => {
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
       details: { error: (error as Error).message.slice(0, 200) },
     });
-    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.26.0", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.26.1", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
   }
 });
 
@@ -557,7 +557,7 @@ interface StorageStatus {
 app.get("/api/health/detail", async (request, reply) => {
   const internal = safeTokenMatch(request.headers.authorization);
   if (!internal && !auth.user(request)) return reply.code(401).send({ error: "Unauthorized" });
-  const health: Record<string, unknown> = { version: "0.26.0", at: new Date().toISOString() };
+  const health: Record<string, unknown> = { version: "0.26.1", at: new Date().toISOString() };
   try {
     await pingDatabase();
     health.database = { status: "ok" };
@@ -1052,11 +1052,28 @@ function agileErrorReply(reply: FastifyReply, error: unknown) {
 
 /**
  * Sprint 3 write-back helper: after a run mutation, converge the derived status
- * of every story linked to it. Never throws — a planning-table hiccup must not
- * break the run route that triggered it.
+ * of every story linked to it. A run that just reached a terminal state also
+ * releases any run-level story block it held (a terminal run must not deadlock
+ * the board) and records why as a run event. Never throws — a planning-table
+ * hiccup must not break the run route that triggered it.
  */
 async function reconcileStoryForRun(runId: string) {
   try {
+    const run = store.getRun(runId);
+    if (run && releasesStoryBlocks(run.state)) {
+      const released = await agile.releaseStoryBlocksForTerminalRun(runId, run.state);
+      if (released.length > 0) {
+        await store.appendEvent({
+          runId,
+          round: run.round,
+          source: "system",
+          type: "run.story_blocks_released",
+          message: storyBlockReleaseNote(run.state),
+          at: new Date().toISOString(),
+          meta: { state: run.state, storyIds: released },
+        });
+      }
+    }
     await agile.reconcileRun(runId);
   } catch (error) {
     app.log.warn({ error: (error as Error).message, runId }, "story status reconcile failed");

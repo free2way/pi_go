@@ -102,9 +102,11 @@ describe("deriveStoryStatus", () => {
     });
   });
 
-  it("blocks failed and cancelled runs with a fallback reason", () => {
-    expect(deriveStoryStatus(run("failed"))).toEqual({ status: "blocked", reason: "运行失败" });
-    expect(deriveStoryStatus(run("cancelled", { summary: "已由用户取消" }))).toEqual({ status: "blocked", reason: "已由用户取消" });
+  it("does not hold a block for terminal runs (failed/cancelled)", () => {
+    // A terminal run is final, so it can never advance on its own: keeping the
+    // story blocked would deadlock the board (manual unblock used to 409).
+    expect(deriveStoryStatus(run("failed"))).toEqual({ status: "in_progress" });
+    expect(deriveStoryStatus(run("cancelled", { summary: "已由用户取消" }))).toEqual({ status: "in_progress" });
   });
 
   it("prefers blocked over an old acceptance snapshot (reopened run)", () => {

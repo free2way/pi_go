@@ -284,7 +284,7 @@ describe("shapeReleaseSummary", () => {
       runs: [{ storyId: "s1", run: sparse, linkedAt: "2026-01-01T00:00:00.000Z" }],
       events: [],
     });
-    expect(summary.totals.blocked).toBe(1);
+    expect(summary.totals.blocked).toBe(0);
     expect(summary.usage).toEqual({ cost: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, modelCalls: 0, runs: 1 });
     expect(summary.stories[0].cost).toBe(0);
     expect(summary.modelCombinations).toEqual([]);

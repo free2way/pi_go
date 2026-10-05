@@ -57,14 +57,14 @@
 
 - `POST /api/stories/:id/block` `{ reason }`（必填）：标记手动阻塞。
 - `POST /api/stories/:id/unblock`：解除手动阻塞；若关联运行仍处于
-  `needs_human`/failed/cancelled，返回 `409 BLOCKED_BY_RUN`（消息含 run id），
+  `needs_human`，返回 `409 BLOCKED_BY_RUN`（消息含 run id）；**终态运行**（completed/failed/cancelled）**不再持有阻塞**，解除会成功并恢复阻塞前状态，
   必须先处理该运行。已 `done` 的故事不允许手动阻塞（`409 STORY_DONE`）。
 
 ### 2.3 纯函数优先级 `deriveStoryStatus(run, manual)`
 
 `src/shared/agile.ts` 的 `deriveStoryStatus` 增加可选 `manual: { blockedReason }`：
 
-1. 运行派生 `blocked`（needs_human/failed/cancelled）→ 用**运行的自带原因**，手动原因不覆盖。
+1. 运行派生 `blocked`（**仅 `needs_human`**）→ 用**运行的自带原因**，手动原因不覆盖；终态运行（completed/failed/cancelled）**自动释放阻塞**并恢复阻塞前状态（含 `run.story_blocks_released` 事件）。
 2. 已验收（done）→ `done`，手动阻塞不能把已交付故事改回阻塞。
 3. 有手动阻塞 → `blocked` + 手动原因，覆盖派生的
    `in_progress` / `in_review` / `awaiting_acceptance`。

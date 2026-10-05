@@ -16,7 +16,8 @@ import {
   type StoryStatus,
   type StoryRunSummary,
 } from "../shared/agile.js";
-import type { ModelSelection, Run } from "../shared/types.js";
+import type { ModelSelection, Run, RunState } from "../shared/types.js";
+import { releasesStoryBlocks } from "../shared/run-state.js";
 import { newId, type Db } from "./db.js";
 import { type ReleasePublishStory } from "./release-publish.js";
 
@@ -552,23 +553,29 @@ export class AgileService {
   }
 
   /**
-   * Clears a manual block. Refuses while a linked run is itself parked
-   * (`needs_human`/failed/cancelled) — those must be resolved on the run, so the
-   * caller gets 409 `BLOCKED_BY_RUN` naming the run. Otherwise the status is
-   * re-derived from the run, falling back to the remembered pre-block status.
+   * Clears a manual block. Refuses while the linked run still *holds* the block
+   * (`needs_human`) — those must be resolved on the run, so the caller gets 409
+   * `BLOCKED_BY_RUN` naming the run. A terminal run (completed/failed/cancelled)
+   * never holds a block, so the unblock succeeds and the status is re-derived
+   * from the run, falling back to the remembered pre-block status.
    */
   async unblockStory(ownerKeys: string[], id: string, isAdmin = false): Promise<StoryDetail> {
     const existing = await this.requireStory(ownerKeys, id, isAdmin);
     const latest = latestLinkedRun(await this.listStoryRunsDetailed(id));
-    const derived = deriveStoryStatus(latest?.run);
-    if (derived?.status === "blocked") {
-      throw new AgileError(
-        "BLOCKED_BY_RUN",
-        `该故事仍被运行 ${latest!.run.id} 阻塞（${derived.reason ?? "需要人工处理"}）；请先处理该运行`,
-        409,
-      );
+    // Defense-in-depth: a terminal run is final, so it can no longer hold the
+    // block — release instead of 409 even if the story row still says blocked.
+    if (latest && !releasesStoryBlocks(latest.run.state)) {
+      const blocker = deriveStoryStatus(latest.run);
+      if (blocker?.status === "blocked") {
+        throw new AgileError(
+          "BLOCKED_BY_RUN",
+          `该故事仍被运行 ${latest.run.id} 阻塞（${blocker.reason ?? "需要人工处理"}）；请先处理该运行`,
+          409,
+        );
+      }
     }
     if (!existing.blocked_reason && existing.status !== "blocked") return this.getStory(ownerKeys, id, isAdmin);
+    const derived = deriveStoryStatus(latest?.run);
     const restored = derived?.status ?? (existing.status_before_block as StoryStatus | null) ?? "backlog";
     await this.db.query(
       `UPDATE agile_stories SET blocked_reason = NULL, blocked_at = NULL, blocked_by = NULL, status_before_block = NULL, status = $1, updated_at = $2
@@ -576,6 +583,44 @@ export class AgileService {
       [restored, this.now(), id],
     );
     return this.getStory(ownerKeys, id, isAdmin);
+  }
+
+  /**
+   * Automatic release of the run-level story blocks held by a run that just
+   * reached a terminal state (completed/failed/cancelled). Only stories for which
+   * this run is the *latest* linked run and that carry no manual reason
+   * (`blocked_reason`) are released: a manual block is a human decision and is
+   * left untouched. Restores the pre-block status (derived from the run, else the
+   * stored `status_before_block`), clears the block fields and returns the
+   * released story ids so the caller can record why the block was lifted.
+   *
+   * Pure derivation makes `deriveStoryStatus` non-blocking for these states, so
+   * the read-path `reconcileStory` heals an already-stuck story too; this method
+   * additionally yields the ids and runs before reconcile in the mutation paths.
+   */
+  async releaseStoryBlocksForTerminalRun(runId: string, state: RunState): Promise<string[]> {
+    if (!releasesStoryBlocks(state)) return [];
+    const links = (await this.db.query("SELECT story_id FROM story_runs WHERE run_id = $1", [runId])).rows as Array<{ story_id: string }>;
+    const released: string[] = [];
+    for (const link of links) {
+      const row = (await this.db.query(
+        "SELECT status, blocked_reason, status_before_block FROM agile_stories WHERE id = $1",
+        [link.story_id],
+      )).rows[0] as { status: string; blocked_reason: string | null; status_before_block: string | null } | undefined;
+      // Manual blocks stay; only a run-level block (status blocked, no manual reason) is released.
+      if (!row || row.status !== "blocked" || row.blocked_reason) continue;
+      const latest = latestLinkedRun(await this.listStoryRunsDetailed(link.story_id));
+      // A different, still-blocking run may be the story's actual blocker.
+      if (!latest || latest.run.id !== runId) continue;
+      const restored = deriveStoryStatus(latest.run)?.status ?? (row.status_before_block as StoryStatus | null) ?? "backlog";
+      await this.db.query(
+        `UPDATE agile_stories SET blocked_reason = NULL, blocked_at = NULL, blocked_by = NULL, status_before_block = NULL, status = $1, updated_at = $2
+         WHERE id = $3`,
+        [restored, this.now(), link.story_id],
+      );
+      released.push(link.story_id);
+    }
+    return released;
   }
 
   // ------------------------------------------------------------------- sprints

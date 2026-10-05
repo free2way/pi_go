@@ -42,6 +42,17 @@ async function replaceRun(db: Db, run: Run) {
   await db.query("UPDATE runs SET state = $1, updated_at = $2, document_json = $3 WHERE id = $4", [run.state, run.updatedAt, JSON.stringify(run), run.id]);
 }
 
+/**
+ * Simulates the run-level block the reconciler produces (or a story already
+ * stuck from before the fix): status `blocked` with no manual `blocked_reason`.
+ */
+async function forceRunBlock(db: Db, storyId: string, before: string | null = null) {
+  await db.query(
+    "UPDATE agile_stories SET status = 'blocked', blocked_reason = NULL, blocked_at = NULL, blocked_by = NULL, status_before_block = $1 WHERE id = $2",
+    [before, storyId],
+  );
+}
+
 async function seed() {
   const db = await createTestDb();
   const service = new AgileService(db);
@@ -259,9 +270,11 @@ describe("AgileService run linkage and reconciliation", () => {
     await service.linkRun(story.id, "run_1");
     await service.markStoryInProgress(story.id);
 
+    // A terminal cancelled run must not hold a run-level block: reconcile
+    // releases the story back to its pre-block status.
     await replaceRun(db, makeRun("run_1", "cancelled", { updatedAt: "2026-01-02T00:00:00.000Z", summary: "已由用户取消" }));
-    expect(await service.reconcileRun("run_1")).toEqual(["blocked"]);
-    expect((await service.getStory(["user_a"], story.id)).status).toBe("blocked");
+    expect(await service.reconcileRun("run_1")).toEqual(["in_progress"]);
+    expect((await service.getStory(["user_a"], story.id)).status).toBe("in_progress");
     // Unlinked runs reconcile to nothing.
     expect(await service.reconcileRun("run_missing")).toEqual([]);
   });
@@ -341,6 +354,112 @@ describe("AgileService manual blocking", () => {
     expect((await service.getStory(["user_a"], story.id)).status).toBe("done");
 
     await expect(service.blockStory(["user_a"], story.id, "手动原因", "user_a")).rejects.toMatchObject({ code: "STORY_DONE", status: 409 });
+  });
+});
+
+describe("AgileService automatic run-block release", () => {
+  it("releases a story blocked by a cancelled run, restoring the pre-block status", async () => {
+    const { db, service, project } = await seed();
+    const story = await service.createStory("user_a", { projectId: project.id, title: "故事", status: "ready" });
+    await insertRun(db, makeRun("run_cancel", "developing"));
+    await service.linkRun(story.id, "run_cancel");
+    await service.markStoryInProgress(story.id);
+    await forceRunBlock(db, story.id);
+    await replaceRun(db, makeRun("run_cancel", "cancelled", { summary: "已由用户取消", updatedAt: "2026-01-02T00:00:00.000Z" }));
+
+    // The released ids drive the run audit event recorded by the caller.
+    expect(await service.releaseStoryBlocksForTerminalRun("run_cancel", "cancelled")).toEqual([story.id]);
+    const detail = await service.getStory(["user_a"], story.id);
+    expect(detail.status).toBe("in_progress");
+    expect(detail.blockedReason).toBeNull();
+    expect(detail.blockedBy).toBeNull();
+  });
+
+  it("releases a story blocked by a failed run", async () => {
+    const { db, service, project } = await seed();
+    const story = await service.createStory("user_a", { projectId: project.id, title: "故事" });
+    await insertRun(db, makeRun("run_failed", "developing"));
+    await service.linkRun(story.id, "run_failed");
+    await service.markStoryInProgress(story.id);
+    await forceRunBlock(db, story.id);
+    await replaceRun(db, makeRun("run_failed", "failed", { summary: "运行失败", updatedAt: "2026-01-02T00:00:00.000Z" }));
+
+    expect(await service.releaseStoryBlocksForTerminalRun("run_failed", "failed")).toEqual([story.id]);
+    expect((await service.getStory(["user_a"], story.id)).status).toBe("in_progress");
+  });
+
+  it("releases a story blocked by a completed run to awaiting_acceptance", async () => {
+    const { db, service, project } = await seed();
+    const story = await service.createStory("user_a", { projectId: project.id, title: "故事" });
+    await insertRun(db, makeRun("run_done", "completed"));
+    await service.linkRun(story.id, "run_done");
+    await forceRunBlock(db, story.id);
+
+    expect(await service.releaseStoryBlocksForTerminalRun("run_done", "completed")).toEqual([story.id]);
+    const detail = await service.getStory(["user_a"], story.id);
+    expect(detail.status).toBe("awaiting_acceptance");
+    expect(detail.blockedReason).toBeNull();
+  });
+
+  it("keeps a needs_human run's block and does not release it", async () => {
+    const { db, service, project } = await seed();
+    const story = await service.createStory("user_a", { projectId: project.id, title: "故事" });
+    await insertRun(db, makeRun("run_parked", "needs_human", { summary: "预算超限" }));
+    await service.linkRun(story.id, "run_parked");
+    await service.reconcileRun("run_parked");
+
+    expect((await service.getStory(["user_a"], story.id)).status).toBe("blocked");
+    expect(await service.releaseStoryBlocksForTerminalRun("run_parked", "needs_human")).toEqual([]);
+    expect((await service.getStory(["user_a"], story.id)).status).toBe("blocked");
+  });
+
+  it("unblock succeeds when the blocking run is terminal (defense in depth)", async () => {
+    const { db, service, project } = await seed();
+    const story = await service.createStory("user_a", { projectId: project.id, title: "故事" });
+    await insertRun(db, makeRun("run_cancel", "cancelled", { summary: "已由用户取消" }));
+    await service.linkRun(story.id, "run_cancel");
+    await forceRunBlock(db, story.id);
+
+    const unblocked = await service.unblockStory(["user_a"], story.id);
+    expect(unblocked).toMatchObject({ status: "in_progress", blockedReason: null, blockedBy: null });
+  });
+
+  it("releases an already-stuck story and the kanban query stops reporting it blocked", async () => {
+    const { db, service, project } = await seed();
+    const story = await service.createStory("user_a", { projectId: project.id, title: "故事" });
+    await insertRun(db, makeRun("run_stuck", "cancelled", { summary: "已由用户取消" }));
+    await service.linkRun(story.id, "run_stuck");
+    await forceRunBlock(db, story.id);
+
+    expect(await service.releaseStoryBlocksForTerminalRun("run_stuck", "cancelled")).toEqual([story.id]);
+    const listed = (await service.listStories(["user_a"])).find((entry) => entry.id === story.id);
+    expect(listed?.status).not.toBe("blocked");
+    expect(listed?.blockedReason ?? null).toBeNull();
+  });
+
+  it("heals a stale run-level block on the detail read path", async () => {
+    const { db, service, project } = await seed();
+    const story = await service.createStory("user_a", { projectId: project.id, title: "故事" });
+    await insertRun(db, makeRun("run_stuck", "cancelled", { summary: "已由用户取消" }));
+    await service.linkRun(story.id, "run_stuck");
+    await forceRunBlock(db, story.id);
+
+    // No new run transition fires; reading the story must release the stale block.
+    const detail = await service.getStory(["user_a"], story.id);
+    expect(detail.status).toBe("in_progress");
+    expect(detail.blockedReason).toBeNull();
+  });
+
+  it("leaves a manual block untouched when a linked run goes terminal", async () => {
+    const { db, service, project } = await seed();
+    const story = await service.createStory("user_a", { projectId: project.id, title: "故事" });
+    await insertRun(db, makeRun("run_1", "developing"));
+    await service.linkRun(story.id, "run_1");
+    await service.blockStory(["user_a"], story.id, "暂停开发", "user_a");
+
+    expect(await service.releaseStoryBlocksForTerminalRun("run_1", "cancelled")).toEqual([]);
+    const detail = await service.getStory(["user_a"], story.id);
+    expect(detail).toMatchObject({ status: "blocked", blockedReason: "暂停开发", blockedBy: "user_a" });
   });
 });
 

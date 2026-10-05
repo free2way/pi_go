@@ -264,14 +264,17 @@ export interface StoryStatusDerivation {
  * Returns `undefined` when neither a run is linked nor a manual block is set, so
  * manual planning state (`backlog`/`ready`) is never clobbered.
  *
- * Precedence (documented in docs/14-agile-domain-model.md): a run that needs a
- * human, failed or was cancelled is `blocked` with the *run's* reason even if it
- * carries an old acceptance snapshot (a reopened run keeps `acceptance`) and
- * even if a manual block is set; an accepted run is `done` (a manual block never
- * un-dones a delivered story); otherwise a manual block wins over the derived
- * active statuses (`in_progress`/`in_review`/`awaiting_acceptance`) and shows the
- * manual reason; then a finished run awaits acceptance, an active `reviewing`
- * run is `in_review`, and every other active state is `in_progress`.
+ * Precedence (documented in docs/14-agile-domain-model.md): a run waiting for a
+ * human (`needs_human`) is `blocked` with the *run's* reason even if it carries
+ * an old acceptance snapshot (a reopened run keeps `acceptance`) and even if a
+ * manual block is set. A *terminal* run (completed/failed/cancelled) never holds
+ * a run-level block — a cancelled/failed run is final, so there is nothing left
+ * to resolve and the story is released (see `releasesStoryBlocks`); a completed
+ * run moves the story to awaiting acceptance. An accepted run is `done` (a manual
+ * block never un-dones a delivered story); otherwise a manual block wins over the
+ * derived active statuses (`in_progress`/`in_review`/`awaiting_acceptance`) and
+ * shows the manual reason; then a finished run awaits acceptance, an active
+ * `reviewing` run is `in_review`, and every other active state is `in_progress`.
  */
 export function deriveStoryStatus(
   run: Pick<Run, "state" | "summary" | "acceptance"> | undefined | null,
@@ -280,15 +283,11 @@ export function deriveStoryStatus(
   const manualReason = manual?.blockedReason?.trim() || undefined;
   if (!run) return manualReason ? { status: "blocked", reason: manualReason } : undefined;
   const reason = run.summary?.trim() || undefined;
-  switch (run.state) {
-    case "needs_human":
-      return { status: "blocked", reason: reason ?? "运行需要人工处理" };
-    case "failed":
-      return { status: "blocked", reason: reason ?? "运行失败" };
-    case "cancelled":
-      return { status: "blocked", reason: reason ?? "运行已取消" };
-    default:
-      break;
+  // Only `needs_human` parks the story at the run level. Terminal end states
+  // (failed/cancelled) used to block too, which deadlocked the board: the run
+  // could never advance again, yet manual unblock refused with BLOCKED_BY_RUN.
+  if (run.state === "needs_human") {
+    return { status: "blocked", reason: reason ?? "运行需要人工处理" };
   }
   if (run.acceptance) return { status: "done" };
   if (manualReason) return { status: "blocked", reason: manualReason };
