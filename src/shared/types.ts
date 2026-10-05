@@ -219,6 +219,16 @@ export interface Run {
   baseSha?: string;
   /** GAP-01: acceptance criteria captured with the task. */
   acceptanceCriteria?: string;
+  /**
+   * Sprint 3: the story this run was submitted for (when created through
+   * `POST /api/stories/:id/runs`). Additive; the worker ignores it.
+   */
+  storyId?: string;
+  /**
+   * Sprint 3: story-level parallel task cap captured at submission. Additive
+   * metadata for the UI; the orchestrator's own concurrency rules are unchanged.
+   */
+  maxParallel?: number;
   /** GAP-01/COST-002: hard budget fixed at creation and shown in the UI. */
   budget?: {
     maxTokens: number;
@@ -658,4 +668,50 @@ export interface WorkspaceVerifyResult {
   head?: string;
   dirty?: boolean;
   dirtyFiles?: string[];
+}
+
+/** 账户管理: the two internal roles. `admin` may manage accounts and merge/publish. */
+export type AccountRole = "admin" | "user";
+/** 账户管理: soft account state; `disabled` blocks new logins but keeps history. */
+export type AccountStatus = "active" | "disabled";
+
+/**
+ * 账户管理: one row of `GET /api/accounts`. Additive; contains no credential,
+ * identity-issuer or subject data — only what an administrator needs to manage
+ * an account. `lastLoginAt` is null when the user has never logged in.
+ */
+export interface AccountSummary {
+  id: string;
+  email: string;
+  role: AccountRole;
+  status: AccountStatus;
+  createdAt: string;
+  updatedAt: string;
+  lastLoginAt: string | null;
+  /** Runs whose owner id (internal or legacy) is this user. */
+  runsOwned: number;
+  /** Non-unregistered workspaces owned by this user. */
+  workspacesOwned: number;
+}
+
+/** 账户管理: an explicit `workspace_grants` row, with the workspace name for display. */
+export interface AccountGrant {
+  workspaceId: string;
+  workspaceName: string | null;
+  permission: WorkspacePermission;
+  grantedBy: string | null;
+  createdAt: string;
+}
+
+/** 账户管理: `GET /api/accounts/:id` — summary plus this user's workspace grants. */
+export interface AccountDetail extends AccountSummary {
+  grants: AccountGrant[];
+}
+
+/** 账户管理: admin-only workspace catalog used by the grants editor. */
+export interface AccountWorkspaceOption {
+  id: string;
+  name: string;
+  ownerId: string;
+  status: WorkspaceStatus;
 }

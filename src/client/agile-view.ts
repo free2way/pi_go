@@ -1,0 +1,40 @@
+import { BOARD_COLUMNS, boardColumnFor, STORY_ESTIMATE_LABELS, STORY_PRIORITY_LABELS, type AgileStory, type BoardColumnId } from "../shared/agile";
+
+export interface BoardColumnGroup {
+  id: BoardColumnId;
+  label: string;
+  stories: AgileStory[];
+}
+
+/** Buckets stories into the six fixed sprint-board columns. */
+export function groupStoriesByColumn(stories: AgileStory[]): BoardColumnGroup[] {
+  return BOARD_COLUMNS.map((column) => ({
+    id: column.id,
+    label: column.label,
+    stories: stories.filter((story) => boardColumnFor(story.status) === column.id),
+  }));
+}
+
+/** One textarea line per acceptance criterion / definition-of-done item. */
+export function splitLines(value: string): string[] {
+  return value.split("\n").map((line) => line.trim()).filter(Boolean);
+}
+
+export function priorityLabel(priority: AgileStory["priority"]): string {
+  return STORY_PRIORITY_LABELS[priority] ?? priority;
+}
+
+export function estimateLabel(estimate: number | null): string {
+  if (estimate === null) return "未估算";
+  return STORY_ESTIMATE_LABELS[estimate] ?? `${estimate} 点`;
+}
+
+/** Story reference shown on cards: `AUTH-3` using its index within the project. */
+export function storyReference(key: string, index: number): string {
+  return `${key}-${index + 1}`;
+}
+
+/** Client-side total of the estimates in a board column ("点数" summary). */
+export function columnPoints(group: BoardColumnGroup): number {
+  return group.stories.reduce((total, story) => total + (story.estimate ?? 0), 0);
+}

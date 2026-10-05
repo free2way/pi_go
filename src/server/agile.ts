@@ -1,0 +1,605 @@
+import {
+  deriveStoryStatus,
+  latestLinkedRun,
+  summarizeStoryRun,
+  type AgileProject,
+  type AgileRelease,
+  type AgileSprint,
+  type AgileStory,
+  type ReleaseStatus,
+  type RunBudget,
+  type SprintStatus,
+  type StoryDetail,
+  type StoryPriority,
+  type StoryStatus,
+  type StoryRunSummary,
+} from "../shared/agile.js";
+import type { ModelSelection, Run } from "../shared/types.js";
+import { newId, type Db } from "./db.js";
+
+export class AgileError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+    readonly status = 400,
+  ) {
+    super(message);
+  }
+}
+
+type ProjectRow = {
+  id: string;
+  owner_id: string;
+  name: string;
+  project_key: string;
+  description: string;
+  created_at: string;
+  updated_at: string;
+};
+
+type SprintRow = {
+  id: string;
+  project_id: string;
+  owner_id: string;
+  name: string;
+  goal: string;
+  start_date: string | null;
+  end_date: string | null;
+  status: string;
+  created_at: string;
+  updated_at: string;
+};
+
+type StoryRow = {
+  id: string;
+  project_id: string;
+  owner_id: string;
+  title: string;
+  description: string;
+  acceptance_criteria_json: string;
+  priority: string;
+  estimate: number | null;
+  definition_of_done_json: string;
+  developer_model_json: string | null;
+  reviewer_model_json: string | null;
+  budget_json: string | null;
+  max_parallel: number | null;
+  sprint_id: string | null;
+  workspace_id: string | null;
+  status: string;
+  created_at: string;
+  updated_at: string;
+};
+
+type ReleaseRow = {
+  id: string;
+  project_id: string;
+  owner_id: string;
+  name: string;
+  version: string;
+  notes: string;
+  status: string;
+  story_ids_json: string;
+  created_at: string;
+  updated_at: string;
+};
+
+function parseJson<T>(value: string | null, fallback: T): T {
+  if (!value) return fallback;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function toProject(row: ProjectRow): AgileProject {
+  return {
+    id: row.id,
+    ownerId: row.owner_id,
+    name: row.name,
+    key: row.project_key,
+    description: row.description,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function toSprint(row: SprintRow): AgileSprint {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    ownerId: row.owner_id,
+    name: row.name,
+    goal: row.goal,
+    startDate: row.start_date,
+    endDate: row.end_date,
+    status: row.status as SprintStatus,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function toStory(row: StoryRow): AgileStory {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    ownerId: row.owner_id,
+    title: row.title,
+    description: row.description,
+    acceptanceCriteria: parseJson<string[]>(row.acceptance_criteria_json, []),
+    priority: row.priority as StoryPriority,
+    estimate: row.estimate === null || row.estimate === undefined ? null : Number(row.estimate),
+    definitionOfDone: parseJson<string[]>(row.definition_of_done_json, []),
+    developerModel: parseJson<ModelSelection | null>(row.developer_model_json, null),
+    reviewerModel: parseJson<ModelSelection | null>(row.reviewer_model_json, null),
+    budget: parseJson<RunBudget | null>(row.budget_json, null),
+    maxParallel: row.max_parallel === null || row.max_parallel === undefined ? null : Number(row.max_parallel),
+    status: row.status as StoryStatus,
+    sprintId: row.sprint_id,
+    workspaceId: row.workspace_id,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function toRelease(row: ReleaseRow): AgileRelease {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    ownerId: row.owner_id,
+    name: row.name,
+    version: row.version,
+    notes: row.notes,
+    status: row.status as ReleaseStatus,
+    storyIds: parseJson<string[]>(row.story_ids_json, []),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+export interface CreateProjectInput {
+  name: string;
+  key: string;
+  description?: string;
+}
+
+export interface UpdateProjectInput {
+  name?: string;
+  description?: string;
+}
+
+export interface CreateStoryInput {
+  projectId: string;
+  title: string;
+  description?: string;
+  acceptanceCriteria?: string[];
+  priority?: StoryPriority;
+  estimate?: number | null;
+  definitionOfDone?: string[];
+  developerModel?: ModelSelection | null;
+  reviewerModel?: ModelSelection | null;
+  budget?: RunBudget | null;
+  maxParallel?: number | null;
+  sprintId?: string | null;
+  workspaceId?: string | null;
+  status?: StoryStatus;
+}
+
+export type UpdateStoryInput = Partial<Omit<CreateStoryInput, "projectId">>;
+
+export interface CreateSprintInput {
+  projectId: string;
+  name: string;
+  goal?: string;
+  startDate?: string | null;
+  endDate?: string | null;
+  status?: SprintStatus;
+}
+
+export type UpdateSprintInput = Partial<Omit<CreateSprintInput, "projectId">>;
+
+export interface CreateReleaseInput {
+  projectId: string;
+  name: string;
+  version: string;
+  notes?: string;
+  status?: ReleaseStatus;
+  storyIds?: string[];
+}
+
+export type UpdateReleaseInput = Partial<Omit<CreateReleaseInput, "projectId">>;
+
+/**
+ * Owner-scoped store for the agile planning model. Every read/write is scoped to
+ * the caller's owner keys (admins may read any row, matching the workspace
+ * routes); the `Run` records themselves stay owned by the existing run store.
+ */
+export class AgileService {
+  constructor(
+    private readonly db: Db,
+    private readonly now: () => string = () => new Date().toISOString(),
+  ) {}
+
+  // ------------------------------------------------------------------ projects
+
+  async listProjects(ownerKeys: string[]): Promise<AgileProject[]> {
+    if (ownerKeys.length === 0) return [];
+    const rows = (await this.db.query(
+      `SELECT * FROM agile_projects WHERE owner_id IN (${placeholders(ownerKeys, 1)}) ORDER BY updated_at DESC`,
+      ownerKeys,
+    )).rows as unknown as ProjectRow[];
+    return rows.map(toProject);
+  }
+
+  async getProject(ownerKeys: string[], id: string, isAdmin = false): Promise<AgileProject> {
+    return toProject(await this.requireProject(ownerKeys, id, isAdmin));
+  }
+
+  async createProject(ownerId: string, input: CreateProjectInput): Promise<AgileProject> {
+    const key = input.key.trim().toUpperCase();
+    const now = this.now();
+    const existing = await this.db.query("SELECT id FROM agile_projects WHERE owner_id = $1 AND project_key = $2", [ownerId, key]);
+    if (existing.rows.length > 0) throw new AgileError("PROJECT_KEY_TAKEN", `项目前缀 ${key} 已存在`, 409);
+    const id = newId("proj");
+    await this.db.query(
+      `INSERT INTO agile_projects (id, owner_id, name, project_key, description, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [id, ownerId, input.name.trim(), key, input.description?.trim() ?? "", now, now],
+    );
+    return this.getProject([ownerId], id, true);
+  }
+
+  async updateProject(ownerKeys: string[], id: string, patch: UpdateProjectInput, isAdmin = false): Promise<AgileProject> {
+    await this.requireProject(ownerKeys, id, isAdmin);
+    if (patch.name !== undefined) await this.db.query("UPDATE agile_projects SET name = $1 WHERE id = $2", [patch.name.trim(), id]);
+    if (patch.description !== undefined) await this.db.query("UPDATE agile_projects SET description = $1 WHERE id = $2", [patch.description.trim(), id]);
+    await this.db.query("UPDATE agile_projects SET updated_at = $1 WHERE id = $2", [this.now(), id]);
+    return this.getProject(ownerKeys, id, isAdmin);
+  }
+
+  /** Cascades to the project's stories/sprints/releases and their run links. */
+  async deleteProject(ownerKeys: string[], id: string, isAdmin = false): Promise<void> {
+    await this.requireProject(ownerKeys, id, isAdmin);
+    await this.db.withTransaction(async (tx) => {
+      await tx.query("DELETE FROM story_runs WHERE story_id IN (SELECT id FROM agile_stories WHERE project_id = $1)", [id]);
+      await tx.query("DELETE FROM agile_stories WHERE project_id = $1", [id]);
+      await tx.query("DELETE FROM agile_sprints WHERE project_id = $1", [id]);
+      await tx.query("DELETE FROM agile_releases WHERE project_id = $1", [id]);
+      await tx.query("DELETE FROM agile_projects WHERE id = $1", [id]);
+    });
+  }
+
+  private async requireProject(ownerKeys: string[], id: string, isAdmin = false): Promise<ProjectRow> {
+    const row = (isAdmin || ownerKeys.length === 0
+      ? (await this.db.query("SELECT * FROM agile_projects WHERE id = $1", [id])).rows[0]
+      : (await this.db.query(
+        `SELECT * FROM agile_projects WHERE id = $1 AND owner_id IN (${placeholders(ownerKeys, 2)})`,
+        [id, ...ownerKeys],
+      )).rows[0]) as unknown as ProjectRow | undefined;
+    if (!row) throw new AgileError("PROJECT_NOT_FOUND", "项目不存在", 404);
+    return row;
+  }
+
+  // ------------------------------------------------------------------- stories
+
+  async listStories(
+    ownerKeys: string[],
+    filter: { projectId?: string; sprintId?: string | null; status?: StoryStatus } = {},
+  ): Promise<AgileStory[]> {
+    if (ownerKeys.length === 0) return [];
+    const params: unknown[] = [...ownerKeys];
+    const clauses = [`owner_id IN (${placeholders(ownerKeys, 1)})`];
+    if (filter.projectId) {
+      params.push(filter.projectId);
+      clauses.push(`project_id = $${params.length}`);
+    }
+    if (filter.sprintId !== undefined) {
+      if (filter.sprintId === null) clauses.push("sprint_id IS NULL");
+      else {
+        params.push(filter.sprintId);
+        clauses.push(`sprint_id = $${params.length}`);
+      }
+    }
+    if (filter.status) {
+      params.push(filter.status);
+      clauses.push(`status = $${params.length}`);
+    }
+    const rows = (await this.db.query(
+      `SELECT * FROM agile_stories WHERE ${clauses.join(" AND ")} ORDER BY updated_at DESC`,
+      params,
+    )).rows as unknown as StoryRow[];
+    return rows.map(toStory);
+  }
+
+  /** Reads the story, reconciling its status from its latest linked run first. */
+  async getStory(ownerKeys: string[], id: string, isAdmin = false): Promise<StoryDetail> {
+    await this.requireStory(ownerKeys, id, isAdmin);
+    await this.reconcileStory(id);
+    const row = (await this.db.query("SELECT * FROM agile_stories WHERE id = $1", [id])).rows[0] as unknown as StoryRow;
+    return { ...toStory(row), runs: await this.listStoryRuns(id) };
+  }
+
+  async createStory(ownerId: string, input: CreateStoryInput): Promise<AgileStory> {
+    const project = await this.requireProject([ownerId], input.projectId, true);
+    await this.requireSprintOfProject(input.sprintId ?? null, project.id);
+    const now = this.now();
+    const id = newId("story");
+    await this.db.query(
+      `INSERT INTO agile_stories (
+         id, project_id, owner_id, title, description, acceptance_criteria_json, priority, estimate,
+         definition_of_done_json, developer_model_json, reviewer_model_json, budget_json, max_parallel,
+         sprint_id, workspace_id, status, created_at, updated_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+      [
+        id, project.id, ownerId, input.title.trim(), input.description?.trim() ?? "",
+        JSON.stringify(input.acceptanceCriteria ?? []), input.priority ?? "should", input.estimate ?? null,
+        JSON.stringify(input.definitionOfDone ?? []),
+        input.developerModel ? JSON.stringify(input.developerModel) : null,
+        input.reviewerModel ? JSON.stringify(input.reviewerModel) : null,
+        input.budget ? JSON.stringify(input.budget) : null,
+        input.maxParallel ?? null,
+        input.sprintId ?? null, input.workspaceId ?? null, input.status ?? "backlog", now, now,
+      ],
+    );
+    return toStory((await this.db.query("SELECT * FROM agile_stories WHERE id = $1", [id])).rows[0] as unknown as StoryRow);
+  }
+
+  async updateStory(ownerKeys: string[], id: string, patch: UpdateStoryInput, isAdmin = false): Promise<AgileStory> {
+    const existing = await this.requireStory(ownerKeys, id, isAdmin);
+    if (patch.sprintId !== undefined) await this.requireSprintOfProject(patch.sprintId, existing.project_id);
+    const assignments: string[] = [];
+    const params: unknown[] = [];
+    const set = (column: string, value: unknown) => {
+      params.push(value);
+      assignments.push(`${column} = $${params.length}`);
+    };
+    if (patch.title !== undefined) set("title", patch.title.trim());
+    if (patch.description !== undefined) set("description", patch.description.trim());
+    if (patch.acceptanceCriteria !== undefined) set("acceptance_criteria_json", JSON.stringify(patch.acceptanceCriteria));
+    if (patch.priority !== undefined) set("priority", patch.priority);
+    if (patch.estimate !== undefined) set("estimate", patch.estimate);
+    if (patch.definitionOfDone !== undefined) set("definition_of_done_json", JSON.stringify(patch.definitionOfDone));
+    if (patch.developerModel !== undefined) set("developer_model_json", patch.developerModel ? JSON.stringify(patch.developerModel) : null);
+    if (patch.reviewerModel !== undefined) set("reviewer_model_json", patch.reviewerModel ? JSON.stringify(patch.reviewerModel) : null);
+    if (patch.budget !== undefined) set("budget_json", patch.budget ? JSON.stringify(patch.budget) : null);
+    if (patch.maxParallel !== undefined) set("max_parallel", patch.maxParallel);
+    if (patch.sprintId !== undefined) set("sprint_id", patch.sprintId);
+    if (patch.workspaceId !== undefined) set("workspace_id", patch.workspaceId);
+    if (patch.status !== undefined) set("status", patch.status);
+    set("updated_at", this.now());
+    params.push(id);
+    await this.db.query(`UPDATE agile_stories SET ${assignments.join(", ")} WHERE id = $${params.length}`, params);
+    return toStory((await this.db.query("SELECT * FROM agile_stories WHERE id = $1", [id])).rows[0] as unknown as StoryRow);
+  }
+
+  async deleteStory(ownerKeys: string[], id: string, isAdmin = false): Promise<void> {
+    await this.requireStory(ownerKeys, id, isAdmin);
+    await this.db.withTransaction(async (tx) => {
+      await tx.query("DELETE FROM story_runs WHERE story_id = $1", [id]);
+      await tx.query("DELETE FROM agile_stories WHERE id = $1", [id]);
+    });
+  }
+
+  private async requireStory(ownerKeys: string[], id: string, isAdmin = false): Promise<StoryRow> {
+    const row = (isAdmin || ownerKeys.length === 0
+      ? (await this.db.query("SELECT * FROM agile_stories WHERE id = $1", [id])).rows[0]
+      : (await this.db.query(
+        `SELECT * FROM agile_stories WHERE id = $1 AND owner_id IN (${placeholders(ownerKeys, 2)})`,
+        [id, ...ownerKeys],
+      )).rows[0]) as unknown as StoryRow | undefined;
+    if (!row) throw new AgileError("STORY_NOT_FOUND", "用户故事不存在", 404);
+    return row;
+  }
+
+  private async requireSprintOfProject(sprintId: string | null, projectId: string): Promise<void> {
+    if (!sprintId) return;
+    const row = (await this.db.query("SELECT project_id FROM agile_sprints WHERE id = $1", [sprintId])).rows[0] as { project_id: string } | undefined;
+    if (!row || row.project_id !== projectId) throw new AgileError("SPRINT_NOT_FOUND", "冲刺不存在或不属于该项目", 422);
+  }
+
+  // -------------------------------------------------------------- story ↔ runs
+
+  async linkRun(storyId: string, runId: string): Promise<void> {
+    await this.db.query(
+      `INSERT INTO story_runs (story_id, run_id, created_at) VALUES ($1, $2, $3)
+       ON CONFLICT (story_id, run_id) DO NOTHING`,
+      [storyId, runId, this.now()],
+    );
+  }
+
+  async listStoryRuns(storyId: string): Promise<StoryRunSummary[]> {
+    const rows = (await this.db.query(
+      `SELECT sr.created_at AS linked_at, r.document_json
+       FROM story_runs sr JOIN runs r ON r.id = sr.run_id
+       WHERE sr.story_id = $1
+       ORDER BY sr.created_at DESC`,
+      [storyId],
+    )).rows as unknown as Array<{ linked_at: string; document_json: string }>;
+    return rows.map((row) => summarizeStoryRun(JSON.parse(row.document_json) as Run, row.linked_at));
+  }
+
+  async listStoryRunsDetailed(storyId: string): Promise<Array<{ run: Run; linkedAt: string }>> {
+    const rows = (await this.db.query(
+      `SELECT sr.created_at AS linked_at, r.document_json
+       FROM story_runs sr JOIN runs r ON r.id = sr.run_id
+       WHERE sr.story_id = $1`,
+      [storyId],
+    )).rows as unknown as Array<{ linked_at: string; document_json: string }>;
+    return rows.map((row) => ({ run: JSON.parse(row.document_json) as Run, linkedAt: row.linked_at }));
+  }
+
+  /**
+   * Write-back used by the story read path: derive the status from the latest
+   * linked run and persist it when it changed. Pure derivation lives in
+   * `shared/agile.ts`; this method is only the persistence side effect.
+   */
+  async reconcileStory(storyId: string): Promise<{ status: StoryStatus; changed: boolean } | undefined> {
+    const row = (await this.db.query("SELECT status FROM agile_stories WHERE id = $1", [storyId])).rows[0] as { status: string } | undefined;
+    if (!row) return undefined;
+    const latest = latestLinkedRun(await this.listStoryRunsDetailed(storyId));
+    const derived = deriveStoryStatus(latest?.run);
+    if (!derived) return { status: row.status as StoryStatus, changed: false };
+    const changed = derived.status !== row.status;
+    if (changed) {
+      await this.db.query("UPDATE agile_stories SET status = $1, updated_at = $2 WHERE id = $3", [derived.status, this.now(), storyId]);
+    }
+    return { status: derived.status, changed };
+  }
+
+  /**
+   * Write-back invoked from the run update paths. A run may be linked to several
+   * stories; each derived status is persisted (never an owner-scoped read here —
+   * the caller already authorized the run mutation).
+   */
+  async reconcileRun(runId: string): Promise<StoryStatus[]> {
+    const rows = (await this.db.query("SELECT story_id FROM story_runs WHERE run_id = $1", [runId])).rows as Array<{ story_id: string }>;
+    const statuses: StoryStatus[] = [];
+    for (const row of rows) {
+      const result = await this.reconcileStory(row.story_id);
+      if (result) statuses.push(result.status);
+    }
+    return statuses;
+  }
+
+  /** Marks a story in progress right after a run was linked to it. */
+  async markStoryInProgress(storyId: string): Promise<void> {
+    await this.db.query("UPDATE agile_stories SET status = 'in_progress', updated_at = $1 WHERE id = $2", [this.now(), storyId]);
+  }
+
+  // ------------------------------------------------------------------- sprints
+
+  async listSprints(ownerKeys: string[], projectId?: string): Promise<AgileSprint[]> {
+    if (ownerKeys.length === 0) return [];
+    const params: unknown[] = [...ownerKeys];
+    let clause = `owner_id IN (${placeholders(ownerKeys, 1)})`;
+    if (projectId) {
+      params.push(projectId);
+      clause += ` AND project_id = $${params.length}`;
+    }
+    const rows = (await this.db.query(
+      `SELECT * FROM agile_sprints WHERE ${clause} ORDER BY updated_at DESC`,
+      params,
+    )).rows as unknown as SprintRow[];
+    return rows.map(toSprint);
+  }
+
+  async createSprint(ownerId: string, input: CreateSprintInput): Promise<AgileSprint> {
+    const project = await this.requireProject([ownerId], input.projectId, true);
+    const now = this.now();
+    const id = newId("sprint");
+    await this.db.query(
+      `INSERT INTO agile_sprints (id, project_id, owner_id, name, goal, start_date, end_date, status, created_at, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [id, project.id, ownerId, input.name.trim(), input.goal?.trim() ?? "", input.startDate ?? null, input.endDate ?? null, input.status ?? "planned", now, now],
+    );
+    return toSprint((await this.db.query("SELECT * FROM agile_sprints WHERE id = $1", [id])).rows[0] as unknown as SprintRow);
+  }
+
+  async updateSprint(ownerKeys: string[], id: string, patch: UpdateSprintInput, isAdmin = false): Promise<AgileSprint> {
+    await this.requireSprint(ownerKeys, id, isAdmin);
+    const assignments: string[] = [];
+    const params: unknown[] = [];
+    const set = (column: string, value: unknown) => {
+      params.push(value);
+      assignments.push(`${column} = $${params.length}`);
+    };
+    if (patch.name !== undefined) set("name", patch.name.trim());
+    if (patch.goal !== undefined) set("goal", patch.goal.trim());
+    if (patch.startDate !== undefined) set("start_date", patch.startDate);
+    if (patch.endDate !== undefined) set("end_date", patch.endDate);
+    if (patch.status !== undefined) set("status", patch.status);
+    set("updated_at", this.now());
+    params.push(id);
+    await this.db.query(`UPDATE agile_sprints SET ${assignments.join(", ")} WHERE id = $${params.length}`, params);
+    return toSprint((await this.db.query("SELECT * FROM agile_sprints WHERE id = $1", [id])).rows[0] as unknown as SprintRow);
+  }
+
+  /** Deleting a sprint returns its stories to the backlog instead of deleting them. */
+  async deleteSprint(ownerKeys: string[], id: string, isAdmin = false): Promise<void> {
+    await this.requireSprint(ownerKeys, id, isAdmin);
+    await this.db.withTransaction(async (tx) => {
+      await tx.query("UPDATE agile_stories SET sprint_id = NULL WHERE sprint_id = $1", [id]);
+      await tx.query("DELETE FROM agile_sprints WHERE id = $1", [id]);
+    });
+  }
+
+  private async requireSprint(ownerKeys: string[], id: string, isAdmin = false): Promise<SprintRow> {
+    const row = (isAdmin || ownerKeys.length === 0
+      ? (await this.db.query("SELECT * FROM agile_sprints WHERE id = $1", [id])).rows[0]
+      : (await this.db.query(
+        `SELECT * FROM agile_sprints WHERE id = $1 AND owner_id IN (${placeholders(ownerKeys, 2)})`,
+        [id, ...ownerKeys],
+      )).rows[0]) as unknown as SprintRow | undefined;
+    if (!row) throw new AgileError("SPRINT_NOT_FOUND", "冲刺不存在", 404);
+    return row;
+  }
+
+  // ------------------------------------------------------------------ releases
+
+  async listReleases(ownerKeys: string[], projectId?: string): Promise<AgileRelease[]> {
+    if (ownerKeys.length === 0) return [];
+    const params: unknown[] = [...ownerKeys];
+    let clause = `owner_id IN (${placeholders(ownerKeys, 1)})`;
+    if (projectId) {
+      params.push(projectId);
+      clause += ` AND project_id = $${params.length}`;
+    }
+    const rows = (await this.db.query(
+      `SELECT * FROM agile_releases WHERE ${clause} ORDER BY updated_at DESC`,
+      params,
+    )).rows as unknown as ReleaseRow[];
+    return rows.map(toRelease);
+  }
+
+  async createRelease(ownerId: string, input: CreateReleaseInput): Promise<AgileRelease> {
+    const project = await this.requireProject([ownerId], input.projectId, true);
+    const now = this.now();
+    const id = newId("release");
+    await this.db.query(
+      `INSERT INTO agile_releases (id, project_id, owner_id, name, version, notes, status, story_ids_json, created_at, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [id, project.id, ownerId, input.name.trim(), input.version.trim(), input.notes?.trim() ?? "", input.status ?? "planned", JSON.stringify(input.storyIds ?? []), now, now],
+    );
+    return toRelease((await this.db.query("SELECT * FROM agile_releases WHERE id = $1", [id])).rows[0] as unknown as ReleaseRow);
+  }
+
+  async updateRelease(ownerKeys: string[], id: string, patch: UpdateReleaseInput, isAdmin = false): Promise<AgileRelease> {
+    await this.requireRelease(ownerKeys, id, isAdmin);
+    const assignments: string[] = [];
+    const params: unknown[] = [];
+    const set = (column: string, value: unknown) => {
+      params.push(value);
+      assignments.push(`${column} = $${params.length}`);
+    };
+    if (patch.name !== undefined) set("name", patch.name.trim());
+    if (patch.version !== undefined) set("version", patch.version.trim());
+    if (patch.notes !== undefined) set("notes", patch.notes.trim());
+    if (patch.status !== undefined) set("status", patch.status);
+    if (patch.storyIds !== undefined) set("story_ids_json", JSON.stringify(patch.storyIds));
+    set("updated_at", this.now());
+    params.push(id);
+    await this.db.query(`UPDATE agile_releases SET ${assignments.join(", ")} WHERE id = $${params.length}`, params);
+    return toRelease((await this.db.query("SELECT * FROM agile_releases WHERE id = $1", [id])).rows[0] as unknown as ReleaseRow);
+  }
+
+  async deleteRelease(ownerKeys: string[], id: string, isAdmin = false): Promise<void> {
+    await this.requireRelease(ownerKeys, id, isAdmin);
+    await this.db.query("DELETE FROM agile_releases WHERE id = $1", [id]);
+  }
+
+  private async requireRelease(ownerKeys: string[], id: string, isAdmin = false): Promise<ReleaseRow> {
+    const row = (isAdmin || ownerKeys.length === 0
+      ? (await this.db.query("SELECT * FROM agile_releases WHERE id = $1", [id])).rows[0]
+      : (await this.db.query(
+        `SELECT * FROM agile_releases WHERE id = $1 AND owner_id IN (${placeholders(ownerKeys, 2)})`,
+        [id, ...ownerKeys],
+      )).rows[0]) as unknown as ReleaseRow | undefined;
+    if (!row) throw new AgileError("RELEASE_NOT_FOUND", "发布不存在", 404);
+    return row;
+  }
+}
+
+function placeholders(keys: string[], startIndex: number): string {
+  return keys.map((_, index) => `$${index + startIndex}`).join(", ");
+}

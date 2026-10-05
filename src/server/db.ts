@@ -290,6 +290,106 @@ export const databaseMigrations: Migration[] = [
       ALTER TABLE workspace_grants ADD COLUMN permission TEXT NOT NULL DEFAULT 'read';
     `,
   },
+  {
+    // Sprint 3 batch 1: agile domain (projects → stories/sprints/releases) on
+    // top of the existing Run, which stays the execution unit. One story can
+    // accumulate several runs (repairs/retries) through `story_runs`.
+    id: 9,
+    name: "agile-projects-stories-sprints-releases-story-runs",
+    sql: `
+      CREATE TABLE agile_projects (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        project_key TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (owner_id, project_key)
+      );
+      CREATE INDEX idx_agile_projects_owner ON agile_projects(owner_id, updated_at);
+
+      CREATE TABLE agile_sprints (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES agile_projects(id),
+        owner_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        goal TEXT NOT NULL DEFAULT '',
+        start_date TEXT,
+        end_date TEXT,
+        status TEXT NOT NULL DEFAULT 'planned',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX idx_agile_sprints_project ON agile_sprints(project_id, updated_at);
+
+      CREATE TABLE agile_stories (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES agile_projects(id),
+        owner_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        acceptance_criteria_json TEXT NOT NULL DEFAULT '[]',
+        priority TEXT NOT NULL DEFAULT 'should',
+        estimate INTEGER,
+        definition_of_done_json TEXT NOT NULL DEFAULT '[]',
+        developer_model_json TEXT,
+        reviewer_model_json TEXT,
+        budget_json TEXT,
+        max_parallel INTEGER,
+        sprint_id TEXT,
+        workspace_id TEXT,
+        status TEXT NOT NULL DEFAULT 'backlog',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX idx_agile_stories_project ON agile_stories(project_id, updated_at);
+      CREATE INDEX idx_agile_stories_sprint ON agile_stories(sprint_id);
+
+      CREATE TABLE agile_releases (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES agile_projects(id),
+        owner_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        version TEXT NOT NULL,
+        notes TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'planned',
+        story_ids_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX idx_agile_releases_project ON agile_releases(project_id, updated_at);
+
+      CREATE TABLE story_runs (
+        story_id TEXT NOT NULL REFERENCES agile_stories(id),
+        run_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (story_id, run_id)
+      );
+      CREATE INDEX idx_story_runs_run ON story_runs(run_id);
+    `,
+  },
+  {
+    // 账户管理: durable audit trail for account role/status changes. There was no
+    // existing audit table (alerts are in-memory), so role/status PATCHes append
+    // a row here with actor + target + before/after.
+    id: 10,
+    name: "user-audit",
+    sql: `
+      CREATE TABLE user_audit (
+        id TEXT PRIMARY KEY,
+        actor_id TEXT NOT NULL,
+        target_user_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        field TEXT NOT NULL,
+        before_value TEXT,
+        after_value TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX idx_user_audit_target ON user_audit(target_user_id, created_at);
+      CREATE INDEX idx_user_audit_actor ON user_audit(actor_id, created_at);
+    `,
+  },
 ];
 
 export async function runMigrations(db: Db) {

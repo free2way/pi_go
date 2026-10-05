@@ -1,4 +1,5 @@
-import type { ConfigStatus, CredentialStatus, CurrentUser, ModelCatalogResponse, ModelSelection, Run, RunArtifact, RunEvent, RunRoundsResponse, RunState, Workspace } from "../shared/types";
+import type { AgileProject, AgileRelease, AgileSprint, AgileStory, StoryDetail, StoryPriority, StoryStatus } from "../shared/agile";
+import type { ConfigStatus, CredentialStatus, CurrentUser, ModelCatalogResponse, ModelSelection, Run, RunArtifact, RunEvent, RunRoundsResponse, RunState, Workspace, AccountDetail, AccountSummary, AccountWorkspaceOption, WorkspacePermission } from "../shared/types";
 
 /** A3: read-only deployment status returned by `GET /api/deployments`. */
 export interface DeploymentRecord {
@@ -172,4 +173,56 @@ export const api = {
     request<Run>(`/api/runs/${id}/resume`, { method: "POST", body: JSON.stringify(body) }),
   retryReviewRun: (id: string) => request<Run>(`/api/runs/${id}/retry-review`, { method: "POST" }),
   deleteRun: (id: string) => request<void>(`/api/runs/${id}`, { method: "DELETE" }),
+  // ---------------------------------------------------------------- agile
+  agileProjects: () => request<{ projects: AgileProject[] }>("/api/agile/projects"),
+  createAgileProject: (body: { name: string; key: string; description?: string }) =>
+    request<AgileProject>("/api/agile/projects", { method: "POST", body: JSON.stringify(body) }),
+  agileStories: (params: { projectId?: string; sprintId?: string; status?: StoryStatus } = {}) => {
+    const search = new URLSearchParams();
+    if (params.projectId) search.set("projectId", params.projectId);
+    if (params.sprintId) search.set("sprintId", params.sprintId);
+    if (params.status) search.set("status", params.status);
+    const suffix = search.toString();
+    return request<{ stories: AgileStory[] }>(`/api/stories${suffix ? `?${suffix}` : ""}`);
+  },
+  createStory: (body: {
+    projectId: string;
+    title: string;
+    description?: string;
+    acceptanceCriteria?: string[];
+    priority?: StoryPriority;
+    estimate?: number | null;
+    definitionOfDone?: string[];
+    sprintId?: string | null;
+    workspaceId?: string | null;
+    status?: StoryStatus;
+  }) => request<AgileStory>("/api/stories", { method: "POST", body: JSON.stringify(body) }),
+  story: (id: string) => request<StoryDetail>(`/api/stories/${id}`),
+  patchStory: (id: string, body: { status?: StoryStatus; sprintId?: string | null; acceptanceCriteria?: string[]; definitionOfDone?: string[]; priority?: StoryPriority; estimate?: number | null; description?: string; title?: string }) =>
+    request<AgileStory>(`/api/stories/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  deleteStory: (id: string) => request<void>(`/api/stories/${id}`, { method: "DELETE" }),
+  submitStory: (id: string, body: { mode: "demo" | "real"; workspaceId?: string; checks?: string[] } = { mode: "real" }) =>
+    request<{ run: Run; story: StoryDetail }>(`/api/stories/${id}/runs`, { method: "POST", body: JSON.stringify(body) }),
+  sprints: (projectId?: string) =>
+    request<{ sprints: AgileSprint[] }>(`/api/sprints${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ""}`),
+  createSprint: (body: { projectId: string; name: string; goal?: string; startDate?: string | null; endDate?: string | null }) =>
+    request<AgileSprint>("/api/sprints", { method: "POST", body: JSON.stringify(body) }),
+  patchSprint: (id: string, body: { name?: string; goal?: string; status?: "planned" | "active" | "closed"; startDate?: string | null; endDate?: string | null }) =>
+    request<AgileSprint>(`/api/sprints/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  releases: (projectId?: string) =>
+    request<{ releases: AgileRelease[] }>(`/api/releases${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ""}`),
+  createRelease: (body: { projectId: string; name: string; version: string; notes?: string; storyIds?: string[] }) =>
+    request<AgileRelease>("/api/releases", { method: "POST", body: JSON.stringify(body) }),
+  patchRelease: (id: string, body: { name?: string; version?: string; notes?: string; status?: "planned" | "in_progress" | "released" | "cancelled"; storyIds?: string[] }) =>
+    request<AgileRelease>(`/api/releases/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  // 账户管理（仅管理员）: role/status + workspace grants.
+  accounts: () => request<{ accounts: AccountSummary[] }>("/api/accounts"),
+  account: (id: string) => request<AccountDetail>(`/api/accounts/${encodeURIComponent(id)}`),
+  patchAccount: (id: string, body: { role?: "admin" | "user"; status?: "active" | "disabled" }) =>
+    request<AccountDetail>(`/api/accounts/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) }),
+  accountWorkspaces: () => request<{ workspaces: AccountWorkspaceOption[] }>("/api/accounts/workspaces"),
+  addAccountGrant: (id: string, body: { workspaceId: string; permission: WorkspacePermission }) =>
+    request<AccountDetail>(`/api/accounts/${encodeURIComponent(id)}/grants`, { method: "POST", body: JSON.stringify(body) }),
+  removeAccountGrant: (id: string, workspaceId: string) =>
+    request<AccountDetail>(`/api/accounts/${encodeURIComponent(id)}/grants/${encodeURIComponent(workspaceId)}`, { method: "DELETE" }),
 };

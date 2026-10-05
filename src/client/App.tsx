@@ -26,6 +26,7 @@ import {
   ChevronDown,
   ChevronRight,
   CircleDot,
+  ClipboardList,
   Clock3,
   Code2,
   Copy,
@@ -53,6 +54,7 @@ import {
   Sparkles,
   Square,
   Trash2,
+  Users,
   X,
   XCircle,
   Zap,
@@ -63,6 +65,7 @@ import { describeMergeRestore, mergeRestoreFields } from "../shared/merge";
 import { branchStatus, currentRoundStatus, roundStatuses, roundStatusMeta, roundStatusTooltip, type RoundStatus } from "../shared/round-status";
 import type { ChatMessage, ConfigStatus, CurrentUser, Finding, ModelCatalogResponse, RoundSummary, Run, RunArtifact, RunEvent, RunMode, RunRoleUsage, RunState, Workspace } from "../shared/types";
 import { api, type DeploymentStatus } from "./api";
+import { AgilePage } from "./AgilePage";
 import { HistoryPage } from "./HistoryPage";
 import { runStateLabels, requirementSummary } from "./requirement-history";
 import { batchCleanupConfirmMessage, cleanupFinishedConfirmMessage, cleanupStorageDetailLines, summarizeCleanupStorage } from "./run-cleanup-view";
@@ -71,6 +74,8 @@ import { createRunSelectionGuard, eventsForRun, isRunSelected, pickSelectedRun }
 import { reworkBranchDetailsFromSummaries, resolveReworkRounds, resolveRoundStatuses } from "./rounds-view";
 import { reworkBranchLayout, reworkBranchPath, type ReworkSide } from "./rework-layout";
 import { ModelsPage } from "./ModelsPage";
+import { mergeOptionState } from "./merge-option";
+import { AccountsPage } from "./AccountsPage";
 import { SystemStatusPage } from "./SystemStatusPage";
 import { WorkspacesPage } from "./WorkspacesPage";
 
@@ -1147,12 +1152,14 @@ function EmptyPanel({ icon: Icon, text }: { icon: typeof Activity; text: string 
   return <div className="empty-panel"><Icon size={22} /><span>{text}</span></div>;
 }
 
-function HumanInterventionPanel({ run, events, onUpdated }: { run: Run; events: RunEvent[]; onUpdated: (run: Run) => void }) {
+function HumanInterventionPanel({ run, events, user, onUpdated }: { run: Run; events: RunEvent[]; user?: CurrentUser; onUpdated: (run: Run) => void }) {
   const [instruction, setInstruction] = useState("");
   const [busy, setBusy] = useState<"" | "resume" | "review" | "terminate" | "continue" | "approve" | "reject">("");
   const [error, setError] = useState("");
   const [mergeNotice, setMergeNotice] = useState("");
-  // A2: admin-only merge on accept; the server enforces the admin check.
+  // A2: admin-only merge on accept; the server enforces the admin check, and the
+  // UI mirrors it so a non-admin is never offered an action that can only 403.
+  const mergeOption = mergeOptionState(user);
   const [mergeIntoWorkspace, setMergeIntoWorkspace] = useState(false);
   // Convergence guardrail: the operator can narrow the continued round to the
   // blocking (critical/high) findings so medium/low notes no longer loop.
@@ -1168,6 +1175,11 @@ function HumanInterventionPanel({ run, events, onUpdated }: { run: Run; events: 
   }, [events]);
   const restoreNotice = mergeNotice || eventNotice;
   const restoreFailed = restoreNotice?.startsWith("工作区恢复失败") ?? false;
+
+  // If the merge option is (or becomes) unavailable, never send a stale `true`.
+  useEffect(() => {
+    if (mergeOption.disabled) setMergeIntoWorkspace(false);
+  }, [mergeOption.disabled]);
 
   const act = async (kind: "resume" | "review" | "terminate" | "continue" | "approve" | "reject") => {
     setError("");
@@ -1221,10 +1233,13 @@ function HumanInterventionPanel({ run, events, onUpdated }: { run: Run; events: 
       <label>人工指令 / 审批备注（可选，随恢复或审批记录）
         <textarea rows={3} value={instruction} onChange={(event) => setInstruction(event.target.value)} placeholder="例如：优先修复凭据隔离问题；其余按审核意见逐条处理。" disabled={Boolean(busy)} />
       </label>
-      <label className="merge-option">
-        <input type="checkbox" checked={mergeIntoWorkspace} onChange={(event) => setMergeIntoWorkspace(event.target.checked)} disabled={Boolean(busy)} />
-        审批通过后合并到工作区默认分支（仅管理员；冲突会被拒绝且不修改工作区）
-      </label>
+      {mergeOption.show && (
+        <label className="merge-option" title={mergeOption.hint || undefined}>
+          <input type="checkbox" checked={mergeIntoWorkspace} onChange={(event) => setMergeIntoWorkspace(event.target.checked)} disabled={Boolean(busy) || mergeOption.disabled} />
+          审批通过后合并到工作区默认分支（仅管理员；冲突会被拒绝且不修改工作区）
+        </label>
+      )}
+      {mergeOption.disabled && mergeOption.hint && <div className="merge-option-hint">{mergeOption.hint}</div>}
       <label className="review-scope-option">「继续开发」的审核范围
         <select value={reviewScope} onChange={(event) => setReviewScope(event.target.value === "blocking" ? "blocking" : "all")} disabled={Boolean(busy)}>
           <option value="all">修复全部问题</option>
@@ -1277,7 +1292,7 @@ export function App() {
   // Item-1: which rework branch's detail panel is open; Item-2: the chat round filter.
   const [reworkRound, setReworkRound] = useState<number | null>(null);
   const [chatRoundFilter, setChatRoundFilter] = useState<number | null>(null);
-  const [view, setView] = useState<"run" | "workspaces" | "models" | "history" | "system">("run");
+  const [view, setView] = useState<"run" | "agile" | "workspaces" | "models" | "history" | "system" | "accounts">("run");
   const [createOpen, setCreateOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -1510,10 +1525,13 @@ export function App() {
         <nav className="primary-nav">
           <button type="button" className={view === "run" ? "active" : ""} onClick={() => setView("run")}><GitBranch size={16} />工作流</button>
           <button type="button" className={view === "history" ? "active" : ""} onClick={() => setView("history")}><History size={16} />需求历史</button>
+          <button type="button" className={view === "agile" ? "active" : ""} onClick={() => setView("agile")}><ClipboardList size={16} />敏捷</button>
           <button type="button" className={view === "workspaces" ? "active" : ""} onClick={() => setView("workspaces")}><FolderGit2 size={16} />工作区</button>
           <button type="button" className={view === "models" ? "active" : ""} onClick={() => setView("models")}><Cpu size={16} />模型与凭据</button>
           {/* SYS-01: this used to be a dead `#system` anchor into the sidebar deployment card; it now opens the system status dashboard. */}
           <button type="button" className={view === "system" ? "active" : ""} onClick={() => setView("system")}><Activity size={16} />系统状态</button>
+          {/* 账户管理: admin-only; non-admins never see the entry (direct navigation shows the explicit 仅管理员可见 state). */}
+          {user?.isAdmin && <button type="button" className={view === "accounts" ? "active" : ""} onClick={() => setView("accounts")}><Users size={16} />账户管理</button>}
         </nav>
         <div className="sidebar-section-head"><span>最近任务</span><span className="sidebar-head-actions"><Search size={14} /><button className="sidebar-cleanup" type="button" title="清理 7 天前已结束的任务" onClick={() => void handleCleanup()}><Trash2 size={13} /></button></span></div>
         {batchSelected.size > 0 && (
@@ -1570,7 +1588,11 @@ export function App() {
                   ? <><span>SYSTEM</span><ChevronRight size={13} /><strong>系统状态</strong></>
                   : view === "history"
                     ? <><span>HISTORY</span><ChevronRight size={13} /><strong>需求历史</strong></>
-                    : <><span>WORKFLOWS</span><ChevronRight size={13} /><strong>{activeRun?.id.slice(0, 12) || "OVERVIEW"}</strong></>}
+                    : view === "agile"
+                      ? <><span>AGILE</span><ChevronRight size={13} /><strong>敏捷</strong></>
+                      : view === "accounts"
+                        ? <><span>ACCOUNTS</span><ChevronRight size={13} /><strong>账户管理</strong></>
+                        : <><span>WORKFLOWS</span><ChevronRight size={13} /><strong>{activeRun?.id.slice(0, 12) || "OVERVIEW"}</strong></>}
           </div>
           <div className="topbar-actions">
             {view === "run" && (activeRun?.mode === "demo" ? <span className="demo-chip"><Sparkles size={13} />演示数据</span> : activeRun && <span className="demo-chip real-chip"><Code2 size={13} />真实工作区</span>)}
@@ -1587,6 +1609,10 @@ export function App() {
           <WorkspacesPage config={config} runs={runs} onOpenCredentials={() => setView("models")} />
         ) : view === "history" ? (
           <HistoryPage runs={runs} onOpenRun={(id) => { setSelectedId(id); setView("run"); setSidebarOpen(false); }} />
+        ) : view === "agile" ? (
+          <AgilePage config={config} onOpenRun={(id) => { setSelectedId(id); setView("run"); setSidebarOpen(false); }} />
+        ) : view === "accounts" ? (
+          <AccountsPage user={user} />
         ) : !activeRun ? (
           selectedId ? (
             <section className="run-loading">
@@ -1626,6 +1652,7 @@ export function App() {
               <HumanInterventionPanel
                 run={activeRun}
                 events={events}
+                user={user}
                 onUpdated={(next) => {
                   setRun(next);
                   setRuns((current) => current.map((item) => (item.id === next.id ? next : item)));

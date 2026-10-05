@@ -7,7 +7,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { internalUpdateRejection } from "../shared/run-state.js";
+import { buildStoryRunInput, type RunBudget, type StoryDetail } from "../shared/agile.js";
 import type { ConfigStatus, CurrentUser, ModelCatalogResponse, ReviewScope, Run, RunEvent, RunReleaseRecord, Workspace } from "../shared/types.js";
+import { AccountError, AccountService, accountAdminGate } from "./accounts.js";
 import { AlertManager, createAlertSink } from "./alerts.js";
 import { Authenticator } from "./auth.js";
 import { CredentialVault } from "./credential-vault.js";
@@ -39,6 +41,8 @@ import { coordinateApprovedMerge, replayPendingMerge } from "./merge-approval.js
 import { buildMergeRequestPayload, mergeRequestUnavailable, patchFileName, resolveMergeRequestConfig, selectPatch, type PatchSelection } from "./run-patch.js";
 import { planReopen, reopenEventMeta } from "./run-reopen.js";
 import { isActiveRelease, planReleaseStart, sameReleaseAttempt } from "./run-release.js";
+import { AgileError, AgileService } from "./agile.js";
+import { projectCreateSchema, projectPatchSchema, releaseCreateSchema, releasePatchSchema, sprintCreateSchema, sprintPatchSchema, storyCreateSchema, storyPatchSchema, storySubmitSchema } from "./agile-schemas.js";
 import { executeRelease } from "./release-execution.js";
 import type { RunStoreLike } from "./store.js";
 import { WorkspaceError, WorkspaceService } from "./workspaces.js";
@@ -154,6 +158,7 @@ const workspacesEnabled = process.env.PI_WORKSPACES_ENABLED !== "false";
 // route refuses clearly (409 MERGE_REQUEST_NOT_CONFIGURED) instead of guessing.
 const mergeRequestConfig = resolveMergeRequestConfig(process.env);
 const workspaces = new WorkspaceService(db, workerRequest);
+const agile = new AgileService(db);
 const userCache = new Map<string, CurrentUser>();
 
 const createRunSchema = z.object({
@@ -524,7 +529,7 @@ app.get("/api/health", async (_request, reply) => {
   try {
     await pingDatabase();
     alerts.clear("database_unavailable");
-    return { status: "ok", service: "pigo-web", version: "0.24.2", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.25.0", db: "ok" };
   } catch (error) {
     // AT-REL-005: fail loudly instead of pretending the service is healthy.
     alerts.raise({
@@ -533,7 +538,7 @@ app.get("/api/health", async (_request, reply) => {
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
       details: { error: (error as Error).message.slice(0, 200) },
     });
-    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.24.2", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.25.0", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
   }
 });
 
@@ -548,7 +553,7 @@ interface StorageStatus {
 app.get("/api/health/detail", async (request, reply) => {
   const internal = safeTokenMatch(request.headers.authorization);
   if (!internal && !auth.user(request)) return reply.code(401).send({ error: "Unauthorized" });
-  const health: Record<string, unknown> = { version: "0.24.2", at: new Date().toISOString() };
+  const health: Record<string, unknown> = { version: "0.25.0", at: new Date().toISOString() };
   try {
     await pingDatabase();
     health.database = { status: "ok" };
@@ -593,6 +598,93 @@ app.get("/api/me", async (request): Promise<CurrentUser> => {
   const user = auth.user(request);
   return { ...user, isAdmin: await identities.isAdmin(user.id) };
 });
+
+// ---------------------------------------------------------------------------
+// 账户管理 (account management) — admin only.
+//
+// The instance owner discovered their account was still `role: "user"` while
+// merge refused with 403, so roles/statuses must be inspectable and manageable.
+// Guardrails (no self role change, never lose the last active admin) live in
+// `accounts.ts` and are unit-tested; every change appends a `user_audit` row.
+// ---------------------------------------------------------------------------
+const accountService = new AccountService(db);
+const accountPatchSchema = z.object({
+  role: z.enum(["admin", "user"]).optional(),
+  status: z.enum(["active", "disabled"]).optional(),
+}).strict().refine((value) => value.role !== undefined || value.status !== undefined, { message: "至少需要提供 role 或 status" });
+const accountGrantSchema = z.object({
+  workspaceId: z.string().trim().min(1).max(120),
+  permission: z.enum(["read", "write"]),
+}).strict();
+
+/** Returns the calling admin, or sends 403 and returns undefined. */
+async function requireAccountAdmin(request: FastifyRequest, reply: FastifyReply) {
+  const user = auth.user(request);
+  const gate = accountAdminGate(await identities.isAdmin(user.id));
+  if (!gate.allowed) {
+    reply.code(gate.status).send({ error: gate.message, code: gate.code });
+    return undefined;
+  }
+  return user;
+}
+
+function accountErrorReply(reply: FastifyReply, error: unknown) {
+  if (error instanceof AccountError) return reply.code(error.status).send({ error: error.message, code: error.code });
+  throw error;
+}
+
+app.get("/api/accounts", async (request, reply) => {
+  if (!(await requireAccountAdmin(request, reply))) return reply;
+  return { accounts: await accountService.list() };
+});
+
+// Registered before `/api/accounts/:id` so the static segment wins the match.
+app.get("/api/accounts/workspaces", async (request, reply) => {
+  if (!(await requireAccountAdmin(request, reply))) return reply;
+  return { workspaces: await accountService.listWorkspaces() };
+});
+
+app.get<{ Params: { id: string } }>("/api/accounts/:id", async (request, reply) => {
+  if (!(await requireAccountAdmin(request, reply))) return reply;
+  const account = await accountService.get(request.params.id);
+  if (!account) return reply.code(404).send({ error: "账户不存在", code: "ACCOUNT_NOT_FOUND" });
+  return account;
+});
+
+app.patch<{ Params: { id: string } }>("/api/accounts/:id", async (request, reply) => {
+  const actor = await requireAccountAdmin(request, reply);
+  if (!actor) return reply;
+  const parsed = accountPatchSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
+  try {
+    return await accountService.update(request.params.id, parsed.data, actor.id);
+  } catch (error) {
+    return accountErrorReply(reply, error);
+  }
+});
+
+app.post<{ Params: { id: string } }>("/api/accounts/:id/grants", async (request, reply) => {
+  const actor = await requireAccountAdmin(request, reply);
+  if (!actor) return reply;
+  const parsed = accountGrantSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
+  try {
+    return await accountService.setGrant(request.params.id, parsed.data, actor.id);
+  } catch (error) {
+    return accountErrorReply(reply, error);
+  }
+});
+
+app.delete<{ Params: { id: string; workspaceId: string } }>("/api/accounts/:id/grants/:workspaceId", async (request, reply) => {
+  const actor = await requireAccountAdmin(request, reply);
+  if (!actor) return reply;
+  try {
+    return await accountService.removeGrant(request.params.id, request.params.workspaceId);
+  } catch (error) {
+    return accountErrorReply(reply, error);
+  }
+});
+
 app.get("/api/credentials/status", async (request) => vault.status(vaultKeyFor(request)));
 
 app.put("/api/credentials", async (request, reply) => {
@@ -843,16 +935,23 @@ function isStorageFailure(message: string) {
   return /ECONNREFUSED|Connection terminated|connection is closed|connection timeout|ETIMEDOUT|terminating connection|57P0|no space left on device|ENOSPC|STORAGE_UNAVAILABLE/i.test(message);
 }
 
-function workspaceErrorReply(reply: FastifyReply, error: unknown) {
-  if (error instanceof WorkspaceError) return reply.code(error.status).send({ error: error.message, code: error.code });
+/** Maps a WorkspaceError / storage failure to an HTTP status + body (shared by
+ * the workspace routes and the run-preflight, which must not touch `reply`). */
+function classifyWorkspaceError(error: unknown): { status: number; body: Record<string, unknown> } {
+  if (error instanceof WorkspaceError) return { status: error.status, body: { error: error.message, code: error.code } };
   const message = (error as Error)?.message ?? String(error);
   // AT-REL-005: a database outage is reported as storage degradation, not as a
   // confusing workspace error.
   if (isStorageFailure(message)) {
     alerts.raise({ key: "storage_failure", severity: "critical", message: "存储不可用：工作区操作无法完成", details: { error: message.slice(0, 200) } });
-    return reply.code(503).send({ error: `存储不可用：${message.slice(0, 200)}`, code: "STORAGE_UNAVAILABLE" });
+    return { status: 503, body: { error: `存储不可用：${message.slice(0, 200)}`, code: "STORAGE_UNAVAILABLE" } };
   }
-  return reply.code(503).send({ error: `Workspace operation failed: ${message}` });
+  return { status: 503, body: { error: `Workspace operation failed: ${message}` } };
+}
+
+function workspaceErrorReply(reply: FastifyReply, error: unknown) {
+  const { status, body } = classifyWorkspaceError(error);
+  return reply.code(status).send(body);
 }
 
 app.get("/api/workspaces", async (request, reply) => {
@@ -935,6 +1034,267 @@ app.delete<{ Params: { id: string } }>("/api/workspaces/:id", async (request, re
     return reply.code(204).send();
   } catch (error) {
     return workspaceErrorReply(reply, error);
+  }
+});
+
+// ------------------------------------------------ Sprint 3: agile domain
+// Planning layer on top of the Run. `/api/projects` is already the legacy
+// global worker listing, so the new owner-scoped project CRUD lives under
+// `/api/agile/projects`; stories/sprints/releases use their own namespaces.
+function agileErrorReply(reply: FastifyReply, error: unknown) {
+  if (error instanceof AgileError) return reply.code(error.status).send({ error: error.message, code: error.code });
+  return workspaceErrorReply(reply, error);
+}
+
+/**
+ * Sprint 3 write-back helper: after a run mutation, converge the derived status
+ * of every story linked to it. Never throws — a planning-table hiccup must not
+ * break the run route that triggered it.
+ */
+async function reconcileStoryForRun(runId: string) {
+  try {
+    await agile.reconcileRun(runId);
+  } catch (error) {
+    app.log.warn({ error: (error as Error).message, runId }, "story status reconcile failed");
+  }
+}
+
+app.get("/api/agile/projects", async (request, reply) => {
+  try {
+    return { projects: await agile.listProjects(ownerKeysFor(request)) };
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
+app.post("/api/agile/projects", async (request, reply) => {
+  const parsed = projectCreateSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
+  try {
+    return reply.code(201).send(await agile.createProject(auth.user(request).id, parsed.data));
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
+app.get<{ Params: { id: string } }>("/api/agile/projects/:id", async (request, reply) => {
+  try {
+    return await agile.getProject(ownerKeysFor(request), request.params.id, await identities.isAdmin(auth.user(request).id));
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
+app.patch<{ Params: { id: string } }>("/api/agile/projects/:id", async (request, reply) => {
+  const parsed = projectPatchSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
+  try {
+    return await agile.updateProject(ownerKeysFor(request), request.params.id, parsed.data, await identities.isAdmin(auth.user(request).id));
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
+app.delete<{ Params: { id: string } }>("/api/agile/projects/:id", async (request, reply) => {
+  try {
+    await agile.deleteProject(ownerKeysFor(request), request.params.id, await identities.isAdmin(auth.user(request).id));
+    return reply.code(204).send();
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
+app.get<{ Querystring: { projectId?: string; sprintId?: string; status?: string } }>("/api/stories", async (request, reply) => {
+  const filter: { projectId?: string; sprintId?: string | null; status?: StoryDetail["status"] } = {};
+  if (request.query.projectId) filter.projectId = request.query.projectId;
+  if (request.query.sprintId) filter.sprintId = request.query.sprintId;
+  if (request.query.status) filter.status = request.query.status as StoryDetail["status"];
+  try {
+    return { stories: await agile.listStories(ownerKeysFor(request), filter) };
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
+app.post("/api/stories", async (request, reply) => {
+  const parsed = storyCreateSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
+  try {
+    return reply.code(201).send(await agile.createStory(auth.user(request).id, parsed.data));
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
+// Story detail reconciles the derived status from the latest linked run first.
+app.get<{ Params: { id: string } }>("/api/stories/:id", async (request, reply) => {
+  try {
+    return await agile.getStory(ownerKeysFor(request), request.params.id, await identities.isAdmin(auth.user(request).id));
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
+app.patch<{ Params: { id: string } }>("/api/stories/:id", async (request, reply) => {
+  const parsed = storyPatchSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
+  try {
+    return await agile.updateStory(ownerKeysFor(request), request.params.id, parsed.data, await identities.isAdmin(auth.user(request).id));
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
+app.delete<{ Params: { id: string } }>("/api/stories/:id", async (request, reply) => {
+  try {
+    await agile.deleteStory(ownerKeysFor(request), request.params.id, await identities.isAdmin(auth.user(request).id));
+    return reply.code(204).send();
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
+// Submit a story as a run. Only a `ready` story may be submitted; the run's
+// task carries the description + acceptance criteria + definition of done.
+app.post<{ Params: { id: string } }>("/api/stories/:id/runs", async (request, reply) => {
+  const parsed = storySubmitSchema.safeParse(request.body ?? {});
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
+  const user = auth.user(request);
+  const creationLimit = runCreations.check(user.id);
+  if (!creationLimit.allowed) return tooManyRequests(reply, creationLimit.retryAfterMs);
+  const isAdmin = await identities.isAdmin(user.id);
+  let story: StoryDetail;
+  try {
+    story = await agile.getStory(ownerKeysFor(request), request.params.id, isAdmin);
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+  if (story.status !== "ready") {
+    return reply.code(409).send({ error: "只有「就绪」状态的故事可以提交为运行", code: "STORY_NOT_READY", status: story.status });
+  }
+  const workspaceId = parsed.data.workspaceId ?? story.workspaceId ?? undefined;
+  // Checks default to the workspace's registered commands.
+  let defaultChecks: string[] = [];
+  if (workspaceId) {
+    try {
+      defaultChecks = (await workspaces.get(ownerKeysFor(request), workspaceId, { isAdmin })).defaultChecks;
+    } catch (error) {
+      return agileErrorReply(reply, error);
+    }
+  }
+  const input = buildStoryRunInput(story, { checks: parsed.data.checks ?? defaultChecks, workspaceId });
+
+  if (parsed.data.mode === "demo") {
+    if (!demoMode) return reply.code(403).send({ error: "Demo mode is disabled" });
+    const run = baseDemoRun({ title: input.title, task: input.task, repository: "demo/agile-story" }, user.id);
+    run.storyId = story.id;
+    await store.createRun(run, { runId: run.id, round: 1, source: "system", type: "run.created", message: "已从用户故事创建演示任务", at: new Date().toISOString() });
+    void runDemo(store, run.id);
+    await agile.linkRun(story.id, run.id);
+    await agile.markStoryInProgress(story.id);
+    return reply.code(201).send({ run: store.getRun(run.id, user.id), story: await agile.getStory(ownerKeysFor(request), story.id, isAdmin) });
+  }
+
+  if (!workspaceId) return reply.code(422).send({ error: "真实运行需要指定工作区（故事或请求中的 workspaceId）", code: "STORY_WORKSPACE_REQUIRED" });
+  if (input.checks.length === 0) return reply.code(422).send({ error: "真实运行需要至少一个检查命令（工作区默认检查或请求中的 checks）", code: "STORY_CHECKS_REQUIRED" });
+  const runParsed = createRunSchema.safeParse({
+    title: input.title,
+    task: input.task,
+    repository: "pending-workspace",
+    workspaceId,
+    mode: "real",
+    checks: input.checks,
+    acceptanceCriteria: input.acceptanceCriteria,
+    idempotencyKey: parsed.data.idempotencyKey,
+    developerModel: input.developerModel,
+    reviewerModel: input.reviewerModel,
+  });
+  if (!runParsed.success) return reply.code(422).send({ error: "故事无法生成合法运行", details: runParsed.error.issues });
+  const result = await startRealRun(request, runParsed.data, {
+    budget: story.budget ?? undefined,
+    maxParallel: story.maxParallel ?? undefined,
+    storyId: story.id,
+  });
+  if (result.run) {
+    await agile.linkRun(story.id, result.run.id);
+    if (result.ok) await agile.markStoryInProgress(story.id);
+    else await agile.reconcileRun(result.run.id);
+  }
+  if (!result.ok) return reply.code(result.status).send({ ...result.body, storyId: story.id });
+  return reply.code(201).send({ run: store.getRun(result.run.id, user.id), story: await agile.getStory(ownerKeysFor(request), story.id, isAdmin) });
+});
+
+app.get<{ Querystring: { projectId?: string } }>("/api/sprints", async (request, reply) => {
+  try {
+    return { sprints: await agile.listSprints(ownerKeysFor(request), request.query.projectId) };
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
+app.post("/api/sprints", async (request, reply) => {
+  const parsed = sprintCreateSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
+  try {
+    return reply.code(201).send(await agile.createSprint(auth.user(request).id, parsed.data));
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
+app.patch<{ Params: { id: string } }>("/api/sprints/:id", async (request, reply) => {
+  const parsed = sprintPatchSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
+  try {
+    return await agile.updateSprint(ownerKeysFor(request), request.params.id, parsed.data, await identities.isAdmin(auth.user(request).id));
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
+app.delete<{ Params: { id: string } }>("/api/sprints/:id", async (request, reply) => {
+  try {
+    await agile.deleteSprint(ownerKeysFor(request), request.params.id, await identities.isAdmin(auth.user(request).id));
+    return reply.code(204).send();
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
+app.get<{ Querystring: { projectId?: string } }>("/api/releases", async (request, reply) => {
+  try {
+    return { releases: await agile.listReleases(ownerKeysFor(request), request.query.projectId) };
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
+app.post("/api/releases", async (request, reply) => {
+  const parsed = releaseCreateSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
+  try {
+    return reply.code(201).send(await agile.createRelease(auth.user(request).id, parsed.data));
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
+app.patch<{ Params: { id: string } }>("/api/releases/:id", async (request, reply) => {
+  const parsed = releasePatchSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
+  try {
+    return await agile.updateRelease(ownerKeysFor(request), request.params.id, parsed.data, await identities.isAdmin(auth.user(request).id));
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
+app.delete<{ Params: { id: string } }>("/api/releases/:id", async (request, reply) => {
+  try {
+    await agile.deleteRelease(ownerKeysFor(request), request.params.id, await identities.isAdmin(auth.user(request).id));
+    return reply.code(204).send();
+  } catch (error) {
+    return agileErrorReply(reply, error);
   }
 });
 
@@ -1127,6 +1487,141 @@ app.get<{ Params: { id: string }; Querystring: { after?: string } }>("/api/runs/
   }
 });
 
+/**
+ * Extra (non-client) run inputs used when a story is submitted as a run.
+ * Additive: `POST /api/runs` passes none of these, so its behaviour is
+ * unchanged.
+ */
+type RealRunExtra = { budget?: RunBudget; maxParallel?: number; storyId?: string };
+
+type RealRunResult =
+  | { ok: true; created: boolean; run: Run }
+  | { ok: false; status: number; body: Record<string, unknown>; run?: Run };
+
+/**
+ * Real-run creation core shared by `POST /api/runs` and
+ * `POST /api/stories/:id/runs`: workspace preflight, model/credential checks,
+ * idempotency, run persistence and worker dispatch. Pure refactor of the
+ * previously inline route code; it returns a result instead of touching `reply`
+ * so both routes render the same errors and the story route can still link a run
+ * whose dispatch failed.
+ */
+async function startRealRun(
+  request: FastifyRequest,
+  input: z.infer<typeof createRunSchema>,
+  extra: RealRunExtra = {},
+): Promise<RealRunResult> {
+  const user = auth.user(request);
+  // WS-008: real runs may only target the user's own registered, healthy workspaces.
+  // B4: a read grant may start a run against a shared workspace, so the
+  // preflight refresh is allowed for read access too (the general refresh route
+  // still requires write).
+  let workspace: Workspace;
+  try {
+    workspace = await workspaces.refresh(ownerKeysFor(request), input.workspaceId!, { isAdmin: await identities.isAdmin(user.id), allowRead: true });
+  } catch (error) {
+    const { status, body } = classifyWorkspaceError(error);
+    return { ok: false, status, body };
+  }
+  if (workspace.git?.dirty) {
+    return {
+      ok: false,
+      status: 409,
+      body: {
+        error: "工作区存在未提交修改，请先提交或清理后再创建真实任务",
+        code: "WORKSPACE_DIRTY",
+        dirtyFiles: workspace.git.dirtyFiles,
+      },
+    };
+  }
+  if (!realRunsEnabled || !internalToken) return { ok: false, status: 503, body: { error: "Real agent execution is disabled", code: "REAL_RUNNER_NOT_AVAILABLE" } };
+
+  // AT-REL-010: stop accepting new work when the workspace disk is critical.
+  const storage = await workerRequest<StorageStatus>("/health/storage").catch(() => undefined);
+  if (storage && storage.state === "critical") {
+    alerts.raise({
+      key: "disk_critical",
+      severity: "critical",
+      message: "工作区磁盘空间严重不足，已停止接收新任务",
+      details: { freeBytes: storage.freeBytes, freePercent: storage.freePercent },
+    });
+    return {
+      ok: false,
+      status: 507,
+      body: {
+        error: `磁盘空间不足（剩余 ${Math.round(storage.freeBytes / 1024 / 1024)} MB），已停止接收新任务`,
+        code: "DISK_FULL",
+      },
+    };
+  }
+  if (storage && storage.state === "low") {
+    alerts.raise({
+      key: "disk_low",
+      severity: "warning",
+      message: "工作区磁盘空间偏低，请清理后继续",
+      details: { freeBytes: storage.freeBytes, freePercent: storage.freePercent },
+    });
+  }
+
+  // AUD-08 / AT-MODEL-008 + AUD-09 / AT-MODEL-007: preflight the exact
+  // provider/model combination for every role the run will use (planner and
+  // developer share the developer selection; reviewer has its own) before
+  // queueing. A single provider that serves both roles is enough.
+  const availability = vault.providerAvailability(vaultKeyFor(request));
+  const selections = {
+    developer: input.developerModel ?? modelDefaults.developer,
+    reviewer: input.reviewerModel ?? modelDefaults.reviewer,
+  };
+  const preflight = preflightRunModels(modelCatalog, selections, availability);
+  if (!preflight.ok) return { ok: false, status: 422, body: { error: preflight.message, code: preflight.code, role: preflight.role } };
+  const developerEntry = preflight.roles.developer;
+  const reviewerEntry = preflight.roles.reviewer;
+
+  const credentials = requireCredentials({
+    developer: vault.get(vaultKeyFor(request), developerEntry.provider),
+    reviewer: vault.get(vaultKeyFor(request), reviewerEntry.provider),
+  });
+  if (!credentials) {
+    return { ok: false, status: 403, body: { error: "所选模型的 provider 凭据不完整，请在「模型与凭据」页配置", code: "PERSONAL_CREDENTIALS_REQUIRED" } };
+  }
+  // GAP-01 / AT-RUN-010: an idempotency key returns the existing run instead of
+  // creating a duplicate.
+  if (input.idempotencyKey) {
+    const existing = store.listRuns(ownerKeysFor(request)).find((item) => item.idempotencyKey === input.idempotencyKey);
+    if (existing) return { ok: true, created: false, run: existing };
+  }
+  const run = baseRealRun({
+    ...input,
+    repository: workspace.rootPath,
+    workspaceId: workspace.id,
+    developerModel: { provider: developerEntry.provider, model: developerEntry.model },
+    reviewerModel: { provider: reviewerEntry.provider, model: reviewerEntry.model },
+  }, user.id);
+  // GAP-01: freeze the reproducible inputs with the run.
+  run.baseSha = workspace.git?.head ?? undefined;
+  run.budget = extra.budget ?? readRunBudget();
+  run.pipelineVersion = PIPELINE_VERSION;
+  run.credentialVersions = {
+    developer: credentialFingerprint(vault.get(vaultKeyFor(request), developerEntry.provider)),
+    reviewer: credentialFingerprint(vault.get(vaultKeyFor(request), reviewerEntry.provider)),
+  };
+  if (extra.storyId) run.storyId = extra.storyId;
+  if (extra.maxParallel !== undefined) run.maxParallel = extra.maxParallel;
+  await store.createRun(run, { runId: run.id, round: 1, source: "system", type: "run.created", message: "真实任务已创建，正在交给隔离 Pi Worker", at: new Date().toISOString() });
+  try {
+    await dispatchJob(run, input.checks, {}, credentials);
+    credentials.developer = "";
+    credentials.reviewer = "";
+    return { ok: true, created: true, run };
+  } catch (error) {
+    credentials.developer = "";
+    credentials.reviewer = "";
+    await store.updateRun(run.id, { state: "failed", summary: (error as Error).message });
+    await store.appendEvent({ runId: run.id, round: 1, source: "system", type: "run.failed", message: `Worker 拒绝任务：${(error as Error).message}`, at: new Date().toISOString() });
+    return { ok: false, status: 503, body: { error: (error as Error).message, runId: run.id }, run };
+  }
+}
+
 app.post("/api/runs", async (request, reply) => {
   const parsed = createRunSchema.safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
@@ -1134,103 +1629,9 @@ app.post("/api/runs", async (request, reply) => {
   const creationLimit = runCreations.check(user.id);
   if (!creationLimit.allowed) return tooManyRequests(reply, creationLimit.retryAfterMs);
   if (parsed.data.mode === "real") {
-    // WS-008: real runs may only target the user's own registered, healthy workspaces.
-    // B4: a read grant may start a run against a shared workspace, so the
-    // preflight refresh is allowed for read access too (the general refresh route
-    // still requires write).
-    let workspace: Workspace;
-    try {
-      workspace = await workspaces.refresh(ownerKeysFor(request), parsed.data.workspaceId!, { isAdmin: await identities.isAdmin(user.id), allowRead: true });
-    } catch (error) {
-      return workspaceErrorReply(reply, error);
-    }
-    if (workspace.git?.dirty) {
-      return reply.code(409).send({
-        error: "工作区存在未提交修改，请先提交或清理后再创建真实任务",
-        code: "WORKSPACE_DIRTY",
-        dirtyFiles: workspace.git.dirtyFiles,
-      });
-    }
-    if (!realRunsEnabled || !internalToken) return reply.code(503).send({ error: "Real agent execution is disabled", code: "REAL_RUNNER_NOT_AVAILABLE" });
-
-    // AT-REL-010: stop accepting new work when the workspace disk is critical.
-    const storage = await workerRequest<StorageStatus>("/health/storage").catch(() => undefined);
-    if (storage && storage.state === "critical") {
-      alerts.raise({
-        key: "disk_critical",
-        severity: "critical",
-        message: "工作区磁盘空间严重不足，已停止接收新任务",
-        details: { freeBytes: storage.freeBytes, freePercent: storage.freePercent },
-      });
-      return reply.code(507).send({
-        error: `磁盘空间不足（剩余 ${Math.round(storage.freeBytes / 1024 / 1024)} MB），已停止接收新任务`,
-        code: "DISK_FULL",
-      });
-    }
-    if (storage && storage.state === "low") {
-      alerts.raise({
-        key: "disk_low",
-        severity: "warning",
-        message: "工作区磁盘空间偏低，请清理后继续",
-        details: { freeBytes: storage.freeBytes, freePercent: storage.freePercent },
-      });
-    }
-
-    // AUD-08 / AT-MODEL-008 + AUD-09 / AT-MODEL-007: preflight the exact
-    // provider/model combination for every role the run will use (planner and
-    // developer share the developer selection; reviewer has its own) before
-    // queueing. A single provider that serves both roles is enough.
-    const availability = vault.providerAvailability(vaultKeyFor(request));
-    const selections = {
-      developer: parsed.data.developerModel ?? modelDefaults.developer,
-      reviewer: parsed.data.reviewerModel ?? modelDefaults.reviewer,
-    };
-    const preflight = preflightRunModels(modelCatalog, selections, availability);
-    if (!preflight.ok) return reply.code(422).send({ error: preflight.message, code: preflight.code, role: preflight.role });
-    const developerEntry = preflight.roles.developer;
-    const reviewerEntry = preflight.roles.reviewer;
-
-    const credentials = requireCredentials({
-      developer: vault.get(vaultKeyFor(request), developerEntry.provider),
-      reviewer: vault.get(vaultKeyFor(request), reviewerEntry.provider),
-    });
-    if (!credentials) {
-      return reply.code(403).send({ error: "所选模型的 provider 凭据不完整，请在「模型与凭据」页配置", code: "PERSONAL_CREDENTIALS_REQUIRED" });
-    }
-    // GAP-01 / AT-RUN-010: an idempotency key returns the existing run instead of
-    // creating a duplicate.
-    if (parsed.data.idempotencyKey) {
-      const existing = store.listRuns(ownerKeysFor(request)).find((item) => item.idempotencyKey === parsed.data.idempotencyKey);
-      if (existing) return reply.code(200).send(existing);
-    }
-    const run = baseRealRun({
-      ...parsed.data,
-      repository: workspace.rootPath,
-      workspaceId: workspace.id,
-      developerModel: { provider: developerEntry.provider, model: developerEntry.model },
-      reviewerModel: { provider: reviewerEntry.provider, model: reviewerEntry.model },
-    }, user.id);
-    // GAP-01: freeze the reproducible inputs with the run.
-    run.baseSha = workspace.git?.head ?? undefined;
-    run.budget = readRunBudget();
-    run.pipelineVersion = PIPELINE_VERSION;
-    run.credentialVersions = {
-      developer: credentialFingerprint(vault.get(vaultKeyFor(request), developerEntry.provider)),
-      reviewer: credentialFingerprint(vault.get(vaultKeyFor(request), reviewerEntry.provider)),
-    };
-    await store.createRun(run, { runId: run.id, round: 1, source: "system", type: "run.created", message: "真实任务已创建，正在交给隔离 Pi Worker", at: new Date().toISOString() });
-    try {
-      await dispatchJob(run, parsed.data.checks, {}, credentials);
-      credentials.developer = "";
-      credentials.reviewer = "";
-      return reply.code(201).send(store.getRun(run.id, user.id));
-    } catch (error) {
-      credentials.developer = "";
-      credentials.reviewer = "";
-      await store.updateRun(run.id, { state: "failed", summary: (error as Error).message });
-      await store.appendEvent({ runId: run.id, round: 1, source: "system", type: "run.failed", message: `Worker 拒绝任务：${(error as Error).message}`, at: new Date().toISOString() });
-      return reply.code(503).send({ error: (error as Error).message, runId: run.id });
-    }
+    const result = await startRealRun(request, parsed.data);
+    if (!result.ok) return reply.code(result.status).send(result.body);
+    return reply.code(result.created ? 201 : 200).send(store.getRun(result.run.id, user.id));
   }
   if (!demoMode) return reply.code(403).send({ error: "Demo mode is disabled" });
   const run = baseDemoRun(parsed.data, user.id);
@@ -1256,6 +1657,7 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/cancel", async (request, rep
     throw error;
   }
   await store.appendEvent({ runId: run.id, round: run.round, source: "system", type: "run.cancelled", message: "任务已取消", at: new Date().toISOString() });
+  await reconcileStoryForRun(run.id);
   return store.getRun(run.id, ownerKeysFor(request));
 });
 
@@ -1567,6 +1969,7 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/approve", { bodyLimit: 1024 
 
   // Publishing is deliberately not implicit here. A separate administrator
   // action records a durable release attempt before invoking any external hook.
+  await reconcileStoryForRun(run.id);
   return { ...updated, acceptedOpenFindings: plan.openFindings, acceptance, ...(merge ? { merge } : {}) };
 });
 
@@ -1860,6 +2263,7 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/reopen", { bodyLimit: 1024 *
     at: now,
     meta: reopenEventMeta({ reopenedBy: user.id, reason: plan.reason, note }),
   });
+  await reconcileStoryForRun(run.id);
   return updated;
 });
 
@@ -2248,11 +2652,13 @@ app.post<{ Params: { id: string } }>("/api/internal/runs/:id/update", { bodyLimi
       });
       // AUD-16: the terminal callback carries the run diff; persist it in full.
       if (result.applied) await persistTerminalDiffArtifact(store.getRun(run.id));
+      if (result.applied) await reconcileStoryForRun(run.id);
       return { ok: true, applied: result.applied, seq: result.seq };
     }
     if (patch) await store.updateRun(run.id, patch as Partial<Run>);
     if (event) await store.appendEvent({ ...event, runId: run.id, at: new Date().toISOString() });
     if (patch) await persistTerminalDiffArtifact(store.getRun(run.id));
+    if (patch) await reconcileStoryForRun(run.id);
     return { ok: true, applied: true };
   } catch (error) {
     const conflict = conflictReplyFor(error);
