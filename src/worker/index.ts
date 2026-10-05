@@ -468,11 +468,18 @@ function json(response: ServerResponse, statusCode: number, body: unknown) {
   response.end(JSON.stringify(body));
 }
 
+// 内部网络（带 token）专用：任务派发载荷会携带完整的 Run 文档，文档随轮次增长
+// 已超过 1MB，旧的 1,000,000 字节上限会把「继续开发」拒成 Request body too large。
+// 提升到 8MiB 并给出带体积的错误信息；超出仍严格拒绝。
+const MAX_INTERNAL_BODY = 8 * 1024 * 1024;
+
 async function readJson(request: IncomingMessage) {
   let body = "";
   for await (const chunk of request) {
     body += chunk;
-    if (body.length > 1_000_000) throw new Error("Request body too large");
+    if (body.length > MAX_INTERNAL_BODY) {
+      throw new Error(`Request body too large (${body.length} > ${MAX_INTERNAL_BODY} bytes)`);
+    }
   }
   return JSON.parse(body || "{}") as Record<string, unknown>;
 }

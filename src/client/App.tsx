@@ -60,6 +60,7 @@ import {
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { chatChannelLabels, chatCounts, chatMessageView, chatMessagesFromEvents, chatParticipantLabels, chatTabs, filterChatMessages, isReviewMessage, messageFindings, reworkBranchDetails, reworkBranchRounds, type ChatTab, type ReworkBranchDetail } from "../shared/chat";
 import { describeMergeRestore, mergeRestoreFields } from "../shared/merge";
+import { currentRoundStatus, roundStatuses, roundStatusMeta, roundStatusTooltip, type RoundStatus } from "../shared/round-status";
 import type { ChatMessage, ConfigStatus, CurrentUser, Finding, ModelCatalogResponse, Run, RunArtifact, RunEvent, RunMode, RunRoleUsage, RunState, Workspace } from "../shared/types";
 import { api, type DeploymentStatus } from "./api";
 import { HistoryPage } from "./HistoryPage";
@@ -78,6 +79,8 @@ type FlowNodeData = {
   kind: "task" | "developer" | "checks" | "reviewer" | "complete";
   status: "waiting" | "active" | "done" | "warning";
   meta?: string;
+  /** Live workflow status of the round this node represents. */
+  roundStatus?: RoundStatus;
 };
 
 const terminalStates: RunState[] = ["completed", "needs_human", "failed", "cancelled"];
@@ -102,6 +105,25 @@ const iconForKind = {
   complete: CheckCircle2,
 };
 
+/**
+ * Compact round-workflow badge: Chinese label + semantic colour + a tooltip
+ * carrying the check/finding counts. Reused by the pipeline round marker and
+ * every rework branch label.
+ */
+function RoundStatusBadge({ status, includeRound = false, className }: {
+  status: RoundStatus;
+  includeRound?: boolean;
+  className?: string;
+}) {
+  const meta = roundStatusMeta[status.status];
+  const tooltip = `${includeRound ? `第 ${status.round} 轮 · ` : ""}${meta.label} · ${roundStatusTooltip(status)}`;
+  return (
+    <span className={`round-status round-status-${meta.tone}${className ? ` ${className}` : ""}`} title={tooltip}>
+      {meta.label}
+    </span>
+  );
+}
+
 function FlowCard({ data }: NodeProps<Node<FlowNodeData>>) {
   const Icon = iconForKind[data.kind];
   return (
@@ -114,6 +136,7 @@ function FlowCard({ data }: NodeProps<Node<FlowNodeData>>) {
       </div>
       {data.status === "active" && <LoaderCircle className="spin flow-state-icon" size={15} />}
       {data.status === "done" && <Check className="flow-state-icon" size={15} />}
+      {data.roundStatus && <RoundStatusBadge status={data.roundStatus} includeRound className="flow-round-status" />}
       {data.meta && <span className="flow-meta">{data.meta}</span>}
       <Handle type="source" position={Position.Right} id="main-source" className="flow-handle" />
       <Handle type="target" position={Position.Bottom} id="bottom-target" className="flow-handle flow-handle-bottom" style={{ left: "30%" }} />
@@ -132,6 +155,7 @@ function ReworkEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition, ta
   const round = typeof data?.round === "number" ? data.round : undefined;
   const active = data?.active === true;
   const onSelect = typeof data?.onSelect === "function" ? (data.onSelect as (round: number) => void) : undefined;
+  const roundStatus = data?.roundStatus as RoundStatus | undefined;
   const [edgePath, labelX, labelY] = getSmoothStepPath({
     sourceX,
     sourceY,
@@ -142,6 +166,9 @@ function ReworkEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition, ta
     borderRadius: 16,
     centerY,
   });
+  const title = round === undefined
+    ? undefined
+    : `${roundStatus ? `${roundStatusMeta[roundStatus.status].label} · ${roundStatusTooltip(roundStatus)}\n` : ""}查看第 ${round} 轮返修原因`;
   return (
     <>
       <BaseEdge id={id} path={edgePath} markerEnd={markerEnd} style={style} />
@@ -150,7 +177,7 @@ function ReworkEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition, ta
           <button
             type="button"
             className={`rework-label ${active ? "is-active" : ""}`}
-            title={round === undefined ? undefined : `查看第 ${round} 轮返修原因`}
+            title={title}
             aria-pressed={active}
             style={{ transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)` }}
             onClick={(event) => {
@@ -159,6 +186,7 @@ function ReworkEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition, ta
             }}
           >
             <CornerDownLeft size={11} />{label}
+            {roundStatus && <RoundStatusBadge status={roundStatus} />}
           </button>
         </EdgeLabelRenderer>
       )}
@@ -176,6 +204,12 @@ interface FlowOptions {
 
 function flowForRun(run?: Run, events: RunEvent[] = [], options: FlowOptions = {}): { nodes: Node<FlowNodeData>[]; edges: Edge[] } {
   const currentOrder = run ? stateOrder[run.state] : -1;
+  // Per-round workflow status powers the badge on the pipeline's round marker
+  // and on every rework branch. Later rounds override earlier ones, so the
+  // current marker reads the highest round present.
+  const statuses = roundStatuses(events, run);
+  const statusByRound = new Map(statuses.map((status) => [status.round, status]));
+  const currentStatus = currentRoundStatus(statuses);
   const statusAt = (order: number): FlowNodeData["status"] => {
     if (!run) return "waiting";
     if (order < currentOrder) return "done";
@@ -199,6 +233,7 @@ function flowForRun(run?: Run, events: RunEvent[] = [], options: FlowOptions = {
         caption: run?.plan ? `${run.plan.complexity} · ${run.plan.strategy}` : run?.developer.model || "developer agent",
         kind: "developer",
         status: statusAt(1),
+        roundStatus: currentStatus,
         meta: run?.plan && run.plan.tasks.length > 1
           ? `${run.plan.tasks.filter((task) => task.status === "merged").length}/${run.plan.tasks.length}`
           : run ? `R${run.round}` : undefined,
@@ -260,6 +295,7 @@ function flowForRun(run?: Run, events: RunEvent[] = [], options: FlowOptions = {
         label: `round ${round} · 返修`,
         centerY: 208 + index * 54,
         round,
+        roundStatus: statusByRound.get(round),
         active: options.selectedReworkRound === round,
         onSelect: options.onReworkSelect,
       },

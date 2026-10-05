@@ -167,6 +167,16 @@ button { color: inherit; }
 .rework-label { position: absolute; display: inline-flex; align-items: center; gap: 4px; padding: 3px 7px; border-radius: 999px; background: #1b140d; border: 1px solid rgba(243,166,90,.42); color: #f0b57e; font: 600 9px "DM Mono", monospace; white-space: nowrap; box-shadow: 0 6px 16px rgba(0,0,0,.32); pointer-events: all; cursor: pointer; }
 .rework-label:hover { border-color: rgba(243,166,90,.75); color: #ffd7ac; }
 .rework-label.is-active { background: #2a1d10; border-color: #ffd08a; color: #ffe3bd; }
+/* Round workflow status badge — shared by the pipeline round marker and the
+   rework branch labels. Colours: 通过=green, 退回返修=amber, 进行中=blue,
+   中止/超时=red, 已规划=grey. Typography follows the panel scale. */
+.round-status { display: inline-flex; align-items: center; padding: 1px 6px; border: 1px solid transparent; border-radius: 999px; font: 600 var(--panel-mono-fs) "DM Mono", monospace; line-height: var(--panel-lh); white-space: nowrap; }
+.round-status-green { color: var(--green); border-color: rgba(115,214,162,.42); background: rgba(115,214,162,.1); }
+.round-status-amber { color: var(--orange); border-color: rgba(243,166,90,.42); background: rgba(243,166,90,.1); }
+.round-status-blue { color: var(--blue); border-color: rgba(109,156,247,.42); background: rgba(109,156,247,.1); }
+.round-status-red { color: var(--red); border-color: rgba(242,113,113,.45); background: rgba(242,113,113,.1); }
+.round-status-grey { color: var(--panel-dim); border-color: #2b323a; background: #151a1f; }
+.flow-round-status { position: absolute; left: 8px; top: -9px; box-shadow: 0 4px 12px rgba(0,0,0,.3); }
 .react-flow__edge-path { stroke: #39414a; }
 .react-flow__controls { border: 1px solid #252b32; border-radius: 7px; overflow: hidden; box-shadow: none; }
 .react-flow__controls button { background: #11151a; border-bottom-color: #252b32; fill: #75808a; }
