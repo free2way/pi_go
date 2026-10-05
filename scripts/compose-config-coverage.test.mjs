@@ -25,10 +25,10 @@ test("real compose.yaml forwards every curated critical variable", () => {
 test("curated list covers the v0.22 features named by the review", () => {
   const web = new Set(CRITICAL_ENV.web);
   const worker = new Set(CRITICAL_ENV.worker);
-  for (const name of ["PI_MODEL_CATALOG_JSON", "PI_MERGE_REQUEST_URL", "PI_MERGE_REQUEST_TOKEN", "PI_POST_MERGE_DEPLOY_HOOK", "PI_WEB_VERSION", "PI_WORKER_VERSION", "PI_ROLLBACK_TAGS", "PI_DEPLOY_LOG"]) {
+  for (const name of ["PI_MODEL_CATALOG_JSON", "PI_MERGE_REQUEST_URL", "PI_MERGE_REQUEST_TOKEN", "PI_POST_MERGE_DEPLOY_HOOK", "PI_POST_MERGE_DEPLOY_TOKEN", "PI_WEB_VERSION", "PI_WORKER_VERSION", "PI_ROLLBACK_TAGS", "PI_DEPLOY_LOG"]) {
     assert.ok(web.has(name), `web must cover ${name}`);
   }
-  for (const name of ["PI_PLUGIN_ALLOWLIST", "PI_PLUGIN_REQUESTS", "PI_PLUGIN_REQUIRE_PIN"]) {
+  for (const name of ["PI_PLUGIN_ALLOWLIST", "PI_PLUGIN_REQUESTS", "PI_PLUGIN_REQUIRE_PIN", "PI_PLUGIN_REGISTRY"]) {
     assert.ok(worker.has(name), `worker must cover ${name}`);
   }
   for (const name of ["PI_RUN_MAX_TOKENS", "PI_RUN_MAX_COST_USD", "PI_RUN_MAX_MODEL_CALLS", "PI_RUN_MAX_DURATION_SECONDS"]) {
@@ -41,6 +41,23 @@ test("the deployment log directory is mounted read-only into web", () => {
   const mount = webVolumes.find((entry) => entry.includes("/app/pi-agent/backups"));
   assert.ok(mount, "web must mount the deployment log directory");
   assert.match(mount, /:ro(?:,|$)/, "the deployment log mount must be read-only");
+});
+
+test("the SHA-256 plugin registry is mounted read-only into worker", () => {
+  const workerVolumes = listItems(serviceBlock(composeText.split("\n"), "worker"), "volumes");
+  const mount = workerVolumes.find((entry) => entry.includes("/app/pi-agent/pi-plugins.json"));
+  assert.ok(mount, "worker must mount the plugin registry file");
+  assert.match(mount, /:ro(?:,|$)/, "the plugin registry mount must be read-only");
+});
+
+test("checker FAILS when the plugin registry mount is not read-only", () => {
+  const rw = composeText.replace(/(\$\{PI_PLUGIN_REGISTRY_HOST_FILE:-\.\/pi-plugins\.example\.json\}:\/app\/pi-agent\/pi-plugins\.json):ro/, "$1");
+  assert.notEqual(rw, composeText, "fixture must actually drop the :ro flag");
+  const { problems } = checkComposeCoverage(rw);
+  assert.ok(
+    problems.some((problem) => /plugin registry mount must be read-only/.test(problem)),
+    `expected a read-only complaint for the registry, got:\n${problems.join("\n")}`,
+  );
 });
 
 test("parser reads environment keys and volumes per service", () => {

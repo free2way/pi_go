@@ -409,6 +409,10 @@ needs_human -> queued/developing/reviewing/cancelled by explicit action
 
 `completed` 仅表示开发检查和模型审核通过，不表示已经 merge、push 或 deploy。
 
+代码发布是独立的管理员审批流程：`completed -> merged -> publishing ->
+triggered/succeeded/failed`。其中发布状态持久化在 Run 的 `release` 记录中，不会
+把开发状态倒退到 `needs_human`；合并不会自动触发发布。
+
 ## 9. Pi 集成设计
 
 ### 9.1 SDK 优先
@@ -947,4 +951,3 @@ plugins:
 - 插件**版本固定 / 篡改检测**仍未实现（`PI_PLUGIN_REQUIRE_PIN` 仅覆盖“必须带 pin”，不含第三方镜像签名）；
 - 系统状态页、部署面板的纯函数与展示映射有单测，但真实 PostgreSQL / 真实 Worker `/health` /
   真实部署日志解析仅在生产联调时才能最终确认（见 `docs/11` §5）。
-

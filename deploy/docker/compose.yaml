@@ -36,6 +36,7 @@ services:
       PI_DEVELOPER_MODEL: ${PI_DEVELOPER_MODEL:-deepseek-flash}
       PI_REVIEWER_PROVIDER: ${PI_REVIEWER_PROVIDER:-openai-proxy}
       PI_REVIEWER_MODEL: ${PI_REVIEWER_MODEL:-gpt-5.6-sol}
+      OPENAI_BASE_URL: ${PI_REVIEWER_BASE_URL:-}
     volumes:
       - ./workspace:/workspace
       - pi-config:/home/node/.pi
@@ -95,8 +96,9 @@ services:
       PI_MERGE_REQUEST_TOKEN: ${PI_MERGE_REQUEST_TOKEN:-}
       PI_MERGE_REQUEST_PROJECT: ${PI_MERGE_REQUEST_PROJECT:-}
       PI_MERGE_REQUEST_TARGET_BRANCH: ${PI_MERGE_REQUEST_TARGET_BRANCH:-}
-      # A2: optional post-merge deploy hook (`https://…` or `cmd: <command>`).
+      # Explicit release hook. Webhooks require the token for Bearer + HMAC.
       PI_POST_MERGE_DEPLOY_HOOK: ${PI_POST_MERGE_DEPLOY_HOOK:-}
+      PI_POST_MERGE_DEPLOY_TOKEN: ${PI_POST_MERGE_DEPLOY_TOKEN:-}
       # A3: read-only deployment panel sources.
       PI_WEB_VERSION: ${PI_WEB_VERSION:-}
       PI_WORKER_VERSION: ${PI_WORKER_VERSION:-}
@@ -188,6 +190,11 @@ services:
       PI_PLUGIN_REQUIRE_PIN: ${PI_PLUGIN_REQUIRE_PIN:-false}
       PI_PLUGIN_ALLOW_PROJECT: ${PI_PLUGIN_ALLOW_PROJECT:-false}
       PI_PLUGIN_CONTAINER_DIR: ${PI_PLUGIN_CONTAINER_DIR:-/opt/pigo/plugins}
+      # Sprint 2: SHA-256 pinned plugin registry (container path). Empty (default)
+      # keeps the flat-allowlist behaviour. When set, the file is read from the
+      # read-only mount below; a missing/invalid file fails startup loudly instead
+      # of silently disabling plugins.
+      PI_PLUGIN_REGISTRY: ${PI_PLUGIN_REGISTRY:-}
       # COST-002: run-level budgets; 0 = unlimited. Max duration falls back to
       # PI_RUN_TIMEOUT_SECONDS when unset (empty string here preserves that).
       PI_RUN_MAX_TOKENS: ${PI_RUN_MAX_TOKENS:-0}
@@ -223,6 +230,12 @@ services:
       # the vault and are injected into the child environment for the current
       # role only. Regenerate the file with `deploy/docker/export-models.sh`.
       - ./pi-models.json:/home/node/.pi/agent/models.json:ro
+      # Sprint 2: read-only SHA-256 plugin registry (see PI_PLUGIN_REGISTRY).
+      # Defaults to the shipped example (all-zero placeholder digests) so the
+      # mount always resolves to a real file; point
+      # PI_PLUGIN_REGISTRY_HOST_FILE at a registry with real digests before
+      # enabling PI_PLUGIN_REGISTRY.
+      - ${PI_PLUGIN_REGISTRY_HOST_FILE:-./pi-plugins.example.json}:/app/pi-agent/pi-plugins.json:ro
       - pigo-worker-state:/home/node/.pi
     # The socket is owned by root:docker (typically 0660); the non-root worker
     # user joins that group so it can create sandbox containers without running

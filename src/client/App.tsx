@@ -900,7 +900,16 @@ function BudgetPanel({ run }: { run: Run }) {
   ];
   const format = (value: number, unit: string) => `${unit}${unit === "$" ? value.toFixed(3) : compactNumber(value)}`;
   const roles: RunRoleUsage[] = run.usageRoles ?? [];
+  // Sprint 2: prefer real per-session data; fall back to the derived id for
+  // runs recorded before the `sessions` field existed.
   const sessionFor = (role: string) => {
+    const summaries = (run.sessions ?? [])
+      .filter((entry) => entry.role === role)
+      .sort((a, b) => (a.lastAt < b.lastAt ? 1 : -1));
+    const latest = summaries[0];
+    if (latest) {
+      return `${latest.sessionId}${latest.resumed ? " · 复用" : " · 新建"}（${latest.calls} 次调用 · ${latest.rounds.map((round) => `R${round}`).join("/")}）`;
+    }
     const base = run.id.replaceAll("_", "-");
     if (role === "developer") return `${base}-developer`;
     if (role === "integrator") return `${base}-integrator`;

@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "plugins": [
+    {
+      "name": "example-review-extension",
+      "kind": "extension",
+      "path": "/opt/pigo/plugins/review.ts",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "version": "1.0.0",
+      "roles": ["developer", "sub-agent"]
+    },
+    {
+      "name": "example-pdf-skill",
+      "kind": "skill",
+      "path": "/opt/pigo/plugins/skills/pdf",
+      "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "version": "1.0.0",
+      "roles": ["reviewer"]
+    },
+    {
+      "name": "example-prompt-template",
+      "kind": "prompt",
+      "path": "/opt/pigo/plugins/prompts/review.md",
+      "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+    }
+  ]
+}

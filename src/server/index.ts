@@ -253,6 +253,21 @@ const runUsageSchema = z.object({
   cacheWriteTokens: z.number().min(0).optional(),
   totalTokens: z.number().min(0).optional(),
 });
+const runSessionSummarySchema = z.object({
+  sessionId: z.string().min(1).max(300),
+  role: z.string().min(1).max(40),
+  rounds: z.array(z.number().int().min(1).max(99)).max(99),
+  calls: z.number().int().min(0),
+  resumed: z.boolean(),
+  durationMs: z.number().min(0),
+  inputTokens: z.number().min(0),
+  outputTokens: z.number().min(0),
+  cacheReadTokens: z.number().min(0),
+  cacheWriteTokens: z.number().min(0),
+  modelCalls: z.number().int().min(0),
+  firstAt: z.string().max(80),
+  lastAt: z.string().max(80),
+});
 const runPatchSchema = z.object({
   state: runStateSchema,
   round: z.number().int().min(1).max(99),
@@ -265,6 +280,8 @@ const runPatchSchema = z.object({
   plan: developmentPlanSchema,
   usage: runUsageSchema,
   usageRoles: z.array(runRoleUsageSchema).max(20),
+  // Sprint 2: additive per-session reuse/latency summary.
+  sessions: z.array(runSessionSummarySchema).max(40),
   modelCalls: z.number().int().min(0).max(10_000),
   usageUnknownCalls: z.number().int().min(0).max(10_000),
   checkSnapshot: z.string().max(80),
@@ -507,7 +524,7 @@ app.get("/api/health", async (_request, reply) => {
   try {
     await pingDatabase();
     alerts.clear("database_unavailable");
-    return { status: "ok", service: "pigo-web", version: "0.24.0", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.24.1", db: "ok" };
   } catch (error) {
     // AT-REL-005: fail loudly instead of pretending the service is healthy.
     alerts.raise({
@@ -516,7 +533,7 @@ app.get("/api/health", async (_request, reply) => {
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
       details: { error: (error as Error).message.slice(0, 200) },
     });
-    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.24.0", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.24.1", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
   }
 });
 
@@ -531,7 +548,7 @@ interface StorageStatus {
 app.get("/api/health/detail", async (request, reply) => {
   const internal = safeTokenMatch(request.headers.authorization);
   if (!internal && !auth.user(request)) return reply.code(401).send({ error: "Unauthorized" });
-  const health: Record<string, unknown> = { version: "0.24.0", at: new Date().toISOString() };
+  const health: Record<string, unknown> = { version: "0.24.1", at: new Date().toISOString() };
   try {
     await pingDatabase();
     health.database = { status: "ok" };

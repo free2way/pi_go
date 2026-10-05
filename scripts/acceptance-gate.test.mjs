@@ -51,13 +51,13 @@ test("runAcceptanceGate FAILs (not SKIPs) every missing prerequisite even with a
 });
 
 test("runAcceptanceGate promotes any residual SKIP to FAIL and stays green without one", async () => {
-  const steps = planAcceptanceSteps({ PI_DATABASE_URL: "postgres://u:p@h:5432/d", PI_E2E_BASE_URL: "http://127.0.0.1:3100" });
+  const steps = planAcceptanceSteps({ PI_DATABASE_URL: "postgres://DUMMY_USER:DUMMY_PASSWORD@example.com:5432/d", PI_E2E_BASE_URL: "http://127.0.0.1:3100" });
   // Inject a plan containing a real skip to prove the belt-and-suspenders pass.
   const { results } = await runAcceptanceGate({ env: {}, runStep: async () => ({ ok: true }) });
   assert.ok(results.every((result) => result.status !== SKIP));
 
   const green = await runAcceptanceGate({
-    env: { PI_DATABASE_URL: "postgres://u:p@h:5432/d", PI_E2E_BASE_URL: "http://127.0.0.1:3100" },
+    env: { PI_DATABASE_URL: "postgres://DUMMY_USER:DUMMY_PASSWORD@example.com:5432/d", PI_E2E_BASE_URL: "http://127.0.0.1:3100" },
     runStep: async () => ({ ok: true }),
   });
   assert.equal(green.summary.ok, true);

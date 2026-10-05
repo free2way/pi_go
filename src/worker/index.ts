@@ -43,7 +43,9 @@ import { callbackBodyExceedsInlineLimit, encodeCallbackBody, persistDiffArtifact
 import { uploadRunArtifact } from "./artifact-upload.js";
 import { captureSnapshotHash } from "./snapshot-hash.js";
 import { startRunDeadline } from "./run-deadline.js";
-import { detectProjectPlugins, parsePluginPolicy, pluginArguments, pluginMounts, selectPlugins, verifyPluginPins, type PluginDenial } from "./plugin-policy.js";
+import { detectProjectPlugins, pluginArguments, pluginMounts, selectPlugins, verifyPluginPins, type PluginDenial } from "./plugin-policy.js";
+import { buildPluginPolicy } from "./plugin-registry.js";
+import { CliSessionManager, SessionAccumulator, planPiSession, type PiSessionRole } from "./pi-session.js";
 
 const port = Number(process.env.PORT || 3200);
 const host = process.env.HOST || "localhost";
@@ -156,16 +158,23 @@ const materializeReviewSnapshot = createGitReviewSnapshotMaterializer();
  * are re-enabled through explicit `--extension/--skill/--prompt-template`
  * flags; anything requested but not allowlisted produces a `plugin.denied`
  * event instead of being silently dropped.
+ *
+ * Sprint 2: when `PI_PLUGIN_REGISTRY` is set, the SHA-256 pinned registry file is
+ * loaded and merged (registry wins on a path conflict). A missing/invalid file
+ * throws here, so the worker fails loudly instead of silently disabling plugins.
  */
-const pluginPolicy = parsePluginPolicy({
+const pluginPolicy = buildPluginPolicy({
   allowlist: process.env.PI_PLUGIN_ALLOWLIST,
   requests: process.env.PI_PLUGIN_REQUESTS,
+  registry: process.env.PI_PLUGIN_REGISTRY,
 });
 const allowProjectPlugins = process.env.PI_PLUGIN_ALLOW_PROJECT === "true";
 /** AT-PI-007/AT-SEC-014: when set, every allowlisted plugin must carry a sha256 pin. */
 const requirePluginPin = process.env.PI_PLUGIN_REQUIRE_PIN === "true";
 /** Container directory that hosts read-only allowlisted plugin mounts. */
 const pluginContainerBase = process.env.PI_PLUGIN_CONTAINER_DIR || "/opt/pigo/plugins";
+/** Sprint 2: single CLI-backed Pi session manager (adds instrumentation only). */
+const cliSessionManager = new CliSessionManager();
 
 const reportedPluginEvents = new Set<string>();
 async function reportPluginPolicy(runId: string, round: number, enabled: string[], denials: PluginDenial[]) {
@@ -955,37 +964,74 @@ async function collectDiff(worktree: string, signal: AbortSignal, baseRef?: stri
 /**
  * REL-005 / AT-REL-006: wraps one Pi invocation with bounded backoff so a burst
  * of 429/5xx errors retries a few times before the run is parked for a human.
+ *
+ * Sprint 2: also resolves the Pi *session* plan (id, resume, fresh) and emits a
+ * `session.metrics` event, aggregating the invocation into the run's additive
+ * `sessions` summary. The run's token totals still come from the existing
+ * `addUsage`/`budget.record` path, so sessions never double count them.
  */
 async function runPiWithRetry(
   input: Parameters<typeof runPi>[0],
-  context: { runId: string; round: number; label: string; role: RunRoleUsage["role"]; budget?: RunBudgetContext },
+  context: { runId: string; round: number; label: string; role: PiSessionRole; sessionKey?: string; retry?: boolean; budget?: RunBudgetContext; sessions?: SessionAccumulator },
 ) {
   const budget = context.budget;
-  // NEW-08/AUD-10: every provider attempt (including failed retries) is
-  // reserved and accounted; the hard model-call limit stops the retry loop.
-  const result = await runProviderOperation(() => runPi({ ...input, role: context.role }), {
+  const plan = planPiSession({ role: context.role, run: context.runId, round: context.round, retry: context.retry, key: context.sessionKey });
+  // Sprint 2: the CLI session manager wraps the existing invocation (same
+  // session id, same retry/budget behaviour) and reports per-session metrics.
+  const call = await cliSessionManager.execute({
+    plan,
     signal: input.signal,
-    budget: budget
-      ? { reserve: () => budget.reserve(context.role), recordUnknown: () => budget.recordUnknown() }
-      : undefined,
-    onRetry: async ({ attempt, delayMs, kind, message }) => {
+    onActivity: input.onActivity,
+    invoke: async (sessionId) => {
+      let modelCalls = 0;
+      // NEW-08/AUD-10: every provider attempt (including failed retries) is
+      // reserved and accounted; the hard model-call limit stops the retry loop.
+      const outcome = await runProviderOperation(() => {
+        modelCalls += 1;
+        return runPi({ ...input, sessionId, role: context.role });
+      }, {
+        signal: input.signal,
+        budget: budget
+          ? { reserve: () => budget.reserve(context.role), recordUnknown: () => budget.recordUnknown() }
+          : undefined,
+        onRetry: async ({ attempt, delayMs, kind, message }) => {
+          await postUpdate(context.runId, {
+            event: {
+              round: context.round,
+              source: "system",
+              type: "provider.retry",
+              message: `${context.label} 调用遇到${kind}错误，约 ${Math.max(1, Math.round(delayMs / 1000))} 秒后重试（第 ${attempt} 次）：${message.slice(0, 200)}`,
+            },
+          }).catch(() => undefined);
+        },
+      });
+      return { result: outcome, usage: outcome.usage, modelCalls };
+    },
+    onMetrics: async (metrics) => {
+      // Instrumentation only: the run's token totals still come from the
+      // addUsage/budget.record path, so sessions never double count them. A
+      // failed metrics write never fails the run.
+      const summaries = context.sessions?.merge(metrics, new Date().toISOString());
       await postUpdate(context.runId, {
+        ...(summaries ? { patch: { sessions: summaries } } : {}),
         event: {
           round: context.round,
           source: "system",
-          type: "provider.retry",
-          message: `${context.label} 调用遇到${kind}错误，约 ${Math.max(1, Math.round(delayMs / 1000))} 秒后重试（第 ${attempt} 次）：${message.slice(0, 200)}`,
+          type: "session.metrics",
+          message: `会话 ${metrics.sessionId}（${plan.role} · 第 ${plan.round} 轮 · ${plan.resume ? "复用" : "新建"}）：${metrics.modelCalls} 次调用，${(metrics.durationMs / 1000).toFixed(1)}s`,
+          meta: { ...metrics },
         },
       }).catch(() => undefined);
     },
   });
+  const result = call.result;
   // GAP-02: surface allowlist decisions as audit events (never silent).
   await reportPluginPolicy(context.runId, context.round, result.plugins.enabled, result.plugins.denials);
   if (budget) await budget.record(context.role, input, result.usage);
   return result;
 }
 
-async function planDevelopment(run: Run, worktree: string, credentials: JobInput["credentials"], signal: AbortSignal, usage: UsageTotals, budget?: RunBudgetContext) {
+async function planDevelopment(run: Run, worktree: string, credentials: JobInput["credentials"], signal: AbortSignal, usage: UsageTotals, budget?: RunBudgetContext, sessions?: SessionAccumulator) {
   const prompt = [
     "You are the lead engineering planner. Inspect the current repository read-only and size the requested implementation.",
     `Task: ${run.task}`,
@@ -1008,7 +1054,7 @@ async function planDevelopment(run: Run, worktree: string, credentials: JobInput
       apiKeyEnvironmentName: apiKeyEnvName(run.developer.provider),
       signal,
       onActivity: (message) => postUpdate(run.id, { event: { round: run.round, source: "developer", type: "planner.activity", message: `主 Agent：${message}` } }),
-    }, { runId: run.id, round: run.round, label: "主 Agent 规划", role: "planner", budget });
+    }, { runId: run.id, round: run.round, label: "主 Agent 规划", role: "planner", budget, sessions });
     addUsage(usage, result.usage);
     return parseDevelopmentPlan(redactJobSecrets(result.text, credentials), maxSubagents);
   } catch (error) {
@@ -1031,7 +1077,8 @@ async function runDeveloperAgent(input: {
   agentName?: string;
   usage: UsageTotals;
   budget?: RunBudgetContext;
-  role?: RunRoleUsage["role"];
+  role?: PiSessionRole;
+  sessions?: SessionAccumulator;
 }) {
   const extra = input.agentName ? { agent: input.agentName } : {};
   await chat(input.run, "developer", "orchestrator", "developer", "prompt", input.prompt, input.signal, extra);
@@ -1040,7 +1087,6 @@ async function runDeveloperAgent(input: {
     provider: input.run.developer.provider,
     model: input.run.developer.model,
     prompt: input.prompt,
-    sessionId: `${input.run.id.replaceAll("_", "-")}-${input.sessionSuffix}`,
     apiKey: input.credentials.developer,
     apiKeyEnvironmentName: apiKeyEnvName(input.run.developer.provider),
     signal: input.signal,
@@ -1052,7 +1098,7 @@ async function runDeveloperAgent(input: {
         message: input.activityPrefix ? `${input.activityPrefix}：${message}` : message,
       },
     }),
-  }, { runId: input.run.id, round: input.run.round, label: input.activityPrefix ?? "开发 Agent", role: input.role ?? "developer", budget: input.budget });
+  }, { runId: input.run.id, round: input.run.round, label: input.activityPrefix ?? "开发 Agent", role: input.role ?? "developer", sessionKey: input.sessionSuffix, budget: input.budget, sessions: input.sessions });
   addUsage(input.usage, result.usage);
   await chat(input.run, "developer", "developer", "orchestrator", "response", redactJobSecrets(result.text, input.credentials), input.signal, extra);
   return result.text;
@@ -1094,6 +1140,7 @@ async function runSubAgent(input: {
   signal: AbortSignal;
   usage: UsageTotals;
   budget?: RunBudgetContext;
+  sessions?: SessionAccumulator;
 }): Promise<SubAgentResult> {
   const startedAt = Date.now();
   const branch = `${input.mainBranch}-sub-${input.task.id}`;
@@ -1133,6 +1180,7 @@ async function runSubAgent(input: {
       usage: input.usage,
       budget: input.budget,
       role: "sub-agent",
+      sessions: input.sessions,
     });
     const changed = await git(worktree, ["status", "--porcelain"], input.signal);
     let commit: string | undefined;
@@ -1259,6 +1307,7 @@ async function orchestrateSubAgents(input: {
   usage: UsageTotals;
   tracker: CheckpointTracker;
   budget?: RunBudgetContext;
+  sessions?: SessionAccumulator;
 }) {
   const integrationNotes: string[] = [];
   const restored: string[] = [];
@@ -1313,6 +1362,7 @@ async function orchestrateSubAgents(input: {
         signal: input.signal,
         usage: input.usage,
         budget: input.budget,
+        sessions: input.sessions,
       })));
       for (const result of results) {
         let keepBranch = false;
@@ -1471,6 +1521,7 @@ async function performReview(input: {
   usage: UsageTotals;
   started: number;
   budget?: RunBudgetContext;
+  sessions?: SessionAccumulator;
 }): Promise<ReviewOutcome> {
   const reviewPrompt = [
     "You are an independent read-only code reviewer. Do not modify files.",
@@ -1494,7 +1545,7 @@ async function performReview(input: {
       apiKeyEnvironmentName: apiKeyEnvName(input.run.reviewer.provider),
       signal: input.signal,
       onActivity: (message) => postUpdate(input.run.id, { event: { round: input.round, source: "reviewer", type: "agent.activity", message } }),
-    }, { runId: input.run.id, round: input.round, label: "审核 Agent", role: "reviewer", budget: input.budget });
+    }, { runId: input.run.id, round: input.round, label: "审核 Agent", role: "reviewer", budget: input.budget, sessions: input.sessions });
   } catch (providerError) {
     if (providerError instanceof BudgetExceededError) throw providerError;
     const reason = redactJobSecrets((providerError as Error).message, input.credentials).slice(0, 500);
@@ -1525,7 +1576,7 @@ async function performReview(input: {
         apiKeyEnvironmentName: apiKeyEnvName(input.run.reviewer.provider),
         signal: input.signal,
         onActivity: (message) => postUpdate(input.run.id, { event: { round: input.round, source: "reviewer", type: "agent.activity", message } }),
-      }, { runId: input.run.id, round: input.round, label: "审核 Agent（协议重试）", role: "reviewer", budget: input.budget });
+      }, { runId: input.run.id, round: input.round, label: "审核 Agent（协议重试）", role: "reviewer", retry: true, budget: input.budget, sessions: input.sessions });
     } catch (providerError) {
       if (providerError instanceof BudgetExceededError) throw providerError;
       const providerReason = redactJobSecrets((providerError as Error).message, input.credentials).slice(0, 500);
@@ -1561,6 +1612,7 @@ async function executeRetryReview(input: {
   usage: UsageTotals;
   started: number;
   budget?: RunBudgetContext;
+  sessions?: SessionAccumulator;
   checks: string[];
 }) {
   const { run } = input;
@@ -1600,6 +1652,7 @@ async function executeRetryReview(input: {
       usage: input.usage,
       started: input.started,
       budget: input.budget,
+      sessions: input.sessions,
     });
   } finally {
     // AT-REVIEW-012: the one-shot snapshot (and its Pi state) is discarded after
@@ -1676,6 +1729,9 @@ async function executeJob(input: JobInput, controller: AbortController) {
   // AUD-10: resumes, worker restarts and human continuations accumulate into the
   // persisted usage instead of resetting it.
   const usage: UsageTotals = usageFromRun(run.usage);
+  // Sprint 2: per-session summary, seeded from the run document so a restart
+  // resumes the totals instead of resetting them.
+  const sessions = new SessionAccumulator(run.sessions);
   const tracker = await loadTracker(run.id);
   // COST-002/003: budgets are evaluated before every model call and after each
   // one, with a single 80% warning per dimension.
@@ -1796,7 +1852,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
     }
 
     if (input.retryReview) {
-      await executeRetryReview({ run, worktree, baseCommit, credentials: input.credentials, controller, usage, started, budget, checks: input.checks });
+      await executeRetryReview({ run, worktree, baseCommit, credentials: input.credentials, controller, usage, started, budget, sessions, checks: input.checks });
       return;
     }
     await update(run, "developing", "developer", "agent.started", `${run.developer.model} 主 Agent 开始评估工作量`, { summary: "主 Agent 正在分析任务并决定是否拆分 Sub Agent" });
@@ -1820,7 +1876,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
         findings = [...(run.findings ?? [])];
       } else if (round === 1) {
         const storedPlan = tracker.isCompleted(stages.planning) ? tracker.payload<DevelopmentPlan>(stages.planning) : undefined;
-        plan = storedPlan ?? await planDevelopment(run, worktree, input.credentials, controller.signal, usage, budget);
+        plan = storedPlan ?? await planDevelopment(run, worktree, input.credentials, controller.signal, usage, budget, sessions);
         assignPlanCodenames(run.id, plan);
         run.plan = plan;
         if (storedPlan) {
@@ -1843,7 +1899,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
           await tracker.complete(stages.planning, plan);
         }
         if (plan.tasks.length > 1) {
-          const integrationNotes = await orchestrateSubAgents({ run, project: worktree, worktree, plan, credentials: input.credentials, signal: controller.signal, usage, tracker, budget });
+          const integrationNotes = await orchestrateSubAgents({ run, project: worktree, worktree, plan, credentials: input.credentials, signal: controller.signal, usage, tracker, budget, sessions });
           const integrationPrompt = [
             "You are the lead integration agent. Work only in the current Git worktree.",
             `Original task: ${run.task}`,
@@ -1852,7 +1908,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
             "Inspect the combined code, resolve integration gaps, complete any skipped work, and add or update end-to-end tests.",
             "Do not push, deploy, delete the repository, or read credentials. Do not undo correct sub-agent work.",
           ].join("\n\n");
-          await runDeveloperAgent({ run, worktree, credentials: input.credentials, signal: controller.signal, prompt: integrationPrompt, sessionSuffix: "integrator", activityPrefix: "集成 Agent", usage, budget, role: "integrator" });
+          await runDeveloperAgent({ run, worktree, credentials: input.credentials, signal: controller.signal, prompt: integrationPrompt, sessionSuffix: "integrator", activityPrefix: "集成 Agent", usage, budget, role: "integrator", sessions });
         } else {
           const task = plan.tasks[0];
           task.status = "running";
@@ -1863,7 +1919,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
             "Inspect the repository, implement the task completely, and add or update tests.",
             "Do not push, deploy, delete the repository, or read credentials. Do not claim checks passed unless you ran them.",
           ].join("\n\n");
-          const summary = await runDeveloperAgent({ run, worktree, credentials: input.credentials, signal: controller.signal, prompt: developerPrompt, sessionSuffix: "developer", usage, budget });
+          const summary = await runDeveloperAgent({ run, worktree, credentials: input.credentials, signal: controller.signal, prompt: developerPrompt, sessionSuffix: "developer", usage, budget, sessions });
           task.status = "merged";
           task.summary = redactJobSecrets(summary, input.credentials).slice(0, 1_000);
           await postUpdate(run.id, { patch: { plan }, event: { round, source: "developer", type: "developer.completed", message: "单 Agent 实现完成" } });
@@ -1879,7 +1935,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
         }
         repairSections.push("Inspect the existing combined implementation, make the required fixes, and update tests.", "Do not push, deploy, delete the repository, or read credentials.");
         // COST-004: 返修复用 Developer 会话（保留已实现上下文），只注入新增反馈与必要上下文。
-        await runDeveloperAgent({ run, worktree, credentials: input.credentials, signal: controller.signal, prompt: repairSections.join("\n\n"), sessionSuffix: "developer", activityPrefix: "修复 Agent", usage, budget });
+        await runDeveloperAgent({ run, worktree, credentials: input.credentials, signal: controller.signal, prompt: repairSections.join("\n\n"), sessionSuffix: "developer", activityPrefix: "修复 Agent", usage, budget, sessions });
       }
       if (!developmentDone) await tracker.complete(stages.development(round), { round, at: new Date().toISOString() });
       const diff = await collectDiff(worktree, controller.signal, baseCommit);
@@ -1935,7 +1991,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
         await tracker.start(stages.review(round));
         let outcome: ReviewOutcome;
         try {
-          outcome = await performReview({ run, snapshotPath, credentials: input.credentials, round, diff: latestDiff, signal: controller.signal, usage, started, budget });
+          outcome = await performReview({ run, snapshotPath, credentials: input.credentials, round, diff: latestDiff, signal: controller.signal, usage, started, budget, sessions });
         } finally {
           // AT-REVIEW-012: snapshot and its state are destroyed after one use.
           await destroyReviewSnapshot(snapshotPath);

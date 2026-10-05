@@ -39,13 +39,31 @@
   追加 `run.merged` 事件，并在响应中返回。
 - 未传该字段时行为与之前完全一致。
 
-合并后部署钩子 `PI_POST_MERGE_DEPLOY_HOOK`（可选）：
+## A2.1 显式代码发布
 
-- `https://…` 视为 webhook（POST JSON，30s 超时）。
-- `cmd: <命令>` 视为命令（`/bin/sh -c`，60s 超时，环境仅保留 `PATH`，
-  运行信息经 stdin 传入）。
-- 未设置 / 值无法识别时，响应中的 `deploy` 会明确给出 `not_configured` /
-  `unsupported` 及原因，并记录 `run.post_merge_deploy` 事件，绝不静默跳过。
+合并不再隐式触发部署。正常通过审核的 `completed` Run 由管理员执行两个独立动作：
+
+1. `POST /api/runs/:id/merge`，body `{confirm:true,note?}`：把审核通过的任务分支
+   合并到工作区默认分支；
+2. `POST /api/runs/:id/publish`：body 为
+   `{environment, confirm:true, retry?}`，显式确认目标环境后才调用发布钩子。
+
+发布执行具有以下语义：
+
+- 调用外部系统前先持久化 `run.release`，包括 commit、环境、操作者、attempt、
+  `deliveryId` 和 `publishing` 状态；失败后必须显式 `retry:true`，并复用同一
+  delivery ID；
+- `https://…` webhook 需要 `PI_POST_MERGE_DEPLOY_TOKEN`，请求同时携带 Bearer、
+  `X-PiGO-Delivery-Id` 和 HMAC-SHA256 `X-PiGO-Signature`；
+- HTTP 202 只表示 `triggered`。部署系统完成后调用 payload 中的 `callbackUrl`，
+  body 为 `{deliveryId,status:"succeeded"|"failed",detail?,deploymentId?,url?}`；
+  回调使用同一个 token 的 `Authorization: Bearer ...`；
+- 其他 2xx 或命令 exit 0 记为 `succeeded`，错误记为 `failed`；发布失败不会伪装
+  成功，也不会重复执行合并；
+- `cmd: <命令>` 仍作为运维自定义方式保留（60s 超时，仅保留 `PATH`，JSON 经
+  stdin 输入）。
+- 已进入合并或发布链路的 Run 视为不可变交付记录，不能再 `reopen` 修改；新的
+  需求或修复应创建新 Run，避免旧发布记录错误关联到新代码。
 
 ## A3 部署面板
 

@@ -200,6 +200,11 @@ export interface Run {
   plan?: DevelopmentPlan;
   /** COST-001: per-role (planner/developer/sub-agent/integrator/reviewer) usage. */
   usageRoles?: RunRoleUsage[];
+  /**
+   * Sprint 2: additive per-Pi-session reuse/latency summary. Tokens here are a
+   * breakdown of the same stream counted in `usage`; they are never added to it.
+   */
+  sessions?: RunSessionSummary[];
   /** COST-002: number of model calls started for this run. */
   modelCalls?: number;
   /** AUD-04: content snapshot hash that passed the required checks. */
@@ -379,6 +384,31 @@ export interface RunRoleUsage {
   cacheWriteTokens?: number;
   estimatedCost: number;
   calls: number;
+}
+
+/**
+ * Sprint 2 phase 1: summary of one Pi session (one `--session-id` reused across
+ * invocations, or one stateless `--no-session` call). Additive and backward
+ * compatible: runs written before this field exist are treated as having no
+ * per-session data. `rounds` are the distinct rounds the session was used in;
+ * `calls` counts instrumented invocations (a session may be resumed several
+ * times within a round, e.g. a protocol retry is its own session).
+ */
+export interface RunSessionSummary {
+  sessionId: string;
+  role: "planner" | "developer" | "sub-agent" | "integrator" | "reviewer" | string;
+  rounds: number[];
+  calls: number;
+  /** True when at least one invocation continued an existing session. */
+  resumed: boolean;
+  durationMs: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  modelCalls: number;
+  firstAt: string;
+  lastAt: string;
 }
 
 export interface ProjectInfo {

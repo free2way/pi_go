@@ -41,6 +41,7 @@ export const CRITICAL_ENV = {
     "PI_MERGE_REQUEST_PROJECT",
     "PI_MERGE_REQUEST_TARGET_BRANCH",
     "PI_POST_MERGE_DEPLOY_HOOK",
+    "PI_POST_MERGE_DEPLOY_TOKEN",
     // deployment panel (docs/10 A3)
     "PI_WEB_VERSION",
     "PI_WORKER_VERSION",
@@ -68,6 +69,8 @@ export const CRITICAL_ENV = {
     "PI_PLUGIN_REQUIRE_PIN",
     "PI_PLUGIN_ALLOW_PROJECT",
     "PI_PLUGIN_CONTAINER_DIR",
+    // plugins (Sprint 2: SHA-256 pinned registry)
+    "PI_PLUGIN_REGISTRY",
     // run budgets (COST-002)
     "PI_RUN_MAX_TOKENS",
     "PI_RUN_MAX_COST_USD",
@@ -104,6 +107,16 @@ export const DEPLOY_LOG_MOUNT = {
   pathFragment: "/app/pi-agent/backups",
   readOnly: true,
 };
+
+/**
+ * Files/directories a critical variable points at and that must therefore be
+ * mounted into the container that reads them. `label` is used verbatim in the
+ * failure message so a broken mount produces a precise diff.
+ */
+export const CRITICAL_MOUNTS = [
+  { label: "deployment log", ...DEPLOY_LOG_MOUNT },
+  { label: "plugin registry", service: "worker", pathFragment: "/app/pi-agent/pi-plugins.json", readOnly: true },
+];
 
 /** Extract one service block: from `  <name>:` to the next 2-space service key. */
 export function serviceBlock(lines, name) {
@@ -145,12 +158,12 @@ export function environmentKeys(block) {
 
 /**
  * @param {string} text raw compose.yaml
- * @param {{ criticalEnv?: Record<string, string[]>, deployLog?: typeof DEPLOY_LOG_MOUNT }} [spec]
+ * @param {{ criticalEnv?: Record<string, string[]>, mounts?: typeof CRITICAL_MOUNTS }} [spec]
  * @returns {{ problems: string[], services: Record<string, { env: string[], volumes: string[] }> }}
  */
 export function checkComposeCoverage(text, spec = {}) {
   const criticalEnv = spec.criticalEnv ?? CRITICAL_ENV;
-  const deployLog = spec.deployLog ?? DEPLOY_LOG_MOUNT;
+  const mounts = spec.mounts ?? CRITICAL_MOUNTS;
   const lines = text.split("\n");
   const services = {};
   const problems = [];
@@ -170,14 +183,16 @@ export function checkComposeCoverage(text, spec = {}) {
     }
   }
 
-  const logBlock = serviceBlock(lines, deployLog.service);
-  const logVolumes = listItems(logBlock, "volumes");
-  services[deployLog.service] ??= { env: environmentKeys(logBlock), volumes: logVolumes };
-  const logMount = logVolumes.find((entry) => entry.includes(deployLog.pathFragment));
-  if (!logMount) {
-    problems.push(`${deployLog.service}: deployment log not mounted (expected a volume containing ${deployLog.pathFragment})`);
-  } else if (deployLog.readOnly && !/:ro(?:,|$)/.test(logMount)) {
-    problems.push(`${deployLog.service}: deployment log mount must be read-only (:ro): ${logMount}`);
+  for (const mount of mounts) {
+    const block = serviceBlock(lines, mount.service);
+    const volumes = listItems(block, "volumes");
+    services[mount.service] ??= { env: environmentKeys(block), volumes };
+    const found = volumes.find((entry) => entry.includes(mount.pathFragment));
+    if (!found) {
+      problems.push(`${mount.service}: ${mount.label} not mounted (expected a volume containing ${mount.pathFragment})`);
+    } else if (mount.readOnly && !/:ro(?:,|$)/.test(found)) {
+      problems.push(`${mount.service}: ${mount.label} mount must be read-only (:ro): ${found}`);
+    }
   }
 
   // Reverse guard: every curated variable must exist somewhere, so a typo here
@@ -220,7 +235,7 @@ service and mounts the deployment log read-only; 1 otherwise.`);
     console.error("\nFix deploy/docker/compose.yaml (and mirror the variable in .env.example).");
   } else {
     const total = Object.values(CRITICAL_ENV).reduce((sum, vars) => sum + vars.length, 0);
-    console.log(`compose config coverage OK (${total} critical env entries + deploy-log mount)`);
+    console.log(`compose config coverage OK (${total} critical env entries + ${CRITICAL_MOUNTS.length} mount(s))`);
   }
   process.exit(problems.length === 0 ? 0 : 1);
 }

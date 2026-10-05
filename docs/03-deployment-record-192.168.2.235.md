@@ -354,4 +354,81 @@ v0.15.2 → v0.16.x（隔离 e2e 验证）→ 生产 v0.18.0 → v0.19.0 → v0.
   断言每个关键变量到达正确服务且部署日志只读挂载，缺失时打印精确 diff 并非零退出。
   该能力为**仓库侧**变更，尚未在任何生产主机上执行验证。
 
+## v0.24.0 发布工作流升级记录（2026-10-05，Asia/Shanghai）
+
+部署日期：2026-10-05。主机 `192.168.2.235`，Compose 项目 `pi-agent`。本次从
+`d65455b+working-tree` 构建并发布 Web/Worker；PostgreSQL 与 Pi Runtime 全程未重建。
+
+| 项 | 值 |
+| --- | --- |
+| 生产版本 | Web `0.24.0`；Worker `0.24.0` |
+| 发布包 | `/app/pi-agent/pigo-source-v0.24.0.tgz` |
+| 发布包 SHA-256 | `ee74835769007b2a4f46fc0811a5152030765430379add1bfac82cc842960cbe` |
+| 数据备份 | `/app/pi-agent/backups/20261005T040652Z` |
+| 源码回滚点 | `/app/pi-agent/source.prev-v0.24.0-20261004-210652`、`/app/pi-agent/source.pre-switch-v0.24.0-20261004-210652` |
+| Compose 回滚点 | `/app/pi-agent/compose.yaml.pre-v0.24.0-20261004-210652` |
+| 镜像回滚标签 | `local/pigo-web:rollback-v0.23.6-20261004-210652`、`local/pigo-worker:rollback-v0.23.6-20261004-210652` |
+
+### 本次能力
+
+- 审核通过后由管理员显式合并，发布不再由合并动作隐式触发。
+- 管理员可为已合并运行选择环境并显式触发发布；发布记录持久化
+  `deliveryId`、提交、分支、操作者、尝试次数及终态。
+- 发布 Webhook 使用 Bearer Token、HMAC-SHA256 签名与稳定投递 ID；HTTP 202 仅表示
+  已接收，最终成功/失败由受保护的回调端点确认。
+- 发布过程支持 CAS、幂等重试与过期占用恢复；发布活动期间禁止删除、清理或重新打开运行。
+- 页面增加发布拓扑节点与发布面板，并依据管理员身份和后端配置控制操作权限。
+
+### 发布前与生产验收证据
+
+- 本地：73 个测试文件、593 项测试通过；typecheck、lint、build、Compose 校验、脚本测试、
+  密钥扫描全部通过；`gate:release` 为 6 PASS / 0 FAIL / 1 SKIP，唯一 SKIP 是本地未提供
+  PostgreSQL URL 的真库并发检查。
+- 生产：Web `/api/health` 返回 `version=0.24.0`、`db=ok`；Worker `/health` 返回
+  `version=0.24.0`、`storage=ok`、`activeJobs=0`。
+- 数据库发布前后均为 `runs=30`、`events=5233`；Web/Worker 最近日志未发现 fatal、panic、
+  storage/database unavailable 等异常。
+- 公网 `https://pigo.ai2note.com/` 返回 Cloudflare Access 登录跳转，未绕过登录保护。
+- 未认证调用发布端点返回 HTTP 401；部署状态日志已写入
+  `/app/pi-agent/backups/deploy.log`，并通过只读目录挂载供页面读取。
+
+### 尚未启用的生产配置
+
+`PI_POST_MERGE_DEPLOY_HOOK` 与 `PI_POST_MERGE_DEPLOY_TOKEN` 当前均未配置，因此页面不会允许
+实际触发发布。这是 fail-closed 状态，不影响现有开发、审核、显式合并和部署状态展示；在提供
+受信任的 CI/CD Webhook 地址及独立签名 Token 后，需再执行一次管理员登录态的真实发布回调验收。
+
+## 2026-10-05 Sprint 1 真实验收证据（v0.24.0）
+
+生产环境 `192.168.2.235`，版本 `v0.24.0`。以下为 Sprint 1 的真实验收证据。
+
+| 项 | 值 |
+| --- | --- |
+| 生产主机 | `192.168.2.235` |
+| 生产版本 | `v0.24.0` |
+| web 镜像 digest | `sha256:58335b49921f4e9f3e837615cc3a6d33520434f42e4a02e9ff5493824eb45164` |
+| worker 镜像 digest | `sha256:4af7cba0f41e6d74b6b61a4f5d4b447de0b5d48ef0a8add66379817431e45071` |
+| postgres 镜像 digest | `sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873` |
+| 回滚标签 | web `prev47`；worker `prev43` |
+
+### 真实闭环运行
+
+| 运行 | 结果 | 说明 |
+| --- | --- | --- |
+| `run_9c8e4730ae17406b`（A） | completed | 成本 `$0.004742364` |
+| `run_d8430033c0344783`（B） | completed | 2 轮，成本 `$0.038821512`；同一波 2 个 Sub Agent（`wave_started` ×1、`subagent.started` ×2、`merged` ×2） |
+| `run_e43b8b4ae241454f`（C） | completed | 成本 `$0.006378564` |
+
+- 预算中止（D）`run_9a9174cb3e3e40b5`：出现 `budget_warning 80% (2/2)`，随后 `budget_exhausted`，之后无进一步模型调用；最终状态由操作者置为 cancelled。
+- 杀进程恢复（E）`run_b4d30926ad484f18`：出现 `run.recovery_detected` 与 `run.recovered`，未出现 `run.failed`/`storage_error`，恢复后进入审核阶段。注意：该次在检查点之前被杀，因此“跳过重复调用”只被部分验证。
+
+### 备份/恢复与回滚
+
+- 备份/恢复演练 `20261005T024653Z`：已用精确计数与行摘要 `9c174edb60df5f72acdb1eccf79694ab` 校验，并完成凭据密文校验；manifest 归档于 `backups/drills/20261005T024654Z/`。
+- 回滚演练仅以 dry-run 方式执行。
+
+### 其他
+
+- Cloudflare One-time PIN 由操作者配置（不在本仓库范围内）。
+
 

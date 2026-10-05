@@ -191,7 +191,7 @@ Test start time:
 | UI | UI-001～009 | AT-UI-001～009 |
 | Git | GIT-001～007 | AT-GIT-001～009 |
 | 安全 | SEC-001～010 | AT-SEC-001～014 |
-| 可靠性 | REL-001～007 | AT-REL-001～010 |
+| 可靠性 | REL-001～007 | AT-REL-001～017 |
 | 成本与性能 | COST-001～006 | AT-PERF-001～009 |
 
 ## 8. 功能验收用例
@@ -374,6 +374,13 @@ Test start time:
 | AT-REL-008 | P0 | SSE 客户端落后大量事件 | 可分页补拉至最新 seq，不导致 Web 内存无限增长 |
 | AT-REL-009 | P0 | 执行每日备份并还原到空环境 | 用户、Run、Event、凭据密文和必要配置数量/hash 一致 |
 | AT-REL-010 | P0 | 模拟磁盘空间不足 | 停止新任务并告警；已有源仓库不损坏 |
+| AT-REL-011 | P0 | 正常 Run 审核完成后由管理员合并 | 不需要 reopen/needs_human；只完成本地合并，不自动发布 |
+| AT-REL-012 | P0 | 未确认或非管理员请求发布 | 返回 400/403；不调用发布钩子，不改变 release 状态 |
+| AT-REL-013 | P0 | 发布调用前终止 Web，再使用 retry 恢复 | release attempt 已持久化；复用同一 deliveryId，不重复合并 |
+| AT-REL-014 | P0 | webhook 返回 202 后再回调成功/失败 | 先显示 triggered；只有认证回调后才进入 succeeded/failed |
+| AT-REL-015 | P0 | 发布失败后显式重试 | attempt 增加、deliveryId 不变；拓扑和详情显示最终结果 |
+| AT-REL-016 | P0 | 检查 webhook 请求 | 含 Bearer、delivery ID、正确 HMAC；浏览器和事件不出现密钥 |
+| AT-REL-017 | P0 | 对已合并或已发布 Run 点击重新打开 | 返回 `RELEASED_RUN_IMMUTABLE`；提示为后续修改创建新 Run |
 
 ## 11. 性能、容量与成本验收
 
