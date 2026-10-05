@@ -1,9 +1,10 @@
-import { BarChart3, ClipboardList, Copy, Download, ListChecks, LoaderCircle, Plus, Rocket, Trash2, X } from "lucide-react";
+import { BarChart3, ClipboardList, Copy, Download, LayoutTemplate, ListChecks, LoaderCircle, Pencil, Plus, Rocket, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { applyModelTemplate, STORY_PRIORITIES, STORY_STATUSES, STORY_STATUS_LABELS, type AgileProject, type AgileRelease, type AgileSprint, type AgileStory, type ModelTemplate, type StoryDetail, type StoryPriority, type StoryStatus } from "../shared/agile";
+import { applyModelTemplate, RELEASE_STATUSES, STORY_PRIORITIES, STORY_STATUSES, STORY_STATUS_LABELS, type AgileProject, type AgileRelease, type AgileSprint, type AgileStory, type ModelTemplate, type ReleaseStatus, type StoryDetail, type StoryPriority, type StoryStatus } from "../shared/agile";
 import type { AgileMetricsResponse, ReleaseRetrospective, ReleaseSummary } from "../shared/agile-metrics";
 import type { ConfigStatus, ModelCatalogResponse, RunState, Workspace } from "../shared/types";
 import { api } from "./api";
+import { agileFormErrorMessage, buildReleaseInput, buildTemplateInput, parseModelSelection } from "./agile-forms";
 import { columnPoints, estimateLabel, groupStoriesByColumn, priorityLabel, releaseExportFilename, releaseExportJson, splitLines, storyReference } from "./agile-view";
 
 const runStateLabels: Record<RunState, string> = {
@@ -34,8 +35,7 @@ function formatDuration(seconds: number): string {
 }
 
 function parseModel(value: string): { provider: string; model: string } | undefined {
-  const [provider, model] = value.split("::");
-  return provider && model ? { provider, model } : undefined;
+  return parseModelSelection(value);
 }
 
 /** Sprint 3 batch 1: project/story planning on top of the existing run engine. */
@@ -52,7 +52,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
-  const [panel, setPanel] = useState<"none" | "project" | "sprint" | "story" | "metrics" | "release">("none");
+  const [panel, setPanel] = useState<"none" | "project" | "sprint" | "story" | "metrics" | "release" | "templates" | "releases">("none");
   const [templates, setTemplates] = useState<ModelTemplate[]>([]);
   const [models, setModels] = useState<ModelCatalogResponse>();
   const [metrics, setMetrics] = useState<AgileMetricsResponse>();
@@ -65,6 +65,24 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
   const [releaseLoading, setReleaseLoading] = useState(false);
   const [releaseExporting, setReleaseExporting] = useState(false);
   const [releaseExportNote, setReleaseExportNote] = useState("");
+
+  // 模板管理 form (create) + delete feedback.
+  const [templateName, setTemplateName] = useState("");
+  const [templateDeveloper, setTemplateDeveloper] = useState("");
+  const [templateReviewer, setTemplateReviewer] = useState("");
+  const [templateBudgetTokens, setTemplateBudgetTokens] = useState("");
+  const [templateBudgetCost, setTemplateBudgetCost] = useState("");
+  const [templateBudgetCalls, setTemplateBudgetCalls] = useState("");
+  const [templateBudgetSeconds, setTemplateBudgetSeconds] = useState("");
+  const [templateMaxParallel, setTemplateMaxParallel] = useState("");
+
+  // 发布管理: `releaseManageId` empty = create mode, otherwise the edited release.
+  const [releaseManageId, setReleaseManageId] = useState("");
+  const [releaseName, setReleaseName] = useState("");
+  const [releaseVersion, setReleaseVersion] = useState("");
+  const [releaseNotes, setReleaseNotes] = useState("");
+  const [releaseStatus, setReleaseStatus] = useState<ReleaseStatus>("planned");
+  const [releaseStoryIds, setReleaseStoryIds] = useState<string[]>([]);
 
   // new-project form
   const [projectName, setProjectName] = useState("");
@@ -128,6 +146,13 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
     setReleaseDetailId("");
     setReleaseSummary(undefined);
     setReleaseRetrospective(undefined);
+    // 发布管理 form is project-scoped; drop the draft when switching projects.
+    setReleaseManageId("");
+    setReleaseName("");
+    setReleaseVersion("");
+    setReleaseNotes("");
+    setReleaseStatus("planned");
+    setReleaseStoryIds([]);
     if (projectId) void loadProjectData(projectId);
     else { setStories([]); setSprints([]); setReleases([]); }
   }, [projectId, loadProjectData]);
@@ -246,6 +271,56 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
     if (applied.maxParallel !== undefined) setStoryMaxParallel(String(applied.maxParallel));
   };
 
+  // 模板管理: create + delete owner-scoped saved model combinations ("模板").
+  // Client validation mirrors the zod contract; the server is still the source
+  // of truth, and a duplicate name surfaces its 409 as 「模板名称 … 已存在」.
+  const createTemplate = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const built = buildTemplateInput({
+      name: templateName,
+      developerModel: templateDeveloper,
+      reviewerModel: templateReviewer,
+      budgetTokens: templateBudgetTokens,
+      budgetCostUsd: templateBudgetCost,
+      budgetModelCalls: templateBudgetCalls,
+      budgetDurationSeconds: templateBudgetSeconds,
+      maxParallel: templateMaxParallel,
+    });
+    if (!built.ok) { setError(built.message); return; }
+    setBusy("template");
+    setError("");
+    try {
+      const template = await api.createTemplate({ ...built.input, maxParallel: built.input.maxParallel ?? null });
+      setTemplates((current) => [template, ...current]);
+      setTemplateName("");
+      setTemplateDeveloper("");
+      setTemplateReviewer("");
+      setTemplateBudgetTokens("");
+      setTemplateBudgetCost("");
+      setTemplateBudgetCalls("");
+      setTemplateBudgetSeconds("");
+      setTemplateMaxParallel("");
+    } catch (cause) {
+      setError(agileFormErrorMessage(cause, "创建模板失败"));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const removeTemplate = async (template: ModelTemplate) => {
+    if (!window.confirm(`删除模板「${template.name}」？已使用该模板的故事不受影响。`)) return;
+    setBusy(`delete-template:${template.id}`);
+    setError("");
+    try {
+      await api.deleteTemplate(template.id);
+      setTemplates((current) => current.filter((item) => item.id !== template.id));
+    } catch (cause) {
+      setError(agileFormErrorMessage(cause, "删除模板失败"));
+    } finally {
+      setBusy("");
+    }
+  };
+
   const createStory = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!projectId) { setError("请先创建或选择项目"); return; }
@@ -347,6 +422,71 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
     }
   };
 
+  // 发布管理: create/edit a release and attach/detach project stories. No
+  // drag-and-drop; membership is a checkbox list committed with the form.
+  const resetReleaseForm = () => {
+    setReleaseManageId("");
+    setReleaseName("");
+    setReleaseVersion("");
+    setReleaseNotes("");
+    setReleaseStatus("planned");
+    setReleaseStoryIds([]);
+  };
+
+  const editRelease = (release: AgileRelease) => {
+    setReleaseManageId(release.id);
+    setReleaseName(release.name);
+    setReleaseVersion(release.version);
+    setReleaseNotes(release.notes);
+    setReleaseStatus(release.status);
+    setReleaseStoryIds([...release.storyIds]);
+    setError("");
+  };
+
+  const saveRelease = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!projectId) { setError("请先创建或选择项目"); return; }
+    const built = buildReleaseInput({ name: releaseName, version: releaseVersion, notes: releaseNotes, status: releaseStatus, storyIds: releaseStoryIds });
+    if (!built.ok) { setError(built.message); return; }
+    const editing = releaseManageId !== "";
+    setBusy("release");
+    setError("");
+    try {
+      if (editing) {
+        const updated = await api.patchRelease(releaseManageId, built.input);
+        setReleases((current) => current.map((item) => (item.id === updated.id ? updated : item)));
+      } else {
+        const created = await api.createRelease({ projectId, ...built.input });
+        setReleases((current) => [created, ...current]);
+      }
+      resetReleaseForm();
+    } catch (cause) {
+      setError(agileFormErrorMessage(cause, editing ? "更新发布失败" : "创建发布失败"));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const removeRelease = async (release: AgileRelease) => {
+    if (!window.confirm(`删除发布「${release.version} · ${release.name}」？已关联的故事不会被删除，只会解除关联。`)) return;
+    setBusy(`delete-release:${release.id}`);
+    setError("");
+    try {
+      await api.deleteRelease(release.id);
+      setReleases((current) => current.filter((item) => item.id !== release.id));
+      if (releaseManageId === release.id) resetReleaseForm();
+      if (releaseDetailId === release.id) { setReleaseDetailId(""); setReleaseSummary(undefined); setReleaseRetrospective(undefined); }
+    } catch (cause) {
+      setError(agileFormErrorMessage(cause, "删除发布失败"));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const toggleReleaseStory = (storyId: string) => {
+    setReleaseStoryIds((current) => (current.includes(storyId) ? current.filter((id) => id !== storyId) : [...current, storyId]));
+  };
+
   // 「导出回顾 (JSON)」: downloads the retrospective payload and best-effort
   // copies it to the clipboard. No secrets are present in these datasets.
   const exportRetrospective = async () => {
@@ -393,8 +533,10 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
           <button className="button secondary" onClick={() => { setPanel(panel === "project" ? "none" : "project"); setError(""); }}><Plus size={15} />新建项目</button>
           <button className="button secondary" disabled={!projectId} onClick={() => { setPanel(panel === "sprint" ? "none" : "sprint"); setError(""); }}><Plus size={15} />新建冲刺</button>
           <button className="button secondary" disabled={!projectId} onClick={() => { setPanel(panel === "story" ? "none" : "story"); setError(""); }}><Plus size={15} />新建故事</button>
+          <button className={`button secondary ${panel === "templates" ? "active" : ""}`} onClick={() => { setPanel(panel === "templates" ? "none" : "templates"); setError(""); }}><LayoutTemplate size={15} />模板管理</button>
           <button className={`button secondary ${panel === "metrics" ? "active" : ""}`} disabled={!projectId} onClick={() => { setPanel(panel === "metrics" ? "none" : "metrics"); setError(""); }}><BarChart3 size={15} />度量</button>
           <button className={`button secondary ${panel === "release" ? "active" : ""}`} disabled={!projectId || releases.length === 0} onClick={() => { setPanel(panel === "release" ? "none" : "release"); setError(""); }}><Rocket size={15} />发布回顾</button>
+          <button className={`button secondary ${panel === "releases" ? "active" : ""}`} disabled={!projectId} onClick={() => { setPanel(panel === "releases" ? "none" : "releases"); setError(""); }}><Pencil size={15} />发布管理</button>
         </div>
       </section>
 
@@ -604,6 +746,64 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
         </>
       )}
 
+      {panel === "templates" && (
+        <section className="panel agile-metrics agile-templates">
+          <div className="panel-head"><div><span className="eyebrow">MODEL TEMPLATES</span><h3>模板管理</h3></div><LayoutTemplate size={15} /></div>
+          <div className="agile-metrics-body">
+            <form className="ws-form" onSubmit={createTemplate}>
+              <div className="ws-form-head"><div><span className="eyebrow">NEW TEMPLATE</span><h3>新建模板</h3></div></div>
+              <p className="ws-form-help">模板保存一组「开发模型 + 审核模型」，可选附带预算与并行度；在<strong>新建故事</strong>时选择即可一键填充。模板属于当前账号，同名不可重复。</p>
+              <label>模板名称<input value={templateName} onChange={(event) => setTemplateName(event.target.value)} placeholder="快速组合" autoFocus /></label>
+              <div className="agile-form-row">
+                <label>开发模型
+                  <select value={templateDeveloper} onChange={(event) => setTemplateDeveloper(event.target.value)}>
+                    <option value="">请选择</option>
+                    {(models?.models ?? []).filter((entry) => entry.roles.includes("developer")).map((entry) => (
+                      <option key={`${entry.provider}::${entry.model}`} value={`${entry.provider}::${entry.model}`}>{entry.label} · {entry.model}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>审核模型
+                  <select value={templateReviewer} onChange={(event) => setTemplateReviewer(event.target.value)}>
+                    <option value="">请选择</option>
+                    {(models?.models ?? []).filter((entry) => entry.roles.includes("reviewer")).map((entry) => (
+                      <option key={`${entry.provider}::${entry.model}`} value={`${entry.provider}::${entry.model}`}>{entry.label} · {entry.model}</option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              <div className="agile-form-row agile-budget-row">
+                <label>预算 Token<input inputMode="numeric" value={templateBudgetTokens} onChange={(event) => setTemplateBudgetTokens(event.target.value)} placeholder="不限" /></label>
+                <label>预算成本（$）<input inputMode="decimal" value={templateBudgetCost} onChange={(event) => setTemplateBudgetCost(event.target.value)} placeholder="不限" /></label>
+                <label>模型调用<input inputMode="numeric" value={templateBudgetCalls} onChange={(event) => setTemplateBudgetCalls(event.target.value)} placeholder="不限" /></label>
+                <label>时长（秒）<input inputMode="numeric" value={templateBudgetSeconds} onChange={(event) => setTemplateBudgetSeconds(event.target.value)} placeholder="不限" /></label>
+              </div>
+              <div className="agile-form-row">
+                <label>最大并行<input inputMode="numeric" value={templateMaxParallel} onChange={(event) => setTemplateMaxParallel(event.target.value)} placeholder="默认（1–32）" /></label>
+                <span />
+              </div>
+              <div className="ws-form-actions">
+                <button type="submit" className="button primary" disabled={busy === "template" || !templateName.trim() || !templateDeveloper || !templateReviewer}>
+                  {busy === "template" ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />}创建模板
+                </button>
+              </div>
+            </form>
+            <div className="agile-manage-list">
+              <h4>已有模板（{templates.length}）</h4>
+              {templates.map((template) => (
+                <div className="agile-release-row" key={template.id}>
+                  <span>{template.name}</span>
+                  <code>{template.developerModel.provider}:{template.developerModel.model} / {template.reviewerModel.provider}:{template.reviewerModel.model}</code>
+                  <small>{template.budget ? `预算 ${template.budget.maxCostUsd} · ${template.budget.maxTokens} tok` : "无预算"}{template.maxParallel !== null ? ` · 并行 ${template.maxParallel}` : ""}</small>
+                  <button type="button" className="danger" disabled={busy === `delete-template:${template.id}`} onClick={() => void removeTemplate(template)}><Trash2 size={12} />删除</button>
+                </div>
+              ))}
+              {templates.length === 0 && <div className="agile-hint">还没有模板。创建后可在「新建故事」的模板下拉中选用，它会自动填入开发/审核模型与预算。</div>}
+            </div>
+          </div>
+        </section>
+      )}
+
       {panel === "metrics" && (
         <section className="panel agile-metrics">
           <div className="panel-head"><div><span className="eyebrow">SPRINT METRICS</span><h3>度量</h3></div><BarChart3 size={15} /></div>
@@ -805,6 +1005,62 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
                 </div>
               </>
             )}
+          </div>
+        </section>
+      )}
+
+      {panel === "releases" && (
+        <section className="panel agile-metrics agile-release-manage">
+          <div className="panel-head"><div><span className="eyebrow">RELEASE MANAGEMENT</span><h3>发布管理</h3></div><Pencil size={15} /></div>
+          <div className="agile-metrics-body">
+            <form className="ws-form" onSubmit={saveRelease}>
+              <div className="ws-form-head">
+                <div><span className="eyebrow">{releaseManageId ? "EDIT RELEASE" : "NEW RELEASE"}</span><h3>{releaseManageId ? "编辑发布" : "新建发布"}</h3></div>
+                {releaseManageId && <button className="icon-button" type="button" onClick={resetReleaseForm}><X size={16} /></button>}
+              </div>
+              <p className="ws-form-help">发布把一组故事归入同一个交付版本；「发布回顾」会汇总这些故事的运行结果、成本与合并记录。关联关系可随时调整，不会改动故事本身。</p>
+              <div className="agile-form-row">
+                <label>版本号<input value={releaseVersion} onChange={(event) => setReleaseVersion(event.target.value)} placeholder="v1.2.0" /></label>
+                <label>发布名称<input value={releaseName} onChange={(event) => setReleaseName(event.target.value)} placeholder="结账体验" /></label>
+              </div>
+              <div className="agile-form-row">
+                <label>状态
+                  <select value={releaseStatus} onChange={(event) => setReleaseStatus(event.target.value as ReleaseStatus)}>
+                    {RELEASE_STATUSES.map((value) => <option key={value} value={value}>{releaseStatusLabels[value]}</option>)}
+                  </select>
+                </label>
+                <span className="agile-hint agile-release-picker-hint">勾选下方故事即加入发布，取消勾选即移出；{releaseStoryIds.length} 个已关联。</span>
+              </div>
+              <label>备注<textarea rows={2} value={releaseNotes} onChange={(event) => setReleaseNotes(event.target.value)} placeholder="本次发布的范围与注意事项" /></label>
+              <div className="agile-release-story-picker">
+                {stories.map((story) => (
+                  <label className="agile-check" key={story.id}>
+                    <input type="checkbox" checked={releaseStoryIds.includes(story.id)} onChange={() => toggleReleaseStory(story.id)} />
+                    <span>{story.title}<small>{STORY_STATUS_LABELS[story.status]}</small></span>
+                  </label>
+                ))}
+                {stories.length === 0 && <div className="agile-hint">当前项目还没有故事。</div>}
+              </div>
+              <div className="ws-form-actions">
+                {releaseManageId && <button type="button" className="button secondary" onClick={resetReleaseForm}>取消编辑</button>}
+                <button type="submit" className="button primary" disabled={busy === "release" || !releaseName.trim() || !releaseVersion.trim()}>
+                  {busy === "release" ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />}{releaseManageId ? "保存" : "创建"}
+                </button>
+              </div>
+            </form>
+            <div className="agile-manage-list">
+              <h4>已有发布（{releases.length}）</h4>
+              {releases.map((release) => (
+                <div className={`agile-release-row ${releaseManageId === release.id ? "selected" : ""}`} key={release.id}>
+                  <code>{release.version}</code>
+                  <span>{release.name}</span>
+                  <small>{releaseStatusLabels[release.status]} · {release.storyIds.length} 个故事</small>
+                  <button type="button" onClick={() => editRelease(release)}><Pencil size={12} />编辑</button>
+                  <button type="button" className="danger" disabled={busy === `delete-release:${release.id}`} onClick={() => void removeRelease(release)}><Trash2 size={12} />删除</button>
+                </div>
+              ))}
+              {releases.length === 0 && <div className="agile-hint">还没有发布记录。填写上方表单创建第一个发布。</div>}
+            </div>
           </div>
         </section>
       )}

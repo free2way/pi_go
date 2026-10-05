@@ -766,6 +766,22 @@ button.agile-metrics-row:hover strong { color: #c3d274; }
 @media (max-width: 1100px) { .agile-metrics-cols { grid-template-columns: 1fr; } .agile-budget-row { grid-template-columns: 1fr 1fr; } }
 @media (max-width: 760px) { .agile-metrics-sprints .agile-metrics-row { grid-template-columns: 1fr 1fr; } }
 
+/* Sprint 4 follow-up: 「模板管理」/「发布管理」 panels (form + compact list). */
+.agile-templates .ws-form, .agile-release-manage .ws-form { margin: 0; }
+.agile-manage-list { display: flex; flex-direction: column; gap: 2px; }
+.agile-manage-list h4 { margin: 0 0 6px; color: #a7b0b8; font-size: var(--panel-fs-sm); }
+.agile-manage-list .agile-hint { padding: 4px 0; }
+.agile-release-row button { display: inline-flex; align-items: center; gap: 4px; }
+.agile-release-row button.danger:hover { color: #e78b8b; border-color: rgba(224,106,106,.32); }
+.agile-release-row.selected { border: 1px solid var(--line-soft); background: #0d1115; }
+.agile-release-picker-hint { align-self: end; padding-bottom: 8px; }
+.agile-release-story-picker { display: flex; flex-direction: column; gap: 3px; margin-top: 12px; max-height: 220px; overflow: auto; border: 1px solid var(--line-soft); border-radius: 8px; padding: 8px 10px; }
+.agile-release-story-picker .agile-hint { padding: 2px 0; }
+.ws-form .agile-check { display: flex; flex-direction: row; align-items: center; gap: 8px; margin-top: 0; color: #a7b0b8; font-size: var(--panel-fs-sm); cursor: pointer; }
+.ws-form .agile-check input[type="checkbox"] { width: auto; margin: 0; flex: 0 0 auto; accent-color: #c3d274; }
+.agile-check > span { display: flex; flex-direction: column; gap: 1px; }
+.agile-check small { color: #5f6973; font: 9px "DM Mono", monospace; }
+
 /* 账户管理（仅管理员）: user table + grants editor. */
 .accounts-page { max-width: 1240px; margin: 0 auto; padding: 28px 30px 42px; }
 .ac-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; flex-wrap: wrap; }

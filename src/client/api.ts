@@ -216,10 +216,11 @@ export const api = {
     request<AgileSprint>(`/api/sprints/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   releases: (projectId?: string) =>
     request<{ releases: AgileRelease[] }>(`/api/releases${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ""}`),
-  createRelease: (body: { projectId: string; name: string; version: string; notes?: string; storyIds?: string[] }) =>
+  createRelease: (body: { projectId: string; name: string; version: string; notes?: string; status?: "planned" | "in_progress" | "released" | "cancelled"; storyIds?: string[] }) =>
     request<AgileRelease>("/api/releases", { method: "POST", body: JSON.stringify(body) }),
   patchRelease: (id: string, body: { name?: string; version?: string; notes?: string; status?: "planned" | "in_progress" | "released" | "cancelled"; storyIds?: string[] }) =>
     request<AgileRelease>(`/api/releases/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  deleteRelease: (id: string) => request<void>(`/api/releases/${encodeURIComponent(id)}`, { method: "DELETE" }),
   /** Sprint 4: read-only sprint metrics + project rollup. */
   agileMetrics: (params: { projectId?: string; sprintId?: string } = {}) => {
     const search = new URLSearchParams();
