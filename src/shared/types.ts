@@ -54,6 +54,37 @@ export interface RunEvent {
   meta?: Record<string, unknown>;
 }
 
+/** Terminal verdict a review round can carry; `none` means no verdict (yet). */
+export type RoundVerdict = "approved" | "changes_requested" | "none";
+
+/**
+ * Read-only per-round workflow summary returned by `GET /api/runs/:id/rounds`.
+ *
+ * It is aggregated server-side from all of a run's `run_events` + `run_findings`
+ * so the topology's round model never depends on how many events a client
+ * currently buffers. Additive: older servers simply do not serve the route and
+ * the client falls back to its event-derived model.
+ */
+export interface RoundSummary {
+  round: number;
+  /** Timestamp of the round's first event, when one exists. */
+  startedAt?: string;
+  /** Timestamp of the terminal review verdict, when the round has one. */
+  finishedAt?: string;
+  verdict: RoundVerdict;
+  /** The `review.changes_requested` message for this round, when one exists. */
+  reason?: string;
+  checks: { passed: number; failed: number };
+  findings: { total: number; resolved: number };
+  /** Deadline / recovery / failed-resume with no review verdict in this round. */
+  interrupted: boolean;
+}
+
+export interface RunRoundsResponse {
+  schemaVersion: number;
+  rounds: RoundSummary[];
+}
+
 export type ChatChannel = "developer" | "reviewer" | "handoff" | "checks" | "system";
 
 export type ChatParticipant = "orchestrator" | "developer" | "reviewer" | "checks" | "user";

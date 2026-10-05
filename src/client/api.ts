@@ -1,4 +1,4 @@
-import type { ConfigStatus, CredentialStatus, CurrentUser, ModelCatalogResponse, ModelSelection, Run, RunArtifact, RunEvent, RunState, Workspace } from "../shared/types";
+import type { ConfigStatus, CredentialStatus, CurrentUser, ModelCatalogResponse, ModelSelection, Run, RunArtifact, RunEvent, RunRoundsResponse, RunState, Workspace } from "../shared/types";
 
 /** A3: read-only deployment status returned by `GET /api/deployments`. */
 export interface DeploymentRecord {
@@ -141,6 +141,8 @@ export const api = {
   },
   run: (id: string) => request<Run>(`/api/runs/${id}`),
   events: (id: string) => request<RunEvent[]>(`/api/runs/${id}/events`),
+  /** 拓扑轮次模型: server-aggregated per-round summary (source of truth for branches/badges). */
+  runRounds: (id: string) => request<RunRoundsResponse>(`/api/runs/${id}/rounds`),
   artifacts: (id: string) => request<{ artifacts: RunArtifact[] }>(`/api/runs/${id}/artifacts`),
   artifactDownloadUrl: (id: string, artifactId: string) => `/api/runs/${id}/artifacts/${encodeURIComponent(artifactId)}/download`,
   /** A1: full run patch (regenerated on the worker when no artifact body exists). */

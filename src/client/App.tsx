@@ -61,13 +61,14 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { chatChannelLabels, chatCounts, chatMessageView, chatMessagesFromEvents, chatParticipantLabels, chatTabs, filterChatMessages, isReviewMessage, messageFindings, reworkBranchDetails, reworkBranchRounds, type ChatTab, type ReworkBranchDetail } from "../shared/chat";
 import { describeMergeRestore, mergeRestoreFields } from "../shared/merge";
 import { branchStatus, currentRoundStatus, roundStatuses, roundStatusMeta, roundStatusTooltip, type RoundStatus } from "../shared/round-status";
-import type { ChatMessage, ConfigStatus, CurrentUser, Finding, ModelCatalogResponse, Run, RunArtifact, RunEvent, RunMode, RunRoleUsage, RunState, Workspace } from "../shared/types";
+import type { ChatMessage, ConfigStatus, CurrentUser, Finding, ModelCatalogResponse, RoundSummary, Run, RunArtifact, RunEvent, RunMode, RunRoleUsage, RunState, Workspace } from "../shared/types";
 import { api, type DeploymentStatus } from "./api";
 import { HistoryPage } from "./HistoryPage";
 import { runStateLabels, requirementSummary } from "./requirement-history";
 import { batchCleanupConfirmMessage, cleanupFinishedConfirmMessage, cleanupStorageDetailLines, summarizeCleanupStorage } from "./run-cleanup-view";
 import { MAX_BUFFERED_EVENTS, mergeRunEvents, shouldAcceptRun } from "./run-events";
 import { createRunSelectionGuard, eventsForRun, isRunSelected, pickSelectedRun } from "./run-selection";
+import { reworkBranchDetailsFromSummaries, resolveReworkRounds, resolveRoundStatuses } from "./rounds-view";
 import { ModelsPage } from "./ModelsPage";
 import { SystemStatusPage } from "./SystemStatusPage";
 import { WorkspacesPage } from "./WorkspacesPage";
@@ -201,14 +202,23 @@ interface FlowOptions {
   /** Currently inspected rework round; its branch label is highlighted. */
   selectedReworkRound?: number | null;
   onReworkSelect?: (round: number) => void;
+  /**
+   * 拓扑轮次模型: server-aggregated per-round summaries. When present they are the
+   * source of truth for the round set, verdicts and branch list; when absent the
+   * event-derived model is used (older server / failed request).
+   */
+  roundSummaries?: RoundSummary[];
 }
 
 function flowForRun(run?: Run, events: RunEvent[] = [], options: FlowOptions = {}): { nodes: Node<FlowNodeData>[]; edges: Edge[] } {
   const currentOrder = run ? stateOrder[run.state] : -1;
   // Per-round workflow status powers the badge on the pipeline's round marker
   // and on every rework branch. Later rounds override earlier ones, so the
-  // current marker reads the highest round present.
-  const statuses = roundStatuses(events, run);
+  // current marker reads the highest round present. The server summary is
+  // authoritative for the round set so rounds older than the buffered event
+  // window still render; the event-derived statuses only add the live stage.
+  const eventStatuses = roundStatuses(events, run);
+  const statuses = resolveRoundStatuses(options.roundSummaries, eventStatuses);
   const currentStatus = currentRoundStatus(statuses);
   const statusAt = (order: number): FlowNodeData["status"] => {
     if (!run) return "waiting";
@@ -282,7 +292,8 @@ function flowForRun(run?: Run, events: RunEvent[] = [], options: FlowOptions = {
   // Each return round is drawn as its own branch below the pipeline rather
   // than as a reverse traversal over the original edges. Only real review
   // returns qualify — checks failures advance the round without the reviewer.
-  const returns = reworkBranchRounds(events);
+  const eventReturns = reworkBranchRounds(events);
+  const returns = resolveReworkRounds(options.roundSummaries, eventReturns);
   for (const [index, round] of returns.entries()) {
     // The branch badge follows the round the branch leads into (the repair it
     // opens), not the returned round's terminal `已退回返修`; clicks still open the
@@ -1085,6 +1096,9 @@ export function App() {
   const [selectedId, setSelectedId] = useState<string>();
   const [run, setRun] = useState<Run>();
   const [events, setEvents] = useState<RunEvent[]>([]);
+  // 拓扑轮次模型: server-aggregated round summaries; `undefined` means the
+  // endpoint was unavailable (older server / failed request) → event fallback.
+  const [roundSummaries, setRoundSummaries] = useState<RoundSummary[] | undefined>(undefined);
   const [artifacts, setArtifacts] = useState<RunArtifact[]>([]);
   const [config, setConfig] = useState<ConfigStatus>();
   const [user, setUser] = useState<CurrentUser>();
@@ -1136,11 +1150,12 @@ export function App() {
   }, [refreshRuns]);
 
   useEffect(() => {
-    if (!selectedId) { setRun(undefined); setEvents([]); setArtifacts([]); setReworkRound(null); setChatRoundFilter(null); return; }
+    if (!selectedId) { setRun(undefined); setEvents([]); setArtifacts([]); setRoundSummaries(undefined); setReworkRound(null); setChatRoundFilter(null); return; }
     // Reset for the newly selected run before any snapshot/stream data merges in,
     // so seq numbers from different runs are never mixed.
     setEvents([]);
     setArtifacts([]);
+    setRoundSummaries(undefined);
     setReworkRound(null);
     setChatRoundFilter(null);
     // Stale-response guard: every in-flight request/stream for the previously
@@ -1161,6 +1176,13 @@ export function App() {
       // Keep only events of this run so a draining previous stream cannot collide.
       setEvents((current) => mergeRunEvents(eventsForRun(current, guard.runId), nextEvents.filter((event) => guard.acceptEvent(event)), MAX_BUFFERED_EVENTS));
       setArtifacts(nextArtifacts.artifacts);
+    }).catch(() => undefined);
+    // 拓扑轮次模型: fetched on its own so a failure (or an older server without
+    // the route) leaves `undefined` and the topology uses the event-derived model
+    // instead of dropping the whole run detail.
+    void api.runRounds(selectedId).then((response) => {
+      if (!guard.isActive()) return;
+      setRoundSummaries(Array.isArray(response?.rounds) ? response.rounds : undefined);
     }).catch(() => undefined);
     const stream = new EventSource(`/api/runs/${selectedId}/stream`);
     stream.onmessage = (message) => {
@@ -1189,14 +1211,22 @@ export function App() {
   const handleReworkSelect = useCallback((round: number) => {
     setReworkRound((current) => (current === round ? null : round));
   }, []);
-  // Item-1: one detail entry per rendered branch, built from the run's events +
-  // findings (no new API).
-  const reworkDetails = useMemo(() => reworkBranchDetails(events, activeRun?.findings ?? []), [events, activeRun?.findings]);
+  // Item-1: one detail entry per rendered branch. The event-derived details are
+  // the fallback; when the server round summaries are available they supply the
+  // authoritative branch list and the return reason for rounds whose original
+  // event fell outside the buffered window.
+  const eventReworkDetails = useMemo(() => reworkBranchDetails(events, activeRun?.findings ?? []), [events, activeRun?.findings]);
+  const reworkDetails = useMemo(
+    () => (roundSummaries
+      ? reworkBranchDetailsFromSummaries(roundSummaries, activeRun?.findings ?? [], eventReworkDetails)
+      : eventReworkDetails),
+    [roundSummaries, activeRun?.findings, eventReworkDetails],
+  );
   const reworkRounds = useMemo(() => new Set(reworkDetails.map((detail) => detail.round)), [reworkDetails]);
   const selectedRework = reworkRound === null ? undefined : reworkDetails.find((detail) => detail.round === reworkRound);
   const flow = useMemo(
-    () => flowForRun(activeRun, events, { selectedReworkRound: reworkRound, onReworkSelect: handleReworkSelect }),
-    [activeRun, events, reworkRound, handleReworkSelect],
+    () => flowForRun(activeRun, events, { selectedReworkRound: reworkRound, onReworkSelect: handleReworkSelect, roundSummaries }),
+    [activeRun, events, reworkRound, handleReworkSelect, roundSummaries],
   );
   const chatMessages = useMemo(() => chatMessagesFromEvents(events), [events]);
   const running = runs.filter((item) => !terminalStates.includes(item.state)).length;
@@ -1218,6 +1248,7 @@ export function App() {
     setRun(created);
     setEvents([]);
     setArtifacts([]);
+    setRoundSummaries(undefined);
     setReworkRound(null);
     setChatRoundFilter(null);
     setView("run");

@@ -29,6 +29,7 @@ import { conflictReplyFor } from "./request-errors.js";
 import { appendHumanNote } from "./run-notes.js";
 import { resumeDeadlinePatch } from "./run-deadline-base.js";
 import { parseRunSearch, searchRuns } from "./run-search.js";
+import { ROUNDS_SCHEMA_VERSION, readRunRounds } from "./run-rounds.js";
 import { buildAcceptanceSnapshot } from "./acceptance.js";
 import { batchItemFailure, batchItemSuccess, parseBatchRunIds, summarizeBatch, MAX_BATCH_RUN_IDS, type BatchItemOutcome } from "./batch-runs.js";
 import { buildDeploymentStatus, parseDeployLog, resolveDeployLogPath, type DeploymentStatus } from "./deployments.js";
@@ -539,7 +540,7 @@ app.get("/api/health", async (_request, reply) => {
   try {
     await pingDatabase();
     alerts.clear("database_unavailable");
-    return { status: "ok", service: "pigo-web", version: "0.23.4", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.23.5", db: "ok" };
   } catch (error) {
     // AT-REL-005: fail loudly instead of pretending the service is healthy.
     alerts.raise({
@@ -548,7 +549,7 @@ app.get("/api/health", async (_request, reply) => {
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
       details: { error: (error as Error).message.slice(0, 200) },
     });
-    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.23.4", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.23.5", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
   }
 });
 
@@ -563,7 +564,7 @@ interface StorageStatus {
 app.get("/api/health/detail", async (request, reply) => {
   const internal = safeTokenMatch(request.headers.authorization);
   if (!internal && !auth.user(request)) return reply.code(401).send({ error: "Unauthorized" });
-  const health: Record<string, unknown> = { version: "0.23.4", at: new Date().toISOString() };
+  const health: Record<string, unknown> = { version: "0.23.5", at: new Date().toISOString() };
   try {
     await pingDatabase();
     health.database = { status: "ok" };
@@ -973,6 +974,19 @@ app.get<{ Params: { id: string }; Querystring: { after?: string; limit?: string 
   if (!store.getRun(request.params.id, ownerKeysFor(request))) return reply.code(404).send({ error: "Run not found" });
   const limit = Math.min(Math.max(Number(request.query.limit || 500), 1), 1_000);
   return store.getEvents(request.params.id, Number(request.query.after || 0), limit);
+});
+
+/**
+ * 拓扑轮次模型: read-only, owner-scoped per-round summary aggregated from the
+ * run's full `run_events` + `run_findings`. The client topology uses it as the
+ * source of truth for its round model so branches older than the buffered event
+ * window still render. Additive: absent on older servers, where the client falls
+ * back to its event-derived model.
+ */
+app.get<{ Params: { id: string } }>("/api/runs/:id/rounds", async (request, reply) => {
+  const run = store.getRun(request.params.id, ownerKeysFor(request));
+  if (!run) return reply.code(404).send({ error: "Run not found" });
+  return { schemaVersion: ROUNDS_SCHEMA_VERSION, rounds: await readRunRounds(db, run.id, run.round) };
 });
 
 // GAP-04 / AT-UI-005: artifact listing and download, authenticated like every
