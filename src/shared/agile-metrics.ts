@@ -1,5 +1,5 @@
-import type { Run, RunState, RunEvent } from "./types.js";
-import { deriveStoryStatus, latestLinkedRun, STORY_STATUSES, type StoryStatus } from "./agile.js";
+import type { ModelSelection, Run, RunEvent, RunMergeRecord, RunReleaseRecord, RunReleaseStatus, RunState } from "./types.js";
+import { deriveStoryStatus, latestLinkedRun, STORY_STATUSES, type ReleaseStatus, type StoryStatus } from "./agile.js";
 
 /**
  * Sprint 4 core — pure metrics model for the agile board.
@@ -306,4 +306,453 @@ export function shapeMetrics(stories: MetricStory[], runs: MetricRun[], events: 
 /** Type guard/helper kept close to the domain for callers filtering run rows. */
 export function isTerminalOutcome(state: RunState): state is "completed" | "needs_human" | "cancelled" | "failed" {
   return state === "completed" || state === "needs_human" || state === "cancelled" || state === "failed";
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 4 core — release summary + retrospective export.
+//
+// Both payloads are shaped by the pure helpers below from the same bounded rows
+// the metrics endpoint already reads (release's stories, their linked runs and
+// only the two review event types). Every optional field (usage, acceptance,
+// merge, release) is read defensively so sparse/legacy run documents never
+// throw, and empty releases render explicit zeros.
+
+/** The release identity columns the summary/retrospective payloads echo back. */
+export interface ReleaseIdentity {
+  id: string;
+  projectId: string;
+  name: string;
+  version: string;
+  status: ReleaseStatus;
+}
+
+/** Latest-run snapshot shown next to a release story. */
+export interface ReleaseStoryLatestRun {
+  runId: string;
+  state: RunState;
+  round: number;
+  maxRounds: number;
+  updatedAt: string;
+}
+
+/** Acceptance snapshot projection; only present when the latest run carries one. */
+export interface ReleaseStoryAcceptance {
+  acceptedAt: string;
+  acceptedBy: string;
+  acknowledgedOpenFindings: boolean;
+  resolvedFindings: number;
+  remainingFindings: number;
+}
+
+/** One release story with its derived outcome and rolled-up counters. */
+export interface ReleaseStoryOutcome {
+  storyId: string;
+  title: string;
+  /** Status derived from the latest linked run, falling back to the stored status. */
+  status: StoryStatus;
+  runs: number;
+  /** Absent when the story has no linked run yet. */
+  latest?: ReleaseStoryLatestRun;
+  /** Absent when the latest run was never accepted. */
+  acceptance?: ReleaseStoryAcceptance;
+  cost: number;
+  inputTokens: number;
+  outputTokens: number;
+  modelCalls: number;
+  findings: { total: number; resolved: number };
+  changesRequested: number;
+  notConverging: number;
+  /** Human-readable reason, only set when `status` is `blocked`. */
+  blockedReason?: string;
+}
+
+/** One developer/reviewer pair used by the release's runs. */
+export interface ModelCombination {
+  developer: ModelSelection;
+  reviewer: ModelSelection;
+  runs: number;
+  stories: number;
+}
+
+export interface ReleaseMergeEntry {
+  storyId: string;
+  runId: string;
+  commit: string;
+  strategy: RunMergeRecord["strategy"];
+  targetBranch: string;
+  mergedAt: string;
+  mergedBy: string;
+}
+
+export interface ReleaseDeploymentEntry {
+  storyId: string;
+  runId: string;
+  status: RunReleaseStatus;
+  environment: string;
+  commit: string;
+  kind: RunReleaseRecord["kind"];
+  requestedAt: string;
+  requestedBy: string;
+  finishedAt?: string;
+  url?: string;
+  deploymentId?: string;
+}
+
+export interface ReleaseTotals {
+  stories: number;
+  done: number;
+  /** `in_progress` | `in_review` | `awaiting_acceptance`. */
+  inProgress: number;
+  blocked: number;
+  /** `backlog` | `ready`. */
+  notStarted: number;
+  runs: number;
+}
+
+export interface ReleaseSummary {
+  releaseId: string;
+  projectId: string;
+  name: string;
+  version: string;
+  status: ReleaseStatus;
+  generatedAt: string;
+  stories: ReleaseStoryOutcome[];
+  totals: ReleaseTotals;
+  usage: UsageTotals;
+  modelCombinations: ModelCombination[];
+  merges: ReleaseMergeEntry[];
+  deployments: ReleaseDeploymentEntry[];
+}
+
+/** One story's review footprint, ordered by first run to form a trend. */
+export interface ReviewTrendPoint {
+  storyId: string;
+  title: string;
+  total: number;
+  resolved: number;
+  changesRequested: number;
+  notConverging: number;
+}
+
+export interface BlockedStoryInsight {
+  storyId: string;
+  title: string;
+  reason: string;
+  state: RunState | null;
+}
+
+export interface ReleaseRetrospective {
+  releaseId: string;
+  projectId: string;
+  name: string;
+  version: string;
+  generatedAt: string;
+  totals: ReleaseTotals;
+  cycleTime: CycleTimeStats;
+  rework: ReworkStats;
+  reviewFindings: ReviewFindingsStats;
+  /** Distinct runs that emitted `review.not_converging`. */
+  notConvergingRuns: number;
+  reviewTrend: ReviewTrendPoint[];
+  costPerCompletedStory: number;
+  usage: UsageTotals;
+  blockedStories: BlockedStoryInsight[];
+}
+
+export interface ReleaseShapeInput {
+  release: ReleaseIdentity;
+  generatedAt: string;
+  stories: MetricStory[];
+  runs: MetricRun[];
+  events: MetricEvent[];
+}
+
+interface ReleaseAnalysis {
+  core: MetricsCore;
+  outcomes: ReleaseStoryOutcome[];
+  totals: ReleaseTotals;
+  modelCombinations: ModelCombination[];
+  merges: ReleaseMergeEntry[];
+  deployments: ReleaseDeploymentEntry[];
+  blockedStories: BlockedStoryInsight[];
+  reviewTrend: ReviewTrendPoint[];
+  notConvergingRuns: number;
+}
+
+function toReleaseStoryOutcome(
+  story: MetricStory,
+  links: MetricRun[],
+  eventsByRun: Map<string, MetricEvent[]>,
+): { outcome: ReleaseStoryOutcome; firstRunAt: number | null; comboRuns: Map<string, number>; notConvergingRunIds: string[] } {
+  const latest = latestLinkedRun(links.map((link) => ({ run: link.run, linkedAt: link.linkedAt })));
+  const derived = deriveStoryStatus(latest?.run);
+  const status = derived?.status ?? story.status;
+
+  let cost = 0;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let modelCalls = 0;
+  let findingsTotal = 0;
+  let findingsResolved = 0;
+  let changesRequested = 0;
+  let notConverging = 0;
+  let firstRunAt: number | null = null;
+  const comboRuns = new Map<string, number>();
+  const notConvergingRunIds: string[] = [];
+
+  for (const link of links) {
+    const run = link.run;
+    cost += run.usage?.estimatedCost ?? 0;
+    inputTokens += run.usage?.inputTokens ?? 0;
+    outputTokens += run.usage?.outputTokens ?? 0;
+    modelCalls += run.modelCalls ?? 0;
+
+    const findings = run.findings ?? [];
+    findingsTotal += findings.length;
+    findingsResolved += findings.filter((finding) => finding.resolved).length;
+
+    for (const event of eventsByRun.get(run.id) ?? []) {
+      if (event.type === "review.changes_requested") changesRequested += 1;
+      if (event.type === "review.not_converging") {
+        notConverging += 1;
+        notConvergingRunIds.push(run.id);
+      }
+    }
+
+    const createdAt = parseTime(run.createdAt);
+    if (createdAt !== null && (firstRunAt === null || createdAt < firstRunAt)) firstRunAt = createdAt;
+
+    const developer = run.developer;
+    const reviewer = run.reviewer;
+    if (developer?.provider && developer.model && reviewer?.provider && reviewer.model) {
+      const key = `${developer.provider}::${developer.model}|${reviewer.provider}::${reviewer.model}`;
+      comboRuns.set(key, (comboRuns.get(key) ?? 0) + 1);
+    }
+  }
+
+  const acceptance = latest?.run.acceptance;
+  const outcome: ReleaseStoryOutcome = {
+    storyId: story.id,
+    title: story.title,
+    status,
+    runs: links.length,
+    ...(latest
+      ? {
+          latest: {
+            runId: latest.run.id,
+            state: latest.run.state,
+            round: latest.run.round ?? 0,
+            maxRounds: latest.run.maxRounds ?? 0,
+            updatedAt: latest.run.updatedAt,
+          },
+        }
+      : {}),
+    ...(acceptance
+      ? {
+          acceptance: {
+            acceptedAt: acceptance.acceptedAt,
+            acceptedBy: acceptance.acceptedBy,
+            acknowledgedOpenFindings: Boolean(acceptance.acknowledgedOpenFindings),
+            resolvedFindings: acceptance.findings?.resolved?.count ?? 0,
+            remainingFindings: acceptance.findings?.remaining?.count ?? 0,
+          },
+        }
+      : {}),
+    cost: round6(cost),
+    inputTokens,
+    outputTokens,
+    modelCalls,
+    findings: { total: findingsTotal, resolved: findingsResolved },
+    changesRequested,
+    notConverging,
+    ...(status === "blocked" && derived?.reason ? { blockedReason: derived.reason } : {}),
+  };
+  return { outcome, firstRunAt, comboRuns, notConvergingRunIds };
+}
+
+function analyzeRelease(stories: MetricStory[], runs: MetricRun[], events: MetricEvent[]): ReleaseAnalysis {
+  const core = shapeMetrics(stories, runs, events);
+  const storyIds = new Set(stories.map((story) => story.id));
+  const runsByStory = new Map<string, MetricRun[]>();
+  for (const link of runs) {
+    if (!storyIds.has(link.storyId)) continue;
+    const list = runsByStory.get(link.storyId);
+    if (list) list.push(link);
+    else runsByStory.set(link.storyId, [link]);
+  }
+  const eventsByRun = new Map<string, MetricEvent[]>();
+  for (const event of events) {
+    const list = eventsByRun.get(event.runId);
+    if (list) list.push(event);
+    else eventsByRun.set(event.runId, [event]);
+  }
+
+  const totals: ReleaseTotals = { stories: stories.length, done: 0, inProgress: 0, blocked: 0, notStarted: 0, runs: 0 };
+  const combos = new Map<string, { developer: ModelSelection; reviewer: ModelSelection; runs: number; stories: number }>();
+  const merges: ReleaseMergeEntry[] = [];
+  const deployments: ReleaseDeploymentEntry[] = [];
+  const blockedStories: BlockedStoryInsight[] = [];
+  const notConvergingRunIds = new Set<string>();
+  const analyzed: Array<{
+    outcome: ReleaseStoryOutcome;
+    firstRunAt: number | null;
+    comboRuns: Map<string, number>;
+    notConvergingRunIds: string[];
+  }> = [];
+
+  for (const story of stories) {
+    const links = runsByStory.get(story.id) ?? [];
+    const result = toReleaseStoryOutcome(story, links, eventsByRun);
+    analyzed.push(result);
+    totals.runs += links.length;
+
+    switch (result.outcome.status) {
+      case "done":
+        totals.done += 1;
+        break;
+      case "blocked":
+        totals.blocked += 1;
+        blockedStories.push({
+          storyId: story.id,
+          title: story.title,
+          reason: result.outcome.blockedReason?.trim() || "运行阻塞，等待人工处理",
+          state: result.outcome.latest?.state ?? null,
+        });
+        break;
+      case "in_progress":
+      case "in_review":
+      case "awaiting_acceptance":
+        totals.inProgress += 1;
+        break;
+      default:
+        totals.notStarted += 1;
+        break;
+    }
+
+    for (const [key, runCount] of result.comboRuns) {
+      const existing = combos.get(key);
+      if (existing) {
+        existing.runs += runCount;
+        existing.stories += 1;
+      } else {
+        const [developer, reviewer] = key.split("|");
+        const [devProvider, devModel] = developer.split("::");
+        const [revProvider, revModel] = reviewer.split("::");
+        combos.set(key, {
+          developer: { provider: devProvider, model: devModel },
+          reviewer: { provider: revProvider, model: revModel },
+          runs: runCount,
+          stories: 1,
+        });
+      }
+    }
+    for (const runId of result.notConvergingRunIds) notConvergingRunIds.add(runId);
+
+    for (const link of links) {
+      const merge = link.run.merge;
+      if (merge?.commit) {
+        merges.push({
+          storyId: story.id,
+          runId: link.run.id,
+          commit: merge.commit,
+          strategy: merge.strategy,
+          targetBranch: merge.targetBranch,
+          mergedAt: merge.mergedAt,
+          mergedBy: merge.mergedBy,
+        });
+      }
+      const release = link.run.release;
+      if (release?.commit) {
+        deployments.push({
+          storyId: story.id,
+          runId: link.run.id,
+          status: release.status,
+          environment: release.environment,
+          commit: release.commit,
+          kind: release.kind,
+          requestedAt: release.requestedAt,
+          requestedBy: release.requestedBy,
+          ...(release.finishedAt ? { finishedAt: release.finishedAt } : {}),
+          ...(release.url ? { url: release.url } : {}),
+          ...(release.deploymentId ? { deploymentId: release.deploymentId } : {}),
+        });
+      }
+    }
+  }
+
+  analyzed.sort((left, right) => {
+    const leftAt = left.firstRunAt ?? Number.POSITIVE_INFINITY;
+    const rightAt = right.firstRunAt ?? Number.POSITIVE_INFINITY;
+    if (leftAt !== rightAt) return leftAt - rightAt;
+    return left.outcome.storyId.localeCompare(right.outcome.storyId);
+  });
+
+  merges.sort((left, right) => right.mergedAt.localeCompare(left.mergedAt) || left.runId.localeCompare(right.runId));
+  deployments.sort((left, right) => right.requestedAt.localeCompare(left.requestedAt) || left.runId.localeCompare(right.runId));
+  blockedStories.sort((left, right) => left.storyId.localeCompare(right.storyId));
+
+  return {
+    core,
+    outcomes: analyzed.map((entry) => entry.outcome),
+    totals,
+    modelCombinations: [...combos.values()].sort(
+      (left, right) =>
+        left.developer.provider.localeCompare(right.developer.provider) ||
+        left.developer.model.localeCompare(right.developer.model) ||
+        left.reviewer.provider.localeCompare(right.reviewer.provider) ||
+        left.reviewer.model.localeCompare(right.reviewer.model),
+    ),
+    merges,
+    deployments,
+    blockedStories,
+    reviewTrend: analyzed.map((entry) => ({
+      storyId: entry.outcome.storyId,
+      title: entry.outcome.title,
+      total: entry.outcome.findings.total,
+      resolved: entry.outcome.findings.resolved,
+      changesRequested: entry.outcome.changesRequested,
+      notConverging: entry.outcome.notConverging,
+    })),
+    notConvergingRuns: notConvergingRunIds.size,
+  };
+}
+
+/** Pure release summary: per-story outcomes, totals, cost/tokens, model pairs, merges/deploys. */
+export function shapeReleaseSummary(input: ReleaseShapeInput): ReleaseSummary {
+  const analysis = analyzeRelease(input.stories, input.runs, input.events);
+  return {
+    releaseId: input.release.id,
+    projectId: input.release.projectId,
+    name: input.release.name,
+    version: input.release.version,
+    status: input.release.status,
+    generatedAt: input.generatedAt,
+    stories: analysis.outcomes,
+    totals: analysis.totals,
+    usage: analysis.core.usage,
+    modelCombinations: analysis.modelCombinations,
+    merges: analysis.merges,
+    deployments: analysis.deployments,
+  };
+}
+
+/** Pure retrospective: cycle time, rework, review trend, blocked stories, cost/story. */
+export function shapeReleaseRetrospective(input: ReleaseShapeInput): ReleaseRetrospective {
+  const analysis = analyzeRelease(input.stories, input.runs, input.events);
+  return {
+    releaseId: input.release.id,
+    projectId: input.release.projectId,
+    name: input.release.name,
+    version: input.release.version,
+    generatedAt: input.generatedAt,
+    totals: analysis.totals,
+    cycleTime: analysis.core.cycleTime,
+    rework: analysis.core.rework,
+    reviewFindings: analysis.core.reviewFindings,
+    notConvergingRuns: analysis.notConvergingRuns,
+    reviewTrend: analysis.reviewTrend,
+    costPerCompletedStory: analysis.core.costPerCompletedStory,
+    usage: analysis.core.usage,
+    blockedStories: analysis.blockedStories,
+  };
 }

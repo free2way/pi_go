@@ -1,14 +1,19 @@
 import {
   shapeMetrics,
+  shapeReleaseRetrospective,
+  shapeReleaseSummary,
   type AgileMetricsResponse,
   type MetricEvent,
   type MetricRun,
   type MetricStory,
   type ProjectMetrics,
+  type ReleaseIdentity,
+  type ReleaseRetrospective,
+  type ReleaseSummary,
   type SprintMetrics,
 } from "../shared/agile-metrics.js";
 import type { Run, RunState } from "../shared/types.js";
-import type { StoryStatus } from "../shared/agile.js";
+import type { ReleaseStatus, StoryStatus } from "../shared/agile.js";
 import type { Db } from "./db.js";
 
 /**
@@ -191,4 +196,140 @@ export async function readAgileMetrics(
   }));
 
   return { generatedAt, sprints, projects };
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 4 core — release summary / retrospective readers.
+//
+// Same bounded-row strategy as `readAgileMetrics`, but scoped by release id:
+// the release's `story_ids_json` is resolved against the owner's stories, then
+// only those stories' linked runs and the two review event types are read. An
+// unknown or foreign release resolves to `undefined` so the route can answer a
+// 404 without a leak; an empty release still shapes explicit zeros.
+
+type ReleaseRow = {
+  id: string;
+  project_id: string;
+  name: string;
+  version: string;
+  status: string;
+  story_ids_json: string;
+};
+
+export interface ReleaseDataset {
+  release: ReleaseIdentity;
+  stories: MetricStory[];
+  runs: MetricRun[];
+  events: MetricEvent[];
+}
+
+function parseStoryIds(value: string): string[] {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((entry): entry is string => typeof entry === "string");
+  } catch {
+    return [];
+  }
+}
+
+export async function readReleaseDataset(db: Db, ownerKeys: string[], releaseId: string): Promise<ReleaseDataset | undefined> {
+  if (ownerKeys.length === 0) return undefined;
+  const releaseRow = (await db.query(
+    `SELECT id, project_id, name, version, status, story_ids_json FROM agile_releases
+     WHERE id = $1 AND owner_id IN (${placeholders(ownerKeys.length, 2)})`,
+    [releaseId, ...ownerKeys],
+  )).rows[0] as unknown as ReleaseRow | undefined;
+  if (!releaseRow) return undefined;
+
+  const release: ReleaseIdentity = {
+    id: releaseRow.id,
+    projectId: releaseRow.project_id,
+    name: releaseRow.name,
+    version: releaseRow.version,
+    status: releaseRow.status as ReleaseStatus,
+  };
+
+  // Only story ids that actually belong to the caller are kept, so a stale or
+  // forged `story_ids_json` entry can never pull in a foreign story's runs.
+  const storyIds = [...new Set(parseStoryIds(releaseRow.story_ids_json))];
+  const stories: MetricStory[] = [];
+  const runs: MetricRun[] = [];
+  const events: MetricEvent[] = [];
+  if (storyIds.length === 0) return { release, stories, runs, events };
+
+  const storyRows = (await db.query(
+    `SELECT id, title, project_id, sprint_id, status FROM agile_stories
+     WHERE id IN (${placeholders(storyIds.length, 1)}) AND owner_id IN (${placeholders(ownerKeys.length, storyIds.length + 1)})`,
+    [...storyIds, ...ownerKeys],
+  )).rows as unknown as StoryRow[];
+  for (const row of storyRows) {
+    stories.push({
+      id: row.id,
+      title: row.title,
+      projectId: row.project_id,
+      sprintId: row.sprint_id,
+      status: row.status as StoryStatus,
+    });
+  }
+  const ownedStoryIds = stories.map((story) => story.id);
+  if (ownedStoryIds.length === 0) return { release, stories, runs, events };
+
+  const runRows = (await db.query(
+    `SELECT sr.story_id, sr.created_at AS linked_at, r.id AS run_id, r.state,
+            r.created_at, r.updated_at, r.document_json
+     FROM story_runs sr
+     JOIN runs r ON r.id = sr.run_id
+     WHERE sr.story_id IN (${placeholders(ownedStoryIds.length, 1)})`,
+    ownedStoryIds,
+  )).rows as unknown as LinkedRunRow[];
+  const ownedStorySet = new Set(ownedStoryIds);
+  const runIds: string[] = [];
+  for (const row of runRows) {
+    if (!ownedStorySet.has(row.story_id)) continue;
+    const run = safeParseRun(row);
+    if (!run) continue;
+    runs.push({ storyId: row.story_id, run, linkedAt: row.linked_at });
+    runIds.push(row.run_id);
+  }
+  if (runIds.length > 0) {
+    const eventRows = (await db.query(
+      `SELECT e.run_id, e.type, COUNT(*)::int AS count
+       FROM run_events e
+       WHERE e.run_id IN (${placeholders(runIds.length, 1)})
+         AND e.type IN ('review.changes_requested', 'review.not_converging')
+       GROUP BY e.run_id, e.type`,
+      runIds,
+    )).rows as unknown as EventRow[];
+    for (const row of eventRows) {
+      const count = Number(row.count) || 0;
+      for (let index = 0; index < count; index += 1) events.push({ runId: row.run_id, type: row.type });
+    }
+  }
+
+  return { release, stories, runs, events };
+}
+
+/** Owner-scoped release summary, or `undefined` when the release does not exist for the caller. */
+export async function readReleaseSummary(
+  db: Db,
+  ownerKeys: string[],
+  releaseId: string,
+  now: () => string = () => new Date().toISOString(),
+): Promise<ReleaseSummary | undefined> {
+  const dataset = await readReleaseDataset(db, ownerKeys, releaseId);
+  if (!dataset) return undefined;
+  return shapeReleaseSummary({ ...dataset, generatedAt: now() });
+}
+
+/** Owner-scoped release retrospective, or `undefined` when the release is not visible. */
+export async function readReleaseRetrospective(
+  db: Db,
+  ownerKeys: string[],
+  releaseId: string,
+  now: () => string = () => new Date().toISOString(),
+): Promise<ReleaseRetrospective | undefined> {
+  const dataset = await readReleaseDataset(db, ownerKeys, releaseId);
+  if (!dataset) return undefined;
+  return shapeReleaseRetrospective({ ...dataset, generatedAt: now() });
 }

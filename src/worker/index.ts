@@ -38,7 +38,7 @@ import { runGuardedMerge, type GuardedMergeResult, type MergeGuardGitExec } from
 import { WorkspaceLockManager, workspaceKeyFor } from "./workspace-lock.js";
 import { PiRunError, failureOutputForEvent } from "./agent-failure.js";
 import { captureFailedSubAgentWorktree } from "./subagent-artifacts.js";
-import { recoveryResumePhase, recoveryUpdateState } from "./run-recovery.js";
+import { MAX_ROUNDS_MESSAGE, planRecovery, recoveryResumePhase, recoveryUpdateState } from "./run-recovery.js";
 import { callbackBodyExceedsInlineLimit, encodeCallbackBody, persistDiffArtifact, type DiffArtifactRef } from "./diff-artifacts.js";
 import { uploadRunArtifact } from "./artifact-upload.js";
 import { captureSnapshotHash } from "./snapshot-hash.js";
@@ -1775,6 +1775,39 @@ async function executeJob(input: JobInput, controller: AbortController) {
     controller.abort();
   });
   try {
+    // R3-001 / R3-FINAL-ROUND-AMBIGUOUS: terminal stop conditions are evaluated
+    // before any worktree-dependent recovery/preparation, so a reclaimed run that
+    // already reached its round cap, exhausted its budget or overran its deadline
+    // stops with the existing event/message semantics instead of being processed
+    // further. The worktree is still required (fail-closed) for a genuine
+    // mid-flight resume, which the planner lets through.
+    if (recovering) {
+      const plan = planRecovery({
+        state: run.state,
+        recovery: true,
+        resume: Boolean(input.resume),
+        retryReview: Boolean(input.retryReview),
+        round: run.round,
+        maxRounds: run.maxRounds,
+        usage: run.usage,
+        modelCalls: run.modelCalls,
+        limits: runLimits,
+        createdAt: run.createdAt,
+        deadlineBaseAt: run.deadlineBaseAt,
+      });
+      if (plan.stop) {
+        const maxRoundsStop = plan.reason === "max_rounds";
+        await update(run, "needs_human", "system", plan.eventType, plan.message, {
+          ...(maxRoundsStop ? { findings: run.findings } : {}),
+          usage: toRunUsage(usage),
+          usageRoles: run.usageRoles,
+          modelCalls: run.modelCalls,
+          durationMs: Date.now() - started,
+          summary: maxRoundsStop ? plan.message : plan.message.slice(0, 300),
+        });
+        return;
+      }
+    }
     const project = await resolveProject(run.repository);
     const dirty = await git(project, ["status", "--porcelain"], controller.signal);
     if (dirty) throw new Error("Source repository has uncommitted changes; clean it before starting a real run");
@@ -2109,7 +2142,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
       await chat(run, "handoff", "reviewer", "developer", "feedback", feedback, controller.signal, { findings: review.findings.map((item) => ({ ...item, resolved: false })) });
       await update(run, "developing", "reviewer", "review.changes_requested", `审核发现 ${review.findings.length} 个问题，退回 Developer`, { findings, summary: review.summary, usage: toRunUsage(usage) });
     }
-    await update(run, "needs_human", "system", "run.needs_human", "达到最大审核轮次，需要人工处理", { findings, usage: toRunUsage(usage), usageRoles: run.usageRoles, modelCalls: run.modelCalls, durationMs: Date.now() - started });
+    await update(run, "needs_human", "system", "run.needs_human", MAX_ROUNDS_MESSAGE, { findings, usage: toRunUsage(usage), usageRoles: run.usageRoles, modelCalls: run.modelCalls, durationMs: Date.now() - started });
   } catch (error) {
     if (deadlineExceeded) {
       terminalRecorded = false;

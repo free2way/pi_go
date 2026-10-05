@@ -1,10 +1,10 @@
-import { BarChart3, ClipboardList, ListChecks, LoaderCircle, Plus, Rocket, Trash2, X } from "lucide-react";
+import { BarChart3, ClipboardList, Copy, Download, ListChecks, LoaderCircle, Plus, Rocket, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { applyModelTemplate, STORY_PRIORITIES, STORY_STATUSES, STORY_STATUS_LABELS, type AgileProject, type AgileRelease, type AgileSprint, type AgileStory, type ModelTemplate, type StoryDetail, type StoryPriority, type StoryStatus } from "../shared/agile";
-import type { AgileMetricsResponse } from "../shared/agile-metrics";
+import type { AgileMetricsResponse, ReleaseRetrospective, ReleaseSummary } from "../shared/agile-metrics";
 import type { ConfigStatus, ModelCatalogResponse, RunState, Workspace } from "../shared/types";
 import { api } from "./api";
-import { columnPoints, estimateLabel, groupStoriesByColumn, priorityLabel, splitLines, storyReference } from "./agile-view";
+import { columnPoints, estimateLabel, groupStoriesByColumn, priorityLabel, releaseExportFilename, releaseExportJson, splitLines, storyReference } from "./agile-view";
 
 const runStateLabels: Record<RunState, string> = {
   queued: "排队中",
@@ -52,12 +52,19 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
-  const [panel, setPanel] = useState<"none" | "project" | "sprint" | "story" | "metrics">("none");
+  const [panel, setPanel] = useState<"none" | "project" | "sprint" | "story" | "metrics" | "release">("none");
   const [templates, setTemplates] = useState<ModelTemplate[]>([]);
   const [models, setModels] = useState<ModelCatalogResponse>();
   const [metrics, setMetrics] = useState<AgileMetricsResponse>();
   const [metricsLoading, setMetricsLoading] = useState(false);
   const [metricsSprintId, setMetricsSprintId] = useState("");
+  // Sprint 4 core: release detail panel (summary + retrospective export).
+  const [releaseDetailId, setReleaseDetailId] = useState("");
+  const [releaseSummary, setReleaseSummary] = useState<ReleaseSummary>();
+  const [releaseRetrospective, setReleaseRetrospective] = useState<ReleaseRetrospective>();
+  const [releaseLoading, setReleaseLoading] = useState(false);
+  const [releaseExporting, setReleaseExporting] = useState(false);
+  const [releaseExportNote, setReleaseExportNote] = useState("");
 
   // new-project form
   const [projectName, setProjectName] = useState("");
@@ -118,6 +125,9 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
   useEffect(() => {
     setSelectedId("");
     setDetail(undefined);
+    setReleaseDetailId("");
+    setReleaseSummary(undefined);
+    setReleaseRetrospective(undefined);
     if (projectId) void loadProjectData(projectId);
     else { setStories([]); setSprints([]); setReleases([]); }
   }, [projectId, loadProjectData]);
@@ -143,6 +153,29 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
       .finally(() => { if (!cancelled) setMetricsLoading(false); });
     return () => { cancelled = true; };
   }, [panel, projectId, metricsSprintId]);
+
+  // Sprint 4 core: 发布回顾 panel data. Read-only, owner-scoped; the picker
+  // defaults to the first release of the project and refetches on switch.
+  useEffect(() => {
+    setReleaseSummary(undefined);
+    setReleaseRetrospective(undefined);
+    if (panel !== "release" || !projectId) return;
+    const id = releaseDetailId || releases[0]?.id || "";
+    if (!id) return;
+    if (!releaseDetailId) setReleaseDetailId(id);
+    let cancelled = false;
+    setReleaseLoading(true);
+    setReleaseExportNote("");
+    void Promise.all([api.releaseSummary(id), api.releaseRetrospective(id)])
+      .then(([summary, retrospective]) => {
+        if (cancelled) return;
+        setReleaseSummary(summary);
+        setReleaseRetrospective(retrospective);
+      })
+      .catch((cause) => { if (!cancelled) setError((cause as Error).message || "加载发布汇总失败"); })
+      .finally(() => { if (!cancelled) setReleaseLoading(false); });
+    return () => { cancelled = true; };
+  }, [panel, projectId, releaseDetailId, releases]);
 
   const visibleStories = useMemo(
     () => stories.filter((story) => {
@@ -314,6 +347,40 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
     }
   };
 
+  // 「导出回顾 (JSON)」: downloads the retrospective payload and best-effort
+  // copies it to the clipboard. No secrets are present in these datasets.
+  const exportRetrospective = async () => {
+    if (!releaseSummary || !releaseRetrospective) return;
+    setReleaseExporting(true);
+    setReleaseExportNote("");
+    try {
+      const json = releaseExportJson({ summary: releaseSummary, retrospective: releaseRetrospective });
+      const filename = releaseExportFilename(releaseSummary);
+      const url = URL.createObjectURL(new Blob([json], { type: "application/json" }));
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+      let copied = false;
+      try {
+        if (navigator.clipboard?.writeText) {
+          await navigator.clipboard.writeText(json);
+          copied = true;
+        }
+      } catch {
+        copied = false;
+      }
+      setReleaseExportNote(copied ? `已下载 ${filename}，并已复制到剪贴板` : `已下载 ${filename}`);
+    } catch (cause) {
+      setReleaseExportNote((cause as Error).message || "导出失败");
+    } finally {
+      setReleaseExporting(false);
+    }
+  };
+
   return (
     <div className="workspaces-page">
       <section className="ws-heading">
@@ -327,6 +394,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
           <button className="button secondary" disabled={!projectId} onClick={() => { setPanel(panel === "sprint" ? "none" : "sprint"); setError(""); }}><Plus size={15} />新建冲刺</button>
           <button className="button secondary" disabled={!projectId} onClick={() => { setPanel(panel === "story" ? "none" : "story"); setError(""); }}><Plus size={15} />新建故事</button>
           <button className={`button secondary ${panel === "metrics" ? "active" : ""}`} disabled={!projectId} onClick={() => { setPanel(panel === "metrics" ? "none" : "metrics"); setError(""); }}><BarChart3 size={15} />度量</button>
+          <button className={`button secondary ${panel === "release" ? "active" : ""}`} disabled={!projectId || releases.length === 0} onClick={() => { setPanel(panel === "release" ? "none" : "release"); setError(""); }}><Rocket size={15} />发布回顾</button>
         </div>
       </section>
 
@@ -526,6 +594,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
                     <code>{release.version}</code>
                     <span>{release.name}</span>
                     <small>{releaseStatusLabels[release.status]} · {release.storyIds.length} 个故事</small>
+                    <button type="button" onClick={() => { setReleaseDetailId(release.id); setPanel("release"); setError(""); }}>回顾</button>
                   </div>
                 ))}
                 {releases.length === 0 && <div className="agile-hint">还没有发布记录。</div>}
@@ -596,6 +665,144 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
                     ))}
                   </div>
                 )}
+              </>
+            )}
+          </div>
+        </section>
+      )}
+
+      {panel === "release" && (
+        <section className="panel agile-metrics agile-release">
+          <div className="panel-head"><div><span className="eyebrow">RELEASE SUMMARY</span><h3>发布回顾</h3></div><Rocket size={15} /></div>
+          <div className="agile-metrics-body">
+            <div className="agile-toolbar">
+              <label>发布
+                <select value={releaseDetailId} onChange={(event) => setReleaseDetailId(event.target.value)}>
+                  {releases.map((release) => <option key={release.id} value={release.id}>{release.version} · {release.name}</option>)}
+                </select>
+              </label>
+              <button type="button" className="button secondary" disabled={!releaseSummary || !releaseRetrospective || releaseExporting} onClick={() => void exportRetrospective()}>
+                {releaseExporting ? <LoaderCircle className="spin" size={15} /> : <Download size={15} />}导出回顾 (JSON)
+              </button>
+              <button type="button" className="button secondary" disabled={!releaseSummary || !releaseRetrospective} onClick={() => { void navigator.clipboard?.writeText(releaseExportJson({ summary: releaseSummary!, retrospective: releaseRetrospective! })).then(() => setReleaseExportNote("已复制回顾 JSON 到剪贴板")).catch(() => setReleaseExportNote("复制失败，请使用导出按钮")); }}>
+                <Copy size={15} />复制
+              </button>
+              <span className="agile-hint">只读汇总：故事结果、成本/Token、模型组合、合并与部署记录，以及周期/返工回顾。</span>
+            </div>
+            {releaseExportNote && <div className="agile-hint">{releaseExportNote}</div>}
+            {releaseLoading && <div className="ws-empty"><LoaderCircle className="spin" size={18} /><span>正在计算发布汇总…</span></div>}
+            {!releaseLoading && releases.length === 0 && <div className="agile-hint">当前项目还没有发布记录。</div>}
+            {!releaseLoading && releaseSummary && releaseRetrospective && (
+              <>
+                <div className="metrics-grid agile-metrics-grid">
+                  <div className="metric"><span>完成故事</span><strong>{releaseSummary.totals.done}/{releaseSummary.totals.stories}</strong><small>未开始 {releaseSummary.totals.notStarted}</small></div>
+                  <div className="metric"><span>进行中</span><strong>{releaseSummary.totals.inProgress}</strong><small>开发 / 审核 / 待验收</small></div>
+                  <div className="metric"><span>阻塞</span><strong>{releaseSummary.totals.blocked}</strong><small>关联运行 {releaseSummary.totals.runs}</small></div>
+                  <div className="metric"><span>成本 / 完成故事</span><strong>${releaseRetrospective.costPerCompletedStory.toFixed(3)}</strong><small>合计 ${releaseSummary.usage.cost.toFixed(3)}</small></div>
+                </div>
+                <div className="agile-metrics-cols">
+                  <div>
+                    <h4>周期与返工</h4>
+                    <div className="agile-metrics-row"><span>周期 中位</span><strong>{formatDuration(releaseRetrospective.cycleTime.medianSeconds)}</strong></div>
+                    <div className="agile-metrics-row"><span>周期 P90</span><strong>{formatDuration(releaseRetrospective.cycleTime.p90Seconds)}</strong></div>
+                    <div className="agile-metrics-row"><span>周期样本</span><strong>{releaseRetrospective.cycleTime.samples}</strong></div>
+                    <div className="agile-metrics-row"><span>返工率</span><strong>{(releaseRetrospective.rework.rate * 100).toFixed(0)}%</strong></div>
+                  </div>
+                  <div>
+                    <h4>用量</h4>
+                    <div className="agile-metrics-row"><span>模型调用</span><strong>{releaseSummary.usage.modelCalls}</strong></div>
+                    <div className="agile-metrics-row"><span>Token 输入/输出</span><strong>{releaseSummary.usage.inputTokens} / {releaseSummary.usage.outputTokens}</strong></div>
+                    <div className="agile-metrics-row"><span>缓存读取</span><strong>{releaseSummary.usage.cacheReadTokens}</strong></div>
+                    <div className="agile-metrics-row"><span>关联运行</span><strong>{releaseSummary.usage.runs}</strong></div>
+                  </div>
+                  <div>
+                    <h4>审核</h4>
+                    <div className="agile-metrics-row"><span>发现 已解决/合计</span><strong>{releaseRetrospective.reviewFindings.resolved}/{releaseRetrospective.reviewFindings.total}</strong></div>
+                    <div className="agile-metrics-row"><span>退回事件</span><strong>{releaseRetrospective.reviewTrend.reduce((count, point) => count + point.changesRequested, 0)}</strong></div>
+                    <div className="agile-metrics-row"><span>未收敛运行</span><strong>{releaseRetrospective.notConvergingRuns}</strong></div>
+                    <div className="agile-metrics-row"><span>未收敛事件</span><strong>{releaseRetrospective.reviewFindings.notConverging}</strong></div>
+                  </div>
+                </div>
+
+                <div className="agile-metrics-sprints">
+                  <h4>故事结果</h4>
+                  <div className="agile-metrics-row agile-metrics-head"><span>故事</span><strong>状态</strong><strong>运行/轮次</strong><strong>发现</strong><strong>成本</strong></div>
+                  {releaseSummary.stories.map((story) => (
+                    <div className="agile-metrics-row" key={story.storyId}>
+                      <span>{story.title}{story.acceptance ? " · 已验收" : ""}{story.blockedReason ? ` · ${story.blockedReason}` : ""}</span>
+                      <strong>{STORY_STATUS_LABELS[story.status]}</strong>
+                      <strong>{story.runs}{story.latest ? ` · 第 ${story.latest.round}/${story.latest.maxRounds} 轮` : ""}</strong>
+                      <strong>{story.findings.resolved}/{story.findings.total}</strong>
+                      <strong>${story.cost.toFixed(4)}</strong>
+                    </div>
+                  ))}
+                  {releaseSummary.stories.length === 0 && <div className="agile-hint">该发布还没有关联故事。</div>}
+                </div>
+
+                <div className="agile-metrics-sprints">
+                  <h4>模型组合</h4>
+                  <div className="agile-metrics-row agile-metrics-head"><span>开发 / 审核</span><strong>运行</strong><strong>故事</strong><strong /><strong /></div>
+                  {releaseSummary.modelCombinations.map((combo) => (
+                    <div className="agile-metrics-row" key={`${combo.developer.provider}::${combo.developer.model}|${combo.reviewer.provider}::${combo.reviewer.model}`}>
+                      <span>{combo.developer.provider}:{combo.developer.model} / {combo.reviewer.provider}:{combo.reviewer.model}</span>
+                      <strong>{combo.runs}</strong>
+                      <strong>{combo.stories}</strong>
+                      <strong />
+                      <strong />
+                    </div>
+                  ))}
+                  {releaseSummary.modelCombinations.length === 0 && <div className="agile-hint">还没有关联运行的模型组合。</div>}
+                </div>
+
+                <div className="agile-metrics-sprints">
+                  <h4>合并与部署</h4>
+                  <div className="agile-metrics-row agile-metrics-head"><span>运行</span><strong>类型</strong><strong>目标</strong><strong>状态</strong><strong>时间</strong></div>
+                  {releaseSummary.merges.map((merge) => (
+                    <div className="agile-metrics-row" key={`merge-${merge.runId}`}>
+                      <span title={merge.commit}>{merge.runId.slice(0, 12)}</span>
+                      <strong>合并 ({merge.strategy})</strong>
+                      <strong>{merge.targetBranch}</strong>
+                      <strong>{merge.commit.slice(0, 7)}</strong>
+                      <strong>{formatTime(merge.mergedAt)}</strong>
+                    </div>
+                  ))}
+                  {releaseSummary.deployments.map((deploy) => (
+                    <div className="agile-metrics-row" key={`deploy-${deploy.runId}-${deploy.commit}`}>
+                      <span title={deploy.commit}>{deploy.runId.slice(0, 12)}</span>
+                      <strong>部署 ({deploy.kind})</strong>
+                      <strong>{deploy.environment}</strong>
+                      <strong>{deploy.status}{deploy.url ? ` · ${deploy.url}` : ""}</strong>
+                      <strong>{formatTime(deploy.finishedAt ?? deploy.requestedAt)}</strong>
+                    </div>
+                  ))}
+                  {releaseSummary.merges.length === 0 && releaseSummary.deployments.length === 0 && <div className="agile-hint">没有合并或部署记录。</div>}
+                </div>
+
+                <div className="agile-metrics-sprints">
+                  <h4>审核趋势</h4>
+                  <div className="agile-metrics-row agile-metrics-head"><span>故事</span><strong>发现 已解决/合计</strong><strong>退回</strong><strong>未收敛</strong><strong /></div>
+                  {releaseRetrospective.reviewTrend.map((point) => (
+                    <div className="agile-metrics-row" key={`trend-${point.storyId}`}>
+                      <span>{point.title}</span>
+                      <strong>{point.resolved}/{point.total}</strong>
+                      <strong>{point.changesRequested}</strong>
+                      <strong>{point.notConverging}</strong>
+                      <strong />
+                    </div>
+                  ))}
+                  {releaseRetrospective.reviewTrend.length === 0 && <div className="agile-hint">没有可统计的审核记录。</div>}
+                </div>
+
+                <div className="agile-metrics-sprints">
+                  <h4>阻塞故事（{releaseRetrospective.blockedStories.length}）</h4>
+                  {releaseRetrospective.blockedStories.map((story) => (
+                    <div className="agile-metrics-row" key={`blocked-${story.storyId}`}>
+                      <span>{story.title}</span>
+                      <strong>{story.state ? `${runStateLabels[story.state]} · ` : ""}{story.reason}</strong>
+                    </div>
+                  ))}
+                  {releaseRetrospective.blockedStories.length === 0 && <div className="agile-hint">没有阻塞故事。</div>}
+                </div>
               </>
             )}
           </div>

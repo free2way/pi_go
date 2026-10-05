@@ -759,6 +759,9 @@ button.agile-metrics-row:hover strong { color: #c3d274; }
 .agile-metrics-sprints .agile-metrics-row { display: grid; grid-template-columns: 1.6fr repeat(4, 1fr); }
 .agile-metrics-sprints .agile-metrics-row span, .agile-metrics-sprints .agile-metrics-row strong { text-align: right; }
 .agile-metrics-sprints .agile-metrics-row span:first-child { text-align: left; }
+.agile-release { margin-top: 16px; }
+.agile-release-row button { border: 1px solid #2b323a; background: #151a1f; color: #8b96a0; border-radius: 4px; font: 500 var(--panel-mono-fs) "DM Mono", monospace; padding: 2px 7px; cursor: pointer; }
+.agile-release-row button:hover { color: #c3d274; border-color: rgba(223,248,84,.35); }
 .agile-budget-row { grid-template-columns: repeat(4, 1fr); }
 @media (max-width: 1100px) { .agile-metrics-cols { grid-template-columns: 1fr; } .agile-budget-row { grid-template-columns: 1fr 1fr; } }
 @media (max-width: 760px) { .agile-metrics-sprints .agile-metrics-row { grid-template-columns: 1fr 1fr; } }

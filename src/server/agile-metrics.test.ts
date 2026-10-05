@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Run } from "../shared/types.js";
 import type { AcceptanceSnapshot } from "../shared/types.js";
 import { AgileService } from "./agile.js";
-import { readAgileMetrics } from "./agile-metrics.js";
+import { readAgileMetrics, readReleaseRetrospective, readReleaseSummary } from "./agile-metrics.js";
 import { createTestDb } from "./test-db.js";
 import type { Db } from "./db.js";
 
@@ -135,5 +135,74 @@ describe("readAgileMetrics", () => {
     expect(scoped.sprints).toHaveLength(1);
     expect(scoped.sprints[0].stories.total).toBe(1);
     expect(scoped.sprints[0].stories.byStatus.backlog).toBe(1);
+  });
+});
+
+describe("readReleaseSummary / readReleaseRetrospective", () => {
+  it("shapes the release dataset from owner-scoped stories and their linked runs", async () => {
+    const db = await createTestDb();
+    const service = new AgileService(db);
+    const project = await service.createProject("user_a", { name: "认证服务", key: "AUTH" });
+    const done = await service.createStory("user_a", { projectId: project.id, title: "完成的" });
+    const blocked = await service.createStory("user_a", { projectId: project.id, title: "阻塞的" });
+    const release = await service.createRelease("user_a", { projectId: project.id, name: "结账发布", version: "v1.0.0", storyIds: [done.id, blocked.id] });
+
+    await insertRun(db, makeRun("run_done", "completed", {
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-02T00:00:00.000Z",
+      acceptance: acceptance("2026-01-02T00:00:00.000Z"),
+      usage: { inputTokens: 100, outputTokens: 40, cacheReadTokens: 3, estimatedCost: 0.5 },
+      modelCalls: 4,
+      merge: { commit: "abc123", strategy: "merge-commit", targetBranch: "main", mergedAt: "2026-01-02T01:00:00.000Z", mergedBy: "user_a" },
+      release: { deliveryId: "d1", status: "succeeded", environment: "prod", commit: "abc123", targetBranch: "main", requestedAt: "2026-01-02T02:00:00.000Z", requestedBy: "user_a", startedAt: "2026-01-02T02:00:01.000Z", attempt: 1, kind: "webhook" },
+    }));
+    await insertRun(db, makeRun("run_blocked", "needs_human", { summary: "缺少凭据" }));
+    await service.linkRun(done.id, "run_done");
+    await service.linkRun(blocked.id, "run_blocked");
+    await insertEvent(db, "run_done", 1, "review.changes_requested");
+    await insertEvent(db, "run_blocked", 2, "review.not_converging");
+
+    const summary = await readReleaseSummary(db, ["user_a"], release.id);
+    expect(summary).toBeDefined();
+    expect(summary!.totals).toEqual({ stories: 2, done: 1, inProgress: 0, blocked: 1, notStarted: 0, runs: 2 });
+    expect(summary!.usage).toMatchObject({ cost: 0.5, modelCalls: 4, runs: 2 });
+    expect(summary!.merges).toHaveLength(1);
+    expect(summary!.deployments).toHaveLength(1);
+
+    const retro = await readReleaseRetrospective(db, ["user_a"], release.id);
+    expect(retro).toBeDefined();
+    expect(retro!.cycleTime.samples).toBe(1);
+    expect(retro!.notConvergingRuns).toBe(1);
+    expect(retro!.reviewFindings.notConverging).toBe(1);
+    expect(retro!.blockedStories.map((story) => story.reason)).toEqual(["缺少凭据"]);
+    expect(retro!.costPerCompletedStory).toBe(0.5);
+  });
+
+  it("returns undefined for an unknown release and never leaks another owner's release", async () => {
+    const db = await createTestDb();
+    const service = new AgileService(db);
+    const project = await service.createProject("user_a", { name: "认证服务", key: "AUTH" });
+    const release = await service.createRelease("user_a", { projectId: project.id, name: "结账发布", version: "v1.0.0", storyIds: [] });
+
+    expect(await readReleaseSummary(db, ["user_b"], release.id)).toBeUndefined();
+    expect(await readReleaseRetrospective(db, ["user_b"], release.id)).toBeUndefined();
+    expect(await readReleaseSummary(db, ["user_a"], "rel_missing")).toBeUndefined();
+    expect(await readReleaseRetrospective(db, [], release.id)).toBeUndefined();
+  });
+
+  it("shapes an empty release as explicit zeros", async () => {
+    const db = await createTestDb();
+    const service = new AgileService(db);
+    const project = await service.createProject("user_a", { name: "认证服务", key: "AUTH" });
+    const release = await service.createRelease("user_a", { projectId: project.id, name: "结账发布", version: "v1.0.0", storyIds: [] });
+
+    const summary = await readReleaseSummary(db, ["user_a"], release.id);
+    expect(summary).toMatchObject({ releaseId: release.id, version: "v1.0.0" });
+    expect(summary!.totals).toEqual({ stories: 0, done: 0, inProgress: 0, blocked: 0, notStarted: 0, runs: 0 });
+    expect(summary!.stories).toEqual([]);
+
+    const retro = await readReleaseRetrospective(db, ["user_a"], release.id);
+    expect(retro!.cycleTime.samples).toBe(0);
+    expect(retro!.costPerCompletedStory).toBe(0);
   });
 });

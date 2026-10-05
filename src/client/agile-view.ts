@@ -1,4 +1,5 @@
 import { BOARD_COLUMNS, boardColumnFor, STORY_ESTIMATE_LABELS, STORY_PRIORITY_LABELS, type AgileStory, type BoardColumnId } from "../shared/agile";
+import type { ReleaseRetrospective, ReleaseSummary } from "../shared/agile-metrics";
 
 export interface BoardColumnGroup {
   id: BoardColumnId;
@@ -37,4 +38,32 @@ export function storyReference(key: string, index: number): string {
 /** Client-side total of the estimates in a board column ("点数" summary). */
 export function columnPoints(group: BoardColumnGroup): number {
   return group.stories.reduce((total, story) => total + (story.estimate ?? 0), 0);
+}
+
+/**
+ * Stable export payload for the 「导出回顾 (JSON)」 action: the summary and the
+ * retrospective exactly as the API returned them, plus a schema marker so a
+ * later importer can tell revisions apart.
+ */
+export function releaseExportPayload(input: {
+  summary: ReleaseSummary;
+  retrospective: ReleaseRetrospective;
+}): { schemaVersion: number; exportedAt: string; summary: ReleaseSummary; retrospective: ReleaseRetrospective } {
+  return {
+    schemaVersion: 1,
+    exportedAt: new Date().toISOString(),
+    summary: input.summary,
+    retrospective: input.retrospective,
+  };
+}
+
+export function releaseExportJson(input: { summary: ReleaseSummary; retrospective: ReleaseRetrospective }): string {
+  return JSON.stringify(releaseExportPayload(input), null, 2);
+}
+
+/** Filesystem-safe download name, e.g. `release-v1.2.0-checkout-retrospective.json`. */
+export function releaseExportFilename(summary: Pick<ReleaseSummary, "version" | "name" | "releaseId">): string {
+  const raw = `${summary.version}-${summary.name}`.trim();
+  const safe = raw.replace(/[^\w.-]+/g, "_").replace(/^[_.-]+|[_.-]+$/g, "");
+  return `release-${safe || summary.releaseId}-retrospective.json`;
 }

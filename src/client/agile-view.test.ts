@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { deriveStoryStatus, type AgileStory } from "../shared/agile";
-import { columnPoints, estimateLabel, groupStoriesByColumn, priorityLabel, splitLines, storyReference } from "./agile-view";
+import type { ReleaseRetrospective, ReleaseSummary } from "../shared/agile-metrics";
+import { columnPoints, estimateLabel, groupStoriesByColumn, priorityLabel, releaseExportFilename, releaseExportJson, splitLines, storyReference } from "./agile-view";
 
 function story(overrides: Partial<AgileStory>): AgileStory {
   return {
@@ -70,5 +71,52 @@ describe("agile view helpers", () => {
   it("builds a story reference from the project key and 1-based index", () => {
     expect(storyReference("AUTH", 0)).toBe("AUTH-1");
     expect(storyReference("AUTH", 11)).toBe("AUTH-12");
+  });
+});
+
+describe("release export helpers", () => {
+  const summary = {
+    releaseId: "rel_1",
+    projectId: "proj_1",
+    name: "Checkout",
+    version: "v1.2.0",
+    status: "released",
+    generatedAt: "2026-02-01T00:00:00.000Z",
+    stories: [],
+    totals: { stories: 0, done: 0, inProgress: 0, blocked: 0, notStarted: 0, runs: 0 },
+    usage: { cost: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, modelCalls: 0, runs: 0 },
+    modelCombinations: [],
+    merges: [],
+    deployments: [],
+  } as ReleaseSummary;
+  const retrospective = {
+    releaseId: "rel_1",
+    projectId: "proj_1",
+    name: "Checkout",
+    version: "v1.2.0",
+    generatedAt: "2026-02-01T00:00:00.000Z",
+    totals: { stories: 0, done: 0, inProgress: 0, blocked: 0, notStarted: 0, runs: 0 },
+    cycleTime: { samples: 0, medianSeconds: 0, p90Seconds: 0, items: [] },
+    rework: { completed: 0, reworked: 0, rate: 0 },
+    reviewFindings: { total: 0, resolved: 0, notConverging: 0 },
+    notConvergingRuns: 0,
+    reviewTrend: [],
+    costPerCompletedStory: 0,
+    usage: { cost: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, modelCalls: 0, runs: 0 },
+    blockedStories: [],
+  } as ReleaseRetrospective;
+
+  it("serializes a schema-versioned payload with both datasets", () => {
+    const payload = JSON.parse(releaseExportJson({ summary, retrospective }));
+    expect(payload.schemaVersion).toBe(1);
+    expect(typeof payload.exportedAt).toBe("string");
+    expect(payload.summary.version).toBe("v1.2.0");
+    expect(payload.retrospective.notConvergingRuns).toBe(0);
+  });
+
+  it("derives a filesystem-safe filename and falls back to the release id", () => {
+    expect(releaseExportFilename(summary)).toBe("release-v1.2.0-Checkout-retrospective.json");
+    expect(releaseExportFilename({ version: " v1 ", name: "结账 发布", releaseId: "rel_9" })).toBe("release-v1-retrospective.json");
+    expect(releaseExportFilename({ version: "", name: "", releaseId: "rel_9" })).toBe("release-rel_9-retrospective.json");
   });
 });

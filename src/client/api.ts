@@ -1,4 +1,4 @@
-import type { AgileMetricsResponse } from "../shared/agile-metrics";
+import type { AgileMetricsResponse, ReleaseRetrospective, ReleaseSummary } from "../shared/agile-metrics";
 import type { AgileProject, AgileRelease, AgileSprint, AgileStory, ModelTemplate, StoryDetail, StoryPriority, StoryStatus } from "../shared/agile";
 import type { ConfigStatus, CredentialStatus, CurrentUser, ModelCatalogResponse, ModelSelection, Run, RunArtifact, RunEvent, RunRoundsResponse, RunState, Workspace, AccountDetail, AccountSummary, AccountWorkspaceOption, WorkspacePermission } from "../shared/types";
 
@@ -228,6 +228,10 @@ export const api = {
     const suffix = search.toString();
     return request<AgileMetricsResponse>(`/api/agile/metrics${suffix ? `?${suffix}` : ""}`);
   },
+  /** Sprint 4 core: owner-scoped release summary (per-story outcomes + totals). */
+  releaseSummary: (id: string) => request<ReleaseSummary>(`/api/agile/releases/${encodeURIComponent(id)}/summary`),
+  /** Sprint 4 core: owner-scoped release retrospective dataset. */
+  releaseRetrospective: (id: string) => request<ReleaseRetrospective>(`/api/agile/releases/${encodeURIComponent(id)}/retrospective`),
   // Sprint 4: owner-scoped saved model combinations ("模板").
   templates: () => request<{ templates: ModelTemplate[] }>("/api/templates"),
   createTemplate: (body: { name: string; developerModel: ModelSelection; reviewerModel: ModelSelection; budget?: ModelTemplate["budget"]; maxParallel?: number | null }) =>

@@ -42,7 +42,7 @@ import { buildMergeRequestPayload, mergeRequestUnavailable, patchFileName, resol
 import { planReopen, reopenEventMeta } from "./run-reopen.js";
 import { isActiveRelease, planReleaseStart, sameReleaseAttempt } from "./run-release.js";
 import { AgileError, AgileService } from "./agile.js";
-import { readAgileMetrics } from "./agile-metrics.js";
+import { readAgileMetrics, readReleaseRetrospective, readReleaseSummary } from "./agile-metrics.js";
 import { projectCreateSchema, projectPatchSchema, releaseCreateSchema, releasePatchSchema, sprintCreateSchema, sprintPatchSchema, storyCreateSchema, storyPatchSchema, storySubmitSchema, templateCreateSchema } from "./agile-schemas.js";
 import { executeRelease } from "./release-execution.js";
 import type { RunStoreLike } from "./store.js";
@@ -530,7 +530,7 @@ app.get("/api/health", async (_request, reply) => {
   try {
     await pingDatabase();
     alerts.clear("database_unavailable");
-    return { status: "ok", service: "pigo-web", version: "0.25.2", db: "ok" };
+    return { status: "ok", service: "pigo-web", version: "0.25.3", db: "ok" };
   } catch (error) {
     // AT-REL-005: fail loudly instead of pretending the service is healthy.
     alerts.raise({
@@ -539,7 +539,7 @@ app.get("/api/health", async (_request, reply) => {
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
       details: { error: (error as Error).message.slice(0, 200) },
     });
-    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.25.2", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: "0.25.3", db: "unavailable", code: "DATABASE_UNAVAILABLE" });
   }
 });
 
@@ -554,7 +554,7 @@ interface StorageStatus {
 app.get("/api/health/detail", async (request, reply) => {
   const internal = safeTokenMatch(request.headers.authorization);
   if (!internal && !auth.user(request)) return reply.code(401).send({ error: "Unauthorized" });
-  const health: Record<string, unknown> = { version: "0.25.2", at: new Date().toISOString() };
+  const health: Record<string, unknown> = { version: "0.25.3", at: new Date().toISOString() };
   try {
     await pingDatabase();
     health.database = { status: "ok" };
@@ -1294,6 +1294,32 @@ app.delete<{ Params: { id: string } }>("/api/releases/:id", async (request, repl
   try {
     await agile.deleteRelease(ownerKeysFor(request), request.params.id, await identities.isAdmin(auth.user(request).id));
     return reply.code(204).send();
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
+/**
+ * Sprint 4 core: release summary + retrospective export. Both are read-only,
+ * owner-scoped projections of the release's stories and their linked runs. An
+ * unknown/foreign release answers a 404 (`RELEASE_NOT_FOUND`) exactly like the
+ * release CRUD routes, never a 500.
+ */
+app.get<{ Params: { id: string } }>("/api/agile/releases/:id/summary", async (request, reply) => {
+  try {
+    const summary = await readReleaseSummary(db, ownerKeysFor(request), request.params.id);
+    if (!summary) return reply.code(404).send({ error: "RELEASE_NOT_FOUND", message: "发布不存在" });
+    return summary;
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
+app.get<{ Params: { id: string } }>("/api/agile/releases/:id/retrospective", async (request, reply) => {
+  try {
+    const retrospective = await readReleaseRetrospective(db, ownerKeysFor(request), request.params.id);
+    if (!retrospective) return reply.code(404).send({ error: "RELEASE_NOT_FOUND", message: "发布不存在" });
+    return retrospective;
   } catch (error) {
     return agileErrorReply(reply, error);
   }
