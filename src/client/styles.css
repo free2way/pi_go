@@ -43,8 +43,8 @@ button { color: inherit; }
 .sidebar-top { flex: 0 0 auto; min-height: 40px; display: flex; align-items: center; justify-content: space-between; padding: 0 6px; position: relative; z-index: 1; }
 /* UI: the top block (create + nav + routing) is its own scroll area; the runs
    list below takes the remaining height. */
-.sidebar-nav-scroll { flex: 0 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; scrollbar-width: thin; }
-.sidebar-runs { flex: 1 1 auto; min-height: 40vh; margin-top: 10px; display: flex; flex-direction: column; }
+.sidebar-nav-scroll { flex: 0 0 auto; min-height: 0; overflow: visible; }
+.sidebar-runs { flex: 1 1 auto; min-height: 120px; display: flex; flex-direction: column; }
 .brand { display: flex; gap: 10px; align-items: center; }
 .brand-mark { width: 32px; height: 32px; display: grid; place-items: center; color: #10130a; background: var(--accent); border-radius: 9px; box-shadow: 0 0 28px rgba(223,248,84,.11); }
 .brand strong { display: block; letter-spacing: -.03em; font-size: 15px; line-height: 1.05; }
@@ -62,7 +62,7 @@ button { color: inherit; }
 .primary-nav button.active svg { color: var(--accent); }
 .nav-badge { margin-left: auto; min-width: 18px; height: 18px; border-radius: 5px; background: #20262c; color: #8f99a4; display: grid; place-items: center; font: 9px "DM Mono", monospace; }
 .sidebar-section-head { flex: 0 0 auto; display: flex; justify-content: space-between; align-items: center; padding: 0 9px; margin: 0 0 6px; color: #535d67; font: 500 9px "DM Mono", monospace; letter-spacing: .11em; text-transform: uppercase; }
-.run-list { flex: 1 1 auto; display: grid; gap: 3px; overflow-y: auto; min-height: 70px; scrollbar-width: thin; }
+.run-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
 .run-item { position: relative; display: flex; }
 .run-item-main { width: 100%; min-height: 46px; border: 1px solid transparent; background: transparent; border-radius: 8px; display: grid; grid-template-columns: 8px 1fr 14px; gap: 9px; align-items: center; text-align: left; padding: 6px 8px; cursor: pointer; color: var(--muted); }
 .run-item-main:hover { background: #101419; }
