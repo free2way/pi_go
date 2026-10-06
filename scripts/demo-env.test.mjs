@@ -101,12 +101,12 @@ test("db safety: rejects a URL carrying a query string (fail closed)", () => {
 });
 
 test("db safety: never echoes the password when reporting a resolved URL", () => {
-  const target = resolveDbTarget("postgresql://pigo:sup3r-s3cret@postgres:5432/pigo_demo");
-  assert.ok(!target.display.includes("sup3r-s3cret"), "masked display must not contain the password");
+  const target = resolveDbTarget("postgresql://pigo:DUMMY_SUPER_SECRET@postgres:5432/pigo_demo");
+  assert.ok(!target.display.includes("DUMMY_SUPER_SECRET"), "masked display must not contain the password");
   assert.match(target.display, /pigo:\*\*\*@postgres:5432\/pigo_demo/);
-  assert.equal(maskUrl("postgresql://u:p@h/db"), "postgresql://u:***@h/db");
+  assert.equal(maskUrl("postgresql://u:DUMMY_PASSWORD@h/db"), "postgresql://u:***@h/db");
   assert.equal(maskUrl("postgresql://h/db"), "postgresql://h/db");
-  assert.equal(dbNameOf("postgresql://u:p@h:5432/pigo_demo"), "pigo_demo");
+  assert.equal(dbNameOf("postgresql://u:DUMMY_PASSWORD@h:5432/pigo_demo"), "pigo_demo");
 });
 
 test("checkDbSafety: reports every resolved URL and refuses when any service points at prod", () => {
@@ -248,7 +248,7 @@ function demoConfig(overrides = {}) {
           PI_WEB_VERSION: "demo-0.27.1",
         },
         volumes: [{ type: "bind", source: "/app/pi-agent/demo-data", target: "/app/data" }],
-        ports: [{ mode: "host", target: 3100, published: "3101", host_ip: "192.168.2.235" }],
+        ports: [{ mode: "host", target: 3100, published: "3101", host_ip: "0.0.0.0" }],
       },
       "demo-worker": {
         environment: {
@@ -355,7 +355,7 @@ test("compose.demo.yaml joins the existing production network and exposes the de
   assert.match(codeLines, /external: true/);
   assert.match(codeLines, /published: "\$\{PIGO_DEMO_WEB_PORT:-3101\}"/);
   assert.match(codeLines, /published: "\$\{PIGO_DEMO_WEB_LOOPBACK_PORT:-3102\}"/);
-  assert.match(codeLines, /host_ip: \$\{PIGO_DEMO_WEB_BIND_ADDRESS:-192\.168\.2\.235\}/);
+  assert.match(codeLines, /host_ip: \$\{PIGO_DEMO_WEB_BIND_ADDRESS:\?[^}]*\}/);
 });
 
 test("compose.demo.yaml gives the worker the docker socket and its gid", () => {
@@ -510,7 +510,7 @@ test("env-file resolution: only the example exists -> actionable error, never a 
   assert.match(info.error, /refusing to fall back/);
   assert.ok(info.error.includes(info.recommendedPath), "the fix must name the recommended absolute path");
   assert.match(info.error, /cp deploy\/docker\/demo\.env\.example/);
-  assert.match(info.error, /docs\/25-demo-environment\.md/);
+  assert.match(info.error, /Keep it OUTSIDE/);
 });
 
 test("env-file resolution: with nothing present it still names the example and errors", () => {

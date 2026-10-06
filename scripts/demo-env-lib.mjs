@@ -33,7 +33,7 @@ export const EXAMPLE_ENV_FILE = path.join(REPO_ROOT, "deploy", "docker", "demo.e
  * Preferred location on a deploy host: `<parent-of-repo>/demo.env`. A deploy
  * moves this repo (`…/source`) aside to `source.prevN-…` and extracts a fresh
  * `source/`, so an env file inside the tree silently disappears. One directory
- * up survives. See docs/25-demo-environment.md.
+ * up survives deployment directory replacement.
  */
 export const OUTSIDE_TREE_ENV_FILE = path.join(path.dirname(REPO_ROOT), "demo.env");
 
@@ -46,7 +46,7 @@ const ENV_FILE_SOURCE_LABELS = {
   override: "explicit override",
   "outside-tree": "outside the deployed tree (recommended on a deploy host)",
   "in-repo": "in-repo fallback (local development)",
-  example: "EXAMPLE FILE — placeholders only, not usable",
+  example: "EXAMPLE FILE — required private values are empty, not usable",
 };
 
 /** True when an absolute path segment looks like a source tree a deploy swaps out. */
@@ -68,6 +68,7 @@ export const REQUIRED_DEMO_ENV = [
   "PIGO_DEMO_DATA_DIR",
   "PIGO_DEMO_WORKSPACE_ROOT",
   "PIGO_DEMO_MODELS_FILE",
+  "PIGO_DEMO_WEB_BIND_ADDRESS",
 ];
 
 /** Placeholders shipped in demo.env.example; a copied-but-unedited file must not start. */
@@ -305,7 +306,7 @@ export function checkDemoCompose(config, options = {}) {
   const webName = options.webService ?? DEMO_WEB_SERVICE;
   const workerName = options.workerService ?? DEMO_WORKER_SERVICE;
   const expectedPort = String(options.webPort ?? "3101");
-  const expectedBind = String(options.webBindAddress ?? "192.168.2.235");
+  const expectedBind = String(options.webBindAddress ?? "0.0.0.0");
   const services = extractServices(config);
   const web = services[webName];
   const worker = services[workerName];
@@ -449,9 +450,9 @@ export function envFileMissingMessage(info, io = {}) {
     const label = candidate.source === "override" ? "$" + candidate.overrideVar : candidate.source;
     lines.push(`  ${exists(candidate.path) ? "found  " : "missing"} ${candidate.path} (${label})`);
   }
-  lines.push(`refusing to fall back to ${info.path} — it is the example file with replace-with-… placeholders.`);
+  lines.push(`refusing to fall back to ${info.path} — required private values are intentionally empty in the example file.`);
   lines.push(`fix: cp deploy/docker/demo.env.example ${info.recommendedPath} && chmod 600 ${info.recommendedPath}`);
-  lines.push(`     then fill it in and re-run. Keep it OUTSIDE ${REPO_ROOT}/ (a deploy replaces that directory; see docs/25-demo-environment.md).`);
+  lines.push(`     then fill it in and re-run. Keep it OUTSIDE ${REPO_ROOT}/ because a deploy replaces that directory.`);
   return lines.join("\n");
 }
 
@@ -1044,7 +1045,7 @@ Env-file resolution order:
   4. deploy/docker/demo.env.example — refused (placeholders); prints a fix command
 up/status/doctor always print the resolved env-file path, never any value.
 
-This is NOT production. See docs/25-demo-environment.md.`);
+This is NOT production.`);
 }
 
 async function main(argv) {

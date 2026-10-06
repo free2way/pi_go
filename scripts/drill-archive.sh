@@ -18,8 +18,8 @@
 #     no target the commands run on the current host.
 #
 # Usage:
-#   npm run drill:archive -- --target free2way@192.168.2.235 --drill-dir backups/drills/local
-#   npm run drill:archive -- --apply --yes --target free2way@192.168.2.235
+#   npm run drill:archive -- --target deploy-user@deploy-host --drill-dir backups/drills/local
+#   npm run drill:archive -- --apply --yes --target deploy-user@deploy-host
 set -euo pipefail
 
 APPLY=0

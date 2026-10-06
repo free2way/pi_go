@@ -1,7 +1,7 @@
 {
   "providers": {
     "openai-proxy": {
-      "baseUrl": "https://pr.ai2note.com/v1",
+      "baseUrl": "https://provider.example/v1",
       "api": "openai-completions",
       "apiKey": "$OPENAI_API_KEY",
       "models": [

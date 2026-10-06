@@ -21,13 +21,13 @@ describe("env-sanitize (AUD-14 / AT-SEC-001)", () => {
     const sanitized = sanitizeEnvText([
       "PI_VERSION=1.0.0",
       "PI_REVIEWER_MODEL=gpt-5.6-sol",
-      "PI_PUBLIC_ORIGIN=https://pigo.ai2note.com",
+      "PI_PUBLIC_ORIGIN=https://pigo.example",
       "PI_SANDBOX_MODE=container",
       "SOME_THIRD_PARTY_FLAG=value",
     ].join("\n"));
     expect(sanitized).toContain("PI_VERSION=1.0.0");
     expect(sanitized).toContain("PI_REVIEWER_MODEL=gpt-5.6-sol");
-    expect(sanitized).toContain("PI_PUBLIC_ORIGIN=https://pigo.ai2note.com");
+    expect(sanitized).toContain("PI_PUBLIC_ORIGIN=https://pigo.example");
     expect(sanitized).toContain("PI_SANDBOX_MODE=container");
     expect(sanitized).toContain("SOME_THIRD_PARTY_FLAG=[redacted]");
   });

@@ -1971,10 +1971,11 @@ export function App() {
                       instance: `fitView` only runs on mount, so reusing the
                       instance across a run switch could leave the new topology
                       panned/zoomed off-screen (a blank canvas). */}
-                  {/* `fitViewOptions.padding` leaves room around the node box so
-                      the above/below rework arches are not clipped; `fitView`
-                      still runs on mount for every run thanks to the key. */}
-                  <ReactFlow key={activeRun.id} nodes={flow.nodes} edges={flow.edges} nodeTypes={nodeTypes} edgeTypes={edgeTypes} fitView fitViewOptions={{ padding: 0.18 }} minZoom={0.6} maxZoom={1.4} nodesDraggable={false} nodesConnectable={false} elementsSelectable={false} proOptions={{ hideAttribution: true }}>
+                  {/* A compact horizontal padding keeps the six-node pipeline
+                      inside the panel at the readable 0.6 minimum zoom. The
+                      tall canvas already provides vertical room for the
+                      above/below rework arches. */}
+                  <ReactFlow key={activeRun.id} nodes={flow.nodes} edges={flow.edges} nodeTypes={nodeTypes} edgeTypes={edgeTypes} fitView fitViewOptions={{ padding: 0.06 }} minZoom={0.6} maxZoom={1.4} nodesDraggable={false} nodesConnectable={false} elementsSelectable={false} proOptions={{ hideAttribution: true }}>
                     <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#252a31" />
                     <Controls showInteractive={false} />
                   </ReactFlow>

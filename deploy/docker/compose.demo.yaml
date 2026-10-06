@@ -20,7 +20,7 @@
 #      `*DATABASE_URL*` does not end in `/pigo_demo` (it prints exactly what it
 #      resolved first). Tests for the invariant live in scripts/demo-env.test.mjs.
 #
-# Usage (see docs/25-demo-environment.md):
+# Usage:
 #   cp deploy/docker/demo.env.example deploy/docker/demo.env   # then edit
 #   scripts/demo-env.sh up
 #   scripts/demo-env.sh doctor
@@ -113,10 +113,11 @@ services:
       PI_REVIEWER_MODEL: ${PI_REVIEWER_MODEL:-gpt-5.6-sol}
       PI_MODEL_PROBE_MODE: ${PI_MODEL_PROBE_MODE:-probe}
     ports:
-      # Primary demo endpoint (same address the hand-run pigo-web-e2e used).
+      # Primary demo endpoint. The bind address is required and stays outside
+      # version control in deploy/docker/demo.env.
       - target: 3100
         published: "${PIGO_DEMO_WEB_PORT:-3101}"
-        host_ip: ${PIGO_DEMO_WEB_BIND_ADDRESS:-192.168.2.235}
+        host_ip: ${PIGO_DEMO_WEB_BIND_ADDRESS:?Set PIGO_DEMO_WEB_BIND_ADDRESS in deploy/docker/demo.env}
       # Loopback-only endpoint used by scripts/demo-env.sh (health/seed) and by
       # the Playwright suite via PI_E2E_BASE_URL. Comment this pair out to close
       # the loopback listener.
@@ -209,7 +210,7 @@ services:
       PI_SESSION_REUSE: ${PI_SESSION_REUSE:-on}
     volumes:
       - ${PIGO_DEMO_WORKSPACE_ROOT:?Set PIGO_DEMO_WORKSPACE_ROOT in deploy/docker/demo.env}:/workspace
-      # Privileged socket mount — same tradeoff as production (see docs/03).
+      # Privileged socket mount — keep access limited to the isolated worker.
       - /var/run/docker.sock:/var/run/docker.sock
       - ${PIGO_DEMO_MODELS_FILE:?Set PIGO_DEMO_MODELS_FILE in deploy/docker/demo.env}:/home/node/.pi/agent/models.json:ro
       - pigo-demo-worker-state:/home/node/.pi
