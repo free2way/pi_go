@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { RELEASE_DEPLOY_STALE_MS } from "../shared/agile.js";
 import { deriveStoryStatus, type AgileStory } from "../shared/agile";
 import type { ReleaseRetrospective, ReleaseSummary } from "../shared/agile-metrics";
 import { columnPoints, estimateLabel, groupStoriesByColumn, priorityLabel, releaseDeployAction, releaseExportFilename, releaseExportJson, splitLines, storyReference } from "./agile-view";
@@ -141,8 +142,9 @@ describe("releaseDeployAction", () => {
 
   it("waits while a pending deploy is inside the timeout, then offers a retry", () => {
     const deploy = { status: "pending" as const, detail: "HTTP 202", at: "2026-01-02T00:00:00.000Z", startedAt: "2026-01-02T00:00:00.000Z" };
-    expect(releaseDeployAction(deploy, Date.parse("2026-01-02T00:04:59.000Z"))).toBe("waiting");
-    expect(releaseDeployAction(deploy, Date.parse("2026-01-02T00:05:01.000Z"))).toBe("retry");
+    const started = Date.parse("2026-01-02T00:00:00.000Z");
+    expect(releaseDeployAction(deploy, started + RELEASE_DEPLOY_STALE_MS - 1_000)).toBe("waiting");
+    expect(releaseDeployAction(deploy, started + RELEASE_DEPLOY_STALE_MS + 1_000)).toBe("retry");
   });
 
   it("is done for ok / not_configured / unsupported", () => {
