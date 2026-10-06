@@ -115,6 +115,12 @@ services:
       PI_REVIEWER_PROVIDER: ${PI_REVIEWER_PROVIDER:-openai-proxy}
       PI_REVIEWER_MODEL: ${PI_REVIEWER_MODEL:-gpt-5.6-sol}
       PI_MODEL_PROBE_MODE: ${PI_MODEL_PROBE_MODE:-probe}
+      # Closed-loop release transport: operator-configured post-merge deploy hook
+      # (`cmd:…` command run in this container with the payload on stdin, or an
+      # https webhook URL). Empty = explicitly not configured. The demo env sets
+      # `cmd:sh -c 'cat > /app/data/last-release.json'` to make the release step
+      # auditable without touching anything outside the demo volume.
+      PI_POST_MERGE_DEPLOY_HOOK: ${PI_POST_MERGE_DEPLOY_HOOK:-}
     ports:
       # Primary demo endpoint. The bind address is required and stays outside
       # version control in deploy/docker/demo.env.

@@ -86,6 +86,7 @@ import { localeInstruction } from "./prompt-locale.js";
 import { callbackBodyExceedsInlineLimit, encodeCallbackBody, persistDiffArtifact, type DiffArtifactRef } from "./diff-artifacts.js";
 import { uploadRunArtifact } from "./artifact-upload.js";
 import { captureSnapshotHash } from "./snapshot-hash.js";
+import { commitRoundChanges, type CommitRoundChangesResult } from "./round-commit.js";
 import { startRunDeadline } from "./run-deadline.js";
 import { detectProjectPlugins, pluginArguments, pluginMounts, selectPlugins, verifyPluginPins, type PluginDenial } from "./plugin-policy.js";
 import { buildPluginPolicy } from "./plugin-registry.js";
@@ -1060,6 +1061,44 @@ async function runPi(input: {
  * says so explicitly instead of silently clipping. */
 const maxDiffOutput = 3_400_000;
 
+/**
+ * E2E-01b: commits whatever a round's developer work left uncommitted in the run
+ * worktree, on the run branch, before that round's diff/checkpoints/checks/review
+ * are produced. The merge only fetches `refs/heads/<run branch>` from the run
+ * worktree, so without this the human merge fast-forwards to the base commit and
+ * silently reports success while nothing lands in the workspace.
+ *
+ * Runs for every path that reaches the round's checks: the fresh single-agent
+ * round, repair rounds, the multi-agent integrator's own edits, a recovered
+ * round that skipped the developer stage via checkpoint, and retry-review.
+ * Clean worktrees (including the sub-agent/cherry-pick path, whose commits are
+ * already on the branch) are a no-op; a failure is surfaced as a run event and
+ * the round continues unchanged.
+ */
+async function commitRoundWork(
+  run: Run,
+  worktree: string,
+  round: number,
+  signal: AbortSignal,
+): Promise<CommitRoundChangesResult> {
+  return commitRoundChanges({
+    exec: (args, options) => runHardenedGit({ cwd: worktree, args, signal, timeoutMs: options?.timeoutMs ?? 120_000 }),
+    round,
+    // Deterministic across recovery: the run's task text never changes, so a
+    // recovered round targeting the same content produces the same subject.
+    label: run.task,
+    emit: (event) => postUpdate(run.id, {
+      event: {
+        round,
+        source: event.source,
+        type: event.type,
+        message: event.message,
+        ...(event.meta ? { meta: event.meta } : {}),
+      },
+    }).catch(() => undefined),
+  });
+}
+
 async function collectDiff(worktree: string, signal: AbortSignal, baseRef?: string) {
   await git(worktree, ["add", "-N", "."], signal);
   const args = baseRef ? ["diff", "--no-ext-diff", baseRef, "--", "."] : ["diff", "--no-ext-diff", "--", "."];
@@ -1836,6 +1875,12 @@ async function executeRetryReview(input: {
   checks: string[];
 }) {
   const { run } = input;
+  // E2E-01b: a retry-review (human-triggered re-review) can precede a merge, and
+  // it never runs a developer stage, so the worktree may still hold uncommitted
+  // work (e.g. a run started before this fix, or a resume with manual edits).
+  // Commit it onto the run branch before the checks/diff/review artifacts so the
+  // reviewed snapshot is exactly what the merge will fetch.
+  await commitRoundWork(run, input.worktree, run.round, input.controller.signal);
   // AUD-04 / AT-RUN-007 / CHECK-003: an approval may only be produced for a
   // snapshot whose required checks passed. Re-run them here instead of trusting
   // a previous round or manual edits.
@@ -2223,6 +2268,11 @@ async function executeJob(input: JobInput, controller: AbortController) {
         await runDeveloperAgent({ run, worktree, credentials: input.credentials, signal: controller.signal, prompt: repairSections.join("\n\n"), sessionSuffix: "developer", activityPrefix: "修复 Agent", usage, budget, sessions });
       }
       if (!developmentDone) await tracker.complete(stages.development(round), { round, at: new Date().toISOString() });
+      // E2E-01b: the run branch must carry this round's work before anything is
+      // diffed, hashed, checked, reviewed or merged. Covers the fresh/repair
+      // developer, the integrator's own edits and a checkpoint-recovered round
+      // whose worktree is still dirty; a clean worktree is a no-op.
+      await commitRoundWork(run, worktree, round, controller.signal);
       const diff = await collectDiff(worktree, controller.signal, baseCommit);
       const checkSnapshot = await snapshotHash(worktree, controller.signal);
       // NEW-07: persist the full diff durably before reporting it, so an
