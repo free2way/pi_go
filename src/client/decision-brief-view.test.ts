@@ -20,6 +20,7 @@ const green: DecisionBrief = buildDecisionBrief({
   findings: [],
   checks: [{ name: "单元测试", command: "npm test", status: "passed" }],
   diffFiles: ["src/a.ts"],
+  diff: { complete: true, reason: "complete" },
 });
 
 const red: DecisionBrief = buildDecisionBrief({
@@ -62,6 +63,7 @@ describe("decision brief view · three-state rendering", () => {
         { id: "f3", stableKey: "tools/colors.ts|问题三", severity: "low", resolved: false, file: "tools/colors.ts", title: "问题三", evidence: "证据内容足够长可以判断" },
       ],
       diffFiles: ["src/a.ts"],
+      diff: { complete: true, reason: "complete" },
     });
     const groups = groupRemainingByAc(brief.remaining);
     expect(groups.map((group) => group.kind)).toEqual(["unknown", "ac", "unmapped"]);
@@ -71,6 +73,25 @@ describe("decision brief view · three-state rendering", () => {
     expect(groups[1].items[0].streak).toBe(0);
     expect(groups[0].items[0].relevance).toBe("unknown");
     expect(groups[2].items[0].relevance).toBe("irrelevant");
+  });
+
+  it("audit follow-up: a would-be 'unmapped' finding stays in 相关性未确认 when the change set is truncated", () => {
+    // Same finding as the 'unmapped' bucket above (proven outside a COMPLETE
+    // change set) but now the inline diff is truncated, so "outside" is not
+    // provable and the UI must not present it as a clearable unmapped item.
+    const brief = buildDecisionBrief({
+      criteria: [{ label: "AC#1", text: "修改 src/a.ts 的行为" }],
+      findings: [
+        { id: "f3", stableKey: "tools/colors.ts|问题三", severity: "high", resolved: false, file: "tools/colors.ts", title: "问题三", evidence: "证据内容足够长可以判断" },
+      ],
+      diffFiles: ["src/a.ts"],
+      diff: { complete: false, reason: "truncated", inlineBytes: 4096, recordedBytes: 3_200_000 },
+    });
+    const groups = groupRemainingByAc(brief.remaining);
+    expect(brief.diff.complete).toBe(false);
+    expect(groups.map((group) => group.kind)).toEqual(["unknown"]);
+    expect(groups[0].items[0].relevance).toBe("unknown");
+    expect(decisionBriefTone(brief)).toBe("continue");
   });
 
   it("exposes catalog keys for the gate labels", () => {

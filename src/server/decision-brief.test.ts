@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { findingFingerprint } from "../shared/finding-fingerprint.js";
 import type { CheckResult, Finding, Run, RunEvent } from "../shared/types.js";
 import { newId } from "./db.js";
-import { collectDecisionBriefInput, readDecisionBrief } from "./decision-brief.js";
+import { INLINE_DIFF_TRUNCATION_MARKER, collectDecisionBriefInput, readDecisionBrief } from "./decision-brief.js";
 import { baseRealRun } from "./real-run.js";
 import { PostgresRunStore } from "./run-store-pg.js";
 import { createTestDb } from "./test-db.js";
@@ -54,6 +54,33 @@ const diff = [
 
 async function event(store: PostgresRunStore, run: Run, overrides: Partial<Omit<RunEvent, "seq">> & { type: string; message: string }): Promise<void> {
   await store.appendEvent({ runId: run.id, round: run.round, source: "system", at: at(1), ...overrides });
+}
+
+/**
+ * Records the worker's full-diff byte count (`diff.artifact_persisted`), which
+ * is what proves the inline `run.diff` is the whole change set. `bytesOverride`
+ * lets a test simulate missing/zero metadata.
+ */
+async function diffArtifactEvent(
+  store: PostgresRunStore,
+  run: Run,
+  fullDiff: string,
+  bytesOverride?: number,
+): Promise<void> {
+  await store.appendEvent({
+    runId: run.id,
+    round: run.round,
+    source: "checks",
+    at: at(2),
+    type: "diff.artifact_persisted",
+    message: "完整 diff 已持久化为制品",
+    meta: {
+      artifactId: `diff-r${run.round}-abc123`,
+      sha256: "a".repeat(64),
+      bytes: bytesOverride ?? Buffer.byteLength(fullDiff, "utf8"),
+      kind: "diff",
+    },
+  });
 }
 
 /** Links a story with AC/DoD to the run so the aggregation reads real rows. */
@@ -144,11 +171,13 @@ describe("decision brief aggregation (docs/22 §6)", () => {
     });
     await store.createRun(run, { runId: run.id, round: 1, source: "system", type: "run.created", message: "created", at: at(0) });
     await event(store, run, { type: "run.needs_human", message: "达到最大审核轮次" });
+    await diffArtifactEvent(store, run, diff);
     await linkStory(db, run, { acceptanceCriteria: ["修改 src/server/credential-vault.ts 实现凭据隔离"], definitionOfDone: ["npm test 通过"] });
 
     const brief = await readDecisionBrief(db, run);
 
     expect(brief.gates.map((gate) => gate.status)).toEqual(["green", "green", "green", "green"]);
+    expect(brief.diff).toMatchObject({ complete: true, reason: "complete" });
     expect(brief.remaining[0].severity).toBe("low");
     expect(brief.recommendation.action).toBe("accept");
     expect(brief.recommendation.note).toContain("low 1 条");
@@ -249,12 +278,134 @@ describe("decision brief aggregation (docs/22 §6)", () => {
     });
     await store.createRun(run, { runId: run.id, round: 1, source: "system", type: "run.created", message: "created", at: at(0) });
     await event(store, run, { type: "run.needs_human", message: "达到最大审核轮次" });
+    // Proof that the inline diff is the whole change set (audit follow-up).
+    await diffArtifactEvent(store, run, diff);
     await linkStory(db, run, { acceptanceCriteria: ["修改 credential-vault.ts 实现凭据隔离"] });
 
     const brief = await readDecisionBrief(db, run);
 
+    expect(brief.diff).toMatchObject({ complete: true, reason: "complete" });
     expect(brief.gates.every((gate) => gate.status === "green")).toBe(true);
     expect(brief.remaining[0].relevance).toBe("irrelevant");
     expect(brief.recommendation.action).toBe("accept");
+  });
+
+  it("regression (audit follow-up: truncated diff fail-open): a changed-but-unlisted high stays blocking", async () => {
+    const db = await createTestDb();
+    const store = new PostgresRunStore(db);
+    // The inline diff is a bounded/truncated copy: it only lists an unrelated
+    // file, while the finding's file WAS changed. Treating the partial list as
+    // the change set would fake an out-of-scope proof and clear a real high.
+    const truncatedDiff = [
+      "diff --git a/src/client/theme.ts b/src/client/theme.ts",
+      "--- a/src/client/theme.ts",
+      "+++ b/src/client/theme.ts",
+      "@@ -1 +1 @@",
+      "-old",
+      "+new",
+      `${INLINE_DIFF_TRUNCATION_MARKER}; full artifact diff-r2-abc123 (sha256=${"a".repeat(64)} bytes=3200000)`,
+    ].join("\n");
+    const run = makeRun({
+      checks: [check()],
+      diff: truncatedDiff,
+      findings: [
+        finding({
+          title: "事务提交顺序颠倒",
+          file: "src/server/credential-vault.ts",
+          evidence: "并发写入时会覆盖前一次提交，导致数据不一致",
+          requiredChange: "改为串行提交",
+          consecutiveRounds: 1,
+          fingerprint: findingFingerprint({ file: "src/server/credential-vault.ts", title: "事务提交顺序颠倒" }),
+        }),
+      ],
+    });
+    await store.createRun(run, { runId: run.id, round: 1, source: "system", type: "run.created", message: "created", at: at(0) });
+    await event(store, run, { type: "run.needs_human", message: "达到最大审核轮次" });
+    // The worker recorded the real (3.2 MB) full diff, far above the inline copy.
+    await diffArtifactEvent(store, run, "x".repeat(3_200_000), 3_200_000);
+    await linkStory(db, run, { acceptanceCriteria: ["实现凭据隔离：API Key 不得写入日志"] });
+
+    const brief = await readDecisionBrief(db, run);
+
+    expect(brief.diff).toMatchObject({ complete: false, reason: "truncated" });
+    expect(brief.diff.recordedBytes).toBe(3_200_000);
+    const blocking = brief.gates.find((gate) => gate.id === "blocking");
+    expect(blocking?.status).toBe("red");
+    expect(blocking?.detail).toContain("改动清单不完整");
+    expect(brief.remaining[0]).toMatchObject({ severity: "high", relevance: "unknown" });
+    expect(brief.gates.find((gate) => gate.id === "scope")?.status).toBe("unknown");
+    expect(brief.recommendation.action).toBe("continue");
+  });
+
+  it("regression (audit follow-up: silently partial diff): inline shorter than the recorded artifact stays blocking", async () => {
+    const db = await createTestDb();
+    const store = new PostgresRunStore(db);
+    // No truncation marker, but the worker recorded a 3.2 MB full diff while the
+    // inline copy is a few hundred bytes: the list is partial without saying so.
+    const run = makeRun({
+      checks: [check()],
+      diff,
+      findings: [
+        finding({
+          title: "按钮颜色对比度不足",
+          file: "src/client/theme.ts",
+          line: 12,
+          evidence: "对比度 3.2 低于 AA 标准",
+          requiredChange: "调整前景色",
+          consecutiveRounds: 0,
+          fingerprint: findingFingerprint({ file: "src/client/theme.ts", title: "按钮颜色对比度不足" }),
+        }),
+      ],
+    });
+    await store.createRun(run, { runId: run.id, round: 1, source: "system", type: "run.created", message: "created", at: at(0) });
+    await event(store, run, { type: "run.needs_human", message: "达到最大审核轮次" });
+    await diffArtifactEvent(store, run, "x".repeat(3_200_000), 3_200_000);
+    await linkStory(db, run, { acceptanceCriteria: ["修改 credential-vault.ts 实现凭据隔离"] });
+
+    const input = await collectDecisionBriefInput(db, run);
+    expect(input.diff).toMatchObject({ complete: false, reason: "partial", recordedBytes: 3_200_000 });
+
+    const brief = await readDecisionBrief(db, run);
+    expect(brief.diff.reason).toBe("partial");
+    expect(brief.gates.find((gate) => gate.id === "blocking")?.status).toBe("red");
+    expect(brief.gates.find((gate) => gate.id === "scope")?.status).toBe("unknown");
+    expect(brief.remaining[0].relevance).toBe("unknown");
+    expect(brief.recommendation.action).toBe("continue");
+  });
+
+  it("treats missing or zero-length artifact metadata as an unproven change set (unknown, never clear)", async () => {
+    const db = await createTestDb();
+    const store = new PostgresRunStore(db);
+    const run = makeRun({
+      checks: [check()],
+      diff,
+      findings: [
+        finding({
+          title: "按钮颜色对比度不足",
+          file: "src/client/theme.ts",
+          line: 12,
+          evidence: "对比度 3.2 低于 AA 标准",
+          requiredChange: "调整前景色",
+          consecutiveRounds: 0,
+          fingerprint: findingFingerprint({ file: "src/client/theme.ts", title: "按钮颜色对比度不足" }),
+        }),
+      ],
+    });
+    await store.createRun(run, { runId: run.id, round: 1, source: "system", type: "run.created", message: "created", at: at(0) });
+    await event(store, run, { type: "run.needs_human", message: "达到最大审核轮次" });
+    await linkStory(db, run, { acceptanceCriteria: ["修改 credential-vault.ts 实现凭据隔离"] });
+
+    // No artifact event at all: completeness cannot be proven.
+    const missing = await collectDecisionBriefInput(db, run);
+    expect(missing.diff).toMatchObject({ complete: false, reason: "missing-metadata", recordedBytes: null });
+    const withoutMetadata = await readDecisionBrief(db, run);
+    expect(withoutMetadata.gates.find((gate) => gate.id === "blocking")?.status).toBe("red");
+    expect(withoutMetadata.gates.find((gate) => gate.id === "scope")?.status).toBe("unknown");
+    expect(withoutMetadata.remaining[0].relevance).toBe("unknown");
+
+    // A zero-length recorded byte count is not a proof either.
+    await diffArtifactEvent(store, run, "", 0);
+    const zeroLength = await collectDecisionBriefInput(db, run);
+    expect(zeroLength.diff).toMatchObject({ complete: false, reason: "missing-metadata", recordedBytes: null });
   });
 });

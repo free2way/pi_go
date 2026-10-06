@@ -121,6 +121,15 @@ export interface ReleaseDeployRecord {
   deploymentId?: string;
 }
 
+/**
+ * Why a deploy settlement was refused without any state change. The callback /
+ * settle path must match the exact in-flight attempt, so:
+ * - `stale_attempt` — the settle names a different attempt than the in-flight
+ *   one (or carries no attempt at all): a late callback from a previous attempt.
+ * - `not_pending` — the named attempt is no longer `pending` (already settled).
+ */
+export type ReleaseDeploySettlementRejection = "stale_attempt" | "not_pending";
+
 export interface AgileProject {
   id: string;
   ownerId: string;

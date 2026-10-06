@@ -24,6 +24,7 @@ import { convergenceGuardEnabled, convergenceStop, reviewStallRounds } from "./r
 import { buildReviewDiff } from "./review-input.js";
 import { blockingFindings, deferredFindings, deferredMessage, isDeferral, resolveReviewScope, shouldAcceptRound } from "./review-scope.js";
 import {
+  awaitSandboxExit,
   buildContainerSpec,
   createShutdownHandler,
   hostPathFor,
@@ -32,6 +33,7 @@ import {
   SandboxContainerRegistry,
   SandboxUnavailableError,
   sandboxStateDirectory,
+  SANDBOX_KILLED_EXIT_CODE,
   type SandboxMode,
 } from "./sandbox.js";
 import { mergeFindings, repeatedSevereFindings, severeRepeatThreshold, unresolvedFeedback } from "./review-findings.js";
@@ -371,9 +373,16 @@ async function runInSandbox(input: SandboxRunInput): Promise<CommandResult> {
       stdout = `${stdout}${line}\n`.slice(-maxSandboxOutput);
       input.onStdoutLine?.(line);
     }, input.signal).catch((error) => { stderr += String(error.message); });
-    const { StatusCode } = await docker.waitContainer(containerId);
+    const exit = await awaitSandboxExit(() => docker.waitContainer(containerId));
     await logs;
-    return { code: StatusCode, stdout, stderr };
+    // AUD follow-up: a wait that ended because the container was concurrently
+    // force-removed (shutdown teardown) is a kill, not an error — report SIGKILL's
+    // exit code so the run fails deterministically instead of surfacing a 404.
+    if (exit.outcome === "failed") throw new Error(`容器等待失败：${exit.error}`);
+    const code = exit.outcome === "exited"
+      ? (exit.value as { StatusCode: number }).StatusCode
+      : SANDBOX_KILLED_EXIT_CODE;
+    return { code, stdout, stderr };
   } finally {
     if (timer) clearTimeout(timer);
     input.signal.removeEventListener("abort", onAbort);

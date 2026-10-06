@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
-import type { AgileRelease } from "../shared/agile.js";
+import type { AgileRelease, ReleaseDeployRecord } from "../shared/agile.js";
 import {
   buildReleaseDeployPayload,
   isReleasePublishTerminal,
   planReleaseDeployAttempt,
+  planReleaseDeployCallback,
   planReleasePublish,
   planReleasePublishGate,
   releaseDeployDeliveryId,
@@ -13,7 +14,20 @@ import {
 } from "./release-publish.js";
 
 function story(overrides: Partial<ReleasePublishStory> = {}): ReleasePublishStory {
-  return { storyId: "story_1", title: "故事一", status: "done", runState: "completed", ...overrides };
+  return {
+    storyId: "story_1",
+    title: "故事一",
+    status: "done",
+    runState: "completed",
+    runId: "run_1",
+    checkPassed: true,
+    checks: [{ name: "lint", command: "npm run lint", status: "passed" }],
+    findings: [],
+    criteria: ["结账成功"],
+    diffFiles: ["src/pay.ts"],
+    mergedCommit: "abc1234",
+    ...overrides,
+  };
 }
 
 function release(overrides: Partial<AgileRelease> = {}): AgileRelease {
@@ -61,8 +75,60 @@ describe("planReleasePublish", () => {
     expect(plan.blocked[1].reason).toBe("阻塞（无原因说明）");
   });
 
-  it("is ready when every story is unblocked", () => {
-    expect(planReleasePublish({ stories: [story(), story({ storyId: "s2", status: "in_progress" })] })).toEqual({ kind: "ready" });
+  it("is ready when every story has a completed run, passing checks, no blocking findings and a merged commit", () => {
+    expect(planReleasePublish({ stories: [story(), story({ storyId: "s2", status: "awaiting_acceptance" })] })).toEqual({ kind: "ready" });
+  });
+
+  it("reports RELEASE_NOT_READY for a story with no linked run", () => {
+    const plan = planReleasePublish({ stories: [story({ storyId: "s_missing", runId: null, runState: null })] });
+    expect(plan).toMatchObject({ kind: "not_ready", status: 409, code: "RELEASE_NOT_READY" });
+    if (plan.kind !== "not_ready") throw new Error("expected not_ready");
+    expect(plan.stories.map((entry) => entry.storyId)).toEqual(["s_missing"]);
+    expect(plan.stories[0].reason).toContain("没有关联的运行");
+  });
+
+  it("reports RELEASE_NOT_READY for a run that is not a terminal success", () => {
+    for (const runState of ["developing", "needs_human", "failed", "cancelled"] as const) {
+      const plan = planReleasePublish({ stories: [story({ runState })] });
+      expect(plan).toMatchObject({ kind: "not_ready", code: "RELEASE_NOT_READY" });
+      if (plan.kind !== "not_ready") throw new Error("expected not_ready");
+      expect(plan.stories[0].runState).toBe(runState);
+    }
+  });
+
+  it("reports RELEASE_CHECKS_FAILED when the run's checks did not pass or cannot be proven to pass", () => {
+    expect(planReleasePublish({ stories: [story({ checkPassed: false })] })).toMatchObject({ kind: "checks_failed", code: "RELEASE_CHECKS_FAILED" });
+    expect(planReleasePublish({ stories: [story({ checkPassed: true, checks: [{ name: "lint", status: "failed" }] })] })).toMatchObject({ kind: "checks_failed", code: "RELEASE_CHECKS_FAILED" });
+    // No positive evidence (no checkPassed, no checks) is fail-safe.
+    expect(planReleasePublish({ stories: [story({ checkPassed: null, checks: [] })] })).toMatchObject({ kind: "checks_failed", code: "RELEASE_CHECKS_FAILED" });
+  });
+
+  it("reports RELEASE_BLOCKED for an unresolved critical finding even when the story is not blocked", () => {
+    const plan = planReleasePublish({
+      stories: [story({ findings: [{ id: "f1", severity: "critical", title: "注入漏洞", resolved: false }] })],
+    });
+    expect(plan).toMatchObject({ kind: "blocked", status: 409, code: "RELEASE_BLOCKED" });
+    if (plan.kind !== "blocked") throw new Error("expected blocked");
+    expect(plan.blocked).toEqual([]);
+    expect(plan.findings).toHaveLength(1);
+    expect(plan.findings[0]).toMatchObject({ storyId: "story_1", severity: "critical", title: "注入漏洞" });
+  });
+
+  it("fails safe on an unresolved high whose irrelevance cannot be proven", () => {
+    const plan = planReleasePublish({
+      stories: [story({ findings: [{ id: "f2", severity: "high", title: "未知模块缺陷", resolved: false }] })],
+    });
+    expect(plan).toMatchObject({ kind: "blocked", code: "RELEASE_BLOCKED" });
+  });
+
+  it("reports RELEASE_NOT_MERGED when requireMergedCommit is set and no commit is merged", () => {
+    const plan = planReleasePublish({ stories: [story({ mergedCommit: null })] });
+    expect(plan).toMatchObject({ kind: "not_merged", status: 409, code: "RELEASE_NOT_MERGED" });
+    if (plan.kind !== "not_merged") throw new Error("expected not_merged");
+    expect(plan.stories).toEqual([{ storyId: "story_1", title: "故事一", runId: "run_1" }]);
+
+    // Policy off: the same story is publishable without a merged commit.
+    expect(planReleasePublish({ stories: [story({ mergedCommit: null })], requireMergedCommit: false })).toEqual({ kind: "ready" });
   });
 });
 
@@ -118,6 +184,18 @@ describe("shapeReleaseDeployOutcome", () => {
 });
 
 describe("buildReleaseDeployPayload", () => {
+  it("carries the exact delivery id + attempt so the callback can be matched", () => {
+    const payload = buildReleaseDeployPayload({
+      release: { id: "rel_1", projectId: "proj_1", name: "结账", version: "v1.2.0" },
+      stories: [{ storyId: "s1", title: "故事一", status: "done" }],
+      releasedAt: "2026-01-01T00:00:00.000Z",
+      releasedBy: "user_a",
+      deliveryId: "release-publish:rel_1",
+      attempt: 2,
+    });
+    expect(payload).toMatchObject({ deliveryId: "release-publish:rel_1", attempt: 2 });
+  });
+
   it("shapes the release publish payload with stories and actor", () => {
     const payload = buildReleaseDeployPayload({
       release: { id: "rel_1", projectId: "proj_1", name: "结账", version: "v1.2.0" },
@@ -214,3 +292,48 @@ describe("releaseDeployDeliveryId", () => {
     expect(releaseDeployDeliveryId("release_1")).toBe(releaseDeployDeliveryId("release_1"));
   });
 });
+
+describe("planReleaseDeployCallback (old-attempt isolation)", () => {
+  const deliveryId = "release-publish:release_1";
+  function pending(overrides: Partial<ReleaseDeployRecord> = {}): ReleaseDeployRecord {
+    return { status: "pending", detail: "HTTP 202", at: NOW, startedAt: NOW, deliveryId, attempt: 2, ...overrides };
+  }
+
+  it("rejects a callback for a previous attempt with RELEASE_ATTEMPT_STALE and audits it", () => {
+    const plan = planReleaseDeployCallback({ current: pending(), deliveryId, attempt: 1, status: "succeeded", now: NOW });
+    expect(plan).toMatchObject({ kind: "reject", status: 409, code: "RELEASE_ATTEMPT_STALE", audit: true, attempt: 2 });
+  });
+
+  it("rejects a callback that omits the attempt (cannot prove it is for the current one)", () => {
+    const plan = planReleaseDeployCallback({ current: pending(), deliveryId, attempt: undefined, status: "succeeded", now: NOW });
+    expect(plan).toMatchObject({ kind: "reject", code: "RELEASE_ATTEMPT_STALE", audit: true });
+  });
+
+  it("rejects a foreign delivery id with RELEASE_DELIVERY_MISMATCH and no audit", () => {
+    const plan = planReleaseDeployCallback({ current: pending(), deliveryId, attempt: 2, status: "succeeded", now: NOW });
+    expect(plan.kind).toBe("settle");
+    const mismatch = planReleaseDeployCallback({ current: pending(), deliveryId: "release-publish:other", attempt: 2, status: "succeeded", now: NOW });
+    expect(mismatch).toMatchObject({ kind: "reject", code: "RELEASE_DELIVERY_MISMATCH", audit: false });
+  });
+
+  it("settles only the current pending attempt, shaping the final record", () => {
+    const plan = planReleaseDeployCallback({ current: pending(), deliveryId, attempt: 2, status: "failed", detail: "HTTP 500", now: "2026-01-02T00:01:00.000Z" });
+    expect(plan).toMatchObject({
+      kind: "settle",
+      action: "release.deploy_failed",
+      deploy: { status: "failed", detail: "HTTP 500", deliveryId, attempt: 2, finishedAt: "2026-01-02T00:01:00.000Z" },
+    });
+  });
+
+  it("stays idempotent for a duplicate callback on the current attempt", () => {
+    const settled = pending({ status: "ok", finishedAt: NOW });
+    const plan = planReleaseDeployCallback({ current: settled, deliveryId, attempt: 2, status: "succeeded", now: NOW });
+    expect(plan).toEqual({ kind: "duplicate", deploy: settled });
+  });
+
+  it("rejects a conflicting status for the current, already-final attempt", () => {
+    const plan = planReleaseDeployCallback({ current: pending({ status: "ok" }), deliveryId, attempt: 2, status: "failed", now: NOW });
+    expect(plan).toMatchObject({ kind: "reject", code: "RELEASE_ALREADY_FINAL", audit: false });
+  });
+});
+

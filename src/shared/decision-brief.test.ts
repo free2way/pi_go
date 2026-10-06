@@ -18,6 +18,13 @@ import {
 
 const ac = (label: string, text: string) => ({ label, text });
 
+/**
+ * A change set freshly proven complete. The audit follow-up means the brief may
+ * only clear a finding as "outside the change set" when the caller has this
+ * proof; tests that exercise the clearing path must pass it explicitly.
+ */
+const completeDiff = { complete: true as const, reason: "complete" as const };
+
 describe("decision brief · text normalization", () => {
   it("normalizes case, whitespace and Chinese/English punctuation", () => {
     expect(normalizeBriefText("  凭据  隔离：API  Key（必填）")).toBe("凭据 隔离:api key(必填)");
@@ -81,12 +88,12 @@ describe("decision brief · AC relevance matcher (fail-safe)", () => {
     expect(acRelevance({ file: null, title: "API Key 写入日志", evidence: "日志中出现 key" }, criteria)).toBe("relevant");
   });
 
-  it("is irrelevant only with explicit out-of-scope proof (file outside a known change set, zero shared tokens)", () => {
+  it("is irrelevant only with explicit out-of-scope proof (file outside a known, complete change set, zero shared tokens)", () => {
     expect(
       acRelevance(
         { file: "src/client/App.tsx", title: "按钮颜色对比度不足", evidence: "对比度 3.2 低于标准" },
         criteria,
-        { diffFiles: changedFiles },
+        { diffFiles: changedFiles, diffComplete: true },
       ),
     ).toBe("irrelevant");
   });
@@ -99,17 +106,26 @@ describe("decision brief · AC relevance matcher (fail-safe)", () => {
     expect(acRelevance(finding, criteria, { diffFiles: null })).toBe("unknown");
   });
 
+  it("never clears when the change set exists but is not provably complete (audit follow-up: truncated diff)", () => {
+    const finding = { file: "src/client/App.tsx", title: "按钮颜色对比度不足", evidence: "对比度 3.2 低于标准" };
+    // Omitted / false completeness ⇒ the changed-file list may have been
+    // truncated, so the file could in fact be part of the change set.
+    expect(acRelevance(finding, criteria, { diffFiles: changedFiles })).toBe("unknown");
+    expect(acRelevance(finding, criteria, { diffFiles: changedFiles, diffComplete: false })).toBe("unknown");
+    expect(acRelevance(finding, criteria, { diffFiles: changedFiles, diffComplete: null })).toBe("unknown");
+  });
+
   it("keeps a high-severity defect in scope when its file is part of the change, even with no shared keywords", () => {
     const finding = { file: "src/server/credential-vault.ts", title: "事务提交顺序颠倒", evidence: "并发写入时可能覆盖前一次提交" };
-    expect(acRelevance(finding, criteria, { diffFiles: changedFiles })).toBe("unknown");
+    expect(acRelevance(finding, criteria, { diffFiles: changedFiles, diffComplete: true })).toBe("unknown");
   });
 
   it("never clears a finding with no concrete file, or one that shares even a single token", () => {
     expect(
-      acRelevance({ file: null, title: "按钮颜色对比度不足", evidence: "对比度 3.2 低于标准" }, criteria, { diffFiles: changedFiles }),
+      acRelevance({ file: null, title: "按钮颜色对比度不足", evidence: "对比度 3.2 低于标准" }, criteria, { diffFiles: changedFiles, diffComplete: true }),
     ).toBe("unknown");
     expect(
-      acRelevance({ file: "src/client/App.tsx", title: "日志轮转策略不合理", evidence: "轮转阈值过高" }, criteria, { diffFiles: changedFiles }),
+      acRelevance({ file: "src/client/App.tsx", title: "日志轮转策略不合理", evidence: "轮转阈值过高" }, criteria, { diffFiles: changedFiles, diffComplete: true }),
     ).toBe("unknown");
   });
 
@@ -158,6 +174,7 @@ describe("decision brief · blocking gate (fail-safe)", () => {
       [{ severity: "high", file: "src/server/credential-vault.ts", title: "事务提交顺序颠倒", evidence: "并发写入时会覆盖前一次提交" }],
       criteria,
       changedFiles,
+      true,
     );
     expect(gate.status).toBe("red");
     expect(gate.findings?.[0]?.key).toBe("src/server/credential-vault.ts|事务提交顺序颠倒");
@@ -165,14 +182,19 @@ describe("decision brief · blocking gate (fail-safe)", () => {
 
   it("is green only when the finding names a file outside the change AND is clearly unrelated to every criterion", () => {
     const finding = { severity: "high", file: "src/client/App.tsx", title: "按钮颜色对比度不足", evidence: "对比度 3.2 低于 AA 标准" };
-    expect(gateBlocking([finding], criteria, changedFiles).status).toBe("green");
+    expect(gateBlocking([finding], criteria, changedFiles, true).status).toBe("green");
   });
 
-  it("keeps that same finding blocking whenever the change set is unknown or empty", () => {
+  it("keeps that same finding blocking whenever the change set is unknown, empty or not provably complete", () => {
     const finding = { severity: "high", file: "src/client/App.tsx", title: "按钮颜色对比度不足", evidence: "对比度 3.2 低于 AA 标准" };
     expect(gateBlocking([finding], criteria).status).toBe("red");
     expect(gateBlocking([finding], criteria, []).status).toBe("red");
     expect(gateBlocking([finding], criteria, null).status).toBe("red");
+    // Audit follow-up: an incomplete (truncated) change set must not clear.
+    expect(gateBlocking([finding], criteria, changedFiles, false).status).toBe("red");
+    expect(gateBlocking([finding], criteria, changedFiles).status).toBe("red");
+    const incomplete = gateBlocking([finding], criteria, changedFiles, false);
+    expect(incomplete.detail).toContain("改动清单不完整");
   });
 
   it("treats an unresolved high of unknown relevance conservatively as blocking", () => {
@@ -191,10 +213,12 @@ describe("decision brief · blocking gate (fail-safe)", () => {
       ],
       criteria,
       ["src/server/credential-vault.ts", "src/server/run-patch.ts"],
+      true,
     );
     expect(gate.status).toBe("red");
     expect(gate.detail).toContain("1 个明确与 AC/DoD 相关");
     expect(gate.detail).toContain("1 个相关性无法排除");
+    expect(gate.detail).not.toContain("改动清单不完整");
   });
 
   it("ignores resolved findings", () => {
@@ -203,25 +227,35 @@ describe("decision brief · blocking gate (fail-safe)", () => {
 });
 
 describe("decision brief · scope gate", () => {
-  it("is green for source files only", () => {
-    expect(gateScope(["src/a.ts", "src/b.ts"], null).status).toBe("green");
+  it("is green for source files only when the change set is provably complete", () => {
+    expect(gateScope(["src/a.ts", "src/b.ts"], null, true).status).toBe("green");
   });
 
-  it("is red for generated/dirty files", () => {
-    expect(gateScope(["src/a.ts", ".state/artifacts/diff.patch", "package-lock.json"], null).status).toBe("red");
-    expect(gateScope(["dist/server/index.js"], null).status).toBe("red");
+  it("is red for generated/dirty files even in a partial list", () => {
+    expect(gateScope(["src/a.ts", ".state/artifacts/diff.patch", "package-lock.json"], null, true).status).toBe("red");
+    expect(gateScope(["dist/server/index.js"], null, false).status).toBe("red");
   });
 
   it("is red for files outside the allowed paths", () => {
     const gate = gateScope(["src/a.ts", "docs/secret.md"], ["src"]);
     expect(gate.status).toBe("red");
     expect(gate.detail).toContain("docs/secret.md");
-    expect(gateScope(["src/a.ts", "src/nested/b.ts"], ["src"]).status).toBe("green");
+    expect(gateScope(["src/a.ts", "src/nested/b.ts"], ["src"], true).status).toBe("green");
   });
 
   it("is unknown when the file list is missing or empty", () => {
     expect(gateScope(undefined, null).status).toBe("unknown");
     expect(gateScope([], null).status).toBe("unknown");
+  });
+
+  it("is unknown when a clean-looking list is not provably complete (audit follow-up: truncated diff)", () => {
+    // A truncated inline diff can hide a generated/out-of-scope file, so a clean
+    // partial list must not yield a green "scope is clean" claim.
+    const omitted = gateScope(["src/a.ts"], null);
+    expect(omitted.status).toBe("unknown");
+    expect(omitted.detail).toContain("改动清单不完整");
+    expect(gateScope(["src/a.ts"], null, false).status).toBe("unknown");
+    expect(gateScope(["src/a.ts"], null, null).status).toBe("unknown");
   });
 });
 
@@ -360,6 +394,8 @@ describe("decision brief · buildDecisionBrief", () => {
     expect(brief.remaining).toEqual([]);
     expect(brief.stopReason.code).toBe("unknown");
     expect(brief.recommendation.action).toBe("continue");
+    // No diff metadata at all ⇒ completeness is not proven.
+    expect(brief.diff).toMatchObject({ complete: false, reason: "absent" });
   });
 
   it("accepts a fully green run and classifies remaining findings by AC", () => {
@@ -370,10 +406,12 @@ describe("decision brief · buildDecisionBrief", () => {
       ],
       checks: [{ name: "单元测试", command: "npm test", status: "passed" }],
       diffFiles: ["src/server/credential-vault.ts"],
+      diff: completeDiff,
       events: [{ type: "run.needs_human", message: "达到最大审核轮次", meta: { findings: [] } }],
     });
     expect(brief.stopReason.code).toBe("max_review_rounds");
     expect(brief.gates.every((gate) => gate.status === "green")).toBe(true);
+    expect(brief.diff).toMatchObject({ complete: true, reason: "complete" });
     expect(brief.remaining).toHaveLength(1);
     expect(brief.remaining[0].ac).toBe("AC#1");
     expect(brief.remaining[0].streak).toBe(0);
@@ -420,10 +458,13 @@ describe("decision brief · buildDecisionBrief", () => {
       ],
       checks: [{ name: "单元测试", command: "npm test", status: "passed" }],
       diffFiles: ["src/server/credential-vault.ts"],
+      diff: completeDiff,
     });
     expect(brief.gates.every((gate) => gate.status === "green")).toBe(true);
     expect(brief.remaining[0].relevance).toBe("irrelevant");
     expect(brief.recommendation.action).toBe("accept");
+    // The green blocking gate names the complete change set as the proof.
+    expect(brief.gates.find((gate) => gate.id === "blocking")?.detail).toContain("完整改动范围");
   });
 
   it("blocks an out-of-scope high when the brief has no diff to prove it out of scope", () => {
@@ -435,6 +476,45 @@ describe("decision brief · buildDecisionBrief", () => {
       checks: [{ name: "单元测试", command: "npm test", status: "passed" }],
     });
     expect(brief.gates.find((gate) => gate.id === "blocking")?.status).toBe("red");
+    expect(brief.recommendation.action).toBe("continue");
+  });
+
+  it("audit follow-up: a truncated change set can never clear a real changed-file high (fail-safe)", () => {
+    // The inline diff was truncated, so the changed file legitimately missing
+    // from `diffFiles` must not be treated as "outside the change set".
+    const finding = { id: "f1", severity: "high", resolved: false, file: "src/server/credential-vault.ts", title: "事务提交顺序颠倒", evidence: "并发写入时会覆盖前一次提交" };
+    const criteria = [ac("AC#1", "实现凭据隔离：API Key 不得写入日志")];
+    const brief = buildDecisionBrief({
+      criteria,
+      findings: [finding],
+      checks: [{ name: "单元测试", command: "npm test", status: "passed" }],
+      // Only an unrelated file survived the truncated list.
+      diffFiles: ["src/client/theme.ts"],
+      diff: { complete: false, reason: "truncated", inlineBytes: 400_150, recordedBytes: 3_200_000 },
+    });
+    expect(brief.diff).toMatchObject({ complete: false, reason: "truncated" });
+    expect(brief.diff.detail).toContain("截断");
+    const blocking = brief.gates.find((gate) => gate.id === "blocking");
+    expect(blocking?.status).toBe("red");
+    expect(blocking?.detail).toContain("改动清单不完整");
+    expect(brief.remaining[0]).toMatchObject({ severity: "high", relevance: "unknown" });
+    expect(brief.recommendation.action).toBe("continue");
+    // The scope gate cannot claim the partial list is clean either.
+    expect(brief.gates.find((gate) => gate.id === "scope")?.status).toBe("unknown");
+  });
+
+  it("audit follow-up: a change set without provenance is treated as incomplete (missing artifact metadata)", () => {
+    const brief = buildDecisionBrief({
+      criteria: [ac("AC#1", "实现凭据隔离：API Key 不得写入日志")],
+      findings: [
+        { id: "f1", severity: "high", resolved: false, file: "src/a.ts", title: "事务提交顺序颠倒", evidence: "并发写入时会覆盖前一次提交" },
+      ],
+      checks: [{ name: "单元测试", command: "npm test", status: "passed" }],
+      diffFiles: ["src/b.ts"],
+    });
+    expect(brief.diff).toMatchObject({ complete: false, reason: "missing-metadata" });
+    expect(brief.gates.find((gate) => gate.id === "blocking")?.status).toBe("red");
+    expect(brief.gates.find((gate) => gate.id === "scope")?.status).toBe("unknown");
     expect(brief.recommendation.action).toBe("continue");
   });
 });

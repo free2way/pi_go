@@ -20,9 +20,17 @@
  * be decided it reports `unknown` (never a fabricated green/red); the AC matcher
  * refuses to guess — a possible-but-unproven match is `unknown`, never a false
  * "relevant"; and an unresolved `critical`/`high` is cleared only with explicit
- * out-of-scope proof (a concrete file outside a known change set that shares
- * nothing with any criterion). Every ambiguous relevance verdict therefore
- * blocks, so a genuine high-severity defect is never silently dropped.
+ * out-of-scope proof (a concrete file outside a *provably complete* change set
+ * that shares nothing with any criterion). Every ambiguous relevance verdict
+ * therefore blocks, so a genuine high-severity defect is never silently dropped.
+ *
+ * Audit follow-up (truncated change set): the inline `run.diff` the server reads
+ * can be a truncated copy of the run's real diff. A file that WAS changed but is
+ * missing from such a partial list would look "outside the change set", so a
+ * real high could be cleared. Completeness must therefore be *proven*: the
+ * caller passes {@link DecisionBriefDiffProvenance}, and unless it says
+ * `complete: true` the relevance/scope judgements degrade to `unknown`
+ * (⇒ blocking) and never to `irrelevant`.
  */
 
 import type { Finding } from "./types.js";
@@ -34,13 +42,50 @@ export type DecisionAction = "continue" | "accept";
 export type AcRelevance = "relevant" | "irrelevant" | "unknown";
 
 /**
+ * Why the change set the brief judged is (or is not) provably the run's whole
+ * diff. `complete` is the only reason that permits clearing a finding as
+ * "outside the change set".
+ */
+export type DiffSetCompleteness = "complete" | "truncated" | "partial" | "missing-metadata" | "absent";
+
+/**
+ * Provenance of the `diffFiles` list. A truncated inline diff (the pipeline
+ * persists a bounded copy; the full text lives in a durable artifact) can omit
+ * a file that WAS changed, so an unproven list must never be treated as the
+ * complete change set.
+ */
+export interface DecisionBriefDiffProvenance {
+  /** True only when `diffFiles` is provably the run's complete change set. */
+  complete: boolean;
+  /** Stable machine token; `complete === true` iff `reason === "complete"`. */
+  reason: DiffSetCompleteness;
+  /** Byte length of the inline diff the brief judged, when known. */
+  inlineBytes?: number | null;
+  /** Byte count of the full diff the pipeline recorded, when known. */
+  recordedBytes?: number | null;
+}
+
+/** Operator-facing diff provenance echoed on the brief (docs/22 §6). */
+export interface DecisionBriefDiffScope extends DecisionBriefDiffProvenance {
+  detail: string;
+}
+
+/**
  * Run context used *only* to rule relevance out (never to claim it). Without a
- * known change set an out-of-scope finding cannot be proven out of scope, so the
- * matcher stays conservative and reports `unknown` (⇒ blocking).
+ * known — and provably complete — change set, an out-of-scope finding cannot be
+ * proven out of scope, so the matcher stays conservative and reports `unknown`
+ * (⇒ blocking).
  */
 export interface AcRelevanceContext {
   /** The run's changed files. Absent/empty ⇒ the change set is unknown. */
   diffFiles?: string[] | null;
+  /**
+   * Whether `diffFiles` is provably the run's *complete* change set. Only an
+   * explicit `true` permits clearing: a truncated inline diff can omit a changed
+   * file and make a real finding look out of scope, so omitted/`false`/`null`
+   * keeps the verdict at `unknown` (⇒ blocking).
+   */
+  diffComplete?: boolean | null;
 }
 
 export interface DecisionBriefFindingRef {
@@ -91,6 +136,12 @@ export interface DecisionBrief {
   gates: DecisionBriefGate[];
   remaining: DecisionBriefRemainingItem[];
   recommendation: DecisionBriefRecommendation;
+  /**
+   * Why the change set behind the gates is (not) provably complete. Lets a
+   * reader tell "cleared: proven outside the complete change set" from
+   * "blocked: the change set may be truncated".
+   */
+  diff: DecisionBriefDiffScope;
 }
 
 /** One acceptance criterion / definition-of-done item, with its display label. */
@@ -133,6 +184,12 @@ export interface DecisionBriefInput {
   findings?: DecisionBriefFindingInput[] | null;
   checks?: DecisionBriefCheckInput[] | null;
   diffFiles?: string[] | null;
+  /**
+   * Provenance of `diffFiles`. When omitted (or `complete !== true`) the change
+   * set is not proven complete and the brief refuses to clear a finding as
+   * "outside the change set" (fail-safe, audit follow-up).
+   */
+  diff?: DecisionBriefDiffProvenance | null;
   allowedPaths?: string[] | null;
   events?: DecisionBriefEventInput[] | null;
 }
@@ -245,6 +302,7 @@ function singleRelevance(
   criterion: DecisionBriefCriterion,
   changedFiles: ReadonlySet<string>,
   diffKnown: boolean,
+  diffComplete: boolean,
 ): AcRelevance {
   const criterionText = normalizeBriefText(criterion.text);
   const { text: findingText, file } = findingMaterial(finding);
@@ -272,15 +330,20 @@ function singleRelevance(
   // No strong or partial lexical overlap. Default to `unknown` (⇒ blocking):
   // only clear a finding when the evidence that it is out of scope is strong
   // and explicit — a concrete file that is demonstrably *not* part of this
-  // run's change set, a known change set, and not a single shared token with
-  // the criterion. Anything else (missing file, unknown diff, weak overlap)
-  // stays `unknown`, so a real high-severity defect is never silently cleared.
+  // run's change set, a known *and provably complete* change set, and not a
+  // single shared token with the criterion. Anything else (missing file,
+  // unknown diff, incompletely known diff, weak overlap) stays `unknown`, so a
+  // real high-severity defect is never silently cleared.
   const hasMaterial = Boolean(file) || (typeof finding.title === "string" && finding.title.trim().length >= 4);
   if (!hasMaterial) return "unknown";
   if (shared.length > 0) return "unknown";
   const concreteFile = file ? normalizeFindingFile(file) : "";
   if (!concreteFile || concreteFile === "<no-file>") return "unknown";
   if (!diffKnown) return "unknown";
+  // Audit follow-up: a partial (truncated) change set can omit the file this
+  // finding actually lives in, which would fake an out-of-scope proof. Only a
+  // proven-complete change set may clear.
+  if (!diffComplete) return "unknown";
   if (isInChangedFiles(concreteFile, changedFiles)) return "unknown";
   return "irrelevant";
 }
@@ -297,11 +360,13 @@ const EMPTY_CHANGED_FILES: ReadonlySet<string> = new Set<string>();
  * - `relevant`   only on a strong signal (shared file path, distinctive
  *                keyword, or ≥2 shared meaningful tokens);
  * - `irrelevant` only with explicit out-of-scope proof: a concrete file outside
- *                a *known* change set that shares nothing at all with the
- *                criterion (and, transitively, with every criterion);
+ *                a *known and provably complete* change set that shares nothing
+ *                at all with the criterion (and, transitively, with every
+ *                criterion);
  * - `unknown`    everything in between, including empty criteria, a finding
- *                without a file, an unknown/empty change set, or partial
- *                overlap — and `unknown` blocks an unresolved critical/high.
+ *                without a file, an unknown/empty/truncated change set, or
+ *                partial overlap — and `unknown` blocks an unresolved
+ *                critical/high.
  */
 export function acRelevance(
   finding: DecisionBriefFindingInput,
@@ -314,9 +379,10 @@ export function acRelevance(
     (context?.diffFiles ?? []).map(normalizeDiffPath).filter(Boolean),
   );
   const diffKnown = changedFiles.size > 0;
+  const diffComplete = context?.diffComplete === true;
   let sawUnknown = false;
   for (const criterion of list) {
-    const verdict = singleRelevance(finding, criterion, changedFiles, diffKnown);
+    const verdict = singleRelevance(finding, criterion, changedFiles, diffKnown, diffComplete);
     if (verdict === "relevant") return "relevant";
     if (verdict === "unknown") sawUnknown = true;
   }
@@ -331,7 +397,7 @@ export function matchCriterion(
   for (const criterion of toCriteria(criteria)) {
     // Change-set context can only downgrade `irrelevant` → `unknown`, never
     // create a `relevant`, so it is not needed to find a strong match.
-    if (singleRelevance(finding, criterion, EMPTY_CHANGED_FILES, false) === "relevant") return criterion;
+    if (singleRelevance(finding, criterion, EMPTY_CHANGED_FILES, false, false) === "relevant") return criterion;
   }
   return undefined;
 }
@@ -405,21 +471,26 @@ function isResolved(finding: DecisionBriefFindingInput): boolean {
 /**
  * `green` when no unresolved `critical` and no AC/DoD-relevant unresolved
  * `high`. Fail-safe: an unresolved high is treated as blocking unless the
- * matcher holds explicit out-of-scope proof (a concrete file outside a known
- * change set sharing nothing with any criterion). `unknown` therefore blocks,
- * and a genuine high whose wording merely shares no keywords with the AC text
- * is never silently cleared.
+ * matcher holds explicit out-of-scope proof (a concrete file outside a *known
+ * and provably complete* change set sharing nothing with any criterion).
+ * `diffComplete` must be an explicit `true` to permit that clearing; omitted or
+ * `false` keeps every would-be-cleared high blocking (`unknown`), because a
+ * truncated change set can hide the file a real finding lives in. `unknown`
+ * therefore blocks, and a genuine high whose wording merely shares no keywords
+ * with the AC text is never silently cleared.
  */
 export function gateBlocking(
   findings: DecisionBriefFindingInput[] | null | undefined,
   criteria: DecisionBriefCriterion[] | string[] | null | undefined,
   diffFiles?: string[] | null,
+  diffComplete?: boolean | null,
 ): DecisionBriefGate {
+  const complete = diffComplete === true;
   const open = (findings ?? []).filter((finding) => !isResolved(finding));
   const critical = open.filter((finding) => normalizeSeverity(finding.severity) === "critical");
   const highs = open.filter((finding) => normalizeSeverity(finding.severity) === "high");
   const relevanceOf = new Map<DecisionBriefFindingInput, AcRelevance>();
-  for (const finding of highs) relevanceOf.set(finding, acRelevance(finding, criteria, { diffFiles }));
+  for (const finding of highs) relevanceOf.set(finding, acRelevance(finding, criteria, { diffFiles, diffComplete: complete }));
   const blockingHighs = highs.filter((finding) => relevanceOf.get(finding) !== "irrelevant");
   const relevantHighs = blockingHighs.filter((finding) => relevanceOf.get(finding) === "relevant").length;
   const unresolvedHighs = blockingHighs.length - relevantHighs;
@@ -433,10 +504,15 @@ export function gateBlocking(
         ? `${blockingHighs.length} 个未解决 high（${relevantHighs} 个明确与 AC/DoD 相关，${unresolvedHighs} 个相关性无法排除）`
         : "",
     ].filter(Boolean).join("；");
+    // Audit follow-up: say *why* an out-of-scope-looking high was not cleared,
+    // so a reader can tell this from a missing/unmapped-AC block.
+    const incompleteNote = !complete && unresolvedHighs > 0
+      ? "；改动清单不完整（inline diff 可能被截断），已按“相关性无法排除”处理，不得据此清除阻断项"
+      : "";
     return {
       id: "blocking",
       status: "red",
-      detail: `仍有阻断级问题未解决：${summary}`,
+      detail: `仍有阻断级问题未解决：${summary}${incompleteNote}`,
       findings: blocking.map(toRef),
     };
   }
@@ -453,7 +529,7 @@ export function gateBlocking(
     id: "blocking",
     status: "green",
     detail: ignoredHighs > 0
-      ? `无未解决 critical；${ignoredHighs} 个 high 有明确证据表明与本故事 AC/DoD 无关（文件不在改动范围内且无共享关键词）`
+      ? `无未解决 critical；${ignoredHighs} 个 high 有明确证据表明与本故事 AC/DoD 无关（文件不在完整改动范围内且无共享关键词）`
       : "无未解决的 critical/high 问题",
     findings: [],
   };
@@ -482,11 +558,15 @@ function isInsideAllowed(path: string, allowed: string[]): boolean {
  * `red` when the diff contains a generated/dirty file or a file outside the
  * allowed paths; `green` when the file list is clean (and, when allowed paths
  * are supplied, entirely inside them); `unknown` when there is no file list to
- * check against.
+ * check against *or* the list is not provably complete (`diffComplete !== true`)
+ * — a truncated inline diff can hide a generated/out-of-scope file. A concrete
+ * offending file found in a partial list still yields `red` (that evidence is
+ * sound regardless of completeness).
  */
 export function gateScope(
   diffFiles: string[] | null | undefined,
   allowedPaths?: string[] | null,
+  diffComplete?: boolean | null,
 ): DecisionBriefGate {
   if (diffFiles === null || diffFiles === undefined) {
     return { id: "scope", status: "unknown", detail: "缺少 diff 文件清单，无法核对改动范围" };
@@ -514,6 +594,13 @@ export function gateScope(
       };
     }
   }
+  if (diffComplete !== true) {
+    return {
+      id: "scope",
+      status: "unknown",
+      detail: `${files.length} 个已列出的改动文件均为源文件，但改动清单不完整（可能被截断），无法排除未列出的生成物/越界文件`,
+    };
+  }
   return { id: "scope", status: "green", detail: `${files.length} 个改动文件均为源文件，未发现生成物/脏文件` };
 }
 
@@ -532,12 +619,12 @@ function criterionCovered(
   checks: DecisionBriefCheckInput[],
 ): boolean {
   for (const file of diffFiles) {
-    if (singleRelevance({ file, title: file, evidence: file }, criterion, EMPTY_CHANGED_FILES, false) === "relevant") return true;
+    if (singleRelevance({ file, title: file, evidence: file }, criterion, EMPTY_CHANGED_FILES, false, false) === "relevant") return true;
   }
   for (const check of checks) {
     const text = [check.name, check.command].filter((value): value is string => Boolean(value && value.trim())).join(" ");
     if (!text) continue;
-    if (singleRelevance({ file: null, title: text, requiredChange: text, evidence: text }, criterion, EMPTY_CHANGED_FILES, false) === "relevant") return true;
+    if (singleRelevance({ file: null, title: text, requiredChange: text, evidence: text }, criterion, EMPTY_CHANGED_FILES, false, false) === "relevant") return true;
   }
   return false;
 }
@@ -548,6 +635,10 @@ function criterionCovered(
  * diff implements nothing at all; `unknown` when a criterion cannot be mapped
  * lexically (needs a human) or there is nothing to verify against. A story with
  * no AC/DoD is vacuously covered.
+ *
+ * Deliberately not gated on change-set completeness: coverage needs *positive*
+ * evidence, so a partial list can only under-count coverage (a false red /
+ * unknown, which blocks) and never fabricate a green.
  */
 export function gateAcceptance(
   criteria: DecisionBriefCriterion[] | string[] | null | undefined,
@@ -720,9 +811,10 @@ export function recommendDecision(
 function remainingItemOf(
   finding: DecisionBriefFindingInput,
   criteria: DecisionBriefCriterion[],
-  diffFiles?: string[] | null,
+  diffFiles: string[] | null | undefined,
+  diffComplete: boolean,
 ): DecisionBriefRemainingItem {
-  const relevance = acRelevance(finding, criteria, { diffFiles });
+  const relevance = acRelevance(finding, criteria, { diffFiles, diffComplete });
   const item: DecisionBriefRemainingItem = {
     severity: normalizeSeverity(finding.severity) ?? "low",
     key: stableKeyOf(finding),
@@ -738,27 +830,72 @@ function remainingItemOf(
 }
 
 /**
+ * Operator-facing explanation of why the change set is (not) provably complete.
+ * Kept in one place so the scope gate, the blocking gate and the API all tell
+ * the same story.
+ */
+export function diffScopeDetail(reason: DiffSetCompleteness): string {
+  switch (reason) {
+    case "complete":
+      return "改动清单已证明完整（inline diff 与流水线记录的完整 diff 字节数一致）";
+    case "truncated":
+      return "inline diff 被流水线截断，改动清单可能不完整，无法据此排除相关性或越界文件";
+    case "partial":
+      return "inline diff 短于流水线记录的完整 diff 字节数，改动清单可能不完整";
+    case "missing-metadata":
+      return "缺少可核对的完整 diff 元数据，无法证明改动清单完整";
+    default:
+      return "没有 inline diff，无法确认改动范围";
+  }
+}
+
+/**
+ * Normalizes the caller-supplied provenance. Fail-safe: anything other than an
+ * explicit `complete: true` yields `complete: false`, so an omitted/partial
+ * change set can never be used to clear a finding.
+ */
+function normalizeDiffProvenance(input: DecisionBriefInput): DecisionBriefDiffScope {
+  const raw = input.diff ?? null;
+  const inlineBytes = raw?.inlineBytes ?? null;
+  const recordedBytes = raw?.recordedBytes ?? null;
+  if (raw?.complete === true) {
+    return { complete: true, reason: "complete", inlineBytes, recordedBytes, detail: diffScopeDetail("complete") };
+  }
+  const hasFiles = (input.diffFiles ?? []).some((file) => typeof file === "string" && file.trim() !== "");
+  const reason: DiffSetCompleteness = raw?.reason && raw.reason !== "complete"
+    ? raw.reason
+    : hasFiles
+      ? "missing-metadata"
+      : "absent";
+  return { complete: false, reason, inlineBytes, recordedBytes, detail: diffScopeDetail(reason) };
+}
+
+/**
  * Aggregates a run's already-collected rows into the Decision Brief (doc §6).
  * Deterministic and total: every malformed/missing field degrades to `unknown`
- * or a default instead of throwing.
+ * or a default instead of throwing. The change set is only trusted as complete
+ * when `input.diff.complete === true` (audit follow-up), so a truncated diff
+ * can never clear a blocking finding.
  */
 export function buildDecisionBrief(input: DecisionBriefInput): DecisionBrief {
   const criteria = toCriteria(input.criteria);
   const findings = input.findings ?? [];
   const checks = input.checks ?? [];
+  const diff = normalizeDiffProvenance(input);
+  const diffComplete = diff.complete;
   const blockingGate: DecisionBriefGate = input.findings === null || input.findings === undefined
     ? { id: "blocking", status: "unknown", detail: "缺少审核问题数据，无法确认是否存在阻断项", findings: [] }
-    : gateBlocking(findings, criteria, input.diffFiles);
+    : gateBlocking(findings, criteria, input.diffFiles, diffComplete);
   const gates: DecisionBriefGate[] = [
     gateChecks(checks),
     blockingGate,
-    gateScope(input.diffFiles, input.allowedPaths),
+    gateScope(input.diffFiles, input.allowedPaths, diffComplete),
     gateAcceptance(criteria, input.diffFiles, checks),
   ];
 
   const remaining = findings
     .filter((finding) => !isResolved(finding))
-    .map((finding) => remainingItemOf(finding, criteria, input.diffFiles))
+    .map((finding) => remainingItemOf(finding, criteria, input.diffFiles, diffComplete))
     .sort(
       (a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity] || b.streak - a.streak || a.key.localeCompare(b.key),
     );
@@ -768,6 +905,7 @@ export function buildDecisionBrief(input: DecisionBriefInput): DecisionBrief {
     gates,
     remaining,
     recommendation: recommendDecision(gates, remaining),
+    diff,
   };
 }
 

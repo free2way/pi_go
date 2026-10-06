@@ -160,4 +160,89 @@ describe("runReleaseDeploy (audit P1)", () => {
     const audit = await db.query("SELECT action FROM agile_release_audit WHERE release_id = $1", [release.id]);
     expect(audit.rows.map((row) => row.action)).toContain("release.deploy_failed");
   });
+
+  it("rejects a late callback for attempt 1 after attempt 2 started and leaves attempt 2 intact", async () => {
+    const db = await createTestDb();
+    const { service, release, stories } = await seed(db);
+    const deliveryId = `release-publish:${release.id}`;
+    const t0 = "2026-01-02T00:00:00.000Z";
+    await service.startReleaseDeploy({
+      releaseId: release.id,
+      deliveryId,
+      attempt: 1,
+      releasedBy: "admin_1",
+      releasedAt: t0,
+      stories,
+      deploy: { status: "pending", detail: "HTTP 202", at: t0, startedAt: t0, deliveryId, attempt: 1 },
+    });
+
+    // Attempt 1 times out (bounded verification) and attempt 2 starts, reusing
+    // the delivery id — exactly the state a stale callback can race against.
+    const t1 = new Date(Date.parse(t0) + 5 * 60_000 + 1).toISOString();
+    await service.expireStaleReleaseDeploys({ now: t1, timeoutMs: 5 * 60_000 });
+    await service.startReleaseDeploy({
+      releaseId: release.id,
+      deliveryId,
+      attempt: 2,
+      releasedBy: "admin_1",
+      releasedAt: t1,
+      stories,
+      deploy: { status: "pending", detail: "HTTP 202", at: t1, startedAt: t1, deliveryId, attempt: 2 },
+    });
+
+    // A late callback for attempt 1 must not settle attempt 2.
+    const stale = await service.settleReleaseDeployResult({
+      releaseId: release.id,
+      action: "release.deploy_succeeded",
+      actorId: "deploy-system",
+      deploy: { status: "ok", detail: "attempt 1 late callback", at: t1, finishedAt: t1, deliveryId, attempt: 1 },
+    });
+    expect(stale.applied).toBe(false);
+    expect(stale.rejected).toBe("stale_attempt");
+    expect((await service.getRelease([], release.id, true)).deploy).toMatchObject({ status: "pending", attempt: 2, deliveryId });
+    const auditAfterStale = await db.query("SELECT action FROM agile_release_audit WHERE release_id = $1", [release.id]);
+    expect(auditAfterStale.rows.map((row) => row.action)).not.toContain("release.deploy_succeeded");
+
+    // The current attempt (2) settles normally afterwards.
+    const ok = await service.settleReleaseDeployResult({
+      releaseId: release.id,
+      action: "release.deploy_succeeded",
+      actorId: "deploy-system",
+      deploy: { status: "ok", detail: "attempt 2 callback", at: t1, finishedAt: t1, deliveryId, attempt: 2 },
+    });
+    expect(ok.applied).toBe(true);
+    expect(ok.release.deploy).toMatchObject({ status: "ok", attempt: 2 });
+  });
+
+  it("is idempotent for a duplicate callback on the current attempt", async () => {
+    const db = await createTestDb();
+    const { service, release, stories } = await seed(db);
+    const deliveryId = `release-publish:${release.id}`;
+    const t0 = "2026-01-02T00:00:00.000Z";
+    await service.startReleaseDeploy({
+      releaseId: release.id,
+      deliveryId,
+      attempt: 1,
+      releasedBy: "admin_1",
+      releasedAt: t0,
+      stories,
+      deploy: { status: "pending", detail: "HTTP 202", at: t0, startedAt: t0, deliveryId, attempt: 1 },
+    });
+
+    const settle = {
+      releaseId: release.id,
+      action: "release.deploy_succeeded" as const,
+      actorId: "deploy-system",
+      deploy: { status: "ok" as const, detail: "部署系统回调：成功", at: t0, finishedAt: t0, deliveryId, attempt: 1 },
+    };
+    expect((await service.settleReleaseDeployResult(settle)).applied).toBe(true);
+    const duplicate = await service.settleReleaseDeployResult(settle);
+    expect(duplicate.applied).toBe(false);
+    expect(duplicate.rejected).toBe("not_pending");
+    expect(duplicate.release.deploy).toMatchObject({ status: "ok", attempt: 1 });
+
+    // Exactly one successful settlement row — the duplicate wrote nothing.
+    const audit = await db.query("SELECT action FROM agile_release_audit WHERE release_id = $1", [release.id]);
+    expect(audit.rows.map((row) => row.action).sort()).toEqual(["release.deploy_succeeded", "release.published"]);
+  });
 });

@@ -212,6 +212,13 @@ export interface SandboxRemovalFailure {
   error: string;
 }
 
+/** A container whose exit could not be confirmed, with the reason. */
+export interface SandboxWaitFailure {
+  id: string;
+  /** Timeout, or the wait's rejection (a concurrently removed container is not a failure). */
+  error: string;
+}
+
 export interface SandboxStopResult {
   /** Containers that exited within the grace period after SIGTERM. */
   stopped: string[];
@@ -227,6 +234,11 @@ export interface SandboxStopResult {
   removed?: string[];
   /** Containers that stopped (or were killed) but whose removal failed/timed out. */
   removalFailed?: SandboxRemovalFailure[];
+  /**
+   * Why each `unconfirmed` container could not be confirmed exited. Optional so
+   * pre-existing producers stay source compatible; stopAll always populates it.
+   */
+  unconfirmedReasons?: SandboxWaitFailure[];
 }
 
 /** Optional overrides for {@link SandboxContainerRegistry.stopAll}. */
@@ -242,19 +254,117 @@ export interface SandboxStopOptions {
 export const DEFAULT_SANDBOX_STOP_GRACE_MS = 10_000;
 export const DEFAULT_SANDBOX_FORCE_KILL_GRACE_MS = 5_000;
 export const DEFAULT_SANDBOX_REMOVAL_TIMEOUT_MS = 5_000;
-export const DEFAULT_SHUTDOWN_TIMEOUT_MS = 20_000;
+/**
+ * Safety cap on teardown passes. Normal shutdown uses one pass, or two when a
+ * still-active job registers a sandbox while the first pass waits. The cap only
+ * exists so a pathological producer that keeps registering cannot spin forever.
+ */
+export const MAX_SANDBOX_TEARDOWN_PASSES = 8;
+/** Room on top of the phase budget so logging, lock release and exit are not starved. */
+export const SANDBOX_TEARDOWN_MARGIN_MS = 5_000;
+
+/**
+ * Worst-case wall clock of one {@link SandboxContainerRegistry.stopAll}.
+ *
+ * Up to two full passes can run (the first SIGTERMs and waits; the second
+ * force-kills whatever a still-active job registered meanwhile), and a fully
+ * stuck container consumes every phase of both: SIGTERM grace + SIGKILL grace +
+ * removal. The old default shutdown bound (20s) was exactly one phase sum, so a
+ * fully stuck teardown was cut off *before* its removal pass and the containers
+ * lingered — the very thing the removal step exists to prevent. The budget is
+ * therefore the worst case plus {@link SANDBOX_TEARDOWN_MARGIN_MS}.
+ */
+export function sandboxTeardownBudgetMs(options: SandboxStopOptions = {}): number {
+  const graceMs = Math.max(0, options.graceMs ?? DEFAULT_SANDBOX_STOP_GRACE_MS);
+  const forceKillGraceMs = Math.max(0, options.forceKillGraceMs ?? DEFAULT_SANDBOX_FORCE_KILL_GRACE_MS);
+  const removalTimeoutMs = Math.max(0, options.removalTimeoutMs ?? DEFAULT_SANDBOX_REMOVAL_TIMEOUT_MS);
+  return 2 * (graceMs + forceKillGraceMs + removalTimeoutMs) + SANDBOX_TEARDOWN_MARGIN_MS;
+}
+
+/**
+ * Hard upper bound for the whole SIGTERM/SIGINT teardown. With the default
+ * phases this is 2×(10s + 5s + 5s) + 5s = 45s; only a container that ignores
+ * SIGTERM *and* SIGKILL *and* a hung removal can approach it.
+ */
+export const DEFAULT_SHUTDOWN_TIMEOUT_MS = sandboxTeardownBudgetMs();
+
+/** Raised when a container is registered after teardown already finished. */
+export class SandboxClosingError extends Error {
+  readonly code = "SANDBOX_CLOSING";
+
+  constructor(id: string) {
+    super(
+      `容器注册表已完成回收，拒绝登记沙箱 ${id}：本次关闭流程已无法再回收它。`
+      + "该容器已在登记处被直接强制终止并尽力移除，调用方不得在该沙箱中继续执行。",
+    );
+    this.name = "SandboxClosingError";
+  }
+}
+
+/** Lifecycle of the registry: open → (stopAll) closing → closed. */
+export type SandboxRegistryState = "open" | "closing" | "closed";
+
+/**
+ * True when a Docker call failed because the container no longer exists
+ * (404 / "No such container"). That is the outcome of a force-remove racing a
+ * pending `wait`/`remove`; for teardown it means "gone", not "failed".
+ */
+export function isContainerGoneError(error: unknown): boolean {
+  const message = messageOf(error);
+  return /no such container/i.test(message) || /\b404\b/.test(message);
+}
+
+export type SandboxExitOutcome =
+  | { outcome: "exited"; value: unknown }
+  | { outcome: "removed"; error: string }
+  | { outcome: "failed"; error: string };
+
+/**
+ * AUD follow-up: awaits a container `wait` without letting a concurrent
+ * force-remove surface as an error. A wait that ends because the container was
+ * removed (shutdown teardown, or the run's own cleanup) resolves as `removed` —
+ * the container is definitively gone — so the run/finalisation path treats it
+ * deterministically instead of raising a spurious 404.
+ */
+export async function awaitSandboxExit(wait: () => Promise<unknown>): Promise<SandboxExitOutcome> {
+  try {
+    return { outcome: "exited", value: await wait() };
+  } catch (error) {
+    const message = messageOf(error);
+    return isContainerGoneError(error) ? { outcome: "removed", error: message } : { outcome: "failed", error: message };
+  }
+}
+
+/** Exit code reported for a run whose container was force-removed under it (SIGKILL). */
+export const SANDBOX_KILLED_EXIT_CODE = 137;
 
 /**
  * P1: containers this worker started, so SIGTERM/SIGINT can stop them before the
  * process exits. Without it a worker exit left its sandbox running and writing
  * into the run worktree.
+ *
+ * Registration is refused once teardown *finished* (its result is cached, so no
+ * pass can ever sweep a newcomer); a refused container is force-killed and
+ * best-effort removed right there, so refusing cannot orphan it. Between
+ * "stopAll was called" and "teardown finished" registrations are accepted,
+ * because the teardown loop keeps running passes until it observes an empty
+ * registry — a sandbox registered mid-teardown is therefore always swept, never
+ * missed.
  */
 export class SandboxContainerRegistry {
   private readonly handles = new Map<string, SandboxContainerHandle>();
   private stopping?: Promise<SandboxStopResult>;
+  private state: SandboxRegistryState = "open";
 
   /** Registers a started container; the returned disposer forgets it. */
   add(handle: SandboxContainerHandle): () => void {
+    if (this.state === "closed") {
+      // Teardown already cached its result: it will never see this handle again.
+      // Tear the container down here (best effort) so the refusal cannot leak a
+      // live sandbox, then refuse the registration.
+      sweepRefusedContainer(handle);
+      throw new SandboxClosingError(handle.id);
+    }
     this.handles.set(handle.id, handle);
     return () => { this.handles.delete(handle.id); };
   }
@@ -268,15 +378,27 @@ export class SandboxContainerRegistry {
     return this.handles.size;
   }
 
+  /** True once `stopAll` has started (further registrations are swept or refused). */
+  get closing(): boolean {
+    return this.state !== "open";
+  }
+
   /**
    * Stops every tracked container: SIGTERM, a bounded wait for termination, then
    * SIGKILL for anything still alive with a second bounded wait, and finally a
    * bounded best-effort `remove` so no exited sandbox lingers on the host.
-   * Idempotent — concurrent or repeated calls share one teardown, so a repeated
-   * signal can never double-stop (or race) the containers.
+   * Idempotent — concurrent or repeated calls share one teardown and its cached
+   * result, so a repeated signal can never double-stop (or race) the containers.
+   *
+   * Passes repeat until the registry is observed empty (bounded by
+   * {@link MAX_SANDBOX_TEARDOWN_PASSES}), so a sandbox registered while a pass is
+   * waiting is swept by the next pass instead of being missed.
    */
   stopAll(options: SandboxStopOptions = {}): Promise<SandboxStopResult> {
-    this.stopping ??= this.teardown(options);
+    if (!this.stopping) {
+      this.state = "closing";
+      this.stopping = this.teardown(options);
+    }
     return this.stopping;
   }
 
@@ -287,51 +409,129 @@ export class SandboxContainerRegistry {
     const stopped: string[] = [];
     const forced: string[] = [];
     const unconfirmed: string[] = [];
-    const removed: string[] = [];
+    const unconfirmedReasons: SandboxWaitFailure[] = [];
     const removalFailed: SandboxRemovalFailure[] = [];
-    // Two bounded passes: pass 1 politely stops the containers already running
-    // (SIGTERM, grace wait, then SIGKILL for whatever survived); pass 2
-    // force-kills any sandbox a still-active job registered while pass 1 was
-    // waiting, so a shutting-down worker never leaves one writing into a worktree.
-    for (let pass = 0; pass < 2; pass += 1) {
+    const removedIds = new Set<string>();
+    const markRemoved = (id: string) => { removedIds.add(id); };
+
+    // Pass 1 politely stops the containers already running (SIGTERM, grace wait,
+    // then SIGKILL for whatever survived); later passes force-kill the sandboxes
+    // a still-active job registered while an earlier pass was waiting, so a
+    // shutting-down worker never leaves one writing into a worktree. The loop
+    // re-checks the registry after every pass; the empty check and the return
+    // below are not separated by an await, so an `add` either lands before the
+    // check (seen by another pass) or after `state = "closed"` (refused).
+    for (let pass = 0; this.handles.size > 0; pass += 1) {
       const handles = [...this.handles.values()];
-      if (handles.length === 0) break;
+      const gone = new Set<string>();
+      if (pass >= MAX_SANDBOX_TEARDOWN_PASSES) {
+        // Safety valve: a pathological producer keeps registering sandboxes
+        // while we tear down. Refuse (and tear down) anything registered from
+        // here on — so no newcomer can enter the map — then force-sweep and
+        // report what is tracked. Teardown therefore always terminates and never
+        // closes with a live sandbox still "tracked".
+        this.state = "closed";
+        forced.push(...handles.map((handle) => handle.id));
+        await Promise.all(handles.map((handle) => handle.stop("SIGKILL").catch(() => undefined)));
+        const exits = await waitForExit(handles, forceKillGraceMs);
+        for (const handle of handles) {
+          const result = exits.get(handle.id);
+          if (result?.kind === "removed") { markRemoved(handle.id); continue; }
+          if (result?.kind === "exited") continue;
+          unconfirmed.push(handle.id);
+          unconfirmedReasons.push({ id: handle.id, error: `teardown pass limit (${MAX_SANDBOX_TEARDOWN_PASSES}) reached` });
+        }
+        await removeHandles(handles, removalTimeoutMs, markRemoved, removalFailed);
+        for (const handle of handles) this.handles.delete(handle.id);
+        break;
+      }
       if (pass > 0) {
         // Late arrival: it never had the chance to receive the polite signal.
         forced.push(...handles.map((handle) => handle.id));
         await Promise.all(handles.map((handle) => handle.stop("SIGKILL").catch(() => undefined)));
-        await Promise.all(handles.map(async (handle) => {
-          if (!(await settlesWithin(handle.wait(), forceKillGraceMs))) unconfirmed.push(handle.id);
-        }));
+        await collectWaitOutcomes(await waitForExit(handles, forceKillGraceMs), handles, gone, unconfirmed, unconfirmedReasons);
       } else {
         await Promise.all(handles.map((handle) => handle.stop("SIGTERM").catch(() => undefined)));
-        const exited = await waitForExit(handles, graceMs);
-        for (const handle of handles) (exited.has(handle.id) ? stopped : forced).push(handle.id);
-        const survivors = handles.filter((handle) => !exited.has(handle.id));
+        const exits = await waitForExit(handles, graceMs);
+        const survivors: SandboxContainerHandle[] = [];
+        for (const handle of handles) {
+          const result = exits.get(handle.id);
+          if (result?.kind === "removed") { gone.add(handle.id); continue; }
+          if (result?.kind === "exited") { stopped.push(handle.id); continue; }
+          // Survived SIGTERM (or its wait timed out/failed): force-kill it.
+          forced.push(handle.id);
+          survivors.push(handle);
+        }
         await Promise.all(survivors.map((handle) => handle.stop("SIGKILL").catch(() => undefined)));
-        await Promise.all(survivors.map(async (handle) => {
-          if (!(await settlesWithin(handle.wait(), forceKillGraceMs))) unconfirmed.push(handle.id);
-        }));
+        await collectWaitOutcomes(await waitForExit(survivors, forceKillGraceMs), survivors, gone, unconfirmed, unconfirmedReasons);
       }
+      for (const id of gone) markRemoved(id);
       // AUD: the normal removal lives in `runInSandbox`'s `finally`, which may
       // never run before `process.exit`; remove here too (a lingering exited
-      // container is exactly what this teardown exists to prevent).
-      await removeHandles(handles, removalTimeoutMs, removed, removalFailed);
+      // container is exactly what this teardown exists to prevent). Handles
+      // already confirmed gone are not removed a second time.
+      await removeHandles(handles.filter((handle) => !gone.has(handle.id)), removalTimeoutMs, markRemoved, removalFailed);
       for (const handle of handles) this.handles.delete(handle.id);
     }
-    return { stopped, forced, unconfirmed, removed, removalFailed };
+    this.state = "closed";
+    return { stopped, forced, unconfirmed, removed: [...removedIds], removalFailed, unconfirmedReasons };
   }
+}
+
+/**
+ * Records bounded-wait outcomes: containers confirmed gone (`removed`) count as
+ * removed, and only genuine timeouts/failures land in `unconfirmed` — with a
+ * reason, so a wait that ended because the container was concurrently removed is
+ * never reported as an unexplained unconfirmed one.
+ */
+async function collectWaitOutcomes(
+  outcomes: Map<string, SandboxWaitResult>,
+  handles: SandboxContainerHandle[],
+  gone: Set<string>,
+  unconfirmed: string[],
+  reasons: SandboxWaitFailure[],
+): Promise<void> {
+  for (const handle of handles) {
+    const result = outcomes.get(handle.id);
+    if (result?.kind === "removed") { gone.add(handle.id); continue; }
+    if (result?.kind === "exited") continue;
+    unconfirmed.push(handle.id);
+    reasons.push({
+      id: handle.id,
+      error: result === undefined
+        ? "wait ended without an outcome"
+        : result.kind === "timeout" ? `exit not confirmed within ${result.ms}ms` : result.error,
+    });
+  }
+}
+
+/**
+ * Tears down a handle the registry refused (teardown already finished). Fire and
+ * forget, deferred to a microtask so a handle whose `stop` hook re-enters `add`
+ * cannot recurse synchronously; the caller gets an error and will not track the
+ * container, and the worker is about to exit, so this is the last chance to
+ * avoid orphaning it.
+ */
+function sweepRefusedContainer(handle: SandboxContainerHandle): void {
+  queueMicrotask(() => {
+    void handle.stop("SIGKILL").catch(() => undefined);
+    const remove = handle.remove;
+    if (typeof remove !== "function") return;
+    void outcomeWithin((async () => remove())(), DEFAULT_SANDBOX_REMOVAL_TIMEOUT_MS);
+  });
 }
 
 /**
  * Best-effort removal of already-stopped containers. Never throws: a failing or
  * over-long removal is recorded so shutdown can report it and still exit, and a
- * handle without a removal hook is skipped. `timeoutMs <= 0` skips removal.
+ * handle without a removal hook is skipped. `timeoutMs <= 0` skips removal. A
+ * remove that finds the container already gone (another remover won the race)
+ * reaches the same end state and counts as removed, not as a failure.
  */
 async function removeHandles(
   handles: SandboxContainerHandle[],
   timeoutMs: number,
-  removed: string[],
+  markRemoved: (id: string) => void,
   failed: SandboxRemovalFailure[],
 ): Promise<void> {
   if (timeoutMs <= 0) return;
@@ -340,23 +540,26 @@ async function removeHandles(
     if (typeof remove !== "function") return;
     // Wrapped so a synchronous throw in the hook is treated as a rejection.
     const outcome = await outcomeWithin((async () => remove())(), timeoutMs);
-    if (outcome.ok) removed.push(handle.id);
+    if (outcome.ok || outcome.gone) markRemoved(handle.id);
     else failed.push({ id: handle.id, error: outcome.error });
   }));
 }
 
 /** Awaits `promise` for at most `ms`, reporting rejection/timeout instead of throwing. */
-async function outcomeWithin(promise: Promise<unknown>, ms: number): Promise<{ ok: true } | { ok: false; error: string }> {
-  if (ms <= 0) return { ok: false, error: "removal skipped: no removal budget" };
+async function outcomeWithin(
+  promise: Promise<unknown>,
+  ms: number,
+): Promise<{ ok: true } | { ok: false; error: string; gone: boolean }> {
+  if (ms <= 0) return { ok: false, error: "removal skipped: no removal budget", gone: false };
   let timer: NodeJS.Timeout | undefined;
   try {
     return await Promise.race([
       promise.then(
         () => ({ ok: true } as const),
-        (error) => ({ ok: false as const, error: (error as Error | undefined)?.message ?? String(error) }),
+        (error) => ({ ok: false as const, error: messageOf(error), gone: isContainerGoneError(error) }),
       ),
-      new Promise<{ ok: false; error: string }>((resolve) => {
-        timer = setTimeout(() => resolve({ ok: false, error: `removal not confirmed within ${ms}ms` }), ms);
+      new Promise<{ ok: false; error: string; gone: boolean }>((resolve) => {
+        timer = setTimeout(() => resolve({ ok: false, error: `removal not confirmed within ${ms}ms`, gone: false }), ms);
         timer.unref?.();
       }),
     ]);
@@ -365,27 +568,47 @@ async function outcomeWithin(promise: Promise<unknown>, ms: number): Promise<{ o
   }
 }
 
-/** Ids of `handles` that exited within `ms` (bounded, never rejects). */
-async function waitForExit(handles: SandboxContainerHandle[], ms: number): Promise<Set<string>> {
-  const exited = new Set<string>();
+type SandboxWaitResult =
+  | { kind: "exited" }
+  | { kind: "removed"; error: string }
+  | { kind: "timeout"; ms: number }
+  | { kind: "failed"; error: string };
+
+/** Bounded wait outcomes for `handles`, keyed by container id (never rejects). */
+async function waitForExit(handles: SandboxContainerHandle[], ms: number): Promise<Map<string, SandboxWaitResult>> {
+  const outcomes = new Map<string, SandboxWaitResult>();
   await Promise.all(handles.map(async (handle) => {
-    if (await settlesWithin(handle.wait(), ms)) exited.add(handle.id);
+    outcomes.set(handle.id, await classifyWait(handle, ms));
   }));
-  return exited;
+  return outcomes;
 }
 
-/** Resolves true when `promise` resolves within `ms`; false on timeout/rejection. */
-async function settlesWithin(promise: Promise<unknown>, ms: number): Promise<boolean> {
-  if (ms <= 0) return false;
+/**
+ * Resolves how `handle.wait()` ended within `ms`. The rejection handler is
+ * attached immediately, so a wait that fails after the timeout won can never
+ * surface as an unhandled rejection.
+ */
+async function classifyWait(handle: SandboxContainerHandle, ms: number): Promise<SandboxWaitResult> {
+  const waiting: Promise<SandboxWaitResult> = (async () => handle.wait())().then(
+    () => ({ kind: "exited" } as const),
+    (error) => isContainerGoneError(error)
+      ? ({ kind: "removed", error: messageOf(error) } as const)
+      : ({ kind: "failed", error: messageOf(error) } as const),
+  );
+  if (ms <= 0) return { kind: "timeout", ms };
   let timer: NodeJS.Timeout | undefined;
   try {
     return await Promise.race([
-      promise.then(() => true, () => false),
-      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), ms); timer.unref?.(); }),
+      waiting,
+      new Promise<SandboxWaitResult>((resolve) => { timer = setTimeout(() => resolve({ kind: "timeout", ms }), ms); timer.unref?.(); }),
     ]);
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+function messageOf(error: unknown): string {
+  return (error as Error | undefined)?.message ?? String(error);
 }
 
 export interface WorkerShutdownDeps {
@@ -406,8 +629,11 @@ export interface WorkerShutdownDeps {
  * P1: builds the SIGTERM/SIGINT handler. The first signal stops job claiming and
  * reclaims the sandbox containers; repeated signals are ignored so a second
  * signal can never exit the process before the sandboxes have stopped. The whole
- * teardown is bounded by `timeoutMs`, so even a stuck stop exits (SIGINT=130,
- * SIGTERM=143).
+ * teardown is bounded by `timeoutMs` (defaulting to
+ * {@link DEFAULT_SHUTDOWN_TIMEOUT_MS}, which covers two full teardown passes plus
+ * a margin, so the removal pass is never cut off with containers still on the
+ * host). Lock release and the exit always run, even when the sandbox phases
+ * exhaust the bound (SIGINT=130, SIGTERM=143).
  */
 export function createShutdownHandler(deps: WorkerShutdownDeps): (signal: "SIGTERM" | "SIGINT") => Promise<void> {
   const log = deps.log ?? (() => undefined);
@@ -435,8 +661,16 @@ export function createShutdownHandler(deps: WorkerShutdownDeps): (signal: "SIGTE
       } catch (error) {
         log(`[shutdown] 回收沙箱失败：${(error as Error).message}`);
       }
-      deps.releaseLocks();
-      deps.exit(exitCode);
+      // Lock release and exit must happen even when the sandbox phases exhausted
+      // the bound above: a workspace must never stay locked by an exiting worker,
+      // and the process must still exit bounded.
+      try {
+        deps.releaseLocks();
+      } catch (error) {
+        log(`[shutdown] 释放工作区锁失败：${(error as Error).message}`);
+      } finally {
+        deps.exit(exitCode);
+      }
     })();
     return shutdown;
   };

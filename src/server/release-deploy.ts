@@ -135,6 +135,8 @@ export async function runReleaseDeploy(input: ReleaseDeployInput, deps: ReleaseD
       releasedBy: input.releasedBy,
       note: input.note,
       callbackUrl: input.callbackUrl,
+      deliveryId,
+      attempt: decision.attempt,
     }),
     { deliveryId, ...(input.webhookToken ? { webhookToken: input.webhookToken } : {}) },
   );

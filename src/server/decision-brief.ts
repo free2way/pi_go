@@ -14,6 +14,7 @@ import {
   type DecisionBrief,
   type DecisionBriefCheckInput,
   type DecisionBriefCriterion,
+  type DecisionBriefDiffProvenance,
   type DecisionBriefEventInput,
   type DecisionBriefFindingInput,
   type DecisionBriefInput,
@@ -28,6 +29,17 @@ import type { Queryable } from "./db.js";
  * keeping the read bounded on long runs.
  */
 export const DECISION_BRIEF_EVENT_LIMIT = 200;
+
+/**
+ * Marker the worker appends when it has to shrink the inline diff
+ * (`inlineDiffTruncationFlag` in `src/worker/diff-artifacts.ts`). Duplicated as
+ * a literal on purpose: that module imports `node:crypto`/`node:fs` and must not
+ * be pulled into the browser-shared graph this file's types come from.
+ */
+export const INLINE_DIFF_TRUNCATION_MARKER = "# [PiGO] inline diff truncated";
+
+/** `… bytes=<full diff byte count>` embedded in the truncation marker. */
+const MARKER_BYTES = /bytes=(\d+)/;
 
 function str(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
@@ -70,6 +82,66 @@ function parseStringArray(value: unknown): string[] {
 
 function isResolved(value: unknown): boolean {
   return value === true || value === 1 || value === "1" || value === "true";
+}
+
+/**
+ * Full-diff byte counts the pipeline recorded *before* any inline truncation:
+ * `diff.artifact_persisted.meta.bytes` (emitted every round by the worker right
+ * after persisting the durable full diff) and `meta.diffArtifact.bytes`
+ * (attached when an oversized callback body forced a real artifact upload). The
+ * largest recorded count wins, so a later smaller-but-complete diff is still
+ * judged against the biggest full artifact in the window — conservative.
+ *
+ * `run_artifacts.bytes` is deliberately NOT used: when its content is null it
+ * merely mirrors the inline preview, and when content is set it is the same
+ * (possibly truncated) inline body, so it cannot prove completeness.
+ */
+function recordedFullDiffBytes(
+  rows: Array<Record<string, unknown>>,
+  markerBytes: number | undefined,
+): number | undefined {
+  let recorded: number | undefined;
+  const consider = (value: number | undefined) => {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return;
+    recorded = recorded === undefined ? value : Math.max(recorded, value);
+  };
+  for (const row of rows) {
+    const type = str(row.type) ?? "";
+    const meta = parseMeta(row.meta_json);
+    if (type === "diff.artifact_persisted") consider(num(meta?.bytes));
+    const artifact = meta?.diffArtifact;
+    if (artifact && typeof artifact === "object") consider(num((artifact as Record<string, unknown>).bytes));
+  }
+  // The truncation marker itself names the full byte count, so a marked diff is
+  // provably incomplete even when no artifact event survived the tail window.
+  consider(markerBytes);
+  return recorded;
+}
+
+/**
+ * Decides whether the inline diff the brief reads is provably the run's whole
+ * diff (audit follow-up). Fail-safe: unless the inline text carries no
+ * truncation marker *and* the pipeline recorded a full-diff byte count that the
+ * inline text actually reaches, the change set is treated as not provably
+ * complete — the relevance/scope judgements then degrade to `unknown` (⇒
+ * blocking) and can never clear a finding as "outside the change set".
+ *
+ * The recorded counts come from the bounded `run_events` tail, so on a very long
+ * run whose artifact event fell out of the window the change set is reported as
+ * `missing-metadata` (blocking) rather than guessed complete.
+ */
+export function assessDiffCompleteness(run: Run, eventRows: Array<Record<string, unknown>>): DecisionBriefDiffProvenance {
+  const inline = typeof run.diff === "string" ? run.diff : "";
+  const inlineBytes = Buffer.byteLength(inline, "utf8");
+  const truncated = inline.includes(INLINE_DIFF_TRUNCATION_MARKER);
+  const markerBytes = truncated ? num(MARKER_BYTES.exec(inline)?.[1]) : undefined;
+  const recordedBytes = recordedFullDiffBytes(eventRows, markerBytes) ?? null;
+  const base = { complete: false as const, inlineBytes, recordedBytes };
+  if (!inline.trim()) return { ...base, reason: "absent" };
+  if (truncated) return { ...base, reason: "truncated" };
+  if (recordedBytes === null) return { ...base, reason: "missing-metadata" };
+  if (inlineBytes < recordedBytes) return { ...base, reason: "partial" };
+  return { complete: true, reason: "complete", inlineBytes, recordedBytes };
 }
 
 /**
@@ -186,6 +258,10 @@ export async function collectDecisionBriefInput(db: Queryable, run: Run): Promis
     findings,
     checks,
     diffFiles: run.diff && run.diff.trim() ? diffFilePaths(run.diff) : [],
+    // Audit follow-up: the inline `run.diff` may be a bounded/truncated copy, so
+    // the changed-file list is only trusted as the whole change set when the
+    // worker's recorded full-diff byte count proves the inline text is complete.
+    diff: assessDiffCompleteness(run, eventRows.rows as Array<Record<string, unknown>>),
     // No explicit allowed-path constraint is recorded on a run yet; generators
     // and dirty artefacts are still rejected by the scope gate.
     allowedPaths: null,

@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { internalUpdateRejection, releasesStoryBlocks, storyBlockReleaseNote } from "../shared/run-state.js";
-import { buildStoryRunInput, STORY_STATUS_LABELS, type ReleaseDeployRecord, type RunBudget, type StoryDetail } from "../shared/agile.js";
+import { buildStoryRunInput, STORY_STATUS_LABELS, type RunBudget, type StoryDetail } from "../shared/agile.js";
 import type { ConfigStatus, CurrentUser, ModelCatalogResponse, ReviewScope, Run, RunEvent, RunReleaseRecord, Workspace } from "../shared/types.js";
 import { AccountError, AccountService, accountAdminGate } from "./accounts.js";
 import { AlertManager, createAlertSink } from "./alerts.js";
@@ -46,7 +46,7 @@ import { AgileError, AgileService } from "./agile.js";
 import { readAgileMetrics, readReleaseRetrospective, readReleaseSummary } from "./agile-metrics.js";
 import { projectCreateSchema, projectPatchSchema, releaseCreateSchema, releasePatchSchema, releasePublishSchema, sprintCreateSchema, sprintPatchSchema, storyBlockSchema, storyCreateSchema, storyPatchSchema, storySubmitSchema, templateCreateSchema } from "./agile-schemas.js";
 import { executeRelease } from "./release-execution.js";
-import { isReleasePublishTerminal, planReleasePublish, planReleasePublishGate, RELEASE_DEPLOY_STALE_MS } from "./release-publish.js";
+import { isReleasePublishTerminal, planReleaseDeployCallback, planReleasePublish, planReleasePublishGate, RELEASE_DEPLOY_STALE_MS, RELEASE_PUBLISH_POLICY } from "./release-publish.js";
 import { runReleaseDeploy } from "./release-deploy.js";
 import type { RunStoreLike } from "./store.js";
 import { WorkspaceError, WorkspaceService } from "./workspaces.js";
@@ -62,7 +62,7 @@ const app = Fastify({
 });
 const port = Number(process.env.PORT || 3100);
 const host = process.env.HOST || "localhost";
-const webVersion = process.env.PI_WEB_VERSION?.trim() || "0.27.0";
+const webVersion = process.env.PI_WEB_VERSION?.trim() || "0.27.1";
 const demoMode = process.env.PI_DEMO_MODE !== "false";
 const realRunsEnabled = process.env.PI_REAL_RUNS_ENABLED === "true";
 const workerUrl = process.env.PI_WORKER_URL || "http://worker:3200";
@@ -1376,20 +1376,30 @@ app.delete<{ Params: { id: string } }>("/api/releases/:id", async (request, repl
 /**
  * Release publish action (Sprint 5). Owner-scoped, but **admin-only** to execute
  * (`release.requireAdmin: true`; same source of truth and error code as
- * `POST /api/runs/:id/publish`). Guards: the release must have ≥1 story and none
- * of its (reconciled) stories may be blocked — those answer 409 RELEASE_EMPTY /
- * RELEASE_BLOCKED. Without `confirm` this is a dry-run preview so the UI can
- * render the confirmation dialog; with `confirm` the release is marked
- * `released`, a DB-level idempotency claim guarantees exactly ONE deploy attempt
- * per confirm, and when PI_POST_MERGE_DEPLOY_HOOK is configured the same deploy
- * transport as run publish (`executeRelease`) is invoked. An HTTP 202 stays
- * `pending` until its callback arrives (or the bounded timeout marks it failed
- * and makes an explicit retry possible); its outcome is recorded on the release
- * + an audit row (never silently skipped, never a premature `ok`).
+ * `POST /api/runs/:id/publish`).
+ *
+ * The full precondition set (`planReleasePublish`, docs/19 §1.1) is enforced
+ * after the admin gate and before any side effect, and is shared by the dry-run
+ * preview and the confirmed publish so both report the identical verdict:
+ * `RELEASE_EMPTY` / `RELEASE_BLOCKED` (blocked story or an unresolved blocking
+ * finding) / `RELEASE_NOT_READY` (missing or unfinished run) /
+ * `RELEASE_CHECKS_FAILED` / `RELEASE_NOT_MERGED` (`release.requireMergedCommit`).
+ *
+ * Without `confirm` this is a dry-run preview so the UI can render the
+ * confirmation dialog (`release.requireExplicitConfirmation`: only `confirm:true`
+ * reaches a deploy). With `confirm` the release is marked `released`, a DB-level
+ * idempotency claim guarantees exactly ONE deploy attempt per confirm, and when
+ * PI_POST_MERGE_DEPLOY_HOOK is configured the same deploy transport as run
+ * publish (`executeRelease`) is invoked. An HTTP 202 stays `pending` until its
+ * callback arrives (or the bounded timeout marks it failed and makes an explicit
+ * retry possible); its outcome is recorded on the release + an audit row (never
+ * silently skipped, never a premature `ok`).
  */
 app.post<{ Params: { id: string } }>("/api/agile/releases/:id/publish", { bodyLimit: 1024 * 1024 }, async (request, reply) => {
   const parsed = releasePublishSchema.safeParse(request.body ?? {});
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
+  if (!parsed.success) {
+    return reply.code(400).send({ error: "发布需要 confirm=true（省略时只做只读预检）", code: "RELEASE_CONFIRM_REQUIRED", details: parsed.error.issues });
+  }
   const user = auth.user(request);
   const isAdmin = await identities.isAdmin(user.id);
   try {
@@ -1401,20 +1411,37 @@ app.post<{ Params: { id: string } }>("/api/agile/releases/:id/publish", { bodyLi
     const gate = planReleasePublishGate({ isAdmin });
     if (gate.kind === "forbidden") return reply.code(gate.status).send({ error: gate.message, code: gate.code });
 
+    // A terminal release has nothing left to publish (failed/timed-out deploys are
+    // deliberately not terminal: they must be explicitly retried).
+    if (isReleasePublishTerminal(release)) return reply.code(409).send({ error: "发布已发布，不可重复发布", code: "RELEASE_RELEASED" });
+
+    // Full, ordered precondition set on the stories' latest runs. Evaluated once
+    // for both the preview and the confirmed publish (same verdict, no side effect).
     const stories = await agile.collectReleaseStories(ownerKeysFor(request), release, isAdmin);
     const plan = planReleasePublish({ stories, label: `发布「${release.version} ${release.name}」` });
     if (plan.kind !== "ready") {
       return reply.code(plan.status).send({
         error: plan.message,
         code: plan.code,
-        ...(plan.kind === "blocked" ? { blocked: plan.blocked } : {}),
+        ...(plan.kind === "blocked" ? { blocked: plan.blocked, findings: plan.findings } : {}),
+        ...(plan.kind === "not_ready" ? { stories: plan.stories } : {}),
+        ...(plan.kind === "checks_failed" ? { stories: plan.stories } : {}),
+        ...(plan.kind === "not_merged" ? { stories: plan.stories } : {}),
       });
     }
 
-    // Dry run: never settles a `failed` deploy, so the UI can offer a retry.
-    if (!parsed.data.confirm) {
-      if (isReleasePublishTerminal(release)) return reply.code(409).send({ error: "发布已发布，不可重复发布", code: "RELEASE_RELEASED" });
-      return { published: false, release, stories, deploy: release.deploy ?? null };
+    // Explicit confirmation (`release.requireExplicitConfirmation`): a request
+    // without `confirm: true` is the read-only dry-run preview. It never settles a
+    // `failed` deploy (so the UI can offer a retry) and never reaches the deploy
+    // below — only an explicit confirmation does.
+    if (RELEASE_PUBLISH_POLICY.requireExplicitConfirmation && !parsed.data.confirm) {
+      return {
+        published: false,
+        confirmationRequired: true,
+        release,
+        stories,
+        deploy: release.deploy ?? null,
+      };
     }
 
     const now = new Date().toISOString();
@@ -1467,44 +1494,67 @@ app.post<{ Params: { id: string } }>("/api/agile/releases/:id/publish", { bodyLi
 /**
  * Internal final-status callback for asynchronous (HTTP 202) release deploys,
  * mirroring `POST /api/internal/runs/:id/release-result`. Authenticated with the
- * deploy webhook token (or the internal token); idempotent — a repeated
- * callback for an already-settled attempt returns the stored record.
+ * deploy webhook token (or the internal token).
+ *
+ * The callback is matched against the **exact current attempt** (delivery id +
+ * attempt + a still-`pending` record). Retries reuse the delivery id, so a late
+ * callback for a previous attempt is rejected with `RELEASE_ATTEMPT_STALE` and an
+ * audit row, and can never overwrite the newer attempt; a duplicate callback for
+ * the current attempt stays idempotent (`{ ok: true }`, no write).
  */
 app.post<{ Params: { id: string } }>("/api/internal/agile/releases/:id/release-result", async (request, reply) => {
   const authorized = safeSecretMatch(request.headers.authorization, releaseWebhookToken) || safeTokenMatch(request.headers.authorization);
   if (!authorized) return reply.code(401).send({ error: "Unauthorized" });
   const parsed = releaseDeployResultSchema.safeParse(request.body ?? {});
   if (!parsed.success) return reply.code(400).send({ error: "Invalid release result", details: parsed.error.issues });
+  const actorId = `deploy-system:${parsed.data.deliveryId}`;
   try {
     const release = await agile.getRelease([], request.params.id, true);
     const current = release.deploy ?? null;
-    if (!current || !current.deliveryId || current.deliveryId !== parsed.data.deliveryId) {
-      return reply.code(409).send({ error: "Release delivery id does not match", code: "RELEASE_DELIVERY_MISMATCH" });
+    const plan = planReleaseDeployCallback({
+      current,
+      deliveryId: parsed.data.deliveryId,
+      attempt: parsed.data.attempt,
+      status: parsed.data.status,
+      detail: parsed.data.detail,
+      deploymentId: parsed.data.deploymentId,
+      url: parsed.data.url,
+      now: new Date().toISOString(),
+    });
+    if (plan.kind === "reject") {
+      // A stale/unsolicited callback is audited but changes no state.
+      if (plan.audit && current) {
+        await agile.recordReleaseDeployRejection({ releaseId: release.id, actorId, detail: plan.message, deploy: current });
+      }
+      return reply.code(plan.status).send({
+        error: plan.message,
+        code: plan.code,
+        ...(plan.attempt === undefined ? {} : { attempt: plan.attempt }),
+      });
     }
-    if (parsed.data.attempt !== undefined && current.attempt !== parsed.data.attempt) {
-      return reply.code(409).send({ error: "Release attempt does not match", code: "RELEASE_DELIVERY_MISMATCH" });
-    }
-    const status: ReleaseDeployRecord["status"] = parsed.data.status === "succeeded" ? "ok" : "failed";
-    if (current.status === status) return { ok: true, release };
-    if (current.status !== "pending") {
-      return reply.code(409).send({ error: `Release deploy is already ${current.status}`, code: "RELEASE_ALREADY_FINAL" });
-    }
-    const at = new Date().toISOString();
+    if (plan.kind === "duplicate") return { ok: true, release };
     const settled = await agile.settleReleaseDeployResult({
       releaseId: release.id,
-      action: status === "ok" ? "release.deploy_succeeded" : "release.deploy_failed",
-      actorId: `deploy-system:${parsed.data.deliveryId}`,
-      deploy: {
-        ...current,
-        status,
-        detail: parsed.data.detail ?? (status === "ok" ? "部署系统回调：成功" : "部署系统回调：失败"),
-        at,
-        finishedAt: at,
-        ...(parsed.data.deploymentId ? { deploymentId: parsed.data.deploymentId } : {}),
-        ...(parsed.data.url ? { url: parsed.data.url } : {}),
-      },
+      action: plan.action,
+      actorId,
+      deploy: plan.deploy,
     });
-    // A concurrent writer may have settled first; its result is authoritative.
+    if (!settled.applied) {
+      // A concurrent writer won the race. A stale attempt is rejected + audited;
+      // a same-verdict winner is an idempotent duplicate. The stored record is
+      // authoritative either way — it is never overwritten.
+      const stored = settled.release.deploy ?? null;
+      if (settled.rejected === "stale_attempt") {
+        await agile.recordReleaseDeployRejection({ releaseId: release.id, actorId, detail: "部署回调因 attempt 已过期而被拒绝", deploy: stored ?? plan.deploy });
+        return reply.code(409).send({
+          error: "Release callback attempt is stale",
+          code: "RELEASE_ATTEMPT_STALE",
+          ...(stored?.attempt === undefined ? {} : { attempt: stored.attempt }),
+        });
+      }
+      if (stored && stored.status === plan.deploy.status) return { ok: true, release: settled.release };
+      return reply.code(409).send({ error: `Release deploy is already ${stored?.status ?? "unknown"}`, code: "RELEASE_ALREADY_FINAL" });
+    }
     return { ok: true, release: settled.release };
   } catch (error) {
     return agileErrorReply(reply, error);

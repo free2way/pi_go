@@ -15,12 +15,28 @@ owner**）一律 `403 ADMIN_REQUIRED`，所有者身份不构成例外。请求�
 
 ### 1.1 发布前校验
 
+在管理员门禁之后、任何副作用之前，按固定顺序校验**完整前置条件集**（`planReleasePublish`），
+同一份判定同时用于只读预检与确认发布（预检报告完全相同的结论，且不写入任何状态）：
+
 1. 发布必须关联 ≥ 1 个**属于调用者**的故事，否则 `409 RELEASE_EMPTY`。
 2. 关联故事中任一为 `blocked`（手动或运行派生）即 `409 RELEASE_BLOCKED`，响应体携带
    `blocked: [{ storyId, title, reason, runState }]`，UI 据此在确认对话框中列出阻塞项。
-3. 缺少 `confirm: true` 时为**只读预检**：返回
-   `{ published: false, release, stories, deploy }`，不写入任何状态，供 UI 渲染确认对话框。
-4. 已发布且部署已终态（`deploy` 为 `ok` / `not_configured` / `unsupported`，或从未记录部署）
+3. `RELEASE_NOT_READY`：故事没有关联运行（无可发布交付物），或其**最新运行**不是终态成功
+   （`state !== "completed"`，含 `needs_human`/`failed`/`cancelled`）。响应体携带
+   `stories: [{ storyId, title, status, runState, reason }]`。
+4. `RELEASE_CHECKS_FAILED`：最新运行的**确定性检查未通过**（`checkPassed=false`，或存在
+   `failed` 检查，或没有可确认通过的检查记录——无正向证据即拒绝）。响应体携带
+   `stories: [{ storyId, title, runId, detail }]`。
+5. `RELEASE_BLOCKED`（阻断级问题，复用 Decision Brief 的 blocking gate）：最新运行仍有**未解决
+   critical**，或存在无法证明与本故事 AC/DoD 无关的未解决 high（gate 为 `red`/`unknown` 均阻断）。
+   响应体携带 `findings: [{ storyId, runId, severity, title }]`。
+6. `RELEASE_NOT_MERGED`：`release.requireMergedCommit: true` 时，最新运行未记录**已合并提交**
+   （`run.merge.commit` 为空）。响应体携带 `stories: [{ storyId, title, runId }]`。
+
+缺少 `confirm: true` 时为**只读预检**（`release.requireExplicitConfirmation: true` 的落地：只有
+显式确认才会产生副作用）：返回 `{ published: false, confirmationRequired: true, release, stories, deploy }`，
+不写入任何状态，供 UI 渲染确认对话框。请求体不是合法对象时返回 `400 RELEASE_CONFIRM_REQUIRED`。
+7. 已发布且部署已终态（`deploy` 为 `ok` / `not_configured` / `unsupported`，或从未记录部署）
    的版本重复发布 → `409 RELEASE_RELEASED`。**部署失败或回调超时不在此列**：它们是可重试的，
    见 1.3。已发布版本仍是**编辑终态**：`PATCH /api/releases/:id` 对其返回 `409 RELEASE_RELEASED`。
 
@@ -47,9 +63,15 @@ owner**）一律 `403 ADMIN_REQUIRED`，所有者身份不构成例外。请求�
 ### 1.3 异步部署（HTTP 202）与重试
 
 - HTTP 202 只记为 **`pending`**（不再是 `ok`）：部署系统已受理，最终结果必须由回调
-  `POST /api/internal/agile/releases/:id/release-result`（`{ deliveryId, attempt?, status,
-  detail?, deploymentId?, url? }`，与运行回调同一鉴权）给出。回调把 `pending` 结算为
-  `ok` / `failed` 并追加审计行（`release.deploy_succeeded` / `release.deploy_failed`）。
+  `POST /api/internal/agile/releases/:id/release-result`（`{ deliveryId, attempt, status,
+  detail?, deploymentId?, url? }`，与运行回调同一鉴权）给出。发布钩子 payload 与
+  `X-PiGO-Delivery-Id` 头都会带上 `deliveryId` 与 `attempt`，供部署系统原样回传。
+- **回调按“精确当前 attempt”匹配**（`planReleaseDeployCallback` / `settleReleaseDeployResult`）：
+  回调的 `deliveryId` 与 `attempt` 必须与当前记录的 `pending` 尝试完全一致。
+  重试复用同一 `deliveryId`、只递增 `attempt`，因此**上一次尝试的迟到回调**（attempt 不匹配或
+  未携带 attempt）一律以 `409 RELEASE_ATTEMPT_STALE` 拒绝，追加审计行 `release.deploy_rejected`，
+  **不改变状态、不覆盖更新的尝试**；`deliveryId` 不匹配仍为 `RELEASE_DELIVERY_MISMATCH`；
+  当前尝试重复回调（状态一致）幂等返回 `{ ok: true }`，不重复写入。
 - **有界校验**：`pending` 超过 `RELEASE_DEPLOY_STALE_MS`（5 分钟，`src/shared/agile.ts`）仍未
   回调即为超时，被标记为 `failed` 并在 detail 记录超时原因（确认时即时结算，另有 60s 周期
   巡检）。`ok` 只有在同步 2xx 或回调报告成功后才出现——**不会出现提前的 `ok`**。

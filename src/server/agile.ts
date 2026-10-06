@@ -8,6 +8,7 @@ import {
   type AgileStory,
   type ModelTemplate,
   type ReleaseDeployRecord,
+  type ReleaseDeploySettlementRejection,
   type ReleaseStatus,
   type RunBudget,
   type SprintStatus,
@@ -17,6 +18,7 @@ import {
   type StoryRunSummary,
 } from "../shared/agile.js";
 import type { ModelSelection, Run, RunState } from "../shared/types.js";
+import { diffFilePaths } from "../shared/decision-brief.js";
 import { releasesStoryBlocks } from "../shared/run-state.js";
 import { newId, type Db } from "./db.js";
 import { type ReleasePublishStory } from "./release-publish.js";
@@ -804,9 +806,12 @@ export class AgileService {
 
   /**
    * Resolves the release's story ids against the caller's stories, reconciling
-   * each to its derived status/reason. Foreign/unknown ids are skipped, so a
-   * stale id can never pull in another owner's story. An empty result is the
-   * `RELEASE_EMPTY` condition the publish guard reports.
+   * each to its derived status/reason and carrying the latest linked run's
+   * release-readiness data (state, check verdict, findings, merged commit) so
+   * `planReleasePublish` can enforce the full precondition set without a second
+   * query pass. Foreign/unknown ids are skipped, so a stale id can never pull in
+   * another owner's story. An empty result is the `RELEASE_EMPTY` condition the
+   * publish guard reports.
    */
   async collectReleaseStories(ownerKeys: string[], release: AgileRelease, isAdmin = false): Promise<ReleasePublishStory[]> {
     const stories: ReleasePublishStory[] = [];
@@ -818,12 +823,21 @@ export class AgileService {
         continue;
       }
       const latest = latestLinkedRun(await this.listStoryRunsDetailed(storyId));
+      const run = latest?.run ?? null;
+      const criteria = [...story.acceptanceCriteria, ...story.definitionOfDone].map((item) => item.trim()).filter(Boolean);
       stories.push({
         storyId: story.id,
         title: story.title,
         status: story.status,
         ...(story.status === "blocked" && story.blockedReason ? { reason: story.blockedReason } : {}),
-        runState: latest?.run.state ?? null,
+        runState: run?.state ?? null,
+        runId: run?.id ?? null,
+        checkPassed: run?.checkPassed ?? null,
+        checks: run?.checks ?? null,
+        findings: run?.findings ?? null,
+        criteria,
+        diffFiles: run ? diffFilePaths(run.diff) : null,
+        mergedCommit: run?.merge?.commit ?? null,
       });
     }
     return stories;
@@ -889,11 +903,15 @@ export class AgileService {
 
   /**
    * Settles the in-flight deploy of one attempt with the result actually
-   * observed (synchronous outcome or asynchronous callback). Only a `pending`
-   * attempt of the *same* delivery/attempt may be settled, and the write is a
-   * compare-and-swap on the stored `deploy_json`; a late duplicate writer can
-   * therefore never overwrite a callback that already recorded the final status
-   * — it returns `applied: false` with the authoritative release instead.
+   * observed (synchronous outcome or asynchronous callback). The match is
+   * *exact*: the write only applies when the stored record is still `pending`
+   * and its `deliveryId` **and** `attempt` equal the ones carried by the settle
+   * input. A wildcard (missing identity) is refused rather than accepted, so a
+   * late callback from a previous attempt can never settle a newer one.
+   *
+   * The write itself is a compare-and-swap on the stored `deploy_json`; a late
+   * duplicate writer therefore cannot overwrite a callback that already recorded
+   * the final status — it returns `applied: false` with the authoritative release.
    */
   async settleReleaseDeployResult(input: {
     releaseId: string;
@@ -901,17 +919,21 @@ export class AgileService {
     action: "release.deploy_result" | "release.deploy_succeeded" | "release.deploy_failed";
     actorId: string;
     now?: string;
-  }): Promise<{ applied: boolean; release: AgileRelease }> {
+  }): Promise<{ applied: boolean; release: AgileRelease; rejected?: ReleaseDeploySettlementRejection }> {
     const now = input.now ?? this.now();
     const releaseRow = (await this.db.query("SELECT * FROM agile_releases WHERE id = $1", [input.releaseId])).rows[0] as unknown as ReleaseRow | undefined;
     if (!releaseRow) throw new AgileError("RELEASE_NOT_FOUND", "发布不存在", 404);
     const current = parseJson<ReleaseDeployRecord | null>(releaseRow.deploy_json, null);
-    const sameAttempt = Boolean(current)
-      && current!.status === "pending"
-      && (input.deploy.deliveryId === undefined || current!.deliveryId === input.deploy.deliveryId)
-      && (input.deploy.attempt === undefined || current!.attempt === input.deploy.attempt);
-    if (!sameAttempt) {
-      return { applied: false, release: toRelease(releaseRow) };
+    const identityMatches = Boolean(current)
+      && input.deploy.deliveryId !== undefined
+      && input.deploy.attempt !== undefined
+      && current!.deliveryId === input.deploy.deliveryId
+      && current!.attempt === input.deploy.attempt;
+    if (!identityMatches) {
+      return { applied: false, release: toRelease(releaseRow), rejected: "stale_attempt" };
+    }
+    if (current!.status !== "pending") {
+      return { applied: false, release: toRelease(releaseRow), rejected: "not_pending" };
     }
     const applied = await this.db.withTransaction(async (tx) => {
       const row = (await tx.query(
@@ -928,7 +950,37 @@ export class AgileService {
       return true;
     });
     const release = toRelease((await this.db.query("SELECT * FROM agile_releases WHERE id = $1", [input.releaseId])).rows[0] as unknown as ReleaseRow);
-    return { applied, release };
+    if (applied) return { applied, release };
+    // The CAS lost a race. Distinguish "another writer settled this same attempt"
+    // (not_pending → idempotent for the caller) from "the attempt changed under
+    // us" (stale_attempt → a newer attempt must never be overwritten).
+    const stored = release.deploy ?? null;
+    const sameIdentity = Boolean(stored) && stored!.deliveryId === input.deploy.deliveryId && stored!.attempt === input.deploy.attempt;
+    return { applied, release, rejected: sameIdentity ? "not_pending" : "stale_attempt" };
+  }
+
+  /**
+   * Append-only audit for a callback that was *rejected* and therefore changed no
+   * state (stale/unsolicited attempt). Keeping this separate from
+   * `settleReleaseDeployResult` makes the "rejected callbacks are audited but
+   * never mutate" property explicit.
+   */
+  async recordReleaseDeployRejection(input: {
+    releaseId: string;
+    actorId: string;
+    detail: string;
+    deploy: ReleaseDeployRecord;
+    now?: string;
+    action?: string;
+  }): Promise<void> {
+    const now = input.now ?? this.now();
+    const releaseRow = (await this.db.query("SELECT owner_id FROM agile_releases WHERE id = $1", [input.releaseId])).rows[0] as { owner_id: string } | undefined;
+    if (!releaseRow) throw new AgileError("RELEASE_NOT_FOUND", "发布不存在", 404);
+    await this.db.query(
+      `INSERT INTO agile_release_audit (id, release_id, owner_id, action, actor_id, note, status, deploy_json, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [newId("relaudit"), input.releaseId, releaseRow.owner_id, input.action ?? "release.deploy_rejected", input.actorId, input.detail, input.deploy.status, JSON.stringify(input.deploy), now],
+    );
   }
 
   /**
