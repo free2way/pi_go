@@ -177,6 +177,7 @@ services:
       PI_RUN_TIMEOUT_SECONDS: ${PI_RUN_TIMEOUT_SECONDS:-1800}
       # SEC-004/AT-SEC-007:每个 Agent 调用与检查命令都在独立容器中执行。
       PI_SANDBOX_MODE: ${PI_SANDBOX_MODE:-auto}
+      PI_SANDBOX_ALLOW_DEGRADED: ${PI_SANDBOX_ALLOW_DEGRADED:-}
       PI_SANDBOX_IMAGE: ${PI_SANDBOX_IMAGE:-local/pigo-sandbox:0.1.0}
       PI_SANDBOX_NETWORK: ${PI_SANDBOX_NETWORK:-pi-agent-network}
       PI_HOST_WORKSPACE_ROOT: ${PI_HOST_WORKSPACE_ROOT:-/app/pi-agent/workspace}

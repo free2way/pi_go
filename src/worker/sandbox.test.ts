@@ -157,26 +157,44 @@ describe("SandboxUnavailableError", () => {
 });
 
 type FakeExit = "SIGTERM" | "SIGKILL" | "never";
+type FakeRemoval = "ok" | "fail" | "never" | "absent";
 
-/** A sandbox container stub: `wait()` only settles when its exit signal arrives. */
+/**
+ * A sandbox container stub: `wait()` only settles when its exit signal arrives.
+ * `journal` records the ordered teardown calls so tests can assert that removal
+ * happens *after* the container stopped (or was force-killed).
+ */
 function fakeSandbox(
   id: string,
   exitsOn: FakeExit = "SIGTERM",
   onStop?: (signal: "SIGTERM" | "SIGKILL") => void,
+  removal: FakeRemoval = "ok",
 ) {
   const signals: Array<"SIGTERM" | "SIGKILL"> = [];
+  const journal: string[] = [];
+  let removals = 0;
   let release: () => void = () => undefined;
   const exited = new Promise<void>((resolve) => { release = resolve; });
   const handle: SandboxContainerHandle = {
     id,
     stop: async (signal) => {
       signals.push(signal);
+      journal.push(`stop:${signal}`);
       onStop?.(signal);
       if (exitsOn === signal) release();
     },
     wait: () => exited,
   };
-  return { handle, signals };
+  if (removal !== "absent") {
+    handle.remove = () => {
+      removals += 1;
+      journal.push("remove");
+      if (removal === "fail") return Promise.reject(new Error(`cannot remove ${id}`));
+      if (removal === "never") return new Promise(() => undefined);
+      return Promise.resolve();
+    };
+  }
+  return { handle, signals, journal, get removals() { return removals; } };
 }
 
 describe("SandboxContainerRegistry (P1 shutdown)", () => {
@@ -189,7 +207,7 @@ describe("SandboxContainerRegistry (P1 shutdown)", () => {
     expect(registry.size).toBe(0);
   });
 
-  it("stops with SIGTERM and force-kills only what survives the grace period", async () => {
+  it("stops with SIGTERM, force-kills only what survives, and removes both", async () => {
     const polite = fakeSandbox("c1", "SIGTERM");
     const stubborn = fakeSandbox("c2", "SIGKILL");
     const registry = new SandboxContainerRegistry();
@@ -203,10 +221,60 @@ describe("SandboxContainerRegistry (P1 shutdown)", () => {
     expect(result.unconfirmed).toEqual([]);
     expect(polite.signals).toEqual(["SIGTERM"]);
     expect(stubborn.signals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(result.removed?.slice().sort()).toEqual(["c1", "c2"]);
+    expect(result.removalFailed).toEqual([]);
     expect(registry.size).toBe(0);
   });
 
-  it("is idempotent: concurrent and repeated stopAll calls run one teardown", async () => {
+  it("removes a container only after it stopped or was force-killed (AUD follow-up)", async () => {
+    const polite = fakeSandbox("c1", "SIGTERM");
+    const stubborn = fakeSandbox("c2", "SIGKILL");
+    const registry = new SandboxContainerRegistry();
+    registry.add(polite.handle);
+    registry.add(stubborn.handle);
+
+    const result = await registry.stopAll({ graceMs: 30, forceKillGraceMs: 30 });
+
+    expect(polite.journal).toEqual(["stop:SIGTERM", "remove"]);
+    expect(stubborn.journal).toEqual(["stop:SIGTERM", "stop:SIGKILL", "remove"]);
+    expect(polite.removals).toBe(1);
+    expect(stubborn.removals).toBe(1);
+    expect(result.removed?.slice().sort()).toEqual(["c1", "c2"]);
+  });
+
+  it("reports a failed or hanging removal and still completes teardown (never throws/hangs)", async () => {
+    const failing = fakeSandbox("c1", "SIGTERM", undefined, "fail");
+    const hanging = fakeSandbox("c2", "SIGTERM", undefined, "never");
+    const registry = new SandboxContainerRegistry();
+    registry.add(failing.handle);
+    registry.add(hanging.handle);
+
+    const started = Date.now();
+    const result = await registry.stopAll({ graceMs: 30, forceKillGraceMs: 30, removalTimeoutMs: 20 });
+
+    expect(result.stopped.slice().sort()).toEqual(["c1", "c2"]);
+    expect(result.removed).toEqual([]);
+    expect(result.removalFailed?.map((failure) => failure.id).sort()).toEqual(["c1", "c2"]);
+    expect(result.removalFailed?.find((failure) => failure.id === "c1")?.error).toContain("cannot remove c1");
+    expect(result.removalFailed?.find((failure) => failure.id === "c2")?.error).toContain("20ms");
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(registry.size).toBe(0);
+  });
+
+  it("skips (without failing) handles that predate the removal hook", async () => {
+    const legacy = fakeSandbox("c1", "SIGTERM", undefined, "absent");
+    const registry = new SandboxContainerRegistry();
+    registry.add(legacy.handle);
+
+    const result = await registry.stopAll({ graceMs: 30, forceKillGraceMs: 30 });
+
+    expect(result.stopped).toEqual(["c1"]);
+    expect(result.removed).toEqual([]);
+    expect(result.removalFailed).toEqual([]);
+    expect(registry.size).toBe(0);
+  });
+
+  it("is idempotent: concurrent and repeated stopAll calls run one teardown (one removal)", async () => {
     const sandbox = fakeSandbox("c1", "SIGTERM");
     const registry = new SandboxContainerRegistry();
     registry.add(sandbox.handle);
@@ -220,9 +288,11 @@ describe("SandboxContainerRegistry (P1 shutdown)", () => {
     expect(second).toEqual(first);
     expect(third).toEqual(first);
     expect(sandbox.signals).toEqual(["SIGTERM"]);
+    expect(sandbox.removals).toBe(1);
+    expect(first.removed).toEqual(["c1"]);
   });
 
-  it("gives up on a stuck sandbox within the bounded timeout (never hangs)", async () => {
+  it("gives up on a stuck sandbox within the bounded timeout and still removes it", async () => {
     const stuck = fakeSandbox("stuck", "never");
     const registry = new SandboxContainerRegistry();
     registry.add(stuck.handle);
@@ -233,10 +303,12 @@ describe("SandboxContainerRegistry (P1 shutdown)", () => {
     expect(result.forced).toEqual(["stuck"]);
     expect(result.unconfirmed).toEqual(["stuck"]);
     expect(stuck.signals).toEqual(["SIGTERM", "SIGKILL"]);
+    // A stuck container is still handed to `remove` (a forced remove kills it).
+    expect(result.removed).toEqual(["stuck"]);
     expect(Date.now() - started).toBeLessThan(2_000);
   });
 
-  it("force-kills a sandbox that starts while the teardown is still running", async () => {
+  it("force-kills and removes a sandbox that starts while teardown is still running", async () => {
     const registry = new SandboxContainerRegistry();
     const late = fakeSandbox("late", "SIGKILL");
     const first = fakeSandbox("c1", "SIGTERM", (signal) => {
@@ -250,11 +322,14 @@ describe("SandboxContainerRegistry (P1 shutdown)", () => {
     expect(result.stopped).toEqual(["c1"]);
     expect(result.forced).toEqual(["late"]);
     expect(late.signals).toEqual(["SIGKILL"]);
+    expect(late.journal).toEqual(["stop:SIGKILL", "remove"]);
+    expect(result.removed?.slice().sort()).toEqual(["c1", "late"]);
     expect(registry.size).toBe(0);
   });
 
   it("resolves immediately with an empty result when nothing is running", async () => {
-    expect(await new SandboxContainerRegistry().stopAll()).toEqual({ stopped: [], forced: [], unconfirmed: [] });
+    expect(await new SandboxContainerRegistry().stopAll())
+      .toEqual({ stopped: [], forced: [], unconfirmed: [], removed: [], removalFailed: [] });
   });
 });
 
@@ -267,7 +342,7 @@ describe("createShutdownHandler (P1 worker exit)", () => {
       stopClaiming: () => { order.push("stopClaiming"); },
       stopSandboxes: async () => {
         order.push("stopSandboxes");
-        return { stopped: ["c1"], forced: [], unconfirmed: [] };
+        return { stopped: ["c1"], forced: [], unconfirmed: [], removed: ["c1"], removalFailed: [] };
       },
       releaseLocks: () => { order.push("releaseLocks"); },
       exit: (code) => { order.push(`exit:${code}`); exitCodes.push(code); },
@@ -287,6 +362,21 @@ describe("createShutdownHandler (P1 worker exit)", () => {
     const { shutdown, exitCodes } = deps();
     await shutdown("SIGINT");
     expect(exitCodes).toEqual([130]);
+  });
+
+  it("reports removals (and removal failures) in the shutdown log", async () => {
+    const { shutdown, logs } = deps({
+      stopSandboxes: async () => ({
+        stopped: ["c1"],
+        forced: [],
+        unconfirmed: [],
+        removed: ["c1"],
+        removalFailed: [{ id: "c2", error: "docker API unavailable" }],
+      }),
+    });
+    await shutdown("SIGTERM");
+    expect(logs.join("\n")).toContain("已移除 1 个");
+    expect(logs.join("\n")).toContain("移除失败 1 个");
   });
 
   it("ignores repeated signals while a teardown is in flight", async () => {

@@ -102,7 +102,7 @@ export type ReleaseDeployStatus = "not_configured" | "unsupported" | "pending" |
  * and an explicit retry becomes possible. Shared so the client can offer the
  * retry at the same threshold instead of guessing.
  */
-export const RELEASE_DEPLOY_STALE_MS = 5 * 60_000;
+export const RELEASE_DEPLOY_STALE_MS = 2 * 60 * 1000;
 export interface ReleaseDeployRecord {
   status: ReleaseDeployStatus;
   detail: string;

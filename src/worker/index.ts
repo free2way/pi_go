@@ -347,6 +347,10 @@ async function runInSandbox(input: SandboxRunInput): Promise<CommandResult> {
     id: containerId,
     stop: (signal) => docker.killContainer(containerId, signal),
     wait: () => docker.waitContainer(containerId).then(() => undefined),
+    // AUD-08: shutdown removes the container it stopped/killed too, so an exited
+    // sandbox never lingers on the host when this function's `finally` (which
+    // normally removes it) does not get to run before the shutdown exit.
+    remove: () => docker.removeContainer(containerId),
   });
   let stdout = "";
   let stderr = "";

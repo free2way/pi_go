@@ -195,6 +195,21 @@ export interface SandboxContainerHandle {
   stop: (signal: "SIGTERM" | "SIGKILL") => Promise<void>;
   /** Resolves when the container has exited (best effort; may never resolve). */
   wait: () => Promise<unknown>;
+  /**
+   * Removes the container from the host after it stopped or was force-killed.
+   *
+   * Optional so existing callers keep working; when present it is called once
+   * per handle during teardown. A rejection or an over-long removal is reported
+   * through `SandboxStopResult.removalFailed` and never aborts shutdown.
+   */
+  remove?: () => Promise<unknown>;
+}
+
+/** A container that stopped but could not be confirmed removed. */
+export interface SandboxRemovalFailure {
+  id: string;
+  /** Why the removal was not confirmed (runtime error or timeout). */
+  error: string;
 }
 
 export interface SandboxStopResult {
@@ -204,10 +219,29 @@ export interface SandboxStopResult {
   forced: string[];
   /** Containers still not confirmed exited after the force-kill wait. */
   unconfirmed: string[];
+  /**
+   * Containers whose removal was confirmed during this teardown. Optional so
+   * pre-existing producers (tests, stubs) stay source compatible; stopAll always
+   * populates it.
+   */
+  removed?: string[];
+  /** Containers that stopped (or were killed) but whose removal failed/timed out. */
+  removalFailed?: SandboxRemovalFailure[];
+}
+
+/** Optional overrides for {@link SandboxContainerRegistry.stopAll}. */
+export interface SandboxStopOptions {
+  /** How long a container gets to exit after SIGTERM. */
+  graceMs?: number;
+  /** How long a container gets to exit after SIGKILL. */
+  forceKillGraceMs?: number;
+  /** Upper bound for each container's removal; `<= 0` skips removal entirely. */
+  removalTimeoutMs?: number;
 }
 
 export const DEFAULT_SANDBOX_STOP_GRACE_MS = 10_000;
 export const DEFAULT_SANDBOX_FORCE_KILL_GRACE_MS = 5_000;
+export const DEFAULT_SANDBOX_REMOVAL_TIMEOUT_MS = 5_000;
 export const DEFAULT_SHUTDOWN_TIMEOUT_MS = 20_000;
 
 /**
@@ -236,21 +270,25 @@ export class SandboxContainerRegistry {
 
   /**
    * Stops every tracked container: SIGTERM, a bounded wait for termination, then
-   * SIGKILL for anything still alive with a second bounded wait. Idempotent —
-   * concurrent or repeated calls share one teardown, so a repeated signal can
-   * never double-stop (or race) the containers.
+   * SIGKILL for anything still alive with a second bounded wait, and finally a
+   * bounded best-effort `remove` so no exited sandbox lingers on the host.
+   * Idempotent — concurrent or repeated calls share one teardown, so a repeated
+   * signal can never double-stop (or race) the containers.
    */
-  stopAll(options: { graceMs?: number; forceKillGraceMs?: number } = {}): Promise<SandboxStopResult> {
+  stopAll(options: SandboxStopOptions = {}): Promise<SandboxStopResult> {
     this.stopping ??= this.teardown(options);
     return this.stopping;
   }
 
-  private async teardown(options: { graceMs?: number; forceKillGraceMs?: number }): Promise<SandboxStopResult> {
+  private async teardown(options: SandboxStopOptions): Promise<SandboxStopResult> {
     const graceMs = options.graceMs ?? DEFAULT_SANDBOX_STOP_GRACE_MS;
     const forceKillGraceMs = options.forceKillGraceMs ?? DEFAULT_SANDBOX_FORCE_KILL_GRACE_MS;
+    const removalTimeoutMs = options.removalTimeoutMs ?? DEFAULT_SANDBOX_REMOVAL_TIMEOUT_MS;
     const stopped: string[] = [];
     const forced: string[] = [];
     const unconfirmed: string[] = [];
+    const removed: string[] = [];
+    const removalFailed: SandboxRemovalFailure[] = [];
     // Two bounded passes: pass 1 politely stops the containers already running
     // (SIGTERM, grace wait, then SIGKILL for whatever survived); pass 2
     // force-kills any sandbox a still-active job registered while pass 1 was
@@ -275,9 +313,55 @@ export class SandboxContainerRegistry {
           if (!(await settlesWithin(handle.wait(), forceKillGraceMs))) unconfirmed.push(handle.id);
         }));
       }
+      // AUD: the normal removal lives in `runInSandbox`'s `finally`, which may
+      // never run before `process.exit`; remove here too (a lingering exited
+      // container is exactly what this teardown exists to prevent).
+      await removeHandles(handles, removalTimeoutMs, removed, removalFailed);
       for (const handle of handles) this.handles.delete(handle.id);
     }
-    return { stopped, forced, unconfirmed };
+    return { stopped, forced, unconfirmed, removed, removalFailed };
+  }
+}
+
+/**
+ * Best-effort removal of already-stopped containers. Never throws: a failing or
+ * over-long removal is recorded so shutdown can report it and still exit, and a
+ * handle without a removal hook is skipped. `timeoutMs <= 0` skips removal.
+ */
+async function removeHandles(
+  handles: SandboxContainerHandle[],
+  timeoutMs: number,
+  removed: string[],
+  failed: SandboxRemovalFailure[],
+): Promise<void> {
+  if (timeoutMs <= 0) return;
+  await Promise.all(handles.map(async (handle) => {
+    const remove = handle.remove;
+    if (typeof remove !== "function") return;
+    // Wrapped so a synchronous throw in the hook is treated as a rejection.
+    const outcome = await outcomeWithin((async () => remove())(), timeoutMs);
+    if (outcome.ok) removed.push(handle.id);
+    else failed.push({ id: handle.id, error: outcome.error });
+  }));
+}
+
+/** Awaits `promise` for at most `ms`, reporting rejection/timeout instead of throwing. */
+async function outcomeWithin(promise: Promise<unknown>, ms: number): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (ms <= 0) return { ok: false, error: "removal skipped: no removal budget" };
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise.then(
+        () => ({ ok: true } as const),
+        (error) => ({ ok: false as const, error: (error as Error | undefined)?.message ?? String(error) }),
+      ),
+      new Promise<{ ok: false; error: string }>((resolve) => {
+        timer = setTimeout(() => resolve({ ok: false, error: `removal not confirmed within ${ms}ms` }), ms);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -343,7 +427,10 @@ export function createShutdownHandler(deps: WorkerShutdownDeps): (signal: "SIGTE
         if (result.timedOut) {
           log(`[shutdown] 沙箱回收超过 ${timeoutMs}ms 仍未完成，进程将强制退出`);
         } else if (result.value) {
-          log(`[shutdown] 沙箱已回收：正常停止 ${result.value.stopped.length} 个，强制终止 ${result.value.forced.length} 个，未确认退出 ${result.value.unconfirmed.length} 个`);
+          const removed = result.value.removed?.length ?? 0;
+          const removalFailed = result.value.removalFailed?.length ?? 0;
+          log(`[shutdown] 沙箱已回收：正常停止 ${result.value.stopped.length} 个，强制终止 ${result.value.forced.length} 个，未确认退出 ${result.value.unconfirmed.length} 个，已移除 ${removed} 个`
+            + (removalFailed > 0 ? `，移除失败 ${removalFailed} 个` : ""));
         }
       } catch (error) {
         log(`[shutdown] 回收沙箱失败：${(error as Error).message}`);
