@@ -88,6 +88,9 @@ services:
       # Development auth + dev server semantics: NODE_ENV must NOT be
       # production, otherwise Authenticator rejects PI_AUTH_MODE=development.
       NODE_ENV: development
+      PI_RUN_MAX_TOKENS: ${PI_RUN_MAX_TOKENS:-}
+      PI_RUN_MAX_COST_USD: ${PI_RUN_MAX_COST_USD:-}
+      PI_RUN_MAX_MODEL_CALLS: ${PI_RUN_MAX_MODEL_CALLS:-}
       HOST: 0.0.0.0
       PORT: 3100
       PI_AUTH_MODE: development
