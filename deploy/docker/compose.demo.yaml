@@ -182,8 +182,8 @@ services:
       # SEC-004: every agent call and check command runs in a dedicated sandbox
       # container. `auto` still fails closed when the Docker socket is unusable.
       PI_SANDBOX_MODE: ${PI_SANDBOX_MODE:-auto}
-      PI_RUN_MAX_TOKENS: ${PI_RUN_MAX_TOKENS:-}}
-      PI_RUN_MAX_COST_USD: ${PI_RUN_MAX_COST_USD:-}}
+      PI_RUN_MAX_TOKENS: ${PI_RUN_MAX_TOKENS:-}
+      PI_RUN_MAX_COST_USD: ${PI_RUN_MAX_COST_USD:-}
       PI_RUN_MAX_MODEL_CALLS: ${PI_RUN_MAX_MODEL_CALLS:-}
       # Fail-closed (default OFF). With the line below commented out, a worker
       # that cannot create sandbox containers REFUSES the run
