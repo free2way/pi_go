@@ -88,15 +88,37 @@ export type RunBudget = NonNullable<Run["budget"]>;
 
 /**
  * Outcome of the post-publish deploy hook. `not_configured`/`unsupported` mirror
- * `planPostMergeDeploy`; `ok` covers an accepted (2xx/202) request, `failed` any
- * non-2xx or transport error. A configured-but-failing hook is always recorded,
- * never silently skipped.
+ * `planPostMergeDeploy`; `ok` means a *confirmed* success (synchronous 2xx, or an
+ * asynchronous request whose callback reported success); `pending` means the
+ * deploy system accepted an asynchronous request (HTTP 202) and the final result
+ * has not arrived yet; `failed` is any non-2xx/transport error *or* a timed-out
+ * `pending` attempt. A configured-but-failing hook is always recorded, never
+ * silently skipped.
  */
-export type ReleaseDeployStatus = "not_configured" | "unsupported" | "ok" | "failed";
+export type ReleaseDeployStatus = "not_configured" | "unsupported" | "pending" | "ok" | "failed";
+/**
+ * A `pending` deploy older than this is considered timed out: the server
+ * materializes it as `failed` (bounded verification, no callback ever arrived)
+ * and an explicit retry becomes possible. Shared so the client can offer the
+ * retry at the same threshold instead of guessing.
+ */
+export const RELEASE_DEPLOY_STALE_MS = 5 * 60_000;
 export interface ReleaseDeployRecord {
   status: ReleaseDeployStatus;
   detail: string;
+  /** Last update time of this record. */
   at: string;
+  /** Stable deployment identity (`release-publish:<releaseId>`); set once a deploy was attempted. */
+  deliveryId?: string;
+  /** 1-based deploy attempt; a retry increments it while reusing `deliveryId`. */
+  attempt?: number;
+  /** When the attempt started; a `pending` record older than the timeout is retryable. */
+  startedAt?: string;
+  /** When the attempt reached a final status. */
+  finishedAt?: string;
+  /** Deployment URL / id reported by the deploy system or its callback. */
+  url?: string;
+  deploymentId?: string;
 }
 
 export interface AgileProject {
@@ -165,7 +187,10 @@ export interface AgileRelease {
   /** Set when the release was published (status `released`); else `null`. */
   releasedAt?: string | null;
   releasedBy?: string | null;
-  /** Deploy hook outcome recorded at publish time; `null` before publish. */
+  /**
+   * Deploy hook outcome; `null` before publish. An async (HTTP 202) hook stays
+   * `pending` until its callback arrives or the bounded timeout marks it failed.
+   */
   deploy?: ReleaseDeployRecord | null;
   createdAt: string;
   updatedAt: string;

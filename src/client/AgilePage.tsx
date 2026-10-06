@@ -5,7 +5,7 @@ import type { AgileMetricsResponse, ReleaseRetrospective, ReleaseSummary } from 
 import type { ConfigStatus, ModelCatalogResponse, RunState, Workspace } from "../shared/types";
 import { api } from "./api";
 import { agileFormErrorMessage, buildReleaseInput, buildTemplateInput, parseModelSelection } from "./agile-forms";
-import { columnPoints, estimateLabel, groupStoriesByColumn, priorityLabel, releaseExportFilename, releaseExportJson, splitLines, storyReference } from "./agile-view";
+import { columnPoints, estimateLabel, groupStoriesByColumn, priorityLabel, RELEASE_DEPLOY_ACTION_LABELS, releaseDeployAction, releaseExportFilename, releaseExportJson, splitLines, storyReference } from "./agile-view";
 
 const runStateLabels: Record<RunState, string> = {
   queued: "排队中",
@@ -24,7 +24,8 @@ const releaseStatusLabels: Record<AgileRelease["status"], string> = { planned: "
 const deployStatusLabels: Record<ReleaseDeployRecord["status"], string> = {
   not_configured: "未配置部署钩子",
   unsupported: "部署钩子类型不支持",
-  ok: "部署已触发",
+  pending: "部署进行中（等待回调）",
+  ok: "部署成功",
   failed: "部署失败",
 };
 
@@ -539,7 +540,13 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
     setPublishBusy(true);
     setPublishError("");
     try {
-      const result = await api.publishRelease(publishTarget.id, { confirm: true, ...(publishNote.trim() ? { note: publishNote.trim() } : {}) });
+      const result = await api.publishRelease(publishTarget.id, {
+        confirm: true,
+        // An existing deploy record means this confirm is a retry (failed or
+        // timed-out attempt); the server still refuses a non-stale `pending` one.
+        retry: publishTarget.deploy != null,
+        ...(publishNote.trim() ? { note: publishNote.trim() } : {}),
+      });
       setReleases((current) => current.map((item) => (item.id === result.release.id ? result.release : item)));
       closePublish();
     } catch (cause) {
@@ -1183,16 +1190,21 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
             </form>
             <div className="agile-manage-list">
               <h4>已有发布（{releases.length}）</h4>
-              {releases.map((release) => (
+              {releases.map((release) => {
+                // A failed or timed-out deploy stays retryable even though the
+                // release itself is already marked `released`.
+                const deployAction = releaseDeployAction(release.deploy);
+                return (
                 <div className={`agile-release-row ${releaseManageId === release.id ? "selected" : ""}`} key={release.id}>
                   <code>{release.version}</code>
                   <span>{release.name}</span>
                   <small>{releaseStatusLabels[release.status]} · {release.storyIds.length} 个故事{release.deploy ? ` · 部署 ${deployStatusLabels[release.deploy.status]}` : ""}</small>
-                  <button type="button" disabled={release.status === "released"} onClick={() => void openPublish(release)}><Rocket size={12} />{release.status === "released" ? "已发布" : "发布"}</button>
+                  <button type="button" disabled={deployAction === "done" || deployAction === "waiting"} onClick={() => void openPublish(release)}><Rocket size={12} />{RELEASE_DEPLOY_ACTION_LABELS[deployAction]}</button>
                   <button type="button" disabled={release.status === "released"} onClick={() => editRelease(release)}><Pencil size={12} />编辑</button>
                   <button type="button" className="danger" disabled={busy === `delete-release:${release.id}`} onClick={() => void removeRelease(release)}><Trash2 size={12} />删除</button>
                 </div>
-              ))}
+                );
+              })}
               {releases.length === 0 && <div className="agile-hint">还没有发布记录。填写上方表单创建第一个发布。</div>}
             </div>
           </div>
@@ -1205,7 +1217,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
             <div><span className="eyebrow">PUBLISH RELEASE</span><h3>发布「{publishTarget.version} · {publishTarget.name}」</h3></div>
             <button className="icon-button" type="button" onClick={closePublish}><X size={16} /></button>
           </div>
-          <p className="ws-form-help">发布将把该版本标记为「已发布」且不可再编辑。若配置了 <code>PI_POST_MERGE_DEPLOY_HOOK</code>，确认后会立即触发部署钩子；失败也会如实记录，不会静默跳过。</p>
+          <p className="ws-form-help">发布需要管理员权限，且会把该版本标记为「已发布」且不可再编辑。若配置了 <code>PI_POST_MERGE_DEPLOY_HOOK</code>，确认后会立即触发部署钩子；异步（HTTP 202）部署在回调到达前保持「部署进行中」，失败或回调超时都会如实记录并可显式重试。</p>
           {publishError && <div className="form-error">{publishError}</div>}
           {publishBlocked.length > 0 && (
             <div className="agile-blocked-list">
@@ -1214,12 +1226,12 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
             </div>
           )}
           {publishBusy && <div className="ws-empty"><LoaderCircle className="spin" size={18} /><span>正在校验发布…</span></div>}
-          {!publishBusy && publishReady && <div className="agile-hint">发布前校验通过，可确认发布。</div>}
+          {!publishBusy && publishReady && <div className="agile-hint">{publishTarget.deploy?.status === "failed" || releaseDeployAction(publishTarget.deploy) === "retry" ? "上次部署未成功，确认将开始一次新的部署重试（不会重复触发成功中的部署）。" : "发布前校验通过，可确认发布。"}</div>}
           <label>发布备注<textarea rows={2} value={publishNote} onChange={(event) => setPublishNote(event.target.value)} placeholder="本次发布说明（可选）" /></label>
           <div className="ws-form-actions">
             <button type="button" className="button secondary" onClick={closePublish}>取消</button>
             <button type="button" className="button primary" disabled={publishBusy || !publishReady} onClick={() => void confirmPublish()}>
-              {publishBusy ? <LoaderCircle className="spin" size={15} /> : <Rocket size={15} />}确认发布
+              {publishBusy ? <LoaderCircle className="spin" size={15} /> : <Rocket size={15} />}{releaseDeployAction(publishTarget.deploy) === "retry" ? "确认重试部署" : "确认发布"}
             </button>
           </div>
         </section>

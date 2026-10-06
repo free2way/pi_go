@@ -13,6 +13,20 @@
  *      (`PI_DATABASE_URL` / `DATABASE_URL` required).
  *   4. The Playwright browser suite MUST actually execute
  *      (`PI_E2E_BASE_URL` required); a missing URL is a FAIL, not a skip.
+ *   5. Executing is not enough (P1 audit fix, v0.27). The Playwright JSON report
+ *      is graded by scripts/e2e-suite-result.mjs: 0 executed scenarios is a
+ *      FAIL, and every scenario in `REQUIRED_E2E_SCENARIOS` must actually run —
+ *      a `skipped`/`fixme`/`todo` required scenario fails the gate and is named
+ *      in the output. Because the suite self-skips without a browser/server and
+ *      the docs/05 §13 live scenarios are `fixme` by default, an exit-0 run is
+ *      no longer sufficient evidence. The gate always prints
+ *      executed/passed/failed/skipped counts.
+ *
+ * Escape hatch (strictly parsed, default OFF):
+ *   PI_E2E_ALLOW_REQUIRED_SKIPS=1            waives required-scenario skips only
+ *   PI_E2E_ALLOW_REQUIRED_SKIPS_REASON=...   mandatory; printed in the summary
+ * It can never waive "0 scenarios executed", and any other value for the switch
+ * ("true", "yes", "0") is itself a FAIL.
  *
  * The fixed command steps, aggregation and table rendering are shared with
  * `gate:release` via scripts/release-gate-lib.mjs, so the two gates cannot drift
@@ -32,6 +46,7 @@ import {
   renderGateTable,
   summarizeResults,
 } from "./release-gate-lib.mjs";
+import { ALLOW_REQUIRED_SKIPS_ENV, ALLOW_REQUIRED_SKIPS_REASON_ENV, runE2eStep } from "./e2e-suite-result.mjs";
 
 export const LINT_STEP_ID = "lint";
 export const E2E_STEP_ID = "e2e-browser";
@@ -80,7 +95,8 @@ export function planAcceptanceSteps(env = process.env) {
       kind: "command",
       command: "node",
       args: [],
-      requiredReason: "PI_E2E_BASE_URL is not set — the acceptance gate requires the Playwright suite to actually run",
+      requiredReason:
+        "PI_E2E_BASE_URL is not set — the acceptance gate requires the Playwright suite to actually run; start a PiGO server (npm run build && npm start) and export PI_E2E_BASE_URL=http://127.0.0.1:3100 (the suite never starts one itself)",
     });
   }
   return steps;
@@ -107,9 +123,19 @@ function runLintNoWarnings(step, cwd) {
   return { ok: true, detail: `0 warnings (${seconds}s)` };
 }
 
-/** Runner that enforces the warning-free lint on top of the shared default. */
-async function runAcceptanceStep(step, cwd) {
+/** Runner that enforces the warning-free lint and the graded E2E suite on top of the shared default. */
+async function runAcceptanceStep(step, cwd, env, options = {}) {
   if (step.id === LINT_STEP_ID) return runLintNoWarnings(step, cwd);
+  if (step.id === E2E_STEP_ID) {
+    return runE2eStep(step, {
+      cwd,
+      env,
+      spawn: options.spawn,
+      readReport: options.readReport,
+      reportDir: options.reportDir,
+      log: options.log,
+    });
+  }
   return defaultRunStep(step, { cwd });
 }
 
@@ -117,20 +143,29 @@ async function runAcceptanceStep(step, cwd) {
  * Run the acceptance gate and return the rendered result. Exported so a future
  * node test can drive it with an injected runner.
  *
- * @param {{ env?: Record<string, string | undefined>, cwd?: string, runStep?: Function }} [options]
+ * @param {{ env?: Record<string, string | undefined>, cwd?: string, runStep?: Function, runE2eStep?: Function, spawn?: Function, readReport?: Function, reportDir?: string, log?: Function }} [options]
  */
 export async function runAcceptanceGate(options = {}) {
   const env = options.env ?? process.env;
   const cwd = options.cwd ?? process.cwd();
   const steps = planAcceptanceSteps(env);
-  const base = options.runStep ?? ((step) => runAcceptanceStep(step, cwd));
+  const base = options.runStep ?? ((step) => runAcceptanceStep(step, cwd, env, options));
+  // The E2E step is graded from the Playwright JSON report. `runE2eStep` can be
+  // injected on its own; when only `runStep` is injected the E2E step keeps
+  // using it, so existing callers and tests are unaffected.
+  const runE2e = options.runE2eStep ?? (options.runStep ? base : (step) => runAcceptanceStep(step, cwd, env, options));
+
+  /** @type {any} */
+  let e2eVerdict;
   const runner = async (step) => {
     if (step.requiredReason) {
       console.log(`\n[acceptance-gate] ✖ ${step.label}`);
       console.log(`[acceptance-gate]   required prerequisite missing: ${step.requiredReason}`);
       return { ok: false, detail: `REQUIRED, not skippable: ${step.requiredReason}` };
     }
-    return base(step);
+    const outcome = step.id === E2E_STEP_ID ? await runE2e(step) : await base(step);
+    if (step.id === E2E_STEP_ID && outcome?.verdict) e2eVerdict = outcome.verdict;
+    return outcome;
   };
   const results = await executeGate(steps, { runStep: runner });
 
@@ -142,7 +177,7 @@ export async function runAcceptanceGate(options = {}) {
       result.detail = `skipped in the developer gate but forbidden here — ${result.detail}`;
     }
   }
-  return { steps, results, summary: summarizeResults(results) };
+  return { steps, results, summary: summarizeResults(results), e2e: e2eVerdict };
 }
 
 const argv = new Set(process.argv.slice(2));
@@ -161,6 +196,18 @@ Required environment:
 
 Rejects (FAIL, never SKIP): a missing prerequisite, any lint warning, an
 unexecuted database check, an unexecuted Playwright suite.
+
+Additionally (P1 audit fix): the Playwright JSON report is graded, so the gate
+also FAILs when the suite executes 0 scenarios (all skipped/fixme) or when any
+docs/05 §13 required scenario (E2E-01a/01b, E2E-02..08) is skipped/fixme/todo —
+the offending scenario ids are printed with their skip reason, together with the
+executed/passed/failed/skipped counts.
+
+Operator override (strictly parsed, default OFF):
+  ${ALLOW_REQUIRED_SKIPS_ENV}=1   waive required-scenario skips
+  ${ALLOW_REQUIRED_SKIPS_REASON_ENV}=<text>  mandatory justification, printed
+  Any other value of the switch is itself a FAIL; the override can never waive
+  "0 scenarios executed".
 
 Exit code: 0 only when every step PASSed.`);
     process.exit(0);
@@ -185,10 +232,17 @@ Exit code: 0 only when every step PASSed.`);
   }
 
   console.log(`[acceptance-gate] running ${planned.length} required step(s)…`);
-  const { results, summary } = await runAcceptanceGate();
+  const { results, summary, e2e } = await runAcceptanceGate();
 
   console.log("\n[acceptance-gate] summary");
   console.log(renderGateTable(results));
+  if (e2e) {
+    // Always re-print the machine verdict in the summary: a human reading the
+    // tail of a CI log must see the counts and any override reason even when
+    // the step detail above scrolled away.
+    console.log("\n[acceptance-gate] e2e evidence:");
+    for (const line of e2e.lines) console.log(`  ${line}`);
+  }
   console.log(
     `\n[acceptance-gate] ${summary.counts.pass} passed, ${summary.counts.fail} failed, ${summary.counts.skip} skipped — ${summary.ok ? "PASS" : "FAIL"}`,
   );

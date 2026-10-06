@@ -119,10 +119,12 @@ export const storyBlockSchema = z.object({
 
 /** Release publish action. `confirm` gates the mutation; without it the route
  * returns a dry-run preview (guards + blocked stories) so the UI can render the
- * confirmation dialog before committing. */
+ * confirmation dialog before committing. `retry` is required to start a new
+ * deploy attempt after a failed or timed-out one, so a retry is always explicit. */
 export const releasePublishSchema = z.object({
   confirm: z.boolean().optional(),
   note: text.optional(),
+  retry: z.boolean().optional(),
 }).strict();
 
 /** Sprint 4: saved model combination. `budget`/`maxParallel` are optional. */

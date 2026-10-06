@@ -69,8 +69,9 @@ describe("decision brief · checks gate", () => {
   });
 });
 
-describe("decision brief · AC relevance matcher (conservative)", () => {
+describe("decision brief · AC relevance matcher (fail-safe)", () => {
   const criteria = [ac("AC#1", "凭据隔离：API Key 不得写入日志")];
+  const changedFiles = ["src/server/credential-vault.ts"];
 
   it("matches on a shared file path", () => {
     expect(acRelevance({ file: "src/server/credential-vault.ts", title: "凭据隔离缺失" }, criteria)).toBe("relevant");
@@ -80,10 +81,36 @@ describe("decision brief · AC relevance matcher (conservative)", () => {
     expect(acRelevance({ file: null, title: "API Key 写入日志", evidence: "日志中出现 key" }, criteria)).toBe("relevant");
   });
 
-  it("is irrelevant when a finding with identifying material shares nothing", () => {
+  it("is irrelevant only with explicit out-of-scope proof (file outside a known change set, zero shared tokens)", () => {
     expect(
-      acRelevance({ file: "src/client/App.tsx", title: "按钮颜色对比度不足", evidence: "对比度 3.2 低于标准" }, criteria),
+      acRelevance(
+        { file: "src/client/App.tsx", title: "按钮颜色对比度不足", evidence: "对比度 3.2 低于标准" },
+        criteria,
+        { diffFiles: changedFiles },
+      ),
     ).toBe("irrelevant");
+  });
+
+  it("fails safe to 'unknown' for the same finding when the change set is unknown or empty", () => {
+    const finding = { file: "src/client/App.tsx", title: "按钮颜色对比度不足", evidence: "对比度 3.2 低于标准" };
+    expect(acRelevance(finding, criteria)).toBe("unknown");
+    expect(acRelevance(finding, criteria, {})).toBe("unknown");
+    expect(acRelevance(finding, criteria, { diffFiles: [] })).toBe("unknown");
+    expect(acRelevance(finding, criteria, { diffFiles: null })).toBe("unknown");
+  });
+
+  it("keeps a high-severity defect in scope when its file is part of the change, even with no shared keywords", () => {
+    const finding = { file: "src/server/credential-vault.ts", title: "事务提交顺序颠倒", evidence: "并发写入时可能覆盖前一次提交" };
+    expect(acRelevance(finding, criteria, { diffFiles: changedFiles })).toBe("unknown");
+  });
+
+  it("never clears a finding with no concrete file, or one that shares even a single token", () => {
+    expect(
+      acRelevance({ file: null, title: "按钮颜色对比度不足", evidence: "对比度 3.2 低于标准" }, criteria, { diffFiles: changedFiles }),
+    ).toBe("unknown");
+    expect(
+      acRelevance({ file: "src/client/App.tsx", title: "日志轮转策略不合理", evidence: "轮转阈值过高" }, criteria, { diffFiles: changedFiles }),
+    ).toBe("unknown");
   });
 
   it("never claims relevance on a single ambiguous token", () => {
@@ -112,8 +139,9 @@ describe("decision brief · evidence sanity / false positives", () => {
   });
 });
 
-describe("decision brief · blocking gate", () => {
+describe("decision brief · blocking gate (fail-safe)", () => {
   const criteria = [ac("AC#1", "凭据隔离：API Key 不得写入日志")];
+  const changedFiles = ["src/server/credential-vault.ts"];
 
   it("is red for any unresolved critical", () => {
     const gate = gateBlocking([{ severity: "critical", file: "src/a.ts", title: "凭据泄漏" }], criteria);
@@ -125,18 +153,48 @@ describe("decision brief · blocking gate", () => {
     expect(gateBlocking([{ severity: "high", file: "src/server/credential-vault.ts", title: "凭据隔离缺失" }], criteria).status).toBe("red");
   });
 
-  it("is green when the unresolved high is confidently unrelated to the story", () => {
+  it("keeps a plausible high-severity defect blocking even when its wording shares no keywords with the AC (audit scenario)", () => {
     const gate = gateBlocking(
-      [{ severity: "high", file: "src/client/App.tsx", title: "按钮颜色对比度不足", evidence: "对比度 3.2 低于 AA 标准" }],
+      [{ severity: "high", file: "src/server/credential-vault.ts", title: "事务提交顺序颠倒", evidence: "并发写入时会覆盖前一次提交" }],
       criteria,
+      changedFiles,
     );
-    expect(gate.status).toBe("green");
+    expect(gate.status).toBe("red");
+    expect(gate.findings?.[0]?.key).toBe("src/server/credential-vault.ts|事务提交顺序颠倒");
+  });
+
+  it("is green only when the finding names a file outside the change AND is clearly unrelated to every criterion", () => {
+    const finding = { severity: "high", file: "src/client/App.tsx", title: "按钮颜色对比度不足", evidence: "对比度 3.2 低于 AA 标准" };
+    expect(gateBlocking([finding], criteria, changedFiles).status).toBe("green");
+  });
+
+  it("keeps that same finding blocking whenever the change set is unknown or empty", () => {
+    const finding = { severity: "high", file: "src/client/App.tsx", title: "按钮颜色对比度不足", evidence: "对比度 3.2 低于 AA 标准" };
+    expect(gateBlocking([finding], criteria).status).toBe("red");
+    expect(gateBlocking([finding], criteria, []).status).toBe("red");
+    expect(gateBlocking([finding], criteria, null).status).toBe("red");
   });
 
   it("treats an unresolved high of unknown relevance conservatively as blocking", () => {
     expect(gateBlocking([{ severity: "high", file: "src/server/run-patch.ts", title: "补丁生成失败" }], [ac("AC#1", "导出补丁功能必须可用")]).status).toBe("red");
     // No criteria at all ⇒ relevance is unknown, so a high still blocks.
     expect(gateBlocking([{ severity: "high", file: "src/a.ts", title: "输出不稳定" }], []).status).toBe("red");
+    // A finding with no file can never be proven out of scope.
+    expect(gateBlocking([{ severity: "high", file: null, title: "输出不稳定", evidence: "输出内容不稳定" }], criteria, changedFiles).status).toBe("red");
+  });
+
+  it("distinguishes AC-relevant blockers from unresolved-relevance blockers in the detail", () => {
+    const gate = gateBlocking(
+      [
+        { severity: "high", file: "src/server/credential-vault.ts", title: "凭据隔离缺失" },
+        { severity: "high", file: "src/server/run-patch.ts", title: "补丁生成失败" },
+      ],
+      criteria,
+      ["src/server/credential-vault.ts", "src/server/run-patch.ts"],
+    );
+    expect(gate.status).toBe("red");
+    expect(gate.detail).toContain("1 个明确与 AC/DoD 相关");
+    expect(gate.detail).toContain("1 个相关性无法排除");
   });
 
   it("ignores resolved findings", () => {
@@ -337,5 +395,46 @@ describe("decision brief · buildDecisionBrief", () => {
     expect(brief.remaining[0].streak).toBe(2);
     expect(brief.recommendation.action).toBe("continue");
     expect(brief.recommendation.note).toContain("已返修 2 次未解决");
+  });
+
+  it("never clears a real high whose file is in the change but whose wording misses the AC text (audit regression)", () => {
+    const brief = buildDecisionBrief({
+      criteria: [ac("AC#1", "凭据隔离：API Key 不得写入日志")],
+      findings: [
+        { id: "f1", severity: "high", resolved: false, file: "src/server/credential-vault.ts", title: "事务提交顺序颠倒", evidence: "并发写入时会覆盖前一次提交" },
+      ],
+      checks: [{ name: "单元测试", command: "npm test", status: "passed" }],
+      diffFiles: ["src/server/credential-vault.ts"],
+    });
+    expect(brief.gates.find((gate) => gate.id === "blocking")?.status).toBe("red");
+    expect(brief.remaining[0]).toMatchObject({ severity: "high", relevance: "unknown" });
+    expect(brief.remaining[0].ac).toBeUndefined();
+    expect(brief.recommendation.action).toBe("continue");
+  });
+
+  it("clears an out-of-scope high only with explicit proof and records its relevance", () => {
+    const brief = buildDecisionBrief({
+      criteria: [ac("AC#1", "修改 credential-vault.ts 实现凭据隔离")],
+      findings: [
+        { id: "f1", severity: "high", resolved: false, file: "src/client/theme.ts", title: "按钮颜色对比度不足", evidence: "对比度 3.2 低于 AA 标准" },
+      ],
+      checks: [{ name: "单元测试", command: "npm test", status: "passed" }],
+      diffFiles: ["src/server/credential-vault.ts"],
+    });
+    expect(brief.gates.every((gate) => gate.status === "green")).toBe(true);
+    expect(brief.remaining[0].relevance).toBe("irrelevant");
+    expect(brief.recommendation.action).toBe("accept");
+  });
+
+  it("blocks an out-of-scope high when the brief has no diff to prove it out of scope", () => {
+    const brief = buildDecisionBrief({
+      criteria: [ac("AC#1", "凭据隔离：API Key 不得写入日志")],
+      findings: [
+        { id: "f1", severity: "high", resolved: false, file: "src/client/theme.ts", title: "按钮颜色对比度不足", evidence: "对比度 3.2 低于 AA 标准" },
+      ],
+      checks: [{ name: "单元测试", command: "npm test", status: "passed" }],
+    });
+    expect(brief.gates.find((gate) => gate.id === "blocking")?.status).toBe("red");
+    expect(brief.recommendation.action).toBe("continue");
   });
 });

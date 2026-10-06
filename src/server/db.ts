@@ -461,6 +461,30 @@ export const databaseMigrations: Migration[] = [
       CREATE INDEX idx_run_findings_stable ON run_findings(run_id, stable_key);
     `,
   },
+  {
+    // Release deploy idempotency (audit P1: two simultaneous confirms must yield
+    // exactly ONE deployment attempt). The documented release idempotency policy
+    // (`run+commit+environment`, config/workflow.example.yaml) is applied at the
+    // release granularity: `idempotency_key = <deliveryId>#<attempt>` is UNIQUE,
+    // so `INSERT … ON CONFLICT DO NOTHING` lets exactly one confirm claim an
+    // attempt; the loser observes the existing row and refuses. A retry claims
+    // the next attempt while reusing the same `delivery_id`, which is what lets
+    // the deploy receiver de-duplicate a repeated delivery.
+    id: 14,
+    name: "agile-release-deploy-claims",
+    sql: `
+      CREATE TABLE agile_release_deploy_claims (
+        id TEXT PRIMARY KEY,
+        release_id TEXT NOT NULL REFERENCES agile_releases(id),
+        attempt INTEGER NOT NULL,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        delivery_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (release_id, attempt)
+      );
+      CREATE INDEX idx_agile_release_deploy_claims_release ON agile_release_deploy_claims(release_id, created_at);
+    `,
+  },
 ];
 
 export async function runMigrations(db: Db) {

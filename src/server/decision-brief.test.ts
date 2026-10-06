@@ -200,4 +200,61 @@ describe("decision brief aggregation (docs/22 §6)", () => {
     expect(brief.remaining[0]).toMatchObject({ severity: "critical", key: "src/server/db.ts|事务未回滚" });
     expect(brief.remaining[0].evidenceOk).toBe(true);
   });
+
+  it("keeps a changed-file high blocking even when its wording shares no AC keywords (audit regression)", async () => {
+    const db = await createTestDb();
+    const store = new PostgresRunStore(db);
+    const run = makeRun({
+      checks: [check()],
+      diff,
+      findings: [
+        finding({
+          title: "事务提交顺序颠倒",
+          evidence: "并发写入时会覆盖前一次提交，导致数据不一致",
+          requiredChange: "改为串行提交",
+          consecutiveRounds: 1,
+          fingerprint: findingFingerprint({ file: "src/server/credential-vault.ts", title: "事务提交顺序颠倒" }),
+        }),
+      ],
+    });
+    await store.createRun(run, { runId: run.id, round: 1, source: "system", type: "run.created", message: "created", at: at(0) });
+    await event(store, run, { type: "run.needs_human", message: "达到最大审核轮次" });
+    await linkStory(db, run, { acceptanceCriteria: ["实现凭据隔离：API Key 不得写入日志"] });
+
+    const brief = await readDecisionBrief(db, run);
+
+    const blocking = brief.gates.find((gate) => gate.id === "blocking");
+    expect(blocking?.status).toBe("red");
+    expect(brief.remaining[0]).toMatchObject({ severity: "high", relevance: "unknown" });
+    expect(brief.recommendation.action).toBe("continue");
+  });
+
+  it("clears an out-of-scope high only with explicit proof (file outside the diff, unrelated to every criterion)", async () => {
+    const db = await createTestDb();
+    const store = new PostgresRunStore(db);
+    const run = makeRun({
+      checks: [check()],
+      diff,
+      findings: [
+        finding({
+          title: "按钮颜色对比度不足",
+          file: "src/client/theme.ts",
+          line: 12,
+          evidence: "对比度 3.2 低于 AA 标准",
+          requiredChange: "调整前景色",
+          consecutiveRounds: 0,
+          fingerprint: findingFingerprint({ file: "src/client/theme.ts", title: "按钮颜色对比度不足" }),
+        }),
+      ],
+    });
+    await store.createRun(run, { runId: run.id, round: 1, source: "system", type: "run.created", message: "created", at: at(0) });
+    await event(store, run, { type: "run.needs_human", message: "达到最大审核轮次" });
+    await linkStory(db, run, { acceptanceCriteria: ["修改 credential-vault.ts 实现凭据隔离"] });
+
+    const brief = await readDecisionBrief(db, run);
+
+    expect(brief.gates.every((gate) => gate.status === "green")).toBe(true);
+    expect(brief.remaining[0].relevance).toBe("irrelevant");
+    expect(brief.recommendation.action).toBe("accept");
+  });
 });

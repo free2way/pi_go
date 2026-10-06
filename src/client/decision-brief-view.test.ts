@@ -46,18 +46,21 @@ describe("decision brief view · three-state rendering", () => {
     expect(decisionBriefExpanded("developing", false, ["needs_human"])).toBe(false);
   });
 
-  it("groups remaining findings by AC label and buckets the unmapped ones", () => {
+  it("groups remaining findings by AC label and splits the unmapped bucket by relevance", () => {
     const brief = buildDecisionBrief({
       criteria: [{ label: "AC#1", text: "修改 src/a.ts 的行为" }],
       findings: [
         { id: "f1", stableKey: "src/a.ts|问题一", severity: "medium", resolved: false, file: "src/a.ts", title: "问题一", evidence: "证据内容足够长可以判断" },
-        { id: "f2", stableKey: "src/b.ts|问题二", severity: "low", resolved: false, file: "src/b.ts", title: "问题二", evidence: "证据内容足够长可以判断" },
+        { id: "f2", stableKey: "src/b.ts|问题二", severity: "high", resolved: false, file: "src/b.ts", title: "问题二", evidence: "证据内容足够长可以判断" },
+        { id: "f3", stableKey: "tools/colors.ts|问题三", severity: "low", resolved: false, file: "tools/colors.ts", title: "问题三", evidence: "证据内容足够长可以判断" },
       ],
       diffFiles: ["src/a.ts"],
     });
     const groups = groupRemainingByAc(brief.remaining);
-    expect(groups.map((group) => group.label)).toEqual(["AC#1", "未映射到 AC"]);
-    expect(groups[0].items[0].streak).toBe(0);
+    expect(groups.map((group) => group.label)).toEqual(["相关性未确认", "AC#1", "未映射到 AC"]);
+    expect(groups[1].items[0].streak).toBe(0);
+    expect(groups[0].items[0].relevance).toBe("unknown");
+    expect(groups[2].items[0].relevance).toBe("irrelevant");
   });
 });
 

@@ -23,7 +23,17 @@ import { parseReview, type ReviewResult } from "./review-protocol.js";
 import { convergenceGuardEnabled, convergenceStop, reviewStallRounds } from "./review-convergence.js";
 import { buildReviewDiff } from "./review-input.js";
 import { blockingFindings, deferredFindings, deferredMessage, isDeferral, resolveReviewScope, shouldAcceptRound } from "./review-scope.js";
-import { buildContainerSpec, hostPathFor, resolveSandboxMode, sandboxStateDirectory } from "./sandbox.js";
+import {
+  buildContainerSpec,
+  createShutdownHandler,
+  hostPathFor,
+  parseSandboxAllowDegraded,
+  resolveSandboxMode,
+  SandboxContainerRegistry,
+  SandboxUnavailableError,
+  sandboxStateDirectory,
+  type SandboxMode,
+} from "./sandbox.js";
 import { mergeFindings, repeatedSevereFindings, severeRepeatThreshold, unresolvedFeedback } from "./review-findings.js";
 import {
   buildSnapshotDivergenceFinding,
@@ -67,6 +77,9 @@ const maxSubagents = Number.isInteger(configuredMaxSubagents) ? Math.min(4, Math
 const configuredMaxActiveJobs = Number(process.env.PI_MAX_ACTIVE_JOBS || 1);
 const maxActiveJobs = Number.isInteger(configuredMaxActiveJobs) ? Math.min(4, Math.max(1, configuredMaxActiveJobs)) : 1;
 const active = new Map<string, AbortController>();
+// P1: set by the SIGTERM/SIGINT handler so a shutting-down worker never claims
+// (or starts) another job while it reclaims its sandbox containers.
+let shuttingDown = false;
 // GAP-05 / AT-RUN-012: one run per workspace at a time. Lock files live under
 // the workspace root so a worker restart cannot leave a workspace locked: the
 // heartbeat goes stale and the next claim reclaims it.
@@ -150,14 +163,31 @@ const sandboxImage = process.env.PI_SANDBOX_IMAGE || "local/pigo-sandbox:0.1.0";
 const agentNetwork = process.env.PI_SANDBOX_NETWORK || "pi-agent-network";
 const hostWorkspaceRoot = process.env.PI_HOST_WORKSPACE_ROOT || workspaceRoot;
 const docker = new DockerApi();
-let sandboxMode: "container" | "process" = "process";
+let sandboxMode: SandboxMode = "process";
 let sandboxReason: string | undefined = "not initialised";
+/** True when the container sandbox was unusable and the operator opted into the degraded mode. */
+let sandboxDegraded = false;
+/**
+ * P1: every sandbox container this worker started, so a shutdown can stop them
+ * before the process exits instead of leaving one writing into a run worktree.
+ */
+const sandboxContainers = new SandboxContainerRegistry();
 
 const imageForSandbox = sandboxImage;
 /** Extra bind mounts for the sandbox container (operator/test escape hatch). */
 const sandboxExtraBinds = (process.env.PI_SANDBOX_EXTRA_BINDS || "").split(",").map((item) => item.trim()).filter(Boolean);
 /** Extra environment variable names to pass through into the sandbox. */
 const sandboxExtraEnv = (process.env.PI_SANDBOX_EXTRA_ENV || "").split(",").map((item) => item.trim()).filter(Boolean);
+
+/**
+ * P1 (fail-closed): refuse to execute an agent when the container sandbox could
+ * not be established. The default must never silently degrade to in-process
+ * execution; only `PI_SANDBOX_ALLOW_DEGRADED=1` (strictly parsed) or an explicit
+ * `PI_SANDBOX_MODE=process` makes `sandboxMode` a usable non-container mode.
+ */
+function assertSandboxReady() {
+  if (sandboxMode === "unavailable") throw new SandboxUnavailableError(sandboxReason);
+}
 
 /**
  * GAP-03: creates the reviewer's immutable one-shot snapshot. Injectable so the
@@ -311,6 +341,13 @@ async function runInSandbox(input: SandboxRunInput): Promise<CommandResult> {
 
   const name = `pigo-task-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   const containerId = await docker.createContainer(name, spec);
+  // P1: track the container so SIGTERM/SIGINT stops it before the worker exits;
+  // otherwise a sandbox can keep writing into the run worktree after exit.
+  const forgetContainer = sandboxContainers.add({
+    id: containerId,
+    stop: (signal) => docker.killContainer(containerId, signal),
+    wait: () => docker.waitContainer(containerId).then(() => undefined),
+  });
   let stdout = "";
   let stderr = "";
   // A container timeout of 0/absent means no limit; only a positive value kills it.
@@ -337,6 +374,7 @@ async function runInSandbox(input: SandboxRunInput): Promise<CommandResult> {
     if (timer) clearTimeout(timer);
     input.signal.removeEventListener("abort", onAbort);
     await docker.removeContainer(containerId).catch(() => undefined);
+    forgetContainer();
     // AUD-07: the per-run Pi state directory is intentionally kept so the next
     // call (repair round, retry review, recovery) can resume the same session.
     // It is removed together with the run directory during explicit cleanup.
@@ -457,6 +495,8 @@ async function dispatchJob(input: JobInput, controller: AbortController) {
 
 /** Retries locally deferred jobs whose workspace lock has freed up. */
 async function drainDeferredJobs() {
+  // P1: a shutting-down worker never starts deferred work either.
+  if (shuttingDown) return 0;
   if (drainingDeferred || deferredJobs.size === 0) return 0;
   drainingDeferred = true;
   let started = 0;
@@ -892,6 +932,9 @@ async function runPi(input: {
     "--thinking", input.thinking === "low" || input.thinking === "medium" ? input.thinking : "high",
     "--tools", input.readOnly ? "read,grep,find,ls" : "read,bash,edit,write,grep,find,ls",
   ];
+  // P1 (fail-closed): never fall through to an in-process Pi call when the
+  // container sandbox is unavailable.
+  assertSandboxReady();
   // GAP-02: re-enable only allowlisted resources. The `--no-*` flags above
   // disable discovery (including project `.pi/extensions`); explicit paths still
   // load, so the allowlist is the single source of truth.
@@ -1496,6 +1539,9 @@ async function runChecks(run: Run, worktree: string, commands: string[], signal:
     commands,
     signal,
     execute: async (checkCommand, execSignal) => {
+      // P1 (fail-closed): checks execute untrusted repository commands, so they
+      // must never silently fall back to an in-process shell.
+      assertSandboxReady();
       // SEC-004/010: check commands run with the worker's secrets stripped, so a
       // malicious check cannot read the internal callback token or provider keys.
       return sandboxMode === "container"
@@ -1884,6 +1930,25 @@ async function executeJob(input: JobInput, controller: AbortController) {
     controller.abort();
   });
   try {
+    // P1 (fail-closed): refuse before touching the workspace at all when the
+    // container sandbox is unavailable; the run fails with an actionable Chinese
+    // message instead of silently running without isolation.
+    assertSandboxReady();
+    // P1: a non-container sandbox is never silent — record it on the run itself,
+    // not only in the worker log.
+    if (sandboxMode === "process") {
+      await postUpdate(run.id, {
+        event: {
+          round: run.round,
+          source: "system",
+          type: "sandbox.degraded",
+          message: sandboxDegraded
+            ? `容器沙箱不可用，已按 PI_SANDBOX_ALLOW_DEGRADED=1 降级为 worker 进程内执行（隔离已关闭）：${sandboxReason ?? "未提供原因"}`
+            : `已按 PI_SANDBOX_MODE=process 在 worker 进程内执行 Agent（容器隔离已关闭）：${sandboxReason ?? "未提供原因"}`,
+          meta: { mode: sandboxMode, degraded: sandboxDegraded, reason: sandboxReason, requested: process.env.PI_SANDBOX_MODE ?? "auto" },
+        },
+      }).catch(() => undefined);
+    }
     // R3-001 / R3-FINAL-ROUND-AMBIGUOUS: terminal stop conditions are evaluated
     // before any worktree-dependent recovery/preparation, so a reclaimed run that
     // already reached its round cap, exhausted its budget or overran its deadline
@@ -2302,37 +2367,49 @@ async function executeJob(input: JobInput, controller: AbortController) {
       }
       return;
     }
+    // P1 (fail-closed): the sandbox unavailable error is never classified as a
+    // provider/storage problem (its reason may contain ECONNREFUSED etc.) and
+    // never parked: the run fails with the actionable sandbox message.
+    const sandboxUnavailable = !cancelled && error instanceof SandboxUnavailableError;
     const safeMessage = redactJobSecrets((error as Error).message, input.credentials).slice(0, 2_000);
     const followup = Boolean(input.resume || input.retryReview);
-    const kind = cancelled ? undefined : classifyProviderError(safeMessage);
+    const kind = cancelled || sandboxUnavailable ? undefined : classifyProviderError(safeMessage);
     // AT-REL-006/007: classified provider and storage failures are parked for a
     // human (bounded retries already happened above); only unclassified errors
     // mark the run permanently failed.
-    const parked = followup || recovering || (kind !== undefined && kind !== "unknown");
+    const parked = sandboxUnavailable ? false : followup || recovering || (kind !== undefined && kind !== "unknown");
     const state: RunState = cancelled ? "cancelled" : parked ? "needs_human" : "failed";
     const type = cancelled
       ? "run.cancelled"
-      : kind === "storage"
-        ? "run.storage_error"
-        : parked
-          ? "run.provider_error"
-          : followup
-            ? "run.resume_failed"
-            : recovering
-              ? "run.recovery_failed"
-              : "run.failed";
+      : sandboxUnavailable
+        ? "run.sandbox_unavailable"
+        : kind === "storage"
+          ? "run.storage_error"
+          : parked
+            ? "run.provider_error"
+            : followup
+              ? "run.resume_failed"
+              : recovering
+                ? "run.recovery_failed"
+                : "run.failed";
     const message = cancelled
       ? "任务已取消"
-      : kind === "storage"
-        ? `存储错误，任务未完成，保持人工处理（${kind}）：${safeMessage}`
-        : `${followup ? "恢复执行失败，保持人工处理" : recovering ? "Worker 恢复执行失败，保持人工处理" : "真实运行失败"}（${kind}）：${safeMessage}`;
+      : sandboxUnavailable
+        ? safeMessage
+        : kind === "storage"
+          ? `存储错误，任务未完成，保持人工处理（${kind}）：${safeMessage}`
+          : `${followup ? "恢复执行失败，保持人工处理" : recovering ? "Worker 恢复执行失败，保持人工处理" : "真实运行失败"}（${kind}）：${safeMessage}`;
     // AT-REL-007: retry the terminal write so a short store outage cannot leave
     // the run silently mid-flight; if it still fails the job stays claimed and a
     // later reclaim repeats this stage (never marking a false completion).
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       try {
         await update(run, state, "system", type, message, {
-          summary: cancelled ? "已取消" : providerErrorSummary(kind ?? "unknown", safeMessage).slice(0, 800),
+          summary: cancelled
+            ? "已取消"
+            : sandboxUnavailable
+              ? "容器沙箱不可用，已按 fail-closed 拒绝执行；请修复 Docker/PI_DOCKER_SOCKET 或显式设置 PI_SANDBOX_ALLOW_DEGRADED=1"
+              : providerErrorSummary(kind ?? "unknown", safeMessage).slice(0, 800),
           usage: toRunUsage(usage),
           durationMs: Date.now() - started,
         });
@@ -2362,6 +2439,8 @@ async function executeJob(input: JobInput, controller: AbortController) {
 
 /** Picks up jobs that were never delivered or whose worker died mid-run (REL-002). */
 async function reclaimPendingJobs() {
+  // P1: a shutting-down worker never claims new work.
+  if (shuttingDown) return 0;
   if (active.size >= maxActiveJobs) return 0;
   if ((await storageStatus()).state === "critical") {
     console.warn("[jobs] disk space critically low; skipping reclaim until cleaned up");
@@ -2549,6 +2628,9 @@ const server = createServer(async (request, response) => {
       return json(response, 200, await createWorkspace(String(body.name ?? "")));
     }
     if (request.method === "POST" && url.pathname === "/jobs") {
+      // P1: a shutting-down worker stops claiming new jobs so it can reclaim its
+      // sandbox containers without racing a new run.
+      if (shuttingDown) return json(response, 503, { error: "Worker 正在停止，暂不接受新任务，请稍后重试", code: "WORKER_SHUTTING_DOWN" });
       const body = await readJson(request) as unknown as JobInput;
       if (!body.run?.id || body.run.mode !== "real" || !Array.isArray(body.checks) || !body.credentials?.developer || !body.credentials?.reviewer) return json(response, 400, { error: "Invalid job" });
       // Dispatch is at-least-once: a run already executing locally is not an error.
@@ -2636,17 +2718,44 @@ const server = createServer(async (request, response) => {
   }
 });
 
-const resolvedSandbox = await resolveSandboxMode(process.env.PI_SANDBOX_MODE || "auto", () => docker.ping());
+// P1 (fail-closed): the default never degrades to in-process execution; only
+// PI_SANDBOX_ALLOW_DEGRADED=1 (strictly parsed) or PI_SANDBOX_MODE=process does.
+const resolvedSandbox = await resolveSandboxMode(
+  process.env.PI_SANDBOX_MODE || "auto",
+  () => docker.ping(),
+  { allowDegraded: parseSandboxAllowDegraded(process.env.PI_SANDBOX_ALLOW_DEGRADED) },
+);
 sandboxMode = resolvedSandbox.mode;
 sandboxReason = resolvedSandbox.reason;
+sandboxDegraded = resolvedSandbox.degraded === true;
 process.stdout.write(`[sandbox] mode=${sandboxMode}${sandboxReason ? ` (${sandboxReason})` : ""} image=${imageForSandbox}\n`);
+if (sandboxMode === "unavailable") {
+  process.stderr.write(
+    "[sandbox] 容器沙箱不可用：已启用 fail-closed，worker 将拒绝执行任何 Agent。"
+    + "请修复 Docker daemon / PI_DOCKER_SOCKET / 沙箱镜像后重启；"
+    + "仅在明确接受关闭隔离时，才可设置 PI_SANDBOX_ALLOW_DEGRADED=1 允许降级执行。\n",
+  );
+}
 
-// GAP-05: never leave a workspace locked by a worker that is shutting down.
+// P1: on SIGTERM/SIGINT stop claiming jobs, stop the sandbox containers this
+// worker started (bounded wait, then force-kill) and only then exit, so no
+// sandbox is left writing into a run worktree. GAP-05: never leave a workspace
+// locked by a worker that is shutting down.
+const shutdown = createShutdownHandler({
+  stopClaiming: () => {
+    shuttingDown = true;
+    server.close();
+  },
+  stopSandboxes: () => sandboxContainers.stopAll(),
+  releaseLocks: () => workspaceLocks.releaseAllSync(),
+  exit: (code) => process.exit(code),
+  log: (message) => process.stdout.write(`${message}\n`),
+});
 for (const signal of ["SIGTERM", "SIGINT"] as const) {
-  process.once(signal, () => {
-    workspaceLocks.releaseAllSync();
-    process.exit(signal === "SIGINT" ? 130 : 143);
-  });
+  // `on`, not `once`: a repeated signal must reach the handler (which ignores it)
+  // instead of falling through to the default handler and killing the process
+  // before the sandboxes have stopped.
+  process.on(signal, () => { void shutdown(signal); });
 }
 
 server.listen(port, host, () => {

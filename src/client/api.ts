@@ -236,13 +236,15 @@ export const api = {
     request<AgileRelease>(`/api/releases/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   deleteRelease: (id: string) => request<void>(`/api/releases/${encodeURIComponent(id)}`, { method: "DELETE" }),
   /** Sprint 5: explicit release publish. Without `confirm` the server returns a
-   * dry-run preview (guards + blocked stories) for the confirmation dialog. */
-  publishRelease: (id: string, body: { confirm?: boolean; note?: string } = {}) =>
+   * dry-run preview (guards + blocked stories) for the confirmation dialog.
+   * `retry: true` is required to start a new deploy attempt after a failed or
+   * timed-out one. */
+  publishRelease: (id: string, body: { confirm?: boolean; note?: string; retry?: boolean } = {}) =>
     request<{
       published: boolean;
       release: AgileRelease;
       stories?: Array<{ storyId: string; title: string; status: StoryStatus; reason?: string; runState?: string | null }>;
-      deploy?: ReleaseDeployRecord;
+      deploy?: ReleaseDeployRecord | null;
     }>(`/api/agile/releases/${encodeURIComponent(id)}/publish`, { method: "POST", body: JSON.stringify(body) }),
   /** Sprint 4: read-only sprint metrics + project rollup. */
   agileMetrics: (params: { projectId?: string; sprintId?: string } = {}) => {

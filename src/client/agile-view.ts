@@ -1,4 +1,4 @@
-import { BOARD_COLUMNS, boardColumnFor, STORY_ESTIMATE_LABELS, STORY_PRIORITY_LABELS, type AgileStory, type BoardColumnId } from "../shared/agile";
+import { BOARD_COLUMNS, boardColumnFor, RELEASE_DEPLOY_STALE_MS, STORY_ESTIMATE_LABELS, STORY_PRIORITY_LABELS, type AgileStory, type BoardColumnId, type ReleaseDeployRecord } from "../shared/agile";
 import type { ReleaseRetrospective, ReleaseSummary } from "../shared/agile-metrics";
 
 export interface BoardColumnGroup {
@@ -66,4 +66,30 @@ export function releaseExportFilename(summary: Pick<ReleaseSummary, "version" | 
   const raw = `${summary.version}-${summary.name}`.trim();
   const safe = raw.replace(/[^\w.-]+/g, "_").replace(/^[_.-]+|[_.-]+$/g, "");
   return `release-${safe || summary.releaseId}-retrospective.json`;
+}
+
+export type ReleaseDeployAction = "publish" | "retry" | "waiting" | "done";
+
+export const RELEASE_DEPLOY_ACTION_LABELS: Record<ReleaseDeployAction, string> = {
+  publish: "发布",
+  retry: "重试部署",
+  waiting: "部署进行中",
+  done: "已发布",
+};
+
+/**
+ * What the publish button should offer, derived from the release's deploy record:
+ * a first publish, an explicit retry after a failure/timeout, a wait while an
+ * asynchronous deploy is still pending (before the shared timeout), or nothing
+ * (successfully deployed / nothing to deploy).
+ */
+export function releaseDeployAction(deploy: ReleaseDeployRecord | null | undefined, now = Date.now()): ReleaseDeployAction {
+  if (!deploy) return "publish";
+  if (deploy.status === "failed") return "retry";
+  if (deploy.status === "pending") {
+    const startedAt = Date.parse(deploy.startedAt ?? deploy.at);
+    const age = now - startedAt;
+    return Number.isFinite(age) && age >= RELEASE_DEPLOY_STALE_MS ? "retry" : "waiting";
+  }
+  return "done";
 }

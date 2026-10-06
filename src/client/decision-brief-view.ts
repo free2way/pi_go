@@ -49,11 +49,22 @@ export interface DecisionRemainingGroup {
   items: DecisionBrief["remaining"];
 }
 
-/** Groups remaining findings by their mapped AC/DoD label, preserving order. */
+/** Bucket label for findings whose relevance to the story could not be ruled out. */
+export const UNRESOLVED_RELEVANCE_LABEL = "相关性未确认";
+/** Bucket label for findings the matcher holds explicit out-of-scope proof for. */
+export const UNMAPPED_AC_LABEL = "未映射到 AC";
+
+/**
+ * Groups remaining findings by their mapped AC/DoD label, preserving order.
+ * Findings with no confident label are split by *why*: relevance that could not
+ * be ruled out is a blocking state (`unknown`), so it must not be lumped in
+ * with findings proven unrelated to the story.
+ */
 export function groupRemainingByAc(remaining: DecisionBrief["remaining"]): DecisionRemainingGroup[] {
   const groups = new Map<string, DecisionBrief["remaining"]>();
   for (const item of remaining) {
-    const label = item.ac ?? "未映射到 AC";
+    const label = item.ac
+      ?? (item.relevance === "unknown" ? UNRESOLVED_RELEVANCE_LABEL : UNMAPPED_AC_LABEL);
     const list = groups.get(label);
     if (list) list.push(item);
     else groups.set(label, [item]);

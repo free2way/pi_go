@@ -9,6 +9,13 @@ import { chromium, test as base, expect, type APIRequestContext, type Page } fro
  * `/api/health`. When either check fails the test is skipped with a clear
  * message instead of failing — this keeps the suite usable on machines and CI
  * images that have no browsers or no running deployment.
+ *
+ * This self-skip is deliberately *not* a pass for the acceptance gate: the
+ * guard's skip reason lands in the `skip` annotation of the Playwright JSON
+ * report, and `npm run gate:acceptance` (scripts/e2e-suite-result.mjs) FAILs on
+ * 0 executed scenarios and on any skipped docs/05 §13 required scenario
+ * (E2E-01a/01b, E2E-02..08), naming each one. Override only deliberately, with
+ * PI_E2E_ALLOW_REQUIRED_SKIPS=1 plus PI_E2E_ALLOW_REQUIRED_SKIPS_REASON.
  */
 export const E2E_BASE_URL = process.env.PI_E2E_BASE_URL ?? "http://127.0.0.1:3100";
 export const E2E_DEV_EMAIL = (process.env.PI_E2E_DEV_EMAIL ?? "developer@localhost").toLowerCase();

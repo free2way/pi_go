@@ -1,5 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { buildContainerSpec, hostPathFor, resolveSandboxMode, sandboxStateDirectory } from "./sandbox.js";
+import {
+  buildContainerSpec,
+  createShutdownHandler,
+  hostPathFor,
+  parseSandboxAllowDegraded,
+  resolveSandboxMode,
+  SandboxContainerRegistry,
+  SandboxUnavailableError,
+  sandboxStateDirectory,
+  type SandboxContainerHandle,
+} from "./sandbox.js";
 
 const base = {
   image: "local/pigo-sandbox:0.1.0",
@@ -93,21 +103,240 @@ describe("sandboxStateDirectory", () => {
   });
 });
 
-describe("resolveSandboxMode", () => {
+describe("resolveSandboxMode (P1 fail-closed)", () => {
   it("auto mode uses the container sandbox when the socket answers", async () => {
     expect(await resolveSandboxMode("auto", async () => true)).toEqual({ mode: "container" });
   });
 
-  it("auto mode falls back to in-process execution when the socket is missing", async () => {
+  it("auto mode is unavailable (not process) when the socket is missing", async () => {
     const result = await resolveSandboxMode("auto", async () => { throw new Error("ENOENT"); });
-    expect(result.mode).toBe("process");
+    expect(result.mode).toBe("unavailable");
+    expect(result.degraded).toBeUndefined();
     expect(result.reason).toContain("ENOENT");
   });
 
-  it("respects an explicit mode and reports an unusable socket instead of degrading", async () => {
-    expect((await resolveSandboxMode("process", async () => true)).mode).toBe("process");
+  it("explicit container mode is fail-closed too when the socket is unusable", async () => {
     const forced = await resolveSandboxMode("container", async () => { throw new Error("EACCES"); });
-    expect(forced.mode).toBe("container");
+    expect(forced.mode).toBe("unavailable");
     expect(forced.reason).toContain("EACCES");
+  });
+
+  it("keeps an explicit PI_SANDBOX_MODE=process explicit and unflagged", async () => {
+    const result = await resolveSandboxMode("process", async () => true);
+    expect(result.mode).toBe("process");
+    expect(result.degraded).toBeUndefined();
+    expect(result.reason).toContain("PI_SANDBOX_MODE=process");
+  });
+
+  it("only the explicit degraded opt-in allows the in-process fallback, and it is flagged", async () => {
+    const result = await resolveSandboxMode("auto", async () => { throw new Error("ENOENT"); }, { allowDegraded: true });
+    expect(result.mode).toBe("process");
+    expect(result.degraded).toBe(true);
+    expect(result.reason).toContain("ENOENT");
+  });
+});
+
+describe("parseSandboxAllowDegraded (P1 strict opt-in)", () => {
+  it("accepts only the exact literal 1", () => {
+    expect(parseSandboxAllowDegraded("1")).toBe(true);
+    for (const value of [undefined, "", "0", "true", "TRUE", "yes", "on", " 1", "1 ", "01", "11", "2"]) {
+      expect(parseSandboxAllowDegraded(value)).toBe(false);
+    }
+  });
+});
+
+describe("SandboxUnavailableError", () => {
+  it("carries the actionable Chinese fail-closed message and the reason", () => {
+    const error = new SandboxUnavailableError("docker socket unavailable: ENOENT");
+    expect(error).toBeInstanceOf(Error);
+    expect(error.code).toBe("SANDBOX_UNAVAILABLE");
+    expect(error.message).toContain("fail-closed");
+    expect(error.message).toContain("PI_SANDBOX_ALLOW_DEGRADED=1");
+    expect(error.message).toContain("ENOENT");
+  });
+});
+
+type FakeExit = "SIGTERM" | "SIGKILL" | "never";
+
+/** A sandbox container stub: `wait()` only settles when its exit signal arrives. */
+function fakeSandbox(
+  id: string,
+  exitsOn: FakeExit = "SIGTERM",
+  onStop?: (signal: "SIGTERM" | "SIGKILL") => void,
+) {
+  const signals: Array<"SIGTERM" | "SIGKILL"> = [];
+  let release: () => void = () => undefined;
+  const exited = new Promise<void>((resolve) => { release = resolve; });
+  const handle: SandboxContainerHandle = {
+    id,
+    stop: async (signal) => {
+      signals.push(signal);
+      onStop?.(signal);
+      if (exitsOn === signal) release();
+    },
+    wait: () => exited,
+  };
+  return { handle, signals };
+}
+
+describe("SandboxContainerRegistry (P1 shutdown)", () => {
+  it("tracks containers until they are forgotten", () => {
+    const registry = new SandboxContainerRegistry();
+    const forget = registry.add(fakeSandbox("c1").handle);
+    expect(registry.running()).toEqual(["c1"]);
+    expect(registry.size).toBe(1);
+    forget();
+    expect(registry.size).toBe(0);
+  });
+
+  it("stops with SIGTERM and force-kills only what survives the grace period", async () => {
+    const polite = fakeSandbox("c1", "SIGTERM");
+    const stubborn = fakeSandbox("c2", "SIGKILL");
+    const registry = new SandboxContainerRegistry();
+    registry.add(polite.handle);
+    registry.add(stubborn.handle);
+
+    const result = await registry.stopAll({ graceMs: 30, forceKillGraceMs: 30 });
+
+    expect(result.stopped).toEqual(["c1"]);
+    expect(result.forced).toEqual(["c2"]);
+    expect(result.unconfirmed).toEqual([]);
+    expect(polite.signals).toEqual(["SIGTERM"]);
+    expect(stubborn.signals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(registry.size).toBe(0);
+  });
+
+  it("is idempotent: concurrent and repeated stopAll calls run one teardown", async () => {
+    const sandbox = fakeSandbox("c1", "SIGTERM");
+    const registry = new SandboxContainerRegistry();
+    registry.add(sandbox.handle);
+
+    const [first, second] = await Promise.all([
+      registry.stopAll({ graceMs: 30 }),
+      registry.stopAll({ graceMs: 30 }),
+    ]);
+    const third = await registry.stopAll({ graceMs: 30 });
+
+    expect(second).toEqual(first);
+    expect(third).toEqual(first);
+    expect(sandbox.signals).toEqual(["SIGTERM"]);
+  });
+
+  it("gives up on a stuck sandbox within the bounded timeout (never hangs)", async () => {
+    const stuck = fakeSandbox("stuck", "never");
+    const registry = new SandboxContainerRegistry();
+    registry.add(stuck.handle);
+
+    const started = Date.now();
+    const result = await registry.stopAll({ graceMs: 20, forceKillGraceMs: 20 });
+
+    expect(result.forced).toEqual(["stuck"]);
+    expect(result.unconfirmed).toEqual(["stuck"]);
+    expect(stuck.signals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  it("force-kills a sandbox that starts while the teardown is still running", async () => {
+    const registry = new SandboxContainerRegistry();
+    const late = fakeSandbox("late", "SIGKILL");
+    const first = fakeSandbox("c1", "SIGTERM", (signal) => {
+      // A still-active job starts another sandbox during the grace wait.
+      if (signal === "SIGTERM") registry.add(late.handle);
+    });
+    registry.add(first.handle);
+
+    const result = await registry.stopAll({ graceMs: 30, forceKillGraceMs: 30 });
+
+    expect(result.stopped).toEqual(["c1"]);
+    expect(result.forced).toEqual(["late"]);
+    expect(late.signals).toEqual(["SIGKILL"]);
+    expect(registry.size).toBe(0);
+  });
+
+  it("resolves immediately with an empty result when nothing is running", async () => {
+    expect(await new SandboxContainerRegistry().stopAll()).toEqual({ stopped: [], forced: [], unconfirmed: [] });
+  });
+});
+
+describe("createShutdownHandler (P1 worker exit)", () => {
+  function deps(overrides: Partial<Parameters<typeof createShutdownHandler>[0]> = {}) {
+    const order: string[] = [];
+    const exitCodes: number[] = [];
+    const logs: string[] = [];
+    const shutdown = createShutdownHandler({
+      stopClaiming: () => { order.push("stopClaiming"); },
+      stopSandboxes: async () => {
+        order.push("stopSandboxes");
+        return { stopped: ["c1"], forced: [], unconfirmed: [] };
+      },
+      releaseLocks: () => { order.push("releaseLocks"); },
+      exit: (code) => { order.push(`exit:${code}`); exitCodes.push(code); },
+      log: (message) => { logs.push(message); },
+      ...overrides,
+    });
+    return { shutdown, order, exitCodes, logs };
+  }
+
+  it("stops claiming, reclaims sandboxes, releases locks, then exits (SIGTERM=143)", async () => {
+    const { shutdown, order } = deps();
+    await shutdown("SIGTERM");
+    expect(order).toEqual(["stopClaiming", "stopSandboxes", "releaseLocks", "exit:143"]);
+  });
+
+  it("uses exit code 130 for SIGINT", async () => {
+    const { shutdown, exitCodes } = deps();
+    await shutdown("SIGINT");
+    expect(exitCodes).toEqual([130]);
+  });
+
+  it("ignores repeated signals while a teardown is in flight", async () => {
+    const order: string[] = [];
+    const exitCodes: number[] = [];
+    const logs: string[] = [];
+    let stopCalls = 0;
+    let finishStop: ((value: { stopped: string[]; forced: string[]; unconfirmed: string[] }) => void) | undefined;
+    const shutdown = createShutdownHandler({
+      stopClaiming: () => { order.push("stopClaiming"); },
+      stopSandboxes: () => {
+        stopCalls += 1;
+        return new Promise((resolve) => { finishStop = resolve; });
+      },
+      releaseLocks: () => { order.push("releaseLocks"); },
+      exit: (code) => { exitCodes.push(code); },
+      log: (message) => { logs.push(message); },
+    });
+
+    const first = shutdown("SIGTERM");
+    const second = shutdown("SIGTERM");
+    expect(second).toBe(first);
+    await Promise.resolve();
+    expect(stopCalls).toBe(1);
+    expect(exitCodes).toEqual([]);
+
+    finishStop?.({ stopped: [], forced: [], unconfirmed: [] });
+    await first;
+    expect(stopCalls).toBe(1);
+    expect(exitCodes).toEqual([143]);
+    expect(logs.join("\n")).toContain("忽略重复的 SIGTERM");
+  });
+
+  it("still exits (bounded) when the sandbox stop never resolves", async () => {
+    const { shutdown, exitCodes, logs } = deps({
+      stopSandboxes: () => new Promise(() => undefined),
+      timeoutMs: 20,
+    });
+    await shutdown("SIGTERM");
+    expect(exitCodes).toEqual([143]);
+    expect(logs.join("\n")).toContain("20ms");
+  });
+
+  it("releases locks and exits even when the sandbox stop throws", async () => {
+    const { shutdown, order, exitCodes, logs } = deps({
+      stopSandboxes: async () => { throw new Error("docker down"); },
+    });
+    await shutdown("SIGTERM");
+    expect(order).toEqual(["stopClaiming", "releaseLocks", "exit:143"]);
+    expect(exitCodes).toEqual([143]);
+    expect(logs.join("\n")).toContain("docker down");
   });
 });

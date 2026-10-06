@@ -547,13 +547,18 @@ describe("AgileService release publish", () => {
     const stories = await service.collectReleaseStories(["user_a"], release);
     expect(stories).toHaveLength(1);
 
-    const published = await service.publishRelease(["user_a"], release.id, {
+    const started = await service.startReleaseDeploy({
+      releaseId: release.id,
+      deliveryId: `release-publish:${release.id}`,
+      attempt: 1,
       releasedBy: "user_a",
       releasedAt: "2026-01-02T00:00:00.000Z",
       note: "首次发布",
       deploy: { status: "ok", detail: "HTTP 200", at: "2026-01-02T00:00:00.000Z" },
       stories,
     });
+    expect(started.claimed).toBe(true);
+    const published = started.release;
     expect(published).toMatchObject({ status: "released", releasedAt: "2026-01-02T00:00:00.000Z", releasedBy: "user_a" });
     expect(published.deploy).toMatchObject({ status: "ok", detail: "HTTP 200" });
 
@@ -562,16 +567,111 @@ describe("AgileService release publish", () => {
     expect(audit.rows[0]).toMatchObject({ action: "release.published", actor_id: "user_a", note: "首次发布", status: "released" });
   });
 
-  it("treats released as terminal for edits and re-publish", async () => {
+  it("treats released as terminal for edits, and a duplicate attempt is never claimed twice", async () => {
     const { service, project } = await seed();
     const story = await service.createStory("user_a", { projectId: project.id, title: "故事", status: "done" });
     const release = await service.createRelease("user_a", { projectId: project.id, name: "v1.0", version: "1.0.0", storyIds: [story.id] });
     const stories = await service.collectReleaseStories(["user_a"], release);
-    const input = { releasedBy: "user_a", releasedAt: "2026-01-02T00:00:00.000Z", deploy: { status: "not_configured" as const, detail: "未配置", at: "2026-01-02T00:00:00.000Z" }, stories };
-    await service.publishRelease(["user_a"], release.id, input);
+    const input = {
+      releaseId: release.id,
+      deliveryId: `release-publish:${release.id}`,
+      attempt: 1,
+      releasedBy: "user_a",
+      releasedAt: "2026-01-02T00:00:00.000Z",
+      deploy: { status: "not_configured" as const, detail: "未配置", at: "2026-01-02T00:00:00.000Z" },
+      stories,
+    };
+    expect((await service.startReleaseDeploy(input)).claimed).toBe(true);
 
     await expect(service.updateRelease(["user_a"], release.id, { name: "改名" })).rejects.toMatchObject({ code: "RELEASE_RELEASED", status: 409 });
-    await expect(service.publishRelease(["user_a"], release.id, input)).rejects.toMatchObject({ code: "RELEASE_RELEASED", status: 409 });
+    expect((await service.startReleaseDeploy(input)).claimed).toBe(false);
+  });
+
+  it("claims exactly one attempt when two confirms race (audit P1)", async () => {
+    const { service, project } = await seed();
+    const story = await service.createStory("user_a", { projectId: project.id, title: "故事", status: "done" });
+    const release = await service.createRelease("user_a", { projectId: project.id, name: "v1.0", version: "1.0.0", storyIds: [story.id] });
+    const stories = await service.collectReleaseStories(["user_a"], release);
+    const attempt = {
+      releaseId: release.id,
+      deliveryId: `release-publish:${release.id}`,
+      attempt: 1,
+      releasedBy: "user_a",
+      releasedAt: "2026-01-02T00:00:00.000Z",
+      deploy: { status: "pending" as const, detail: "HTTP 202", at: "2026-01-02T00:00:00.000Z", startedAt: "2026-01-02T00:00:00.000Z" },
+      stories,
+    };
+    const [first, second] = await Promise.all([service.startReleaseDeploy(attempt), service.startReleaseDeploy(attempt)]);
+    expect([first.claimed, second.claimed].filter(Boolean)).toHaveLength(1);
+  });
+
+  it("settles a pending attempt once and never lets a stale writer clobber the callback", async () => {
+    const { db, service, project } = await seed();
+    const story = await service.createStory("user_a", { projectId: project.id, title: "故事", status: "done" });
+    const release = await service.createRelease("user_a", { projectId: project.id, name: "v1.0", version: "1.0.0", storyIds: [story.id] });
+    const stories = await service.collectReleaseStories(["user_a"], release);
+    const deliveryId = `release-publish:${release.id}`;
+    await service.startReleaseDeploy({
+      releaseId: release.id,
+      deliveryId,
+      attempt: 1,
+      releasedBy: "user_a",
+      releasedAt: "2026-01-02T00:00:00.000Z",
+      stories,
+      deploy: { status: "pending", detail: "HTTP 202", at: "2026-01-02T00:00:00.000Z", startedAt: "2026-01-02T00:00:00.000Z", deliveryId, attempt: 1 },
+    });
+
+    const ok = await service.settleReleaseDeployResult({
+      releaseId: release.id,
+      action: "release.deploy_succeeded",
+      actorId: "deploy-system",
+      now: "2026-01-02T00:01:00.000Z",
+      deploy: { status: "ok", detail: "部署系统回调：成功", at: "2026-01-02T00:01:00.000Z", finishedAt: "2026-01-02T00:01:00.000Z", deliveryId, attempt: 1 },
+    });
+    expect(ok.applied).toBe(true);
+    expect(ok.release.deploy).toMatchObject({ status: "ok", attempt: 1 });
+
+    // A late duplicate writer must not overwrite the recorded callback result.
+    const late = await service.settleReleaseDeployResult({
+      releaseId: release.id,
+      action: "release.deploy_failed",
+      actorId: "deploy-system",
+      now: "2026-01-02T00:02:00.000Z",
+      deploy: { status: "failed", detail: "late", at: "2026-01-02T00:02:00.000Z", finishedAt: "2026-01-02T00:02:00.000Z", deliveryId, attempt: 1 },
+    });
+    expect(late.applied).toBe(false);
+    expect(late.release.deploy).toMatchObject({ status: "ok" });
+
+    const audit = await db.query("SELECT action FROM agile_release_audit WHERE release_id = $1", [release.id]);
+    expect(audit.rows.map((row) => row.action).sort()).toEqual(["release.deploy_succeeded", "release.published"]);
+  });
+
+  it("expires a pending attempt whose callback never arrived, recording the failure", async () => {
+    const { db, service, project } = await seed();
+    const story = await service.createStory("user_a", { projectId: project.id, title: "故事", status: "done" });
+    const release = await service.createRelease("user_a", { projectId: project.id, name: "v1.0", version: "1.0.0", storyIds: [story.id] });
+    const stories = await service.collectReleaseStories(["user_a"], release);
+    const startedAt = "2026-01-02T00:00:00.000Z";
+    const deliveryId = `release-publish:${release.id}`;
+    await service.startReleaseDeploy({
+      releaseId: release.id,
+      deliveryId,
+      attempt: 1,
+      releasedBy: "user_a",
+      releasedAt: startedAt,
+      stories,
+      deploy: { status: "pending", detail: "HTTP 202", at: startedAt, startedAt, deliveryId, attempt: 1 },
+    });
+
+    const expired = await service.expireStaleReleaseDeploys({ now: "2026-01-02T00:10:00.000Z", timeoutMs: 5 * 60_000 });
+    expect(expired).toEqual([release.id]);
+    const after = await service.getRelease(["user_a"], release.id);
+    expect(after.deploy).toMatchObject({ status: "failed", finishedAt: "2026-01-02T00:10:00.000Z" });
+    expect(after.deploy?.detail).toContain("超时");
+
+    const audit = await db.query("SELECT action, status FROM agile_release_audit WHERE release_id = $1", [release.id]);
+    expect(audit.rows.map((row) => row.action).sort()).toEqual(["release.deploy_failed", "release.published"]);
+    expect(audit.rows.find((row) => row.action === "release.deploy_failed")).toMatchObject({ status: "failed" });
   });
 
   it("skips foreign story ids and reports a blocked story with its reason", async () => {

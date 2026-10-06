@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { internalUpdateRejection, releasesStoryBlocks, storyBlockReleaseNote } from "../shared/run-state.js";
-import { buildStoryRunInput, STORY_STATUS_LABELS, type RunBudget, type StoryDetail } from "../shared/agile.js";
+import { buildStoryRunInput, STORY_STATUS_LABELS, type ReleaseDeployRecord, type RunBudget, type StoryDetail } from "../shared/agile.js";
 import type { ConfigStatus, CurrentUser, ModelCatalogResponse, ReviewScope, Run, RunEvent, RunReleaseRecord, Workspace } from "../shared/types.js";
 import { AccountError, AccountService, accountAdminGate } from "./accounts.js";
 import { AlertManager, createAlertSink } from "./alerts.js";
@@ -46,7 +46,8 @@ import { AgileError, AgileService } from "./agile.js";
 import { readAgileMetrics, readReleaseRetrospective, readReleaseSummary } from "./agile-metrics.js";
 import { projectCreateSchema, projectPatchSchema, releaseCreateSchema, releasePatchSchema, releasePublishSchema, sprintCreateSchema, sprintPatchSchema, storyBlockSchema, storyCreateSchema, storyPatchSchema, storySubmitSchema, templateCreateSchema } from "./agile-schemas.js";
 import { executeRelease } from "./release-execution.js";
-import { buildReleaseDeployPayload, planReleasePublish, shapeReleaseDeployOutcome } from "./release-publish.js";
+import { isReleasePublishTerminal, planReleasePublish, planReleasePublishGate, RELEASE_DEPLOY_STALE_MS } from "./release-publish.js";
+import { runReleaseDeploy } from "./release-deploy.js";
 import type { RunStoreLike } from "./store.js";
 import { WorkspaceError, WorkspaceService } from "./workspaces.js";
 
@@ -61,7 +62,7 @@ const app = Fastify({
 });
 const port = Number(process.env.PORT || 3100);
 const host = process.env.HOST || "localhost";
-const webVersion = process.env.PI_WEB_VERSION?.trim() || "0.26.4";
+const webVersion = process.env.PI_WEB_VERSION?.trim() || "0.26.5";
 const demoMode = process.env.PI_DEMO_MODE !== "false";
 const realRunsEnabled = process.env.PI_REAL_RUNS_ENABLED === "true";
 const workerUrl = process.env.PI_WORKER_URL || "http://worker:3200";
@@ -1373,13 +1374,18 @@ app.delete<{ Params: { id: string } }>("/api/releases/:id", async (request, repl
 });
 
 /**
- * Release publish action (Sprint 5). Owner-scoped. Guards: the release must have
- * ≥1 story and none of its (reconciled) stories may be blocked — those answer
- * 409 RELEASE_EMPTY / RELEASE_BLOCKED. Without `confirm` this is a dry-run
- * preview so the UI can render the confirmation dialog; with `confirm` the
- * release is marked `released` and, when PI_POST_MERGE_DEPLOY_HOOK is configured,
- * the same deploy transport as run publish (`executeRelease`) is invoked and its
- * outcome recorded on the release + audit row (never silently skipped).
+ * Release publish action (Sprint 5). Owner-scoped, but **admin-only** to execute
+ * (`release.requireAdmin: true`; same source of truth and error code as
+ * `POST /api/runs/:id/publish`). Guards: the release must have ≥1 story and none
+ * of its (reconciled) stories may be blocked — those answer 409 RELEASE_EMPTY /
+ * RELEASE_BLOCKED. Without `confirm` this is a dry-run preview so the UI can
+ * render the confirmation dialog; with `confirm` the release is marked
+ * `released`, a DB-level idempotency claim guarantees exactly ONE deploy attempt
+ * per confirm, and when PI_POST_MERGE_DEPLOY_HOOK is configured the same deploy
+ * transport as run publish (`executeRelease`) is invoked. An HTTP 202 stays
+ * `pending` until its callback arrives (or the bounded timeout marks it failed
+ * and makes an explicit retry possible); its outcome is recorded on the release
+ * + an audit row (never silently skipped, never a premature `ok`).
  */
 app.post<{ Params: { id: string } }>("/api/agile/releases/:id/publish", { bodyLimit: 1024 * 1024 }, async (request, reply) => {
   const parsed = releasePublishSchema.safeParse(request.body ?? {});
@@ -1388,7 +1394,13 @@ app.post<{ Params: { id: string } }>("/api/agile/releases/:id/publish", { bodyLi
   const isAdmin = await identities.isAdmin(user.id);
   try {
     const release = await agile.getRelease(ownerKeysFor(request), request.params.id, isAdmin);
-    if (release.status === "released") return reply.code(409).send({ error: "发布已发布，不可重复发布", code: "RELEASE_RELEASED" });
+
+    // AUD-P1: publishing is administrator-only, even for the release's owner.
+    // Checked before any guard detail is computed, so a non-admin learns nothing
+    // about blocked stories (and can never trigger a deploy).
+    const gate = planReleasePublishGate({ isAdmin });
+    if (gate.kind === "forbidden") return reply.code(gate.status).send({ error: gate.message, code: gate.code });
+
     const stories = await agile.collectReleaseStories(ownerKeysFor(request), release, isAdmin);
     const plan = planReleasePublish({ stories, label: `发布「${release.version} ${release.name}」` });
     if (plan.kind !== "ready") {
@@ -1398,26 +1410,102 @@ app.post<{ Params: { id: string } }>("/api/agile/releases/:id/publish", { bodyLi
         ...(plan.kind === "blocked" ? { blocked: plan.blocked } : {}),
       });
     }
-    if (!parsed.data.confirm) return { published: false, release, stories };
 
+    // Dry run: never settles a `failed` deploy, so the UI can offer a retry.
+    if (!parsed.data.confirm) {
+      if (isReleasePublishTerminal(release)) return reply.code(409).send({ error: "发布已发布，不可重复发布", code: "RELEASE_RELEASED" });
+      return { published: false, release, stories, deploy: release.deploy ?? null };
+    }
+
+    const now = new Date().toISOString();
     const deployPlan = planPostMergeDeploy(process.env.PI_POST_MERGE_DEPLOY_HOOK);
     if (deployPlan.configured && deployPlan.kind === "webhook" && !releaseWebhookToken) {
       return reply.code(409).send({ error: "Webhook 发布必须配置 PI_POST_MERGE_DEPLOY_TOKEN", code: "RELEASE_AUTH_NOT_CONFIGURED" });
     }
-    const releasedAt = new Date().toISOString();
-    const execution = await executeRelease(
-      deployPlan,
-      buildReleaseDeployPayload({ release, stories, releasedAt, releasedBy: user.id, note: parsed.data.note }),
-      { deliveryId: `release-publish:${release.id}`, webhookToken: releaseWebhookToken || undefined },
+    if (deployPlan.configured && deployPlan.kind === "webhook" && !publicOrigin) {
+      return reply.code(409).send({ error: "Webhook 发布必须配置 PI_PUBLIC_ORIGIN 以接收异步结果回调", code: "RELEASE_CALLBACK_NOT_CONFIGURED" });
+    }
+    const callbackUrl = publicOrigin
+      ? `${publicOrigin.replace(/\/$/, "")}/api/internal/agile/releases/${encodeURIComponent(release.id)}/release-result`
+      : undefined;
+
+    // AUD-P1: ordering (timeout → claim → execute) is the correctness argument
+    // and lives in `runReleaseDeploy`, unit-tested including the concurrent path.
+    const run = await runReleaseDeploy(
+      {
+        release,
+        stories,
+        deployPlan,
+        retry: parsed.data.retry === true,
+        now,
+        releasedBy: user.id,
+        note: parsed.data.note,
+        callbackUrl,
+        webhookToken: releaseWebhookToken || undefined,
+      },
+      {
+        start: (input) => agile.startReleaseDeploy(input),
+        settle: (input) => agile.settleReleaseDeployResult(input),
+        execute: (payload, options) => executeRelease(deployPlan, payload, options),
+        read: () => agile.getRelease(ownerKeysFor(request), release.id, isAdmin),
+      },
     );
-    const deploy = shapeReleaseDeployOutcome(deployPlan, execution, new Date().toISOString());
-    const published = await agile.publishRelease(
-      ownerKeysFor(request),
-      release.id,
-      { releasedBy: user.id, releasedAt, note: parsed.data.note, deploy, stories },
-      isAdmin,
-    );
-    return { published: true, release: published, deploy };
+    if (run.kind === "conflict") {
+      return reply.code(run.status).send({
+        error: run.message,
+        code: run.code,
+        ...(run.attempt === undefined ? {} : { attempt: run.attempt }),
+        ...(run.deliveryId ? { deliveryId: run.deliveryId } : {}),
+      });
+    }
+    return { published: true, release: run.release, deploy: run.deploy };
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
+/**
+ * Internal final-status callback for asynchronous (HTTP 202) release deploys,
+ * mirroring `POST /api/internal/runs/:id/release-result`. Authenticated with the
+ * deploy webhook token (or the internal token); idempotent — a repeated
+ * callback for an already-settled attempt returns the stored record.
+ */
+app.post<{ Params: { id: string } }>("/api/internal/agile/releases/:id/release-result", async (request, reply) => {
+  const authorized = safeSecretMatch(request.headers.authorization, releaseWebhookToken) || safeTokenMatch(request.headers.authorization);
+  if (!authorized) return reply.code(401).send({ error: "Unauthorized" });
+  const parsed = releaseDeployResultSchema.safeParse(request.body ?? {});
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid release result", details: parsed.error.issues });
+  try {
+    const release = await agile.getRelease([], request.params.id, true);
+    const current = release.deploy ?? null;
+    if (!current || !current.deliveryId || current.deliveryId !== parsed.data.deliveryId) {
+      return reply.code(409).send({ error: "Release delivery id does not match", code: "RELEASE_DELIVERY_MISMATCH" });
+    }
+    if (parsed.data.attempt !== undefined && current.attempt !== parsed.data.attempt) {
+      return reply.code(409).send({ error: "Release attempt does not match", code: "RELEASE_DELIVERY_MISMATCH" });
+    }
+    const status: ReleaseDeployRecord["status"] = parsed.data.status === "succeeded" ? "ok" : "failed";
+    if (current.status === status) return { ok: true, release };
+    if (current.status !== "pending") {
+      return reply.code(409).send({ error: `Release deploy is already ${current.status}`, code: "RELEASE_ALREADY_FINAL" });
+    }
+    const at = new Date().toISOString();
+    const settled = await agile.settleReleaseDeployResult({
+      releaseId: release.id,
+      action: status === "ok" ? "release.deploy_succeeded" : "release.deploy_failed",
+      actorId: `deploy-system:${parsed.data.deliveryId}`,
+      deploy: {
+        ...current,
+        status,
+        detail: parsed.data.detail ?? (status === "ok" ? "部署系统回调：成功" : "部署系统回调：失败"),
+        at,
+        finishedAt: at,
+        ...(parsed.data.deploymentId ? { deploymentId: parsed.data.deploymentId } : {}),
+        ...(parsed.data.url ? { url: parsed.data.url } : {}),
+      },
+    });
+    // A concurrent writer may have settled first; its result is authoritative.
+    return { ok: true, release: settled.release };
   } catch (error) {
     return agileErrorReply(reply, error);
   }
@@ -2031,6 +2119,15 @@ const releaseResultSchema = z.object({
   deploymentId: z.string().trim().max(200).optional(),
   url: z.string().url().max(1_000).optional(),
 });
+/** Final-status callback for an asynchronous agile release deploy. */
+const releaseDeployResultSchema = z.object({
+  deliveryId: z.string().trim().min(8).max(120),
+  attempt: z.number().int().min(1).optional(),
+  status: z.enum(["succeeded", "failed"]),
+  detail: z.string().trim().max(500).optional(),
+  deploymentId: z.string().trim().max(200).optional(),
+  url: z.string().url().max(1_000).optional(),
+}).strict();
 
 async function mergeCompletedRun(request: FastifyRequest, run: Run, userId: string, note?: string) {
   const now = new Date().toISOString();
@@ -2728,6 +2825,28 @@ async function requeueStaleJobs() {
   }
 }
 
+/**
+ * AUD-P1 bounded verification: an asynchronous release deploy whose callback
+ * never arrived is marked `failed` after the timeout, so the operator can see
+ * the real outcome and explicitly retry instead of waiting forever.
+ */
+async function expireStaleReleaseDeploys() {
+  try {
+    const expired = await agile.expireStaleReleaseDeploys({ timeoutMs: RELEASE_DEPLOY_STALE_MS });
+    if (expired.length > 0) {
+      app.log.warn({ expired }, "release deploy callback timed out; attempt marked failed and retryable");
+      alerts.raise({
+        key: "release_deploy_timeout",
+        severity: "warning",
+        message: "发布部署回调超时，已标记失败并可重试",
+        details: { count: expired.length, releases: expired.slice(0, 10) },
+      });
+    }
+  } catch (error) {
+    app.log.error({ error: (error as Error).message }, "stale release deploy expiry failed");
+  }
+}
+
 const resumeSchema = z.object({
   instruction: z.string().trim().max(2_000).optional(),
 });
@@ -3042,7 +3161,13 @@ app.setErrorHandler((error, _request, reply) => {
 // REL-002: jobs left unfinished by a stopped worker are re-queued and (when the
 // worker is back) pushed again, so a run never stalls silently.
 await requeueStaleJobs();
-const jobRecoveryTimer = setInterval(() => { void requeueStaleJobs(); }, 60_000);
+// AUD-P1: asynchronous release deploys that never called back are failed after
+// the bounded timeout, which is what makes an explicit retry possible.
+await expireStaleReleaseDeploys();
+const jobRecoveryTimer = setInterval(() => {
+  void requeueStaleJobs();
+  void expireStaleReleaseDeploys();
+}, 60_000);
 jobRecoveryTimer.unref?.();
 
 await app.listen({ port, host });

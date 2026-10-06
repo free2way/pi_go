@@ -185,7 +185,10 @@ describe("readReleaseSummary / readReleaseRetrospective", () => {
     const story = await service.createStory("user_a", { projectId: project.id, title: "完成的", status: "done" });
     const release = await service.createRelease("user_a", { projectId: project.id, name: "结账发布", version: "v1.0.0", storyIds: [story.id] });
     const stories = await service.collectReleaseStories(["user_a"], release);
-    await service.publishRelease(["user_a"], release.id, {
+    await service.startReleaseDeploy({
+      releaseId: release.id,
+      deliveryId: `release-publish:${release.id}`,
+      attempt: 1,
       releasedBy: "user_a",
       releasedAt: "2026-01-03T00:00:00.000Z",
       deploy: { status: "failed", detail: "HTTP 503", at: "2026-01-03T00:00:01.000Z" },

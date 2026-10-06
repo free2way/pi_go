@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { deriveStoryStatus, type AgileStory } from "../shared/agile";
 import type { ReleaseRetrospective, ReleaseSummary } from "../shared/agile-metrics";
-import { columnPoints, estimateLabel, groupStoriesByColumn, priorityLabel, releaseExportFilename, releaseExportJson, splitLines, storyReference } from "./agile-view";
+import { columnPoints, estimateLabel, groupStoriesByColumn, priorityLabel, releaseDeployAction, releaseExportFilename, releaseExportJson, splitLines, storyReference } from "./agile-view";
 
 function story(overrides: Partial<AgileStory>): AgileStory {
   return {
@@ -124,5 +124,30 @@ describe("release export helpers", () => {
     expect(releaseExportFilename(summary)).toBe("release-v1.2.0-Checkout-retrospective.json");
     expect(releaseExportFilename({ version: " v1 ", name: "结账 发布", releaseId: "rel_9" })).toBe("release-v1-retrospective.json");
     expect(releaseExportFilename({ version: "", name: "", releaseId: "rel_9" })).toBe("release-rel_9-retrospective.json");
+  });
+});
+
+describe("releaseDeployAction", () => {
+  const now = Date.parse("2026-01-02T00:10:00.000Z");
+
+  it("offers a first publish when no deploy was attempted", () => {
+    expect(releaseDeployAction(null, now)).toBe("publish");
+    expect(releaseDeployAction(undefined, now)).toBe("publish");
+  });
+
+  it("offers a retry after a failed deploy", () => {
+    expect(releaseDeployAction({ status: "failed", detail: "HTTP 503", at: "2026-01-02T00:00:00.000Z" }, now)).toBe("retry");
+  });
+
+  it("waits while a pending deploy is inside the timeout, then offers a retry", () => {
+    const deploy = { status: "pending" as const, detail: "HTTP 202", at: "2026-01-02T00:00:00.000Z", startedAt: "2026-01-02T00:00:00.000Z" };
+    expect(releaseDeployAction(deploy, Date.parse("2026-01-02T00:04:59.000Z"))).toBe("waiting");
+    expect(releaseDeployAction(deploy, Date.parse("2026-01-02T00:05:01.000Z"))).toBe("retry");
+  });
+
+  it("is done for ok / not_configured / unsupported", () => {
+    expect(releaseDeployAction({ status: "ok", detail: "HTTP 200", at: "2026-01-02T00:00:00.000Z" }, now)).toBe("done");
+    expect(releaseDeployAction({ status: "not_configured", detail: "未配置", at: "2026-01-02T00:00:00.000Z" }, now)).toBe("done");
+    expect(releaseDeployAction({ status: "unsupported", detail: "无效", at: "2026-01-02T00:00:00.000Z" }, now)).toBe("done");
   });
 });

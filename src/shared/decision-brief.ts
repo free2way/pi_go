@@ -16,10 +16,13 @@
  *                    files) and stays inside the allowed paths (when given)
  *   4. acceptance  — every AC/DoD item maps to an implemented change or a test
  *
- * Conservative by construction: whenever the data does not let a gate be
- * decided it reports `unknown` (never a fabricated green/red), and the AC
- * matcher refuses to guess — a possible-but-unproven match is `unknown`, never
- * a false "relevant".
+ * Conservative/fail-safe by construction: whenever the data does not let a gate
+ * be decided it reports `unknown` (never a fabricated green/red); the AC matcher
+ * refuses to guess — a possible-but-unproven match is `unknown`, never a false
+ * "relevant"; and an unresolved `critical`/`high` is cleared only with explicit
+ * out-of-scope proof (a concrete file outside a known change set that shares
+ * nothing with any criterion). Every ambiguous relevance verdict therefore
+ * blocks, so a genuine high-severity defect is never silently dropped.
  */
 
 import type { Finding } from "./types.js";
@@ -29,6 +32,16 @@ export type GateStatus = "green" | "red" | "unknown";
 export type GateId = "checks" | "blocking" | "scope" | "acceptance";
 export type DecisionAction = "continue" | "accept";
 export type AcRelevance = "relevant" | "irrelevant" | "unknown";
+
+/**
+ * Run context used *only* to rule relevance out (never to claim it). Without a
+ * known change set an out-of-scope finding cannot be proven out of scope, so the
+ * matcher stays conservative and reports `unknown` (⇒ blocking).
+ */
+export interface AcRelevanceContext {
+  /** The run's changed files. Absent/empty ⇒ the change set is unknown. */
+  diffFiles?: string[] | null;
+}
 
 export interface DecisionBriefFindingRef {
   id: string;
@@ -59,6 +72,13 @@ export interface DecisionBriefRemainingItem {
   streak: number;
   ac?: string;
   evidenceOk: boolean;
+  /**
+   * How (un)confidently the finding maps to the story's AC/DoD. `unknown` means
+   * relevance could not be ruled out — for an unresolved critical/high that is
+   * a blocking state, not a clear one. Used by the UI to distinguish
+   * "blocking because clearly AC-relevant" from "blocking, relevance unproven".
+   */
+  relevance?: AcRelevance;
 }
 
 export interface DecisionBriefRecommendation {
@@ -203,8 +223,29 @@ function findingMaterial(finding: DecisionBriefFindingInput): { text: string; fi
   return { text, file };
 }
 
-/** True when a single criterion and the finding share a strong, non-accidental signal. */
-function singleRelevance(finding: DecisionBriefFindingInput, criterion: DecisionBriefCriterion): AcRelevance {
+/** True when the finding's file is part of the run's change set (file or dir level). */
+function isInChangedFiles(normalizedFile: string, changedFiles: ReadonlySet<string>): boolean {
+  if (!normalizedFile || changedFiles.size === 0) return false;
+  if (changedFiles.has(normalizedFile)) return true;
+  for (const changed of changedFiles) {
+    if (normalizedFile.startsWith(`${changed}/`) || changed.startsWith(`${normalizedFile}/`)) return true;
+  }
+  return false;
+}
+
+/**
+ * True when a single criterion and the finding share a strong, non-accidental
+ * signal. The context is used *only* to rule relevance out: strong signals are
+ * all derived from the finding's own material vs. the criterion text, so making
+ * the change set known can never turn a `relevant`/`unknown` into `irrelevant`
+ * beyond the explicit out-of-scope proof below.
+ */
+function singleRelevance(
+  finding: DecisionBriefFindingInput,
+  criterion: DecisionBriefCriterion,
+  changedFiles: ReadonlySet<string>,
+  diffKnown: boolean,
+): AcRelevance {
   const criterionText = normalizeBriefText(criterion.text);
   const { text: findingText, file } = findingMaterial(finding);
   if (!criterionText) return "unknown";
@@ -228,36 +269,54 @@ function singleRelevance(finding: DecisionBriefFindingInput, criterion: Decision
   if (sharedWords.some((token) => token.length >= 6)) return "relevant";
   if (sharedWords.length >= 2) return "relevant";
 
-  // Not clearly relevant. Only claim "irrelevant" when the finding actually
-  // carries identifying material AND shares nothing at all with the criterion;
-  // any partial overlap stays "unknown" so a real match is never ruled out.
+  // No strong or partial lexical overlap. Default to `unknown` (⇒ blocking):
+  // only clear a finding when the evidence that it is out of scope is strong
+  // and explicit — a concrete file that is demonstrably *not* part of this
+  // run's change set, a known change set, and not a single shared token with
+  // the criterion. Anything else (missing file, unknown diff, weak overlap)
+  // stays `unknown`, so a real high-severity defect is never silently cleared.
   const hasMaterial = Boolean(file) || (typeof finding.title === "string" && finding.title.trim().length >= 4);
   if (!hasMaterial) return "unknown";
-  return shared.length > 0 ? "unknown" : "irrelevant";
+  if (shared.length > 0) return "unknown";
+  const concreteFile = file ? normalizeFindingFile(file) : "";
+  if (!concreteFile || concreteFile === "<no-file>") return "unknown";
+  if (!diffKnown) return "unknown";
+  if (isInChangedFiles(concreteFile, changedFiles)) return "unknown";
+  return "irrelevant";
 }
 
 function toCriteria(criteria: DecisionBriefCriterion[] | string[] | null | undefined): DecisionBriefCriterion[] {
   return (criteria ?? []).map(asCriterion).filter((criterion) => criterion.text.trim() !== "");
 }
 
+/** Shared empty change set used where relevance can only be `relevant`/`unknown`. */
+const EMPTY_CHANGED_FILES: ReadonlySet<string> = new Set<string>();
+
 /**
  * Conservatively classifies one finding against the story's AC/DoD:
  * - `relevant`   only on a strong signal (shared file path, distinctive
  *                keyword, or ≥2 shared meaningful tokens);
- * - `irrelevant` only when the finding has identifying material and shares
- *                nothing at all;
- * - `unknown`    everything in between, including empty criteria or a finding
- *                without a file/title.
+ * - `irrelevant` only with explicit out-of-scope proof: a concrete file outside
+ *                a *known* change set that shares nothing at all with the
+ *                criterion (and, transitively, with every criterion);
+ * - `unknown`    everything in between, including empty criteria, a finding
+ *                without a file, an unknown/empty change set, or partial
+ *                overlap — and `unknown` blocks an unresolved critical/high.
  */
 export function acRelevance(
   finding: DecisionBriefFindingInput,
   criteria: DecisionBriefCriterion[] | string[] | null | undefined,
+  context?: AcRelevanceContext | null,
 ): AcRelevance {
   const list = toCriteria(criteria);
   if (list.length === 0) return "unknown";
+  const changedFiles = new Set(
+    (context?.diffFiles ?? []).map(normalizeDiffPath).filter(Boolean),
+  );
+  const diffKnown = changedFiles.size > 0;
   let sawUnknown = false;
   for (const criterion of list) {
-    const verdict = singleRelevance(finding, criterion);
+    const verdict = singleRelevance(finding, criterion, changedFiles, diffKnown);
     if (verdict === "relevant") return "relevant";
     if (verdict === "unknown") sawUnknown = true;
   }
@@ -270,7 +329,9 @@ export function matchCriterion(
   criteria: DecisionBriefCriterion[] | string[] | null | undefined,
 ): DecisionBriefCriterion | undefined {
   for (const criterion of toCriteria(criteria)) {
-    if (singleRelevance(finding, criterion) === "relevant") return criterion;
+    // Change-set context can only downgrade `irrelevant` → `unknown`, never
+    // create a `relevant`, so it is not needed to find a strong match.
+    if (singleRelevance(finding, criterion, EMPTY_CHANGED_FILES, false) === "relevant") return criterion;
   }
   return undefined;
 }
@@ -343,25 +404,34 @@ function isResolved(finding: DecisionBriefFindingInput): boolean {
 
 /**
  * `green` when no unresolved `critical` and no AC/DoD-relevant unresolved
- * `high`. An unresolved high whose relevance cannot be proven is treated
- * conservatively as blocking (unknown ⇒ red); a high the matcher is confident
- * is irrelevant does not block.
+ * `high`. Fail-safe: an unresolved high is treated as blocking unless the
+ * matcher holds explicit out-of-scope proof (a concrete file outside a known
+ * change set sharing nothing with any criterion). `unknown` therefore blocks,
+ * and a genuine high whose wording merely shares no keywords with the AC text
+ * is never silently cleared.
  */
 export function gateBlocking(
   findings: DecisionBriefFindingInput[] | null | undefined,
   criteria: DecisionBriefCriterion[] | string[] | null | undefined,
+  diffFiles?: string[] | null,
 ): DecisionBriefGate {
   const open = (findings ?? []).filter((finding) => !isResolved(finding));
   const critical = open.filter((finding) => normalizeSeverity(finding.severity) === "critical");
   const highs = open.filter((finding) => normalizeSeverity(finding.severity) === "high");
-  const blockingHighs = highs.filter((finding) => acRelevance(finding, criteria) !== "irrelevant");
+  const relevanceOf = new Map<DecisionBriefFindingInput, AcRelevance>();
+  for (const finding of highs) relevanceOf.set(finding, acRelevance(finding, criteria, { diffFiles }));
+  const blockingHighs = highs.filter((finding) => relevanceOf.get(finding) !== "irrelevant");
+  const relevantHighs = blockingHighs.filter((finding) => relevanceOf.get(finding) === "relevant").length;
+  const unresolvedHighs = blockingHighs.length - relevantHighs;
   const indeterminate = open.filter((finding) => normalizeSeverity(finding.severity) === undefined);
   const blocking = [...critical, ...blockingHighs];
 
   if (blocking.length > 0) {
     const summary = [
       critical.length ? `${critical.length} 个未解决 critical` : "",
-      blockingHighs.length ? `${blockingHighs.length} 个未解决 high（与 AC/DoD 相关或相关性无法排除）` : "",
+      blockingHighs.length
+        ? `${blockingHighs.length} 个未解决 high（${relevantHighs} 个明确与 AC/DoD 相关，${unresolvedHighs} 个相关性无法排除）`
+        : "",
     ].filter(Boolean).join("；");
     return {
       id: "blocking",
@@ -383,7 +453,7 @@ export function gateBlocking(
     id: "blocking",
     status: "green",
     detail: ignoredHighs > 0
-      ? `无未解决 critical；${ignoredHighs} 个 high 判定与本故事 AC/DoD 无关`
+      ? `无未解决 critical；${ignoredHighs} 个 high 有明确证据表明与本故事 AC/DoD 无关（文件不在改动范围内且无共享关键词）`
       : "无未解决的 critical/high 问题",
     findings: [],
   };
@@ -462,12 +532,12 @@ function criterionCovered(
   checks: DecisionBriefCheckInput[],
 ): boolean {
   for (const file of diffFiles) {
-    if (singleRelevance({ file, title: file, evidence: file }, criterion) === "relevant") return true;
+    if (singleRelevance({ file, title: file, evidence: file }, criterion, EMPTY_CHANGED_FILES, false) === "relevant") return true;
   }
   for (const check of checks) {
     const text = [check.name, check.command].filter((value): value is string => Boolean(value && value.trim())).join(" ");
     if (!text) continue;
-    if (singleRelevance({ file: null, title: text, requiredChange: text, evidence: text }, criterion) === "relevant") return true;
+    if (singleRelevance({ file: null, title: text, requiredChange: text, evidence: text }, criterion, EMPTY_CHANGED_FILES, false) === "relevant") return true;
   }
   return false;
 }
@@ -647,7 +717,12 @@ export function recommendDecision(
   return { action: "continue", note: parts.join(" ") };
 }
 
-function remainingItemOf(finding: DecisionBriefFindingInput, criteria: DecisionBriefCriterion[]): DecisionBriefRemainingItem {
+function remainingItemOf(
+  finding: DecisionBriefFindingInput,
+  criteria: DecisionBriefCriterion[],
+  diffFiles?: string[] | null,
+): DecisionBriefRemainingItem {
+  const relevance = acRelevance(finding, criteria, { diffFiles });
   const item: DecisionBriefRemainingItem = {
     severity: normalizeSeverity(finding.severity) ?? "low",
     key: stableKeyOf(finding),
@@ -655,6 +730,7 @@ function remainingItemOf(finding: DecisionBriefFindingInput, criteria: DecisionB
       ? Math.max(0, Math.floor(finding.consecutiveRounds))
       : 0,
     evidenceOk: evidenceSanity(finding),
+    relevance,
   };
   const criterion = matchCriterion(finding, criteria);
   if (criterion?.label) item.ac = criterion.label;
@@ -672,7 +748,7 @@ export function buildDecisionBrief(input: DecisionBriefInput): DecisionBrief {
   const checks = input.checks ?? [];
   const blockingGate: DecisionBriefGate = input.findings === null || input.findings === undefined
     ? { id: "blocking", status: "unknown", detail: "缺少审核问题数据，无法确认是否存在阻断项", findings: [] }
-    : gateBlocking(findings, criteria);
+    : gateBlocking(findings, criteria, input.diffFiles);
   const gates: DecisionBriefGate[] = [
     gateChecks(checks),
     blockingGate,
@@ -682,7 +758,7 @@ export function buildDecisionBrief(input: DecisionBriefInput): DecisionBrief {
 
   const remaining = findings
     .filter((finding) => !isResolved(finding))
-    .map((finding) => remainingItemOf(finding, criteria))
+    .map((finding) => remainingItemOf(finding, criteria, input.diffFiles))
     .sort(
       (a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity] || b.streak - a.streak || a.key.localeCompare(b.key),
     );
