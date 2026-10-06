@@ -1,5 +1,5 @@
 import type { APIRequestContext } from "@playwright/test";
-import { expect, test } from "./fixtures";
+import { expect, openRunByTitle, test } from "./fixtures";
 
 type ConfigStatus = { demoMode: boolean; realRunsAvailable: boolean };
 type WorkspaceList = { workspaces: Array<{ status: string }> };
@@ -120,8 +120,12 @@ test.describe("run creation and run detail", () => {
     await expect(page.locator(".timeline-item")).not.toHaveCount(seen, { timeout: 20_000 });
 
     // A full reload re-runs the replay path and still shows the run + events.
+    // The app has no URL routing for run ids and re-selects the newest run on
+    // load (fixtures.ts `openRunByTitle`); when the first test's demo run is
+    // still ticking, that newest run is NOT the run under test, so re-select it
+    // explicitly instead of assuming it lands as `runs[0]` after the reload.
     await page.reload();
-    await expect(page.locator(".run-heading h1")).toHaveText(title);
+    await openRunByTitle(page, title);
     await expect(page.locator(".timeline-item").first()).toBeVisible({ timeout: 20_000 });
   });
 });
