@@ -844,3 +844,43 @@ button.agile-metrics-row:hover strong { color: #c3d274; }
   .accounts-page { padding: 21px 14px 28px; }
   .ac-heading { align-items: flex-start; flex-direction: column; }
 }
+
+/* 决策摘要 (docs/22) — first-screen accept-vs-continue card. */
+.decision-brief { margin-top: 14px; border: 1px solid #2a3037; border-radius: 11px; background: #0f1317; overflow: hidden; }
+.decision-brief-accept { border-color: rgba(115,214,162,.3); }
+.decision-brief-continue { border-color: rgba(243,166,90,.3); }
+.decision-brief-head { width: 100%; display: flex; align-items: center; gap: 14px; padding: 12px 15px; background: none; border: none; cursor: pointer; text-align: left; color: inherit; }
+.decision-brief-title { flex: 0 0 auto; }
+.decision-brief-title h3 { margin: 3px 0 0; font-size: 14px; }
+.decision-stop { flex: 1 1 auto; display: flex; align-items: center; gap: 8px; min-width: 0; }
+.decision-stop em { font: 500 var(--panel-mono-fs) "DM Mono", monospace; color: #dda16b; border: 1px solid rgba(243,166,90,.25); border-radius: 999px; padding: 1px 7px; font-style: normal; white-space: nowrap; }
+.decision-stop span { color: var(--panel-dim); font-size: var(--panel-fs-sm); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.decision-body { border-top: 1px solid #232930; padding: 12px 15px 14px; display: grid; gap: 12px; }
+.decision-gates { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; }
+.decision-gate { position: relative; border: 1px solid #242b33; border-radius: 8px; padding: 9px 10px 9px 22px; background: #11151a; }
+.decision-gate-light { position: absolute; left: 9px; top: 12px; width: 7px; height: 7px; border-radius: 50%; background: #5f6973; }
+.decision-gate-green .decision-gate-light { background: var(--green); box-shadow: 0 0 7px rgba(115,214,162,.5); }
+.decision-gate-red .decision-gate-light { background: var(--red); box-shadow: 0 0 7px rgba(242,113,113,.5); }
+.decision-gate-unknown .decision-gate-light { background: var(--orange); }
+.decision-gate strong { display: block; font-size: var(--panel-fs); color: var(--panel-text); }
+.decision-gate small { display: block; margin-top: 3px; color: var(--panel-dim); font-size: var(--panel-fs-sm); line-height: var(--panel-lh); }
+.decision-gate-link { margin-top: 6px; display: inline-flex; align-items: center; gap: 3px; background: none; border: none; color: #9fb0bf; font-size: var(--panel-fs-sm); cursor: pointer; padding: 0; }
+.decision-gate-link:hover { color: #dfe3e7; }
+.decision-remaining { display: grid; gap: 8px; }
+.decision-group { display: grid; gap: 4px; }
+.decision-group-label { color: #5e6873; font: 500 9px "DM Mono", monospace; letter-spacing: .1em; text-transform: uppercase; }
+.decision-finding { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; background: #11151a; border: 1px solid #232a31; border-radius: 7px; padding: 7px 9px; cursor: pointer; color: inherit; font-family: inherit; }
+.decision-finding:hover { border-color: #3a444f; }
+.decision-sev { font: 500 var(--panel-mono-fs) "DM Mono", monospace; text-transform: uppercase; color: #dda16b; }
+.decision-sev-critical, .decision-sev-high { color: var(--red); }
+.decision-finding-title { flex: 1 1 auto; color: var(--panel-text); font-size: var(--panel-fs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.decision-finding em { font-style: normal; color: var(--orange); font-size: var(--panel-fs-sm); white-space: nowrap; }
+.decision-finding em.decision-suspect { color: #8a94a0; }
+.decision-reco { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; }
+.decision-reco p { display: flex; align-items: center; gap: 7px; margin: 0; color: var(--panel-text); font-size: var(--panel-fs); line-height: var(--panel-lh); }
+.decision-reco p svg { flex: 0 0 auto; color: var(--green); }
+.decision-actions { display: flex; gap: 8px; }
+.finding-flagged { border-color: rgba(242,113,113,.55); box-shadow: 0 0 0 1px rgba(242,113,113,.25); }
+@media (max-width: 900px) {
+  .decision-gates { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}

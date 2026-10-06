@@ -61,10 +61,23 @@ import {
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { chatChannelLabels, chatCounts, chatMessageView, chatMessagesFromEvents, chatParticipantLabels, chatTabs, filterChatMessages, isReviewMessage, messageFindings, reworkBranchDetails, reworkBranchRounds, type ChatTab, type ReworkBranchDetail } from "../shared/chat";
 import { describeMergeRestore, mergeRestoreFields } from "../shared/merge";
+import { findingFingerprint } from "../shared/finding-fingerprint";
+import type { DecisionBrief } from "../shared/decision-brief";
 import { branchStatus, currentRoundStatus, roundStatuses, roundStatusMeta, roundStatusTooltip, type RoundStatus } from "../shared/round-status";
 import type { ChatMessage, ConfigStatus, CurrentUser, Finding, ModelCatalogResponse, RoundSummary, Run, RunArtifact, RunEvent, RunMode, RunRoleUsage, RunState, Workspace } from "../shared/types";
 import type { ModelTemplate } from "../shared/agile";
 import { api } from "./api";
+import {
+  acceptConfirmMessage,
+  continueConfirmMessage,
+  decisionBriefActionRequest,
+  decisionBriefExpanded,
+  decisionBriefHeading,
+  decisionBriefTone,
+  gateNavTarget,
+  groupRemainingByAc,
+  decisionGateLabels,
+} from "./decision-brief-view";
 import { AgilePage } from "./AgilePage";
 import { HistoryPage } from "./HistoryPage";
 import { runStateLabels, requirementSummary } from "./requirement-history";
@@ -607,22 +620,30 @@ function ActivityPanel({ events }: { events: RunEvent[] }) {
   );
 }
 
-function ReviewPanel({ findings }: { findings: Finding[] }) {
+function ReviewPanel({ findings, highlightKey }: { findings: Finding[]; highlightKey?: string | null }) {
+  // 决策摘要: scroll the target finding into view when a red gate item links here.
+  useEffect(() => {
+    if (!highlightKey) return;
+    document.getElementById(`finding-${highlightKey}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [highlightKey]);
   if (!findings.length) return <EmptyPanel icon={ShieldCheck} text="尚无审核问题" />;
   return (
     <div className="finding-list">
-      {findings.map((item) => (
-        <article className={`finding finding-${item.severity}`} key={item.id}>
-          <div className="finding-head">
-            <span>{item.severity}</span>
-            {item.resolved && <em><Check size={12} />已解决</em>}
-          </div>
-          <h4>{item.title}</h4>
-          <code>{item.file}:{item.line}</code>
-          <p>{item.evidence}</p>
-          <div className="required-change"><ArrowUpRight size={13} />{item.requiredChange}</div>
-        </article>
-      ))}
+      {findings.map((item) => {
+        const key = item.fingerprint ?? findingFingerprint(item);
+        return (
+          <article id={`finding-${key}`} className={`finding finding-${item.severity}${key === highlightKey ? " finding-flagged" : ""}`} key={item.id}>
+            <div className="finding-head">
+              <span>{item.severity}</span>
+              {item.resolved && <em><Check size={12} />已解决</em>}
+            </div>
+            <h4>{item.title}</h4>
+            <code>{item.file}:{item.line}</code>
+            <p>{item.evidence}</p>
+            <div className="required-change"><ArrowUpRight size={13} />{item.requiredChange}</div>
+          </article>
+        );
+      })}
     </div>
   );
 }
@@ -1134,7 +1155,115 @@ function EmptyPanel({ icon: Icon, text }: { icon: typeof Activity; text: string 
   return <div className="empty-panel"><Icon size={22} /><span>{text}</span></div>;
 }
 
-function HumanInterventionPanel({ run, events, user, onUpdated }: { run: Run; events: RunEvent[]; user?: CurrentUser; onUpdated: (run: Run) => void }) {
+/**
+ * 决策摘要 (docs/22 §2): a first-screen card on the run detail that answers the
+ * single question a parked run raises — accept or continue? Purely presentational:
+ * every status/verdict comes from the server's shared pure function.
+ */
+function DecisionBriefCard({
+  brief,
+  run,
+  open,
+  onToggle,
+  onContinue,
+  onAccept,
+  onOpenFinding,
+  onOpenTab,
+}: {
+  brief: DecisionBrief;
+  run: Run;
+  open: boolean;
+  onToggle: () => void;
+  onContinue: (note: string) => void;
+  onAccept: () => void;
+  onOpenFinding: (key: string) => void;
+  onOpenTab: (tab: Tab) => void;
+}) {
+  const findingsByKey = useMemo(
+    () => new Map(run.findings.map((finding) => [finding.fingerprint ?? findingFingerprint(finding), finding])),
+    [run.findings],
+  );
+  const groups = groupRemainingByAc(brief.remaining);
+  const tone = decisionBriefTone(brief);
+  const stop = brief.stopReason;
+
+  return (
+    <section className={`decision-brief decision-brief-${tone}`} id="decision-brief">
+      <button type="button" className="decision-brief-head" aria-expanded={open} onClick={onToggle}>
+        <div className="decision-brief-title">
+          <span className="eyebrow">DECISION BRIEF</span>
+          <h3>{decisionBriefHeading(brief)}</h3>
+        </div>
+        <div className="decision-stop">
+          <em>{stop.code}</em>
+          {stop.message ? <span>{stop.message}</span> : null}
+        </div>
+        {open ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+      </button>
+      {open ? (
+        <div className="decision-body">
+          <div className="decision-gates">
+            {brief.gates.map((gate) => {
+              const target = gateNavTarget(gate);
+              return (
+                <div className={`decision-gate decision-gate-${gate.status}`} key={gate.id}>
+                  <span className="decision-gate-light" />
+                  <strong>{decisionGateLabels[gate.id]}</strong>
+                  <small>{gate.detail}</small>
+                  {gate.status !== "green" ? (
+                    <button
+                      type="button"
+                      className="decision-gate-link"
+                      onClick={() => {
+                        if (target.key) onOpenFinding(target.key);
+                        else onOpenTab(target.tab);
+                      }}
+                    >
+                      定位<ArrowRight size={12} />
+                    </button>
+                  ) : null}
+                </div>
+              );
+            })}
+          </div>
+          {groups.length > 0 ? (
+            <div className="decision-remaining">
+              {groups.map(({ label, items }) => (
+                <div className="decision-group" key={label}>
+                  <span className="decision-group-label">{label}</span>
+                  {items.map((item) => {
+                    const finding = findingsByKey.get(item.key);
+                    return (
+                      <button type="button" className="decision-finding" key={item.key} title="定位到审核问题" onClick={() => onOpenFinding(item.key)}>
+                        <span className={`decision-sev decision-sev-${item.severity}`}>{item.severity}</span>
+                        <span className="decision-finding-title">{finding?.title ?? item.key}</span>
+                        {item.streak > 0 ? <em>已返修 {item.streak} 次未解决</em> : null}
+                        {!item.evidenceOk ? <em className="decision-suspect">疑似误报</em> : null}
+                      </button>
+                    );
+                  })}
+                </div>
+              ))}
+            </div>
+          ) : null}
+          <div className="decision-reco">
+            <p><ShieldCheck size={14} />{brief.recommendation.note}</p>
+            <div className="decision-actions">
+              <button type="button" className="button primary" onClick={() => onContinue(brief.recommendation.note)}>
+                <Play size={15} />继续开发
+              </button>
+              <button type="button" className="button primary" onClick={onAccept}>
+                <CheckCircle2 size={15} />接受交付
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function HumanInterventionPanel({ run, events, user, onUpdated, draftNote }: { run: Run; events: RunEvent[]; user?: CurrentUser; onUpdated: (run: Run) => void; draftNote?: string }) {
   const [instruction, setInstruction] = useState("");
   const [busy, setBusy] = useState<"" | "resume" | "review" | "terminate" | "continue" | "approve" | "reject">("");
   const [error, setError] = useState("");
@@ -1162,6 +1291,11 @@ function HumanInterventionPanel({ run, events, user, onUpdated }: { run: Run; ev
   useEffect(() => {
     if (mergeOption.disabled) setMergeIntoWorkspace(false);
   }, [mergeOption.disabled]);
+
+  // 决策摘要: prefill the drafted note (one item naming the file|title fingerprint).
+  useEffect(() => {
+    if (draftNote) setInstruction(draftNote);
+  }, [draftNote]);
 
   const act = async (kind: "resume" | "review" | "terminate" | "continue" | "approve" | "reject") => {
     setError("");
@@ -1266,6 +1400,11 @@ export function App() {
   // 拓扑轮次模型: server-aggregated round summaries; `undefined` means the
   // endpoint was unavailable (older server / failed request) → event fallback.
   const [roundSummaries, setRoundSummaries] = useState<RoundSummary[] | undefined>(undefined);
+  // 决策摘要: server-built Decision Brief; `undefined` means unavailable/loading.
+  const [decisionBrief, setDecisionBrief] = useState<DecisionBrief>();
+  const [briefDraft, setBriefDraft] = useState("");
+  const [briefCollapsed, setBriefCollapsed] = useState(false);
+  const [highlightFinding, setHighlightFinding] = useState<string | null>(null);
   const [artifacts, setArtifacts] = useState<RunArtifact[]>([]);
   const [config, setConfig] = useState<ConfigStatus>();
   const [user, setUser] = useState<CurrentUser>();
@@ -1317,12 +1456,15 @@ export function App() {
   }, [refreshRuns]);
 
   useEffect(() => {
-    if (!selectedId) { setRun(undefined); setEvents([]); setArtifacts([]); setRoundSummaries(undefined); setReworkRound(null); setChatRoundFilter(null); return; }
+    if (!selectedId) { setRun(undefined); setEvents([]); setArtifacts([]); setRoundSummaries(undefined); setDecisionBrief(undefined); setReworkRound(null); setChatRoundFilter(null); return; }
     // Reset for the newly selected run before any snapshot/stream data merges in,
     // so seq numbers from different runs are never mixed.
     setEvents([]);
     setArtifacts([]);
     setRoundSummaries(undefined);
+    setDecisionBrief(undefined);
+    setBriefCollapsed(false);
+    setHighlightFinding(null);
     setReworkRound(null);
     setChatRoundFilter(null);
     // Stale-response guard: every in-flight request/stream for the previously
@@ -1375,6 +1517,18 @@ export function App() {
     return () => { active = false; };
   }, [selectedId, activeRun?.state]);
 
+  // 决策摘要: fetched once per selection / state change. A failure (or an older
+  // server without the route) simply leaves the card hidden — no polling, and
+  // no dependency on the other requests succeeding.
+  useEffect(() => {
+    if (!selectedId) return;
+    let active = true;
+    void api.decisionBrief(selectedId).then((next) => {
+      if (active) setDecisionBrief(next);
+    }).catch(() => undefined);
+    return () => { active = false; };
+  }, [selectedId, activeRun?.state]);
+
   const handleReworkSelect = useCallback((round: number) => {
     setReworkRound((current) => (current === round ? null : round));
   }, []);
@@ -1409,6 +1563,38 @@ export function App() {
     document.getElementById("chat-log")?.scrollIntoView({ behavior: "smooth", block: "start" });
   }, []);
 
+  // 决策摘要 actions reuse the existing approve endpoint (no new mutation API).
+  const applyAccept = useCallback((next: Run) => {
+    setRun(next);
+    setRuns((current) => current.map((item) => (item.id === next.id ? next : item)));
+  }, []);
+
+  const handleBriefContinue = useCallback(async (note: string) => {
+    if (!activeRun || !decisionBrief) return;
+    setBriefDraft(note);
+    if (!window.confirm(continueConfirmMessage(activeRun.title, note))) return;
+    try {
+      applyAccept(await api.approveRun(activeRun.id, decisionBriefActionRequest(decisionBrief, "continue")));
+    } catch (cause) {
+      window.alert(`继续开发失败：${(cause as Error).message}`);
+    }
+  }, [activeRun, decisionBrief, applyAccept]);
+
+  const handleBriefAccept = useCallback(async () => {
+    if (!activeRun || !decisionBrief) return;
+    if (!window.confirm(acceptConfirmMessage(activeRun.title, decisionBrief.remaining.length))) return;
+    try {
+      applyAccept(await api.approveRun(activeRun.id, decisionBriefActionRequest(decisionBrief, "accept")));
+    } catch (cause) {
+      window.alert(`接受交付失败：${(cause as Error).message}`);
+    }
+  }, [activeRun, decisionBrief, applyAccept]);
+
+  const openBriefTarget = useCallback((nextTab: Tab, key?: string) => {
+    setTab(nextTab);
+    setHighlightFinding(key ?? null);
+  }, []);
+
   const handleCreated = (created: Run) => {
     setRuns((current) => [created, ...current]);
     setSelectedId(created.id);
@@ -1416,6 +1602,9 @@ export function App() {
     setEvents([]);
     setArtifacts([]);
     setRoundSummaries(undefined);
+    setDecisionBrief(undefined);
+    setBriefDraft("");
+    setHighlightFinding(null);
     setReworkRound(null);
     setChatRoundFilter(null);
     setView("run");
@@ -1637,11 +1826,25 @@ export function App() {
 
             <DeferredNonBlockingNotice events={events} />
 
+            {decisionBrief ? (
+              <DecisionBriefCard
+                brief={decisionBrief}
+                run={activeRun}
+                open={decisionBriefExpanded(activeRun.state, briefCollapsed, terminalStates)}
+                onToggle={() => setBriefCollapsed((collapsed) => !collapsed)}
+                onContinue={(note) => void handleBriefContinue(note)}
+                onAccept={() => void handleBriefAccept()}
+                onOpenFinding={(key) => openBriefTarget("review", key)}
+                onOpenTab={(target) => openBriefTarget(target)}
+              />
+            ) : null}
+
             {activeRun.state === "needs_human" && (
               <HumanInterventionPanel
                 run={activeRun}
                 events={events}
                 user={user}
+                draftNote={briefDraft}
                 onUpdated={(next) => {
                   setRun(next);
                   setRuns((current) => current.map((item) => (item.id === next.id ? next : item)));
@@ -1703,7 +1906,7 @@ export function App() {
                 <div className="detail-body">
                   {tab === "activity" && <ActivityPanel events={events} />}
                   {tab === "agents" && <SubAgentsPanel run={activeRun} />}
-                  {tab === "review" && <ReviewPanel findings={activeRun.findings} />}
+                  {tab === "review" && <ReviewPanel findings={activeRun.findings} highlightKey={highlightFinding} />}
                   {tab === "diff" && <DiffPanel run={activeRun} artifacts={artifacts} mergeRequestConfigured={config?.mergeRequestConfigured} />}
                   {tab === "checks" && <ChecksPanel run={activeRun} />}
                   {tab === "budget" && <BudgetPanel run={activeRun} />}

@@ -31,6 +31,7 @@ import { appendHumanNote } from "./run-notes.js";
 import { resumeDeadlinePatch } from "./run-deadline-base.js";
 import { parseRunSearch, searchRuns } from "./run-search.js";
 import { ROUNDS_SCHEMA_VERSION, readRunRounds } from "./run-rounds.js";
+import { readDecisionBrief } from "./decision-brief.js";
 import { buildAcceptanceSnapshot } from "./acceptance.js";
 import { batchItemFailure, batchItemSuccess, parseBatchRunIds, summarizeBatch, MAX_BATCH_RUN_IDS, type BatchItemOutcome } from "./batch-runs.js";
 import { buildDeploymentStatus, parseDeployLog, resolveDeployLogPath, type DeploymentStatus } from "./deployments.js";
@@ -60,7 +61,7 @@ const app = Fastify({
 });
 const port = Number(process.env.PORT || 3100);
 const host = process.env.HOST || "localhost";
-const webVersion = process.env.PI_WEB_VERSION?.trim() || "0.26.3";
+const webVersion = process.env.PI_WEB_VERSION?.trim() || "0.26.4";
 const demoMode = process.env.PI_DEMO_MODE !== "false";
 const realRunsEnabled = process.env.PI_REAL_RUNS_ENABLED === "true";
 const workerUrl = process.env.PI_WORKER_URL || "http://worker:3200";
@@ -1533,6 +1534,19 @@ app.get<{ Params: { id: string } }>("/api/runs/:id/rounds", async (request, repl
   const run = store.getRun(request.params.id, ownerKeysFor(request));
   if (!run) return reply.code(404).send({ error: "Run not found" });
   return { schemaVersion: ROUNDS_SCHEMA_VERSION, rounds: await readRunRounds(db, run.id, run.round) };
+});
+
+/**
+ * Decision Brief (docs/22): a read-only, owner-scoped answer to the only
+ * question a parked run raises — accept the delivery or keep developing?
+ * Assembled from existing tables/events only (stoppage, findings, checks, diff
+ * headers, story AC/DoD); all judgement lives in the shared pure function, so
+ * the model never participates. Same auth/ownership as the run-detail route.
+ */
+app.get<{ Params: { id: string } }>("/api/runs/:id/decision-brief", async (request, reply) => {
+  const run = store.getRun(request.params.id, ownerKeysFor(request));
+  if (!run) return reply.code(404).send({ error: "Run not found" });
+  return readDecisionBrief(db, run);
 });
 
 // GAP-04 / AT-UI-005: artifact listing and download, authenticated like every

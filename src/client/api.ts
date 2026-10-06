@@ -1,4 +1,5 @@
 import type { AgileMetricsResponse, ReleaseRetrospective, ReleaseSummary } from "../shared/agile-metrics";
+import type { DecisionBrief } from "../shared/decision-brief";
 import type { AgileProject, AgileRelease, AgileSprint, AgileStory, ReleaseDeployRecord, ModelTemplate, StoryDetail, StoryPriority, StoryStatus } from "../shared/agile";
 import type { ConfigStatus, CredentialStatus, CurrentUser, ModelCatalogResponse, ModelSelection, Run, RunArtifact, RunEvent, RunRoundsResponse, RunState, Workspace, AccountDetail, AccountSummary, AccountWorkspaceOption, WorkspacePermission } from "../shared/types";
 
@@ -145,6 +146,8 @@ export const api = {
   events: (id: string) => request<RunEvent[]>(`/api/runs/${id}/events`),
   /** 拓扑轮次模型: server-aggregated per-round summary (source of truth for branches/badges). */
   runRounds: (id: string) => request<RunRoundsResponse>(`/api/runs/${id}/rounds`),
+  /** 决策摘要: read-only aggregate answering accept-vs-continue for a parked run. */
+  decisionBrief: (id: string) => request<DecisionBrief>(`/api/runs/${id}/decision-brief`),
   artifacts: (id: string) => request<{ artifacts: RunArtifact[] }>(`/api/runs/${id}/artifacts`),
   artifactDownloadUrl: (id: string, artifactId: string) => `/api/runs/${id}/artifacts/${encodeURIComponent(artifactId)}/download`,
   /** A1: full run patch (regenerated on the worker when no artifact body exists). */
