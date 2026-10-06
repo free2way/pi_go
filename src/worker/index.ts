@@ -97,6 +97,7 @@ import {
   reviewerRetryMaxElapsedMs,
   shouldRetryProviderAttempt,
 } from "./review-performance.js";
+import { createReviewTriageTrigger, jevReviewTriageEnabled, recordVerdictThenReviewTriage } from "./decision-triage.js";
 
 const port = Number(process.env.PORT || 3200);
 const host = process.env.HOST || "localhost";
@@ -426,11 +427,16 @@ async function runInSandbox(input: SandboxRunInput): Promise<CommandResult> {
   }
 }
 
-async function internalRequest(pathName: string, init?: RequestInit) {
+/**
+ * Internal control-plane call. `timeoutMs` bounds this hop only; it defaults to
+ * the original 15s and is raised/lowered per caller (the shadow decision call
+ * uses a tighter, still provider-budget-aware ceiling, see `decision-triage.ts`).
+ */
+async function internalRequest(pathName: string, init?: RequestInit, timeoutMs = 15_000) {
   const response = await fetch(`${callbackBase}/api/internal${pathName}`, {
     ...init,
     headers: { Authorization: `Bearer ${internalToken}`, "Content-Type": "application/json", ...init?.headers },
-    signal: AbortSignal.timeout(15_000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   const body = await response.json().catch(() => ({})) as Record<string, unknown>;
   if (!response.ok) throw new Error(String(body.error || `Internal request failed: ${response.status}`));
@@ -453,6 +459,24 @@ const jobApi = {
   finish: (jobId: string, state: string, error?: string) => internalRequest(`/jobs/${encodeURIComponent(jobId)}/finish`, { method: "POST", body: JSON.stringify({ workerId, state, error }) }),
   pending: async () => (await internalRequest(`/jobs/pending?workerId=${encodeURIComponent(workerId)}`)).jobs as PendingJob[],
 };
+
+/**
+ * docs/26 §9.1/§9.2: shadow review triage, opt-in on the WORKER's own env
+ * (`PI_JEV_MODE`), read once at module scope like the other `PI_*` knobs. It is
+ * a no-op when unset/`off`: no HTTP call, no event and no log line. The gateway
+ * stays authoritative, so a worker/web setting mismatch can only ever produce a
+ * business-safe `disabled` there — never a failed run.
+ *
+ * The call reuses the existing internal token (same auth as checkpoints/jobs)
+ * and deliberately adds NO usage to the run: tokens/cost live on the audit row
+ * under the decision role (docs/26 §13). The worker emits no run events either —
+ * the gateway appends `decision.requested` plus one outcome event per batch.
+ */
+const reviewTriageEnabled = jevReviewTriageEnabled(process.env);
+const triggerReviewTriage = createReviewTriageTrigger({
+  enabled: reviewTriageEnabled,
+  send: (pathName, init, timeoutMs) => internalRequest(pathName, init, timeoutMs),
+});
 
 type PendingJob = {
   jobId: string;
@@ -1958,29 +1982,39 @@ async function executeRetryReview(input: {
         },
       });
     }
-    await update(run, "completed", "reviewer", "review.approved", "独立审核通过，代码保留在任务 worktree", {
-      findings,
-      diff,
-      checkSnapshot,
-      reviewSnapshot,
-      checkPassed: true,
-      summary: review.summary,
-      usage: toRunUsage(input.usage),
-      durationMs: Date.now() - input.started,
-    }, { diffArtifact: retryDiffArtifact });
+    await recordVerdictThenReviewTriage({
+      runId: run.id,
+      recordVerdict: () => update(run, "completed", "reviewer", "review.approved", "独立审核通过，代码保留在任务 worktree", {
+        findings,
+        diff,
+        checkSnapshot,
+        reviewSnapshot,
+        checkPassed: true,
+        summary: review.summary,
+        usage: toRunUsage(input.usage),
+        durationMs: Date.now() - input.started,
+      }, { diffArtifact: retryDiffArtifact }),
+      trigger: triggerReviewTriage,
+    });
     return;
   }
   const retryReviewLocale = runLocale(run);
   const changesRequested = guardText(changesRequestedRetryText(review.findings.length), retryReviewLocale);
-  await update(run, "needs_human", "reviewer", "review.changes_requested", changesRequested.message, {
-    findings,
-    diff,
-    checkSnapshot,
-    reviewSnapshot,
-    summary: review.summary,
-    usage: toRunUsage(input.usage),
-    durationMs: Date.now() - input.started,
-  }, { diffArtifact: retryDiffArtifact, meta: changesRequested.meta });
+  // docs/26 §9.1: the verdict is recorded first; the (opt-in) shadow triage runs
+  // strictly after it and can never change or delay this outcome.
+  await recordVerdictThenReviewTriage({
+    runId: run.id,
+    recordVerdict: () => update(run, "needs_human", "reviewer", "review.changes_requested", changesRequested.message, {
+      findings,
+      diff,
+      checkSnapshot,
+      reviewSnapshot,
+      summary: review.summary,
+      usage: toRunUsage(input.usage),
+      durationMs: Date.now() - input.started,
+    }, { diffArtifact: retryDiffArtifact, meta: changesRequested.meta }),
+    trigger: triggerReviewTriage,
+  });
 }
 
 function usageFromRun(documentUsage: Run["usage"] | undefined): UsageTotals {
@@ -2420,13 +2454,17 @@ async function executeJob(input: JobInput, controller: AbortController) {
             },
           });
         }
-        await update(run, "completed", "reviewer", "review.approved", "独立审核通过，代码保留在任务 worktree", {
-          findings,
-          diff: latestDiff,
-          summary: review.summary,
-          usage: toRunUsage(usage),
-          durationMs: Date.now() - started,
-        }, { diffArtifact: reviewDiffArtifact });
+        await recordVerdictThenReviewTriage({
+          runId: run.id,
+          recordVerdict: () => update(run, "completed", "reviewer", "review.approved", "独立审核通过，代码保留在任务 worktree", {
+            findings,
+            diff: latestDiff,
+            summary: review.summary,
+            usage: toRunUsage(usage),
+            durationMs: Date.now() - started,
+          }, { diffArtifact: reviewDiffArtifact }),
+          trigger: triggerReviewTriage,
+        });
         return;
       }
       // Convergence guard (incident run_e2eabf51532448b3): fire BEFORE another
@@ -2461,7 +2499,13 @@ async function executeJob(input: JobInput, controller: AbortController) {
       feedback = JSON.stringify(review.findings, null, 2);
       await chat(run, "handoff", "reviewer", "developer", "feedback", feedback, controller.signal, { findings: review.findings.map((item) => ({ ...item, resolved: false })) });
       const changesRequested = guardText(changesRequestedText(review.findings.length), runLocale(run));
-      await update(run, "developing", "reviewer", "review.changes_requested", changesRequested.message, { findings, summary: review.summary, usage: toRunUsage(usage) }, { meta: changesRequested.meta });
+      // docs/26 §9.1: record the authoritative verdict first, then (opt-in) fire
+      // the shadow review triage for this round.
+      await recordVerdictThenReviewTriage({
+        runId: run.id,
+        recordVerdict: () => update(run, "developing", "reviewer", "review.changes_requested", changesRequested.message, { findings, summary: review.summary, usage: toRunUsage(usage) }, { meta: changesRequested.meta }),
+        trigger: triggerReviewTriage,
+      });
     }
     const maxRounds = guardText(MAX_ROUNDS_TEXT, runLocale(run));
     await update(run, "needs_human", "system", "run.needs_human", maxRounds.message, { findings, usage: toRunUsage(usage), usageRoles: run.usageRoles, modelCalls: run.modelCalls, durationMs: Date.now() - started }, { meta: maxRounds.meta });

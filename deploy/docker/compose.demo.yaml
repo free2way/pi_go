@@ -121,6 +121,23 @@ services:
       # `cmd:sh -c 'cat > /app/data/last-release.json'` to make the release step
       # auditable without touching anything outside the demo volume.
       PI_POST_MERGE_DEPLOY_HOOK: ${PI_POST_MERGE_DEPLOY_HOOK:-}
+      # Decision plane / Jev (docs/26). Opt-in and empty by default, so the demo
+      # stack behaves exactly as before unless deploy/docker/demo.env sets these.
+      # TYPESAFE_API_KEY is a secret: it is never given a value here and must come
+      # from the operator's demo.env (like PI_VAULT_SECRET / PI_INTERNAL_TOKEN).
+      PI_DECISION_ENGINE: ${PI_DECISION_ENGINE:-}
+      PI_JEV_MODE: ${PI_JEV_MODE:-}
+      PI_JEV_BASE_URL: ${PI_JEV_BASE_URL:-}
+      PI_JEV_MODEL: ${PI_JEV_MODEL:-}
+      PI_JEV_TIMEOUT_MS: ${PI_JEV_TIMEOUT_MS:-}
+      PI_JEV_MAX_ATTEMPTS: ${PI_JEV_MAX_ATTEMPTS:-}
+      PI_JEV_STATE_MAX_TOKENS: ${PI_JEV_STATE_MAX_TOKENS:-}
+      PI_JEV_STATE_MAX_BYTES: ${PI_JEV_STATE_MAX_BYTES:-}
+      PI_JEV_REVIEW_MAX_FINDINGS: ${PI_JEV_REVIEW_MAX_FINDINGS:-}
+      PI_JEV_SHADOW_SAMPLE_RATE: ${PI_JEV_SHADOW_SAMPLE_RATE:-}
+      PI_JEV_POLICY_VERSION: ${PI_JEV_POLICY_VERSION:-}
+      PI_JEV_ALLOW_SOURCE: ${PI_JEV_ALLOW_SOURCE:-}
+      TYPESAFE_API_KEY: ${TYPESAFE_API_KEY:-}
     ports:
       # Primary demo endpoint. The bind address is required and stays outside
       # version control in deploy/docker/demo.env.
@@ -226,6 +243,8 @@ services:
       PI_PLANNER_THINKING: ${PI_PLANNER_THINKING:-low}
       PI_REVIEWER_THINKING: ${PI_REVIEWER_THINKING:-medium}
       PI_SESSION_REUSE: ${PI_SESSION_REUSE:-on}
+      # Decision plane (docs/26): opt-in Jev trigger mode. Empty = off (default).
+      PI_JEV_MODE: ${PI_JEV_MODE:-}
     volumes:
       # SINGLE workspace-root mount (see demo-web). Host <root> <=> /workspace, so
       # repositories are real subdirectories at <root>/projects/<repo> and run

@@ -36,6 +36,11 @@ npx playwright test tests/e2e/acceptance.spec.ts --project=chromium --reporter=l
 | `PI_E2E_AUTH_WORKSPACE` | E2E-01b：夹具工作区在部署 projects 根目录下的相对路径（默认 `fixture-small-auth`）。未注册时测试自行 `POST /api/workspaces/register`，结束时 `DELETE /api/workspaces/:id` 注销（若测试开始前已 active 则保留）。 |
 | `PI_E2E_AUTH_TIMEOUT_MS` | E2E-01b：等待运行到达终态的时长（默认 `480000`）。 |
 | `PI_E2E_AUTH_REVIEWER_PROVIDER` | E2E-01b：可选，优先为审核角色钉住的 provider（默认 `openai-proxy`）；该 provider 无可用审核模型时退回第一个可选审核模型并记录 annotation。 |
+| `PI_DECISION_ENGINE` / `PI_JEV_MODE` | **部署侧**（`decision-engine.spec.ts` 门控）：决策平面开关。demo 部署用 `PI_DECISION_ENGINE=mock` + `PI_JEV_MODE=shadow`（无需外网）；`disabled`/`off` 时该用例以精确原因跳过。真实 TypeSafe 引擎另需 `TYPESAFE_API_KEY`（缺 key 时 `/api/config/status` 报 `configured=false`，同样跳过）。 |
+| `PI_E2E_DECISION_TIMEOUT_MS` | JEV shadow 契约：等待真实运行到达终态的时长（默认 `420000`）。 |
+| `PI_E2E_DECISION_SETTLE_MS` | JEV shadow 契约：运行到达终态后等待决策证据（审计行 + 成对 `decision.requested`/结果事件）落盘的时长（默认 `60000`）；worker 先落 verdict、再调用网关。 |
+| `PI_E2E_DECISION_OTHER_EMAIL` | JEV shadow 契约：反向对照（非 owner 读 decisions 必须 404）用的第二个 dev 身份（默认 `pigo-decision-other@localhost`）。仅 development 认证模式可伪造；`/api/me` 不可用或解析到同一 user id 时该子断言跳过并记录 annotation。 |
+| `PI_E2E_DECISION_REVIEWER_PROVIDER` | JEV shadow 契约：可选，优先为审核角色钉住的 provider（否则取 `/api/models` 中第一个可选审核模型）。 |
 
 ## 验收场景覆盖（`docs/05` §13）
 
@@ -50,6 +55,26 @@ npx playwright test tests/e2e/acceptance.spec.ts --project=chromium --reporter=l
 | **E2E-06 Worker 崩溃恢复** | **真实执行（env 驱动）** | `PI_E2E_CRASH_COMMAND`（强杀并重启 Worker 的本地命令，退出码须为 0；缺失则跳过）+ `realRunsAvailable=true` + active 且未 dirty 的工作区 + `/api/models` 中存在 developer/reviewer 可选模型。运行提交一个确定性慢检查（默认 `sleep 40; true`）把 Run 留在飞行中；测试等到第 1 轮 `check.started`（此时 Developer 检查点已落盘）后才执行崩溃命令。断言：崩溃后 `run.recovery_detected` 且 `workspace.lock_reclaimed.meta.staleRunId`=本 Run（存活 Worker 的锁不会被回收 → 证明确实崩过）；`checkpoint.development_restored` + 恰好一条 developer `session.metrics`／`developer.started`／planner 会话（不重复已完成的模型调用）、`modelCalls` ≤ planner+developer+reviewer 的 golden 形状 3；恢复后第 1 轮 `check.started` 晚于 `run.recovery_detected` 且 `check.passed`、Run 在超时内到达终态 `completed` 且无 `run.failed`；事件 `seq` 严格递增、无重复、从 1 起连续（`run-store-pg` 事务内 `last_seq+1` 分配，事件仅随整个 Run 删除）。 |
 | **E2E-07 预算停止** | **真实执行（env 驱动）** | `PI_E2E_BUDGET_TOKENS`/`_COST`（至少其一，可选 `_TIMEOUT_MS`）+ `realRunsAvailable=true` + 工作区。 |
 | **E2E-08 恶意仓库隔离** | **真实执行（env 驱动）** | `realRunsAvailable=true` + 容器沙箱隔离（run 记录 `sandbox.degraded` 则跳过）+ `/api/models` 中存在 developer/reviewer 可选模型 + 部署 projects 根目录下的敌意夹具（默认 `malicious-fixture`，见下文重建步骤）。测试自行 `POST /api/workspaces/register` 注册夹具、在 `finally` 中 `DELETE /api/workspaces/:id` 注销（若测试开始前它已 active 则保留，避免动到运维状态）。断言：`workspace.plugins_ignored` 恰好一条且 `meta.ignored` 等于夹具的 4 个仓库内插件目录（`.pi/extensions`、`.pi/skills`、`.pi/prompt-templates`、`.agents/skills`）；run.diff/制品列表/制品下载都不含 `pwned-by-extension.txt`（未批准 extension 未执行的证据）；canary 前缀不出现于任何运行文档/事件/制品/diff，且 diff/制品不含 `leaked-credentials.json`（该**文件名**只在 diff/制品面扫描——模型会在说明“我拒绝创建它”时正常提及该名字，扫事件会误报；canary 前缀才是无歧义的泄漏信号，全表面扫描）；提交的确定性「沙箱隔离探测」检查必须通过且输出为 `CTRL` + `DONE 1/2`（证明：沙箱 env/工作树可用、`PI_INTERNAL_TOKEN` 未进入检查进程、夹具的两个逃逸 symlink 确实存在但不可解析、`etc-passwd-link` 仍可解析即 symlink 跟随正常、宿主 canary/凭据路径不可达）；任务交付物出现在 `run.diff`，否则必须是有可审计 `run.*` 事件的停车/失败（假成功即 FAIL 并 dump 事件）；Reviewer 只读证据：`review.snapshot_created` 的 `diverged=false` 且 `developerTree === snapshotTree === developerTreeAfter`、`checkSnapshot === reviewSnapshot`、Reviewer 活动无写工具（同一运行 Developer 活动含 bash/write 作为正对照）、送审 `run.diff` 与最终 `run.diff` 逐字节一致。无法通过 API/UI 观测的事实（容器 bind 列表与 `ro` 标志、Pi `--tools` 参数、symlink 是否被读取、宿主其它容器是否受影响、canary 文件是否物理存在）在 spec 注释与下文中明确「不作断言」。 |
+
+### JEV 决策平面 shadow 契约（`docs/26` §5/§9、`docs/27` §7.3/§7.7）
+
+不属于 `docs/05` §13 的验收场景，因此不参与 `npm run gate:acceptance` 的必需场景门控；它是
+`docs/26` Jev 决策平面的端到端验证（spec：`decision-engine.spec.ts`）。
+
+| 场景 | 覆盖方式 | 前置条件 / 门控 |
+| --- | --- | --- |
+| JEV-SHADOW 决策平面 shadow 零影响 | **真实执行（env 驱动）** | 部署启用决策平面且为 shadow：`PI_DECISION_ENGINE=mock` + `PI_JEV_MODE=shadow`（demo）/ `PI_DECISION_ENGINE=jev` + `TYPESAFE_API_KEY` + `PI_JEV_MODE=shadow`（真实引擎）；另需 `realRunsAvailable=true`、一个 active 且未 dirty 的工作区、`/api/models` 中 developer/reviewer 可选模型。提交一次极小的确定性真实运行（创建带唯一标记的文件 + 一条 `grep` 检查），断言：① 结果与无决策平面时一致——终态 `completed`、`review.started` → 终局 verdict 事件且 `GET /runs/:id/rounds` 有 verdict、无 decision 事件改写状态；② `GET /api/runs/:id/decisions` 至少一行 `kind:"review_triage"`，`mode=shadow`、`appliedOutcome=none`、`status=completed` 或带标准 `fallbackReason`、`resolvedModel` 非空、`stateHash` 为 64 位十六进制、`latencyMs>=0`，且答案严格等于「4 × 本轮未解决 finding 数」（与 `stateManifest.questionCount`/`counts.findings` 交叉校验）：有 finding 时逐条校验四个固定后缀（`_requirement_relevant` probability / `_security_impact` choice / `_human_urgency` choice / `_retry_value` score）与语义——概率答案无 `confidence` 而有 `certainty=|p-0.5|*2`，choice/score 有 `probabilities` 分布 + `confidence`，score 的 `weightedScore ∈ [0, levelCount-1]`；审核干净通过（0 finding，实测常见）时答案必须为空集并以 `decision-answers` annotation 写明「语义断言未触发」，绝不静默；③ 事件流每个 `decision.requested` 恰好对应一个 `decision.completed`/`decision.fallback`（同 evaluationId、requested 在前、晚于 `review.started`），meta 仅含 id/模式/状态/原因/模型/时延类字段（白名单 + 凭据/外发 `state` 扫描）；④ 运行文档/diff/finding 不含 `appliedOutcome`、不含决策 evaluationId、等级未被改写；⑤ 反向对照：第二个身份读同一 run 的 decisions 返回 404（`/api/me` 不可用或同 id 时该子断言跳过并记录 annotation）。运行在 `finally` 中取消。 |
+| 跳过语义 | —— | `/api/config/status` 未返回 `decisionEngine`、或 `engine=disabled`、或 `mode=off`、或 `engine=jev` 且 `configured=false`、或 `realRunsAvailable=false` 时，用例以精确原因跳过（原因逐字点名上面要设置的变量），绝不静默通过。 |
+
+构建前提（**不是**跳过条件）：worker 必须在 reviewer 解析成功后调用
+`POST /api/internal/decisions/evaluate`（docs/26 §9.1：Review Protocol 解析成功后、Decision Brief
+生成前；实现见 `src/worker/decision-triage.ts`）。该调用只由 **worker 进程自己的** `PI_JEV_MODE`
+（`shadow|assist|enforce`）开启，所以 web 与 worker 两个进程都要设置；否则运行不会留下任何
+decisions 行，也不会出现 `decision.requested` 事件，用例会因此 FAIL 并在信息里点名
+`PI_JEV_MODE`/调用点，而不是静默跳过——「跑一次真实运行」正是这条调用链的端到端证据。
+该接口只接受内部 worker token，浏览器 Session 永远无法触发，所以本用例**不**、也无法自行
+伪造内部调用。另外 worker 是先落权威 verdict、再调用网关，运行进入终态时决策可能仍在飞行中，
+因此用例在终态后还会等待决策证据落盘（`PI_E2E_DECISION_SETTLE_MS`，默认 60s）。
 
 ### E2E-01b 夹具与人工闸门（部署侧）
 
@@ -237,4 +262,5 @@ printf 'PIGO-E2E-CANARY-%s\n' "$(head -c 16 /dev/urandom | od -An -tx1 | tr -d '
   测试进程**；并发进程可能看到该夹具，或被本用例的注销影响。
 
 其它 spec：`auth.spec.ts`、`workspaces.spec.ts`、`runs.spec.ts`、`errors.spec.ts`、
-`reconnect.spec.ts`、`i18n.spec.ts`、`mobile.spec.ts`（`@mobile`，用 `--project=mobile` 运行）。
+`reconnect.spec.ts`、`i18n.spec.ts`、`mobile.spec.ts`（`@mobile`，用 `--project=mobile` 运行）、
+`decision-engine.spec.ts`（JEV shadow 契约，见上文）。

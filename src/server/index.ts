@@ -33,6 +33,10 @@ import { resumeDeadlinePatch } from "./run-deadline-base.js";
 import { parseRunSearch, searchRuns } from "./run-search.js";
 import { ROUNDS_SCHEMA_VERSION, readRunRounds } from "./run-rounds.js";
 import { readDecisionBrief } from "./decision-brief.js";
+import { DecisionAuditStore } from "./decision-engine/audit-store.js";
+import { createDecisionEngine, loadDecisionEngineConfig } from "./decision-engine/index.js";
+import { buildReviewTriageBatches } from "./decision-engine/review-triage.js";
+import { decisionEngineStatus, registerDecisionRoutes, type DecisionEngineStatus } from "./decision-routes.js";
 import { buildAcceptanceSnapshot } from "./acceptance.js";
 import { batchItemFailure, batchItemSuccess, parseBatchRunIds, summarizeBatch, MAX_BATCH_RUN_IDS, type BatchItemOutcome } from "./batch-runs.js";
 import { buildDeploymentStatus, parseDeployLog, resolveDeployLogPath, type DeploymentStatus } from "./deployments.js";
@@ -772,7 +776,7 @@ app.get("/api/models", async (request): Promise<ModelCatalogResponse> => {
   };
 });
 
-app.get("/api/config/status", async (request): Promise<ConfigStatus> => {
+app.get("/api/config/status", async (request): Promise<ConfigStatus & { decisionEngine: DecisionEngineStatus }> => {
   const credentials = vault.status(vaultKeyFor(request));
   const configured = new Set(credentials.providers.map((item) => item.provider));
   const releasePlan = planPostMergeDeploy(process.env.PI_POST_MERGE_DEPLOY_HOOK);
@@ -780,6 +784,8 @@ app.get("/api/config/status", async (request): Promise<ConfigStatus> => {
   // default provider/credential pairing. As long as at least one provider is
   // configured the user may enter the real-run form; the actual per-role model
   // combination is preflighted when the run is created (AT-MODEL-008).
+  // docs/26 §11 preflight: shape only — the key, the base URL and every env
+  // value stay server-side (`decisionEngineStatus` projects presence, never values).
   return {
     demoMode,
     piVersion: process.env.PI_VERSION || "1.0.0",
@@ -794,6 +800,7 @@ app.get("/api/config/status", async (request): Promise<ConfigStatus> => {
     releaseConfigured: releasePlan.configured
       && releasePlan.kind !== "unsupported"
       && (releasePlan.kind !== "webhook" || Boolean(releaseWebhookToken && publicOrigin)),
+    decisionEngine: decisionEngineStatus(loadDecisionEngineConfig(process.env)),
   };
 });
 
@@ -3197,6 +3204,25 @@ app.post<{ Params: { id: string } }>("/api/internal/runs/:id/checkpoints", async
     idempotencyKey: parsed.data.idempotencyKey ?? `${run.id}:${parsed.data.stageKey}`,
   });
   return { ok: true };
+});
+
+/**
+ * docs/26 §8: the decision plane's internal evaluate API and the owner-scoped,
+ * read-only audit query API. The evaluate route is authenticated with the SAME
+ * internal worker token as the other `/api/internal/*` routes (`safeTokenMatch`,
+ * and the preHandler deliberately skips session auth under `/api/internal/`),
+ * so a browser session can never trigger an outbound provider call.
+ */
+const decisionAudit = new DecisionAuditStore(db);
+registerDecisionRoutes(app, {
+  store,
+  audit: decisionAudit,
+  env: process.env,
+  loadConfig: loadDecisionEngineConfig,
+  createEngine: createDecisionEngine,
+  buildBatches: buildReviewTriageBatches,
+  internalAuthorized: (request) => safeTokenMatch(request.headers.authorization),
+  ownerKeysFor,
 });
 
 const currentDir = path.dirname(fileURLToPath(import.meta.url));

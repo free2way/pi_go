@@ -61,6 +61,22 @@ export const CRITICAL_ENV = {
     "PI_ALERT_COOLDOWN_SECONDS",
     "PI_PIPELINE_VERSION",
     "PI_WORKSPACES_ENABLED",
+    // decision plane / Jev (docs/26). Engine defaults to disabled and every
+    // empty value falls back to the documented default; TYPESAFE_API_KEY is the
+    // secret read by `PI_DECISION_ENGINE=jev` and stays empty by default.
+    "PI_DECISION_ENGINE",
+    "PI_JEV_MODE",
+    "PI_JEV_BASE_URL",
+    "PI_JEV_MODEL",
+    "PI_JEV_TIMEOUT_MS",
+    "PI_JEV_MAX_ATTEMPTS",
+    "PI_JEV_STATE_MAX_TOKENS",
+    "PI_JEV_STATE_MAX_BYTES",
+    "PI_JEV_REVIEW_MAX_FINDINGS",
+    "PI_JEV_SHADOW_SAMPLE_RATE",
+    "PI_JEV_POLICY_VERSION",
+    "PI_JEV_ALLOW_SOURCE",
+    "TYPESAFE_API_KEY",
   ],
   worker: [
     // plugins (GAP-02)
@@ -102,8 +118,18 @@ export const CRITICAL_ENV = {
     "PI_GIT_EMPTY_CONFIG",
     "PI_SANDBOX_EXTRA_BINDS",
     "PI_SANDBOX_EXTRA_ENV",
+    // decision plane / Jev opt-in trigger (docs/26)
+    "PI_JEV_MODE",
   ],
 };
+
+/**
+ * Non-`PI_*` names that are legitimately read by a service and therefore allowed
+ * in `CRITICAL_ENV`. Currently only the decision-plane secret: it must be
+ * forwarded so `PI_DECISION_ENGINE=jev` can authenticate, but it is never given
+ * a value here or in the compose files (see the reverse guard below).
+ */
+export const ALLOWED_NON_PI_ENV = new Set(["TYPESAFE_API_KEY"]);
 
 /**
  * The deployment log must be readable by the web container, and mounted
@@ -203,11 +229,14 @@ export function checkComposeCoverage(text, spec = {}) {
     }
   }
 
-  // Reverse guard: every curated variable must exist somewhere, so a typo here
+  // Reverse guard: every curated variable must be a known env name (a `PI_*`
+  // feature knob, or an explicitly allowlisted non-`PI_*` secret), so a typo here
   // is caught instead of silently never matching the compose file.
   for (const [service, vars] of Object.entries(criticalEnv)) {
     for (const name of vars) {
-      if (!/^PI_[A-Z0-9_]+$/.test(name)) problems.push(`curated list has an invalid variable name: ${service}/${name}`);
+      if (!/^PI_[A-Z0-9_]+$/.test(name) && !ALLOWED_NON_PI_ENV.has(name)) {
+        problems.push(`curated list has an invalid variable name: ${service}/${name}`);
+      }
     }
   }
 

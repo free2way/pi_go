@@ -485,6 +485,63 @@ export const databaseMigrations: Migration[] = [
       CREATE INDEX idx_agile_release_deploy_claims_release ON agile_release_deploy_claims(release_id, created_at);
     `,
   },
+  {
+    // Decision-plane audit trail (docs/26-jev-decision-engine-design.md §13).
+    //
+    // One row per evaluation; the UI/query API only ever reads this table, so it
+    // stores the REDACTED summary (field names/counts/sizes in
+    // `state_manifest_json`, validated answers in `answers_json`) — never the
+    // outbound payload, never a key or raw provider body.
+    //
+    // `idempotency_key` is UNIQUE: the route derives it deterministically from
+    // `runId + kind + policyVersion + stateHash` (and uses the same value as the
+    // row `id`), so `INSERT … ON CONFLICT DO NOTHING` lets a repeated worker
+    // call return the stored evaluation without a second provider call and
+    // without double-counting usage.
+    //
+    // `estimated_cost_usd` is nullable on purpose: when the response cannot
+    // provide reliable tokens or no price is known the column stays NULL and is
+    // never written as 0 (AT-JEV-062 — `$0.00` would be a lie).
+    //
+    // Rollback (additive and safe: nothing else reads the table):
+    //   1. DROP TABLE decision_evaluations;  (drops its indexes too)
+    //   2. DELETE FROM schema_migrations WHERE id = 15;
+    //   3. restart the web server; a run's history is unaffected because the
+    //      table holds only derived audit metadata.
+    id: 15,
+    name: "decision-evaluations",
+    sql: `
+      CREATE TABLE decision_evaluations (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        requested_model TEXT NOT NULL,
+        resolved_model TEXT,
+        policy_version TEXT NOT NULL,
+        state_hash TEXT NOT NULL,
+        question_schema_hash TEXT NOT NULL,
+        state_manifest_json TEXT NOT NULL DEFAULT '{}',
+        answers_json TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL,
+        fallback_reason TEXT,
+        detail TEXT,
+        applied_outcome TEXT,
+        latency_ms INTEGER NOT NULL,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        estimated_cost_usd DOUBLE PRECISION,
+        created_at TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL
+      );
+      CREATE INDEX idx_decision_evaluations_run ON decision_evaluations(run_id, created_at);
+      CREATE INDEX idx_decision_evaluations_kind ON decision_evaluations(kind, created_at);
+      CREATE INDEX idx_decision_evaluations_status ON decision_evaluations(status, created_at);
+      CREATE INDEX idx_decision_evaluations_model ON decision_evaluations(resolved_model, policy_version);
+      CREATE UNIQUE INDEX idx_decision_evaluations_idempotency ON decision_evaluations(idempotency_key);
+    `,
+  },
 ];
 
 export async function runMigrations(db: Db) {

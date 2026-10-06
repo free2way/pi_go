@@ -119,6 +119,24 @@ services:
       PI_JOB_STALE_SECONDS: ${PI_JOB_STALE_SECONDS:-120}
       PI_PIPELINE_VERSION: ${PI_PIPELINE_VERSION:-pigo-pipeline-1}
       PI_WORKSPACES_ENABLED: ${PI_WORKSPACES_ENABLED:-true}
+      # Decision plane / Jev (docs/26). Opt-in: PI_DECISION_ENGINE defaults to
+      # disabled and PI_JEV_MODE to off; every empty value below falls back to the
+      # documented default, so existing deployments are unchanged. TYPESAFE_API_KEY
+      # is the secret read by `PI_DECISION_ENGINE=jev`; it stays empty here and must
+      # be supplied by the deployment environment (never committed).
+      PI_DECISION_ENGINE: ${PI_DECISION_ENGINE:-}
+      PI_JEV_MODE: ${PI_JEV_MODE:-}
+      PI_JEV_BASE_URL: ${PI_JEV_BASE_URL:-}
+      PI_JEV_MODEL: ${PI_JEV_MODEL:-}
+      PI_JEV_TIMEOUT_MS: ${PI_JEV_TIMEOUT_MS:-}
+      PI_JEV_MAX_ATTEMPTS: ${PI_JEV_MAX_ATTEMPTS:-}
+      PI_JEV_STATE_MAX_TOKENS: ${PI_JEV_STATE_MAX_TOKENS:-}
+      PI_JEV_STATE_MAX_BYTES: ${PI_JEV_STATE_MAX_BYTES:-}
+      PI_JEV_REVIEW_MAX_FINDINGS: ${PI_JEV_REVIEW_MAX_FINDINGS:-}
+      PI_JEV_SHADOW_SAMPLE_RATE: ${PI_JEV_SHADOW_SAMPLE_RATE:-}
+      PI_JEV_POLICY_VERSION: ${PI_JEV_POLICY_VERSION:-}
+      PI_JEV_ALLOW_SOURCE: ${PI_JEV_ALLOW_SOURCE:-}
+      TYPESAFE_API_KEY: ${TYPESAFE_API_KEY:-}
     ports:
       - target: 3100
         published: "3100"
@@ -231,6 +249,8 @@ services:
       PI_GIT_EMPTY_CONFIG: ${PI_GIT_EMPTY_CONFIG:-/dev/null}
       PI_SANDBOX_EXTRA_BINDS: ${PI_SANDBOX_EXTRA_BINDS:-}
       PI_SANDBOX_EXTRA_ENV: ${PI_SANDBOX_EXTRA_ENV:-}
+      # Decision plane (docs/26): opt-in Jev trigger mode. Empty = off (default).
+      PI_JEV_MODE: ${PI_JEV_MODE:-}
     volumes:
       - ./workspace:/workspace
       # The worker creates the per-task sandbox containers through the Docker
