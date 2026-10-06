@@ -12,8 +12,9 @@ import { E2E_LIVE_ACCEPTANCE, configStatus, expect, openRunByTitle, stopRun, tes
  * is marked `fixme` by default with the reason recorded, and only enabled in a
  * live acceptance environment via `PI_E2E_LIVE=1`.
  *
- * E2E-02 (check failure → automatic repair), E2E-05 (provider preflight) and
- * E2E-07 (budget stop) are *real* tests: they no longer use `fixme`. Each one is
+ * E2E-02 (check failure → automatic repair), E2E-04 (parallel sub-agents),
+ * E2E-05 (provider preflight) and E2E-07 (budget stop) are *real* tests: they no
+ * longer use `fixme`. Each one is
  * driven entirely by environment variables and either runs its assertions or
  * skips with a precise, actionable reason. That means the acceptance gate still
  * FAILs while such a scenario is skipped — the gate's
@@ -47,6 +48,28 @@ import { E2E_LIVE_ACCEPTANCE, configStatus, expect, openRunByTitle, stopRun, tes
  *   deletion and re-break the check). The check needs `git` in the run sandbox,
  *   which the Pi runtime image provides. The spec cancels the run once round 2
  *   has reached the reviewer, because the review verdict is not part of E2E-02.
+ *
+ * ---------------------------------------------------------------------------
+ * E2E-04 — 并行 Sub Agent: environment contract
+ * ---------------------------------------------------------------------------
+ *   PI_E2E_WORKSPACE_ID         (optional) workspace to target; otherwise the
+ *                              first active, non-dirty registered workspace.
+ *   PI_E2E_PARALLEL_TIMEOUT_MS  (optional) how long to wait for the parallel
+ *                              wave to complete, default 480000 (8 min).
+ *   The developer/reviewer pairs are pinned explicitly from `/api/models` (the
+ *   first entry selectable for each role), so the run never depends on the
+ *   deployment defaults. The test skips with a precise reason when the catalogue
+ *   has no usable model for either role, and also requires
+ *   `realRunsAvailable: true` and an active, non-dirty workspace.
+ *   Determinism: the scenario asks for two tiny deliverables in disjoint paths
+ *   and asserts the worker's own single-wave, single-batch parallel evidence.
+ *   Planner variance is absorbed with at most two extra submissions; if every
+ *   submission collapses to one task the test FAILs with the dumped plan and
+ *   events (never a silent pass). The run is cancelled once the wave completes;
+ *   the post-wave Integrator/checks/review phases and the review verdict are not
+ *   asserted (a 2-sub-agent wave already exhausts the demo deployment's frozen
+ *   token budget). Per-sub-agent worktree paths are not exposed by the API/UI,
+ *   so they are documented, not asserted.
  *
  * ---------------------------------------------------------------------------
  * E2E-05 — Provider 故障不浪费开发成本: environment contract
@@ -144,6 +167,24 @@ type AcceptanceRun = {
   /** Per-role CLI session summary (Sprint 2); `resumed` marks a reused session. */
   sessions?: Array<{ sessionId: string; role: string; rounds: number[]; calls?: number; resumed: boolean }>;
   budget?: { maxTokens: number; maxCostUsd: number; maxModelCalls: number; maxDurationSeconds: number };
+  /** Planner output surfaced on the run document (E2E-04). */
+  plan?: AcceptancePlan;
+};
+type AcceptancePlan = {
+  complexity: string;
+  rationale: string;
+  strategy: "single" | "parallel";
+  tasks: Array<{
+    id: string;
+    title: string;
+    description?: string;
+    files: string[];
+    dependsOn: string[];
+    status: string;
+    summary?: string;
+    durationMs?: number;
+    name?: string;
+  }>;
 };
 type AcceptanceEvent = {
   seq: number;
@@ -566,18 +607,375 @@ test.describe("E2E-03 审核退回自动返修", () => {
 
 // ---------------------------------------------------------------------------
 // E2E-04 — 并行 Sub Agent
+//
+// Real, env-driven test (docs/05 §13). The fixture repository is nearly empty,
+// so the scenario *instructs* the split: two tiny deliverables in disjoint
+// paths, explicitly independent. That makes the Planner emit ONE dependency
+// wave whose tasks form ONE conflict-free batch (`src/worker/orchestrator.ts`:
+// `executionWaves` + `conflictFreeBatches`). The worker then announces the
+// parallel start, runs the tasks concurrently and merges each sub-agent:
+//
+//   plan.created → subagents.wave_started ("并行启动 2 个 Sub Agent") →
+//   per-task subagent.started → per-task subagent.merged → subagents.wave_completed
+//
+// The spec stops there and cancels the run. The Integrator + round checks +
+// review each need more model calls; on the demo deployment the frozen token
+// budget (PI_RUN_MAX_TOKENS=60000) is already consumed by a 2-sub-agent wave, so
+// the run parks at needs_human (`run.budget_exhausted`) before the Integrator.
+// E2E-04 therefore asserts the parallelism evidence only; where a deployment's
+// budget does cover the integration phase, the wave→checks transition (and the
+// integrated diff) is asserted additionally. This mirrors E2E-02, which also
+// stops before any review verdict. docs/05 §13's "Integrator 全局检查 / 独立
+// Reviewer 批准" is out of scope for E2E-04 for the same reason.
+//
+// Planner variance is real (the Planner prompt says "prefer one task for small
+// cohesive changes"), so a NEW run is submitted at most twice more when the
+// returned plan does not qualify. All attempts collapsing to a single task is a
+// FAIL with the dumped plan + events — never a silent pass.
+//
+// Not observable (documented instead of faked): docs/05 §13 asks for "两个独立
+// worktree". The worker creates `<run-worktree>/subagents/<task-id>`
+// (`runSubAgent`) and force-removes it right after the merge
+// (`removeSubAgentWorktree`); neither the run document, the event stream nor the
+// Agents panel exposes a worktree path. So E2E-04 cannot assert "两个 worktree
+// 不同" from the outside and instead asserts the product's own parallelism
+// evidence: the wave announcement, both sub-agents' started/merged events with
+// matching `taskId`, and that every sub-agent started before any merged.
+// See the file header for PI_E2E_PARALLEL_TIMEOUT_MS.
 // ---------------------------------------------------------------------------
+
+/**
+ * Task text for E2E-04: two tiny deliverables in disjoint paths, explicitly
+ * independent and explicitly to be split into parallel sub-agents. Every clause
+ * is load-bearing against the Planner prompt, which otherwise prefers one task.
+ * Verified live against the demo deployment (see the E2E-04 probe table in the
+ * report): 2 dependency-free tasks with disjoint `files` ⇒ one wave, one batch.
+ */
+const E2E04_TASK = [
+  "仓库当前几乎是空的（只有一个 README.md）。请并行完成两个彼此完全独立的交付物，必须拆分为两个并行的 Sub Agent 同时执行：",
+  '1) 在 src/hello.ts 中新增一个 hello(name: string): string 函数，返回 "Hello, <name>!"；并新增 src/hello.test.ts 覆盖它。',
+  "2) 在 docs/notes/usage.md 中新增一份简短的使用说明（不超过 10 行）。",
+  "这两个交付物互不依赖：两个任务的 dependsOn 都必须是空数组 []，files 分别只声明各自涉及的路径（任务1: src/hello.ts, src/hello.test.ts；任务2: docs/notes/usage.md），路径不得重叠。只创建这两个任务，不要新增第三个任务，也不要修改 README.md。",
+].join("\n");
+
+/**
+ * The single deterministic check E2E-04 submits. It always passes and pins the
+ * run's check list, so the wave→checks transition (asserted when the
+ * deployment's budget covers the integration phase) cannot be satisfied by an
+ * empty suite. On the demo deployment the budget is spent before the checks run,
+ * so this remains a marker of the submitted check rather than an executed one.
+ */
+const E2E04_CHECK = "true";
+
+/** Bounded retry budget for Planner variance: 1 initial submission + 2 retries. */
+const E2E04_MAX_ATTEMPTS = 3;
+
+/**
+ * Mirrors `filesOverlap` from `src/worker/orchestrator.ts`. Used ONLY to
+ * pre-check the scenario setup (qualify / re-submit) before more sub-agent calls
+ * are spent; the assertions still use the worker's own `subagents.wave_started`
+ * message, never this helper.
+ */
+function declaredFilesOverlap(left: string[], right: string[]): boolean {
+  const normalize = (file: string) => file.replace(/^\.\/+/, "").replace(/\/+$/, "").toLowerCase();
+  const a = left.map(normalize).filter(Boolean);
+  const b = right.map(normalize).filter(Boolean);
+  return a.some((x) => b.some((y) => x === y || x.startsWith(`${y}/`) || y.startsWith(`${x}/`)));
+}
+
+/** Why a plan does not match E2E-04's required shape; `undefined` means it does. */
+function planDisqualification(plan: AcceptancePlan | undefined): string | undefined {
+  if (!plan) return "Run 文档未携带 plan";
+  if (plan.strategy !== "parallel") return `strategy=${plan.strategy}（应为 parallel）`;
+  if (plan.tasks.length < 2) return `Plan 只产出 ${plan.tasks.length} 个任务`;
+  const dependent = plan.tasks.filter((task) => (task.dependsOn ?? []).length > 0);
+  if (dependent.length > 0) {
+    return `任务声明了 dependsOn（${dependent.map((task) => `${task.id}→${task.dependsOn.join(",")}`).join("; ")}），会产生多个 wave`;
+  }
+  for (let i = 0; i < plan.tasks.length; i += 1) {
+    for (let j = i + 1; j < plan.tasks.length; j += 1) {
+      if (declaredFilesOverlap(plan.tasks[i].files ?? [], plan.tasks[j].files ?? [])) {
+        return `任务 ${plan.tasks[i].id} 与 ${plan.tasks[j].id} 声明的文件重叠（${plan.tasks[i].files.join(",") || "空"} vs ${plan.tasks[j].files.join(",") || "空"}），会被串行化`;
+      }
+    }
+  }
+  return undefined;
+}
+
 test.describe("E2E-04 并行 Sub Agent", () => {
-  test("E2E-04 fixture-parallel-app：同 wave 并行任务、独立 worktree、无冲突合并、Integrator 全局检查（fixme：需生产验收环境）", async ({ request }) => {
-    requireLiveAcceptance(
-      "fixture-parallel-app 工作区 + 真实 Pi Worker（允许多进程并行）+ 真实 Provider 凭据。",
-    );
+  test("E2E-04 单 wave 并行：Plan ≥2 个无依赖、文件不重叠的任务同时启动、逐一合并、wave 完成后才进入集成检查（需真实运行环境）", async ({ page, request }) => {
+    const configuredWait = Number(envValue("PI_E2E_PARALLEL_TIMEOUT_MS") ?? 480_000);
+    const waitMs = Number.isFinite(configuredWait) && configuredWait > 0 ? configuredWait : 480_000;
+    // The planner call is bounded on its own; the wave+integration wait uses
+    // `waitMs`. The worst case across retries is bounded so a hung run fails
+    // instead of blocking the suite forever.
+    const planWaitMs = Math.min(waitMs, 180_000);
+    const preconditions =
+      `需要一个真实运行环境：realRunsAvailable=true（PI_REAL_RUNS_ENABLED=true + PI_INTERNAL_TOKEN + 已配置的 provider 凭据）、一个 active 且未 dirty 的工作区（或设置 PI_E2E_WORKSPACE_ID）、以及 /api/models 中分别可用于 developer 与 reviewer 的模型。该场景会真实创建 1 个（最多 ${E2E04_MAX_ATTEMPTS} 个，用于吸收 Planner 波动）并行运行并消耗模型预算。可选 PI_E2E_PARALLEL_TIMEOUT_MS（默认 480000）控制等待时长；当前值 ${waitMs}。`;
+    test.info().annotations.push({ type: "preconditions", description: preconditions });
+
     const config = await configStatus(request);
-    test.skip(!config.realRunsAvailable, "PI_REAL_RUNS_ENABLED=false 或凭据未配置。");
-    notImplementedYet(
-      "E2E-04",
-      "断言：Plan 至少两个同 wave 任务；两个 Pi Session 并行且 worktree 不同；改动范围可解释；合并无冲突；Integrator 全局检查；独立 Reviewer 批准；Agents 面板显示并行证据。",
+    test.skip(
+      !config.realRunsAvailable,
+      "E2E-04 需要真实运行环境：/api/config/status 报告 realRunsAvailable=false（需 PI_REAL_RUNS_ENABLED=true、PI_INTERNAL_TOKEN 以及至少一个已配置的 provider 凭据）。",
     );
+
+    const workspaceId = await resolveAcceptanceWorkspace(request);
+    test.skip(
+      !workspaceId,
+      "E2E-04 需要工作区：没有 active 且未 dirty 的已注册工作区（或设置 PI_E2E_WORKSPACE_ID 指定）。",
+    );
+
+    const developer = await resolveRoleSelection(request, "developer");
+    const reviewer = await resolveRoleSelection(request, "reviewer");
+    test.skip(
+      !developer || !reviewer,
+      "E2E-04 需要 /api/models 中分别可用于 developer 与 reviewer 的模型（selectableRoles）：缺少任一角色就无法显式钉住运行所用的模型。",
+    );
+
+    test.setTimeout(E2E04_MAX_ATTEMPTS * planWaitMs + waitMs + 120_000);
+
+    const title = `E2E-04 并行 ${Date.now()}`;
+    const retryNotes: string[] = [];
+    let failureDiagnostic: string | undefined;
+    let accepted: { runId: string; plan: AcceptancePlan } | undefined;
+
+    for (let attempt = 1; attempt <= E2E04_MAX_ATTEMPTS && !accepted; attempt += 1) {
+      const created = await request.post("/api/runs", {
+        data: {
+          title,
+          task: E2E04_TASK,
+          mode: "real",
+          workspaceId,
+          checks: [E2E04_CHECK],
+          developerModel: developer,
+          reviewerModel: reviewer,
+        },
+      });
+      expect(created.status(), `第 ${attempt} 次 POST /api/runs 失败（${created.status()}）：${await created.text()}`).toBe(201);
+      const candidateId = ((await created.json()) as AcceptanceRun).id;
+
+      // Wait for the Planner verdict. A run that reaches a terminal state
+      // without ever emitting plan.created is an infrastructure failure, not
+      // Planner variance, so it fails immediately instead of being retried.
+      let sawPlanEvent = false;
+      await expect
+        .poll(
+          async () => {
+            const events = await getRunEvents(request, candidateId);
+            if (events.some((event) => event.type === "plan.created")) {
+              sawPlanEvent = true;
+              return true;
+            }
+            const current = await getRun(request, candidateId);
+            return !ACTIVE_RUN_STATES.includes(current.state);
+          },
+          {
+            message: `第 ${attempt} 次提交的 Run ${candidateId} 未在 ${planWaitMs}ms 内产出 plan.created，也未离开运行态。`,
+            timeout: planWaitMs,
+            intervals: [1_500, 3_000],
+          },
+        )
+        .toBe(true);
+
+      const candidate = await getRun(request, candidateId);
+      if (!sawPlanEvent) {
+        const events = await getRunEvents(request, candidateId);
+        await cancelIfActive(request, candidateId);
+        expect(
+          sawPlanEvent,
+          `E2E-04 第 ${attempt} 次提交的 Run ${candidateId} 在规划完成前就结束了（state=${candidate.state}）：\n${events
+            .map((event) => `#${event.seq} r${event.round} ${event.type}: ${event.message}`)
+            .join("\n")}`,
+        ).toBe(true);
+      }
+
+      const disqualification = planDisqualification(candidate.plan);
+      if (!disqualification) {
+        accepted = { runId: candidateId, plan: candidate.plan! };
+        break;
+      }
+      retryNotes.push(`第 ${attempt} 次提交 run=${candidateId}：${disqualification}`);
+      if (attempt === E2E04_MAX_ATTEMPTS) {
+        const events = await getRunEvents(request, candidateId);
+        failureDiagnostic = `E2E-04 在 ${E2E04_MAX_ATTEMPTS} 次提交内都未得到「≥2 个无依赖、文件不重叠的并行任务」；这是 Planner 波动，不是可忽略的跳过：\n${retryNotes.join(
+          "\n",
+        )}\n实际 Plan（第 ${attempt} 次）：\n${JSON.stringify(candidate.plan, null, 2)}\n相关事件：\n${events
+          .map((event) => `#${event.seq} r${event.round} ${event.type}: ${event.message}`)
+          .join("\n")}`;
+        await cancelIfActive(request, candidateId);
+        break;
+      }
+      // Bounded retry (≤2): absorb Planner variance with a fresh run.
+      await cancelIfActive(request, candidateId);
+    }
+
+    expect(accepted, failureDiagnostic ?? `E2E-04 未获得合格的并行 Plan：${retryNotes.join("; ")}`).toBeTruthy();
+    const { runId } = accepted!;
+
+    try {
+      // Wait until the parallel wave has completed (the last milestone this
+      // scenario asserts) or until the run left the active states on its own.
+      await expect
+        .poll(
+          async () => {
+            const events = await getRunEvents(request, runId);
+            if (events.some((event) => event.type === "subagents.wave_completed")) return true;
+            const current = await getRun(request, runId);
+            return !ACTIVE_RUN_STATES.includes(current.state);
+          },
+          {
+            message: `Run ${runId} 未在 ${waitMs}ms 内完成并行 wave：Sub Agent 可能失败/合并冲突，或运行被预算/时限中止。`,
+            timeout: waitMs,
+            intervals: [2_000, 5_000],
+          },
+        )
+        .toBe(true);
+
+      const events = await getRunEvents(request, runId);
+      const current = await getRun(request, runId);
+      const summarize = () =>
+        events
+          .filter((event) => /^(plan\.created|subagents\.|subagent\.|run\.budget|check\.(started|passed|failed))/.test(event.type))
+          .map((event) => `#${event.seq} r${event.round} ${event.type}`)
+          .join(", ");
+      const require = (event: AcceptanceEvent | undefined, what: string): AcceptanceEvent => {
+        expect(event, `${what}（实际事件：${summarize() || "无"}）`).toBeTruthy();
+        return event!;
+      };
+
+      // (a) The run's plan really is a parallel, single-wave plan. This is the
+      // same shape the pre-check qualified, asserted on the persisted run
+      // document rather than on the transient poll snapshot.
+      const planned = current.plan;
+      expect(planned, "Run 文档必须保留开发计划（plan）").toBeTruthy();
+      expect(planned!.strategy, `Plan 策略必须是 parallel（实际 ${planned!.strategy}）`).toBe("parallel");
+      expect(planned!.tasks.length, `Plan 至少要有 2 个任务（实际 ${planned!.tasks.length}）`).toBeGreaterThanOrEqual(2);
+      for (const task of planned!.tasks) {
+        expect(task.dependsOn, `任务 ${task.id} 不得有依赖（否则不会同 wave 并行）`).toEqual([]);
+      }
+
+      // (b) Exactly ONE wave was announced, for all N planned tasks, and it is
+      // the parallel message — not the "分 X 批串行化执行" variant the worker
+      // emits when declared files overlap. Asserting the exact text rules out
+      // both serialization and a dependency-split (partial) wave.
+      const waves = events.filter((event) => event.type === "subagents.wave_started");
+      expect(waves, `本轮必须有且只有一个并行 wave（实际 ${waves.length} 个：${summarize() || "无"}）`).toHaveLength(1);
+      expect(waves[0].round, `wave_started 必须发生在第 1 轮（实际第 ${waves[0].round} 轮）`).toBe(1);
+      expect(
+        waves[0].message,
+        `wave_started 必须宣布全部 ${planned!.tasks.length} 个任务并行启动，且不得是串行化批次文案：${waves[0].message}`,
+      ).toBe(`并行启动 ${planned!.tasks.length} 个 Sub Agent`);
+      expect(
+        events.filter((event) => event.type === "subagents.restored"),
+        "全新运行不得从检查点恢复 Sub Agent（否则并行执行证据不完整）",
+      ).toEqual([]);
+
+      // (c) Every planned task actually started and was merged, tied back to its
+      // plan id (and codename) through the event meta the worker emits.
+      const startedFor = (taskId: string) => events.filter((event) => event.type === "subagent.started" && event.meta?.taskId === taskId);
+      const mergedFor = (taskId: string) => events.filter((event) => event.type === "subagent.merged" && event.meta?.taskId === taskId);
+      for (const task of planned!.tasks) {
+        const started = startedFor(task.id);
+        expect(started, `任务 ${task.id} 必须有且仅有一条 subagent.started（实际 ${started.length}）`).toHaveLength(1);
+        const merged = mergedFor(task.id);
+        expect(
+          merged,
+          `任务 ${task.id} 必须有且仅有一条 subagent.merged（实际 ${merged.length}；failed=${events.filter((event) => event.type === "subagent.failed" && event.meta?.taskId === task.id).length}）`,
+        ).toHaveLength(1);
+        if (task.name) {
+          expect(merged[0].meta?.codename, `subagent.merged 的 codename 必须与计划中的 ${task.id}（${task.name}）一致`).toBe(task.name);
+        }
+      }
+      expect(events.filter((event) => event.type === "subagent.failed"), "并行任务不得有 Sub Agent 失败").toEqual([]);
+
+      // (d) Real concurrency: all sub-agents were in flight at the same time —
+      // every subagent.started precedes every subagent.merged. A purely
+      // sequential execution cannot satisfy this ordering.
+      const startSeqs = planned!.tasks.flatMap((task) => startedFor(task.id).map((event) => event.seq));
+      const mergeSeqs = planned!.tasks.flatMap((task) => mergedFor(task.id).map((event) => event.seq));
+      expect(
+        Math.max(...startSeqs),
+        `所有 Sub Agent 都必须在任一合并之前启动（started seqs=${startSeqs.join(",")}，merged seqs=${mergeSeqs.join(",")}）`,
+      ).toBeLessThan(Math.min(...mergeSeqs));
+
+      // (e) wave_completed only after all merges, and only then does the run
+      // move on to the Integrator's global checks.
+      const waveCompleted = require(
+        events.find((event) => event.type === "subagents.wave_completed"),
+        "wave 完成后必须记录 subagents.wave_completed",
+      );
+      expect(waveCompleted.seq, "wave_completed 必须晚于所有 subagent.merged").toBeGreaterThan(Math.max(...mergeSeqs));
+      for (const task of planned!.tasks) {
+        expect(task.status, `计划中的任务 ${task.id} 最终状态必须是 merged（实际 ${task.status}）`).toBe("merged");
+      }
+
+      // (f) Post-wave pipeline. The Integrator, the round's checks and the
+      // reviewer each need more model calls. The demo deployment freezes a token
+      // budget (PI_RUN_MAX_TOKENS=60000) that a 2-sub-agent wave already consumes,
+      // so the run parks at `needs_human` (`run.budget_exhausted`) before the
+      // Integrator call and this spec cannot observe the checks there. It
+      // therefore does NOT require `checks.started`; where the deployment budget
+      // does cover the integration phase, the wave→checks transition (and the
+      // integrated diff) is asserted instead, so the criterion is not silently
+      // dropped. docs/05 §13's "Integrator 全局检查 / 独立 Reviewer 批准" is
+      // deliberately out of scope for E2E-04 (it is a parallelism scenario, and
+      // this mirrors E2E-02 stopping before the review verdict).
+      const checksStarted = events.find((event) => event.type === "checks.started" && event.round === 1);
+      if (checksStarted) {
+        expect(checksStarted.seq, "第 1 轮检查必须晚于 wave_completed（集成完成后才检查）").toBeGreaterThan(waveCompleted.seq);
+        expect(
+          current.checks?.map((check) => check.command),
+          "运行的检查列表必须就是本用例提交的那一条（证明检查确实跑过，而非空套件）",
+        ).toEqual([E2E04_CHECK]);
+        const diff = current.diff ?? "";
+        expect(diff, "整合后的 run.diff 必须非空（Sub Agent 的提交必须已合并进工作树）").toContain("diff --git");
+        for (const task of planned!.tasks) {
+          const declared = task.files ?? [];
+          if (declared.length === 0) continue;
+          expect(
+            declared.some((file) => diff.includes(file)),
+            `任务 ${task.id} 声明的文件必须出现在整合 diff 中（声明：${declared.join(", ")}；diff 前 600 字符：${diff.slice(0, 600)}）`,
+          ).toBe(true);
+        }
+      } else if (!ACTIVE_RUN_STATES.includes(current.state)) {
+        // No checks and the run already stopped: that stop must be observable
+        // (budget/deadline/failure), never a silent stall after the wave.
+        const stop = events.find(
+          (event) =>
+            event.seq > waveCompleted.seq &&
+            event.type.startsWith("run.") &&
+            event.type !== "run.budget_warning" &&
+            event.type !== "run.recovered",
+        );
+        expect(
+          stop,
+          `Run ${runId} 在 wave 完成后以 ${current.state} 结束，却没有可解释的 run.* 停止事件（疑似静默卡死）`,
+        ).toBeTruthy();
+      }
+
+      // (g) Read-only UI corroboration: the Agents panel renders the persisted
+      // plan (complexity · strategy, one row per task) and the activity timeline
+      // carries the parallel-start message. No worktree path is asserted here
+      // because the product does not expose one.
+      await page.goto("/");
+      await openRunByTitle(page, title);
+      await page.getByRole("button", { name: /^Agents/ }).click();
+      await expect(page.locator(".agent-plan-summary span"), "Agents 面板必须显示并行策略").toContainText("parallel");
+      await expect(page.locator(".subagent-row"), "Agents 面板必须为每个任务渲染一行").toHaveCount(planned!.tasks.length);
+      for (const task of planned!.tasks) {
+        const row = page.locator(".subagent-row", { hasText: task.title });
+        await expect(row, `Agents 面板必须显示任务「${task.title}」`).toBeVisible();
+        await expect(row.locator("em"), `任务 ${task.id} 在面板中必须显示为 merged`).toHaveText("merged");
+      }
+      await page.getByRole("button", { name: "活动", exact: true }).click();
+      await expect(
+        page.locator(".timeline-item", { hasText: `并行启动 ${planned!.tasks.length} 个 Sub Agent` }),
+        "活动时间线必须显示并行启动文案",
+      ).toBeVisible();
+    } finally {
+      await cancelIfActive(request, runId);
+    }
   });
 });
 
