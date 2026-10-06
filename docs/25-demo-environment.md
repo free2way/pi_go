@@ -155,6 +155,31 @@ web 进程没有任何工作区文件系统读取或 `git` 子进程——`src/s
 - 验收：`tests/e2e/decision-engine.spec.ts`（部署未启用时精确跳过）；离线用例覆盖配置/脱敏/
   载荷上限/响应映射/重试熔断/策略不可变规则。
 
+### 决策平面回滚演练（2026-10-06 已在 demo 执行）
+
+两条演练都在 demo 上跑通并已恢复原状（`PI_DECISION_ENGINE=mock`、`PI_JEV_MODE=shadow`）：
+
+| 用例 | 操作 | 实测结果 |
+| --- | --- | --- |
+| AT-JEV-090 配置回滚 | `demo.env` 设 `PI_JEV_MODE=off` → `--force-recreate demo-web demo-worker` | 两服务 env 均为 `off`；内部评估返回 `{status:"disabled", mode:"off", fallbackReason:"disabled"}`，**零外呼、审计行 17→17 未增**；历史仍可查（有决策行的运行返回 1 行 `review_triage/completed`）；任务路径不阻塞（决策始终 fire-and-forget） |
+| AT-JEV-091 引擎回滚 | `demo.env` 设 `PI_DECISION_ENGINE=disabled` → 重建 | 实例健康（`demo-0.27.17`）；**历史数据照旧可查**（数据库向后兼容）；`/api/config/status` 如实报 `engine=disabled` |
+
+复现步骤：
+
+```sh
+export PIGO_SSH_PW=...            # 只从环境读，不落盘
+cd /app/pi-agent                  # 宿主机；先备份 demo.env
+sed -i 's/^PI_JEV_MODE=.*/PI_JEV_MODE=off/' demo.env        # AT-JEV-090
+cp demo.env source/deploy/docker/demo.env
+cd source && docker compose -f deploy/docker/compose.demo.yaml \
+  --env-file /app/pi-agent/demo.env -p pigo-demo up -d --force-recreate demo-web demo-worker
+# 断言：内部评估返回 disabled、审计表行数不变、历史接口仍返回旧行；随后把值改回并重建
+```
+
+注意：`PI_JEV_MODE` 必须同时进 **web 与 worker**（worker 的 opt-in 在自己进程里读）；`PI_DECISION_ENGINE`
+只被 web 读。宿主机 `/app/pi-agent/compose.yaml` 决定哪些变量能进容器——它曾落后仓库一整段 Jev 变量
+（导致"改了 .env 却不生效"），新增 compose 变量时务必同步宿主机副本。
+
 ## 常用命令
 
 ```sh
