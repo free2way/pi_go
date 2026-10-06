@@ -668,7 +668,9 @@ export async function evaluateDecisionForRun(
     };
   }
   if (!Array.isArray(batches) || batches.length === 0) {
-    // A builder that produced nothing is a refusal, never a silent success.
+    // Nothing to triage (the run has no unresolved findings) or a builder that
+    // produced nothing: a business-safe no-op, never a silent success, and never
+    // an outbound call with an empty question set.
     return {
       status: 200,
       body: disabledResponse({
@@ -677,7 +679,7 @@ export async function evaluateDecisionForRun(
         mode: config.mode,
         status: "fallback",
         fallbackReason: "payload_rejected",
-        detail: "the review-triage builder produced no batch",
+        detail: "nothing to triage: no unresolved findings produced a batch",
         createdAt: now,
       }),
     };

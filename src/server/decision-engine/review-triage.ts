@@ -329,12 +329,16 @@ export function buildReviewTriageBatches(input: ReviewTriageInput, limits: Revie
     maxBytes: limits.maxBytes ?? DECISION_ENGINE_DEFAULTS.maxStateBytes,
   };
   const allFindings = selectReviewFindings(input.run);
+  // Nothing unresolved ⇒ nothing to ask. An empty `questions` object is invalid
+  // for the provider (`minProperties: 1`; verified live as HTTP 422
+  // `loc=body.questions … too_short`), so no batch is produced at all and the
+  // caller returns a business-safe no-op without any outbound call or audit row.
+  if (allFindings.length === 0) return [];
   const chunkSize = Math.max(1, Math.floor(input.maxFindings));
   const chunks: Finding[][] = [];
   for (let index = 0; index < allFindings.length; index += chunkSize) {
     chunks.push(allFindings.slice(index, index + chunkSize));
   }
-  if (chunks.length === 0) chunks.push([]);
 
   const fittings: Fitting[] = [];
   for (const chunk of chunks) {

@@ -357,6 +357,19 @@ describe("POST /api/internal/decisions/evaluate (docs/26 §8.1)", () => {
     expect(await auditRowCount(h.audit)).toBe(0);
   });
 
+  it("treats a run with no unresolved findings as a no-op, not an empty provider call", async () => {
+    // The builder returns no batch when nothing is unresolved; an empty
+    // `questions` object is invalid for TypeSafe (live HTTP 422
+    // `loc=body.questions … too_short`), so this must never reach the provider.
+    const h = await harness({ buildBatches: () => [] });
+    const response = await h.evaluate();
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ status: "fallback", fallbackReason: "payload_rejected" });
+    expect(response.json().detail).toContain("nothing to triage");
+    expect(h.engineCalls).toHaveLength(0);
+    expect(await auditRowCount(h.audit)).toBe(0);
+  });
+
   it("persists exactly one audit row and appends decision.requested then decision.completed", async () => {
     const h = await harness();
     const response = await h.evaluate();

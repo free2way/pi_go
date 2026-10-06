@@ -215,12 +215,13 @@ describe("review-triage request", () => {
     expect(buildReviewTriageRequest(input(run))).toEqual(batches[0].request);
   });
 
-  it("still produces a request for a run with no unresolved findings", () => {
-    const run = makeRun({ findings: [] });
-    const batches = buildReviewTriageBatches(input(run));
-    expect(batches).toHaveLength(1);
-    expect(batches[0].request.questions).toEqual({});
-    expect(batches[0].withinLimits).toBe(true);
+  it("produces no batch when the run has no unresolved findings (empty questions are invalid)", () => {
+    // Live evidence (prod, v0.27.13): a run whose findings were all resolved was
+    // still dispatched with `questions: {}`, and TypeSafe answered
+    // `HTTP 422 loc=body.questions msg=Dictionary should have at least 1 item
+    // after validation, not 0 type=too_short`. Nothing to ask ⇒ no request.
+    expect(buildReviewTriageBatches(input(makeRun({ findings: [] })))).toEqual([]);
+    expect(buildReviewTriageBatches(input(makeRun({ findings: [finding({ resolved: true })] })))).toEqual([]);
   });
 });
 
