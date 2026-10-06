@@ -16,6 +16,48 @@ describe("provider probe", () => {
     expect(providerProbeDisabled({ PI_MODEL_PROBE_MODE: "off" } as NodeJS.ProcessEnv)).toBe(true);
   });
 
+  it("resolves TypeSafe/Jev so the generic /models probe verifies the decision-plane key", () => {
+    // Documented default + the `jev` alias, no /v1 required in PI_JEV_BASE_URL.
+    expect(providerBaseUrl("typesafe", {} as NodeJS.ProcessEnv)).toBe("https://api.typesafe.ai/v1");
+    expect(providerBaseUrl("JEV", {} as NodeJS.ProcessEnv)).toBe("https://api.typesafe.ai/v1");
+    expect(providerBaseUrl("typesafe", { PI_JEV_BASE_URL: "https://jev.example/" } as NodeJS.ProcessEnv)).toBe("https://jev.example/v1");
+    // An operator who already included /v1 must not get /v1/v1.
+    expect(providerBaseUrl("jev", { PI_JEV_BASE_URL: "https://jev.example/v1" } as NodeJS.ProcessEnv)).toBe("https://jev.example/v1");
+    // Every other mapping is unchanged, and the generic override still wins.
+    expect(providerBaseUrl("deepseek", { DEEPSEEK_BASE_URL: "https://ds.example/v1/" } as NodeJS.ProcessEnv)).toBe("https://ds.example/v1");
+    expect(
+      providerBaseUrl("typesafe", {
+        PI_PROVIDER_PROBE_BASE_URL: "https://custom.example",
+        PI_JEV_BASE_URL: "https://jev.example",
+      } as NodeJS.ProcessEnv),
+    ).toBe("https://custom.example");
+  });
+
+  it("probes TypeSafe at {PI_JEV_BASE_URL}/v1/models with the Bearer key", async () => {
+    const calls: string[] = [];
+    const probe = createProviderProbe({
+      env: { PI_JEV_BASE_URL: "https://jev.example" } as NodeJS.ProcessEnv,
+      fetchImpl: (async (url: string, init?: RequestInit) => {
+        calls.push(String(url));
+        expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer typesafe-key");
+        return jsonResponse({ data: [{ id: "jev-1.13.0" }, { id: "jev-1.12.0" }] });
+      }) as unknown as typeof fetch,
+    });
+    expect(await probe({ provider: "typesafe", apiKey: "typesafe-key" })).toMatchObject({
+      ok: true,
+      models: ["jev-1.13.0", "jev-1.12.0"],
+    });
+    expect(calls).toEqual(["https://jev.example/v1/models"]);
+  });
+
+  it("classifies a TypeSafe 401 as unauthorized without throwing", async () => {
+    const probe = createProviderProbe({
+      env: { PI_JEV_BASE_URL: "https://jev.example" } as NodeJS.ProcessEnv,
+      fetchImpl: (async () => jsonResponse({ error: "invalid api key" }, 401)) as unknown as typeof fetch,
+    });
+    expect(await probe({ provider: "jev", apiKey: "bad-key" })).toMatchObject({ ok: false, code: "PROBE_UNAUTHORIZED" });
+  });
+
   it("returns the provider model ids on a successful probe (AT-MODEL-001/004)", async () => {
     const calls: string[] = [];
     const probe = createProviderProbe({

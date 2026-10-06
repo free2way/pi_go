@@ -23,6 +23,12 @@ export type { ReviewTriageInput, ReviewTriageBatch, ReviewTriageRunResult } from
 export interface DecisionEngineDeps {
   fetchImpl?: typeof fetch;
   now?: () => Date;
+  /**
+   * Additive key seam (vault-first, env fallback). Only the `jev` engine reads
+   * it: `disabled`/`mock` never resolve a key, so wiring the vault here can
+   * never turn those engines into an outbound call.
+   */
+  resolveApiKey?: () => string | undefined;
 }
 
 /**
@@ -75,6 +81,6 @@ export function createDecisionEngine(config: DecisionEngineConfig, deps: Decisio
       ? createDisabledEngine(config, engineDeps)
       : config.engine === "mock"
         ? createMockEngine(config, engineDeps)
-        : createJevEngine(config, { ...engineDeps, fetchImpl: deps.fetchImpl });
+        : createJevEngine(config, { ...engineDeps, fetchImpl: deps.fetchImpl, resolveApiKey: deps.resolveApiKey });
   return createPolicyEngine(base, config, deps);
 }

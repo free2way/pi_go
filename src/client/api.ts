@@ -4,6 +4,22 @@ import type { AgileProject, AgileRelease, AgileSprint, AgileStory, ReleaseDeploy
 import type { ConfigStatus, CredentialStatus, CurrentUser, ModelCatalogResponse, ModelSelection, Run, RunArtifact, RunEvent, RunRoundsResponse, RunState, Workspace, AccountDetail, AccountSummary, AccountWorkspaceOption, WorkspacePermission } from "../shared/types";
 import { LOCALE_TAGS, type Locale } from "../shared/i18n";
 
+/**
+ * AUD-09 / docs/26 §11: `/api/config/status` augments the shared `ConfigStatus`
+ * with the decision-plane preflight. Only presence/shape is projected — the key,
+ * base URL and every env value stay server-side, so the client must never expect
+ * a credential value here.
+ */
+export interface DecisionEngineStatus {
+  engine: "disabled" | "mock" | "jev";
+  mode: "off" | "shadow" | "assist" | "enforce";
+  /** Engine is `jev` and the deployment reports a key — never the key itself. */
+  configured: boolean;
+  policyVersion: string | null;
+  /** Present only when the configuration was rejected (standard reason code). */
+  reason?: string;
+}
+
 /** A3: read-only deployment status returned by `GET /api/deployments`. */
 export interface DeploymentRecord {
   at: string | null;

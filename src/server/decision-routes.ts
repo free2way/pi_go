@@ -70,8 +70,15 @@ export type BuildDecisionBatches = (input: ReviewTriageInput) => ReviewTriageBat
 /** Frozen contract of `createDecisionEngine`. */
 export type CreateDecisionEngine = (
   config: DecisionEngineConfig,
-  deps?: { fetchImpl?: typeof fetch },
+  deps?: { fetchImpl?: typeof fetch; resolveApiKey?: () => string | undefined },
 ) => DecisionEngine;
+
+/**
+ * Provider ids a decision-plane key may be stored under, in resolution order.
+ * `typesafe` is canonical; `jev` is accepted as an alias for operators who keyed
+ * the credential by the engine name.
+ */
+export const DECISION_KEY_PROVIDERS = ["typesafe", "jev"] as const;
 
 export interface DecisionRouteDeps {
   store: DecisionRunStore;
@@ -94,6 +101,15 @@ export interface DecisionRouteDeps {
   internalAuthorized: (request: FastifyRequest) => boolean;
   /** Same owner scoping as every other run route (`ownerKeysFor` in index.ts). */
   ownerKeysFor: (request: FastifyRequest) => string | string[];
+  /**
+   * Per-user credential-vault reader, injectable so tests need no vault. It is
+   * consulted ONLY when the effective engine is `jev`: `disabled`/`mock` must
+   * never cause a key lookup (no probe, no extra query). The returned value is
+   * used only to build the engine's key resolver and never enters a projection,
+   * an event or a log. MAY be async: the production wiring resolves the legacy
+   * owner key (AT-REL-002) before reading the vault, like `jobCredentialsFor`.
+   */
+  readVaultKey?: (userId: string, provider: string) => string | undefined | Promise<string | undefined>;
   /** Injectable clock so the disabled path's `createdAt` is deterministic in tests. */
   now?: () => Date;
 }
@@ -152,8 +168,14 @@ export type DecisionEvaluateOutcome =
 export interface DecisionEngineStatus {
   engine: DecisionEngineConfig["engine"];
   mode: DecisionMode;
-  /** Engine is `jev` and a key is present — the key itself is never surfaced. */
+  /** Engine is `jev` and a key is resolvable — the key itself is never surfaced. */
   configured: boolean;
+  /**
+   * Where the resolvable key came from, so the UI can explain itself: `vault`
+   * (per-user credential vault or its `jev` alias), `env` (`TYPESAFE_API_KEY`),
+   * or `null` when nothing resolves. Only reported for the `jev` engine.
+   */
+  keySource?: "vault" | "env" | null;
   policyVersion: string | null;
   /**
    * Present only when the configuration was rejected (docs/26 §11/AT-JEV-003):
@@ -260,17 +282,71 @@ export function projectDecision(record: DecisionEvaluationRecord): DecisionProje
  * embed credentials), never any env value. A rejected configuration degrades to
  * the documented default plus the standard reason, so the preflight can say
  * "unavailable: missing_credentials" without echoing anything (AT-JEV-003).
+ *
+ * `vaultKey` is presence-only information for the CALLING user (the vault key
+ * itself stays in `index.ts`): with `engine=jev` it makes `configured` true and
+ * reports `keySource: "vault"` even when `TYPESAFE_API_KEY` is unset.
  */
-export function decisionEngineStatus(loaded: DecisionConfigLoad): DecisionEngineStatus {
+export function decisionEngineStatus(
+  loaded: DecisionConfigLoad,
+  options: { vaultKey?: boolean } = {},
+): DecisionEngineStatus {
   if (!loaded.ok) {
     return { engine: "disabled", mode: "off", configured: false, policyVersion: null, reason: loaded.reason };
   }
+  if (loaded.config.engine !== "jev") {
+    // disabled/mock never use a key: report the shape only, never a key source.
+    return {
+      engine: loaded.config.engine,
+      mode: loaded.config.mode,
+      configured: false,
+      policyVersion: loaded.config.policyVersion,
+    };
+  }
+  const keySource: "vault" | "env" | null = options.vaultKey ? "vault" : loaded.config.hasApiKey ? "env" : null;
+  if (keySource === null) {
+    // AT-JEV-003: no vault key and no env key — actionable reason, no value.
+    return { engine: "disabled", mode: "off", configured: false, policyVersion: null, reason: "missing_credentials" };
+  }
   return {
-    engine: loaded.config.engine,
+    engine: "jev",
     mode: loaded.config.mode,
-    configured: loaded.config.engine === "jev" && loaded.config.hasApiKey,
+    configured: true,
+    keySource,
     policyVersion: loaded.config.policyVersion,
   };
+}
+
+/** A non-blank `TYPESAFE_API_KEY`, or undefined. The value is never logged. */
+export function envDecisionApiKey(env: NodeJS.ProcessEnv): string | undefined {
+  const value = env.TYPESAFE_API_KEY;
+  const trimmed = value === undefined ? "" : String(value).trim();
+  return trimmed === "" ? undefined : trimmed;
+}
+
+export interface ResolvedDecisionKey {
+  key: string | undefined;
+  source: "vault" | "env" | null;
+}
+
+/**
+ * Key resolution order for one run (vault first, env fallback):
+ * `vault[ownerId].typesafe` → `vault[ownerId].jev` → `TYPESAFE_API_KEY` → none.
+ *
+ * Callers must only invoke this for the `jev` engine; the returned `key` stays
+ * inside the evaluate route (it is handed to the engine's resolver) and is never
+ * projected, evented, audited or logged.
+ */
+export async function resolveDecisionApiKey(
+  userId: string,
+  deps: Pick<DecisionRouteDeps, "env" | "readVaultKey">,
+): Promise<ResolvedDecisionKey> {
+  for (const provider of DECISION_KEY_PROVIDERS) {
+    const key = await deps.readVaultKey?.(userId, provider);
+    if (key !== undefined && key !== "") return { key, source: "vault" };
+  }
+  const envKey = envDecisionApiKey(deps.env);
+  return envKey === undefined ? { key: undefined, source: null } : { key: envKey, source: "env" };
 }
 
 function disabledResponse(input: {
@@ -497,11 +573,12 @@ export async function evaluateDecisionForRun(
       }),
     };
   }
-  const config = loaded.config;
+  let config = loaded.config;
   if (config.engine === "disabled" || config.mode === "off") {
     // Disabled engine / off kill switch (AT-JEV-001/002/005): business-safe
     // response with no outbound call and no audit row. `mock` stays reachable on
     // purpose — it is the documented engine for integration/E2E runs (§6.2).
+    // Neither branch reads the credential vault.
     return {
       status: 200,
       body: disabledResponse({
@@ -513,6 +590,36 @@ export async function evaluateDecisionForRun(
         createdAt: now,
       }),
     };
+  }
+
+  // Only `jev` uses a key. Resolve it per run, vault first (per-user credential
+  // vault) then the platform env; `mock` never touches the vault (deliverable:
+  // no lookup, no probe, no extra query for a non-jev engine).
+  let resolveApiKey: (() => string | undefined) | undefined;
+  if (config.engine === "jev") {
+    const resolved = await resolveDecisionApiKey(run.ownerId, deps);
+    if (resolved.key === undefined) {
+      // AT-JEV-003: no vault key and no env key — the standard, actionable
+      // fallback reason, with no provider call and no audit row.
+      return {
+        status: 200,
+        body: disabledResponse({
+          runId: run.id,
+          kind: input.kind,
+          mode: config.mode,
+          status: "fallback",
+          fallbackReason: "missing_credentials",
+          detail: "no TypeSafe API key is available for this run (credential vault or TYPESAFE_API_KEY)",
+          createdAt: now,
+        }),
+      };
+    }
+    // `hasApiKey` means "a key is resolvable for this request"; the key material
+    // itself is never stored in the config object.
+    config = { ...config, hasApiKey: true };
+    // Read by the engine at call time; the resolver returns the key resolved for
+    // THIS run, so a rotated vault credential is picked up on the next evaluation.
+    resolveApiKey = () => resolved.key;
   }
 
   // The batch builder owns redaction/allowlisting and the payload limits. Its
@@ -583,7 +690,7 @@ export async function evaluateDecisionForRun(
     entries.map((entry) => deps.audit.findByIdempotencyKey(entry.evaluationId)),
   );
 
-  const engine = deps.createEngine(config);
+  const engine = deps.createEngine(config, resolveApiKey ? { resolveApiKey } : undefined);
   const thrown = new Map<string, FallbackReason>();
   const dispatchStarted = Date.now();
   const runResult = await runReviewTriageBatches({

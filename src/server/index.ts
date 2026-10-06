@@ -533,6 +533,36 @@ function vaultKeyFor(request: FastifyRequest) {
   return user.legacyOwnerId ?? user.id;
 }
 
+/**
+ * Decrypted per-user credential read for the decision plane. Only presence is
+ * ever projected; the value is handed straight to the engine's key resolver and
+ * is never logged, evented or persisted. A corrupt/unreadable record degrades to
+ * "no key" (the route then reports `missing_credentials`) instead of failing the
+ * internal evaluate route.
+ *
+ * AT-REL-002: like `jobCredentialsFor`, the vault may hold the credential under
+ * the internal user id **or** under its legacy owner key, so both are tried.
+ */
+async function readVaultKey(userId: string, provider: string): Promise<string | undefined> {
+  const candidates = [userId];
+  const legacy = await identities.legacyOwnerFor(userId).catch(() => undefined);
+  if (legacy && legacy !== userId) candidates.push(legacy);
+  for (const key of candidates) {
+    try {
+      const found = vault.get(key, provider);
+      if (found !== undefined && found !== "") return found;
+    } catch (error) {
+      app.log.warn({ provider, error: (error as Error).message }, "credential vault read failed");
+    }
+  }
+  return undefined;
+}
+
+/** Presence-only vault check for the `/api/config/status` decision-engine block. */
+async function hasVaultDecisionKey(userId: string) {
+  return Boolean((await readVaultKey(userId, "typesafe")) || (await readVaultKey(userId, "jev")));
+}
+
 /** Bounded liveness ping: a frozen database must not hang the health probe. */
 async function pingDatabase(timeoutMs = 2_500) {
   let timer: NodeJS.Timeout | undefined;
@@ -785,7 +815,13 @@ app.get("/api/config/status", async (request): Promise<ConfigStatus & { decision
   // configured the user may enter the real-run form; the actual per-role model
   // combination is preflighted when the run is created (AT-MODEL-008).
   // docs/26 §11 preflight: shape only — the key, the base URL and every env
-  // value stay server-side (`decisionEngineStatus` projects presence, never values).
+  // value stay server-side (`decisionEngineStatus` projects presence, never
+  // values). The key may live in the credential vault (per user) instead of
+  // `TYPESAFE_API_KEY`, so vault presence is resolved here and reported as a
+  // `keySource` label.
+  const decisionLoaded = loadDecisionEngineConfig(process.env, { allowMissingApiKey: true });
+  const decisionVaultKey =
+    decisionLoaded.ok && decisionLoaded.config.engine === "jev" ? await hasVaultDecisionKey(vaultKeyFor(request)) : false;
   return {
     demoMode,
     piVersion: process.env.PI_VERSION || "1.0.0",
@@ -800,7 +836,7 @@ app.get("/api/config/status", async (request): Promise<ConfigStatus & { decision
     releaseConfigured: releasePlan.configured
       && releasePlan.kind !== "unsupported"
       && (releasePlan.kind !== "webhook" || Boolean(releaseWebhookToken && publicOrigin)),
-    decisionEngine: decisionEngineStatus(loadDecisionEngineConfig(process.env)),
+    decisionEngine: decisionEngineStatus(decisionLoaded, { vaultKey: decisionVaultKey }),
   };
 });
 
@@ -3218,11 +3254,15 @@ registerDecisionRoutes(app, {
   store,
   audit: decisionAudit,
   env: process.env,
-  loadConfig: loadDecisionEngineConfig,
+  // A vault-stored per-user key may supply the credentials that the strict env
+  // loader no longer requires; the route reports `missing_credentials` itself
+  // when neither the vault nor the environment resolves one.
+  loadConfig: (env) => loadDecisionEngineConfig(env, { allowMissingApiKey: true }),
   createEngine: createDecisionEngine,
   buildBatches: buildReviewTriageBatches,
   internalAuthorized: (request) => safeTokenMatch(request.headers.authorization),
   ownerKeysFor,
+  readVaultKey,
 });
 
 const currentDir = path.dirname(fileURLToPath(import.meta.url));

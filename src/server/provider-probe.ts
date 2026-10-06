@@ -38,13 +38,33 @@ const DEFAULT_BASE_URLS: Record<string, string> = {
   openai: "https://api.openai.com/v1",
   anthropic: "https://api.anthropic.com/v1",
   google: "https://generativelanguage.googleapis.com/v1beta/openai",
+  /**
+   * TypeSafe System One (Jev) exposes an OpenAI-ish `GET /v1/models` list under
+   * the same host as `/v1/systemone`, so the generic probe can verify a stored
+   * decision-plane key exactly like any other provider.
+   */
+  typesafe: "https://api.typesafe.ai/v1",
 };
 
-/** Resolves the OpenAI-compatible base URL for a provider, if one is known. */
+/** TypeSafe/Jev aliases that share the decision-plane base URL. */
+const TYPESAFE_PROVIDERS = ["typesafe", "jev"];
+
+/**
+ * Resolves the OpenAI-compatible base URL for a provider, if one is known.
+ *
+ * `PI_PROVIDER_PROBE_BASE_URL` still wins for every provider. TypeSafe/Jev uses
+ * `PI_JEV_BASE_URL` (the same variable the adapter reads), which is documented
+ * WITHOUT the `/v1` suffix, so `/v1` is appended here for the `/models` probe.
+ */
 export function providerBaseUrl(provider: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
   const generic = env.PI_PROVIDER_PROBE_BASE_URL?.trim();
   if (generic) return generic.replace(/\/+$/, "");
   const normalized = provider.toLowerCase();
+  if (TYPESAFE_PROVIDERS.some((alias) => normalized === alias || normalized.startsWith(`${alias}-`))) {
+    const base = (env.PI_JEV_BASE_URL || DEFAULT_BASE_URLS.typesafe).replace(/\/+$/, "");
+    // Tolerate an operator who already included the `/v1` prefix.
+    return base.endsWith("/v1") ? base : `${base}/v1`;
+  }
   if (normalized.startsWith("deepseek")) return (env.DEEPSEEK_BASE_URL || DEFAULT_BASE_URLS.deepseek).replace(/\/+$/, "");
   // `openai-proxy` and similar gateways are expected to expose a compatible
   // /models endpoint via OPENAI_BASE_URL.

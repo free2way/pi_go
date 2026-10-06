@@ -3,11 +3,12 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import Fastify, { type FastifyInstance } from "fastify";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Run } from "../shared/types.js";
 import { DecisionAuditStore } from "./decision-engine/audit-store.js";
 import { loadDecisionEngineConfig } from "./decision-engine/config.js";
 import { createDecisionEngine } from "./decision-engine/index.js";
+import { resetDecisionCircuitBreakers } from "./decision-engine/jev.js";
 import { buildReviewTriageBatches, type ReviewTriageBatch, type ReviewTriageInput } from "./decision-engine/review-triage.js";
 import type {
   DecisionEngine,
@@ -43,6 +44,12 @@ const INTERNAL_TOKEN = "internal-worker-token-for-tests";
 const OWNER = "owner-a";
 /** A credential and a raw-state marker that must never reach a response or a row. */
 const FAKE_KEY = "sk-DUMMY-DO-NOT-LEAK-0123456789abcdef";
+/**
+ * The harness's default platform key. `testConfig()` reports `hasApiKey: true`,
+ * so the env must actually resolve one; a test that exercises vault-only or
+ * "nothing resolves" passes its own `env` explicitly.
+ */
+const HARNESS_ENV_KEY = "sk-DUMMY-HARNESS-PLATFORM-KEY-0123456789";
 const RAW_STATE_MARKER = "SECRET-DIFF-SNIPPET-DO-NOT-LEAK";
 
 const directories: string[] = [];
@@ -177,6 +184,21 @@ async function harness(options: {
   /** Uses the real `createDecisionEngine`/`buildReviewTriageBatches` (no network). */
   realContracts?: boolean;
   findings?: Run["findings"];
+  /**
+   * Provider→key map for the injected vault reader. Absent providers read as
+   * "no credential", exactly like a vault miss.
+   */
+  vaultKeys?: Record<string, string | undefined>;
+  /** Records every `readVaultKey` call so a test can prove a path never queried. */
+  vaultReads?: Array<{ userId: string; provider: string }>;
+  /** The route's env (e.g. a platform `TYPESAFE_API_KEY`). */
+  env?: NodeJS.ProcessEnv;
+  /**
+   * When set, `createEngine` wires the REAL jev engine with this fetch, so the
+   * test can observe the outbound request count and Authorization header
+   * without touching the network.
+   */
+  jevFetch?: typeof fetch;
 } = {}): Promise<Harness> {
   const directory = await mkdtemp(path.join(tmpdir(), "pigo-decision-"));
   directories.push(directory);
@@ -209,10 +231,11 @@ async function harness(options: {
   const deps: DecisionRouteDeps = {
     store,
     audit,
-    env: {},
+    env: options.env ?? { TYPESAFE_API_KEY: HARNESS_ENV_KEY },
     loadConfig: () => options.load ?? { ok: true, config: testConfig() },
     createEngine: (config, engineDeps) => {
       engineConfigs.push(config);
+      if (options.jevFetch) return createDecisionEngine(config, { ...engineDeps, fetchImpl: options.jevFetch });
       return options.realContracts ? createDecisionEngine(config, engineDeps) : engine;
     },
     buildBatches: (input) => {
@@ -223,6 +246,10 @@ async function harness(options: {
     },
     internalAuthorized: (request) => bearerMatches(request.headers.authorization, INTERNAL_TOKEN),
     ownerKeysFor: (request) => [String(request.headers["x-owner"] ?? "")],
+    readVaultKey: (userId, provider) => {
+      options.vaultReads?.push({ userId, provider });
+      return options.vaultKeys?.[provider];
+    },
     now: () => new Date("2026-10-06T00:00:00.000Z"),
   };
 
@@ -672,6 +699,167 @@ describe("review-triage batch fan-out (docs/26 §9.2)", () => {
   });
 });
 
+const PROVIDER_BODY = () => ({
+  model: "jev-1.13.0",
+  answers: {
+    f_01_security_impact: { choice: "possible", probabilities: { none: 0.1, possible: 0.8, material: 0.1 }, confidence: 0.8 },
+  },
+  usage: { input_tokens: 3, output_tokens: 2 },
+});
+
+/** Real jev engine fetch: one valid provider response, never a network call. */
+function providerFetch() {
+  return vi.fn(async () =>
+    new Response(JSON.stringify(PROVIDER_BODY()), { status: 200, headers: { "Content-Type": "application/json" } }),
+  );
+}
+
+describe("decision-plane key resolution — vault first, env fallback (docs/26 §11)", () => {
+  it("prefers the per-user vault key and makes exactly one provider call with it", async () => {
+    resetDecisionCircuitBreakers();
+    const fetchImpl = providerFetch();
+    const vaultReads: Array<{ userId: string; provider: string }> = [];
+    const h = await harness({
+      load: { ok: true, config: testConfig({ maxAttempts: 1, hasApiKey: false }) },
+      vaultKeys: { typesafe: FAKE_KEY },
+      vaultReads,
+      env: { TYPESAFE_API_KEY: "sk-DUMMY-ENV-FALLBACK-MUST-LOSE" },
+      jevFetch: fetchImpl as unknown as typeof fetch,
+    });
+
+    const response = await h.evaluate();
+    expect(response.json()).toMatchObject({ status: "completed", provider: "typesafe", resolvedModel: "jev-1.13.0" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("https://api.typesafe.ai/v1/systemone");
+    expect((init.headers as Record<string, string>).Authorization).toBe(`Bearer ${FAKE_KEY}`);
+    // Looked up by the run owner with the canonical provider id; the vault hit
+    // short-circuits, so the `jev` alias and the env key are never consulted.
+    expect(vaultReads).toEqual([{ userId: h.run.ownerId, provider: "typesafe" }]);
+    // The config carries presence, never the value.
+    expect(h.engineConfigs[0].hasApiKey).toBe(true);
+    expect(JSON.stringify(h.engineConfigs[0])).not.toContain(FAKE_KEY);
+  });
+
+  it("accepts a key stored under the `jev` alias of the provider id", async () => {
+    resetDecisionCircuitBreakers();
+    const fetchImpl = providerFetch();
+    const vaultReads: Array<{ userId: string; provider: string }> = [];
+    const h = await harness({
+      load: { ok: true, config: testConfig({ maxAttempts: 1, hasApiKey: false }) },
+      vaultKeys: { jev: FAKE_KEY },
+      vaultReads,
+      env: {},
+      jevFetch: fetchImpl as unknown as typeof fetch,
+    });
+
+    expect((await h.evaluate()).json()).toMatchObject({ status: "completed" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const [, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+    expect((init.headers as Record<string, string>).Authorization).toBe(`Bearer ${FAKE_KEY}`);
+    expect(vaultReads.map((read) => read.provider)).toEqual(["typesafe", "jev"]);
+  });
+
+  it("falls back to TYPESAFE_API_KEY when the vault has no key, with exactly one provider call", async () => {
+    resetDecisionCircuitBreakers();
+    const fetchImpl = providerFetch();
+    const vaultReads: Array<{ userId: string; provider: string }> = [];
+    const h = await harness({
+      load: { ok: true, config: testConfig({ maxAttempts: 1, hasApiKey: true }) },
+      vaultReads,
+      env: { TYPESAFE_API_KEY: FAKE_KEY },
+      jevFetch: fetchImpl as unknown as typeof fetch,
+    });
+
+    expect((await h.evaluate()).json()).toMatchObject({ status: "completed" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const [, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+    expect((init.headers as Record<string, string>).Authorization).toBe(`Bearer ${FAKE_KEY}`);
+    // Both providers were tried (and missed) before the env fallback applied.
+    expect(vaultReads.map((read) => read.provider)).toEqual(["typesafe", "jev"]);
+  });
+
+  it("reports missing_credentials with no provider call, batch build or audit row when nothing resolves", async () => {
+    resetDecisionCircuitBreakers();
+    const fetchImpl = providerFetch();
+    const h = await harness({
+      load: { ok: true, config: testConfig({ hasApiKey: false }) },
+      vaultKeys: {},
+      env: {},
+      jevFetch: fetchImpl as unknown as typeof fetch,
+    });
+
+    const response = await h.evaluate();
+    expect(response.json()).toMatchObject({
+      status: "fallback",
+      fallbackReason: "missing_credentials",
+      provider: "disabled",
+      answers: [],
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(h.buildCalls).toHaveLength(0);
+    expect(h.engineConfigs).toHaveLength(0);
+    expect(await auditRowCount(h.audit)).toBe(0);
+    expect(await decisionEvents(h.store, h.run.id)).toHaveLength(0);
+  });
+
+  it("never persists the resolved key in the response, the audit row or the events", async () => {
+    resetDecisionCircuitBreakers();
+    const fetchImpl = providerFetch();
+    const h = await harness({
+      load: { ok: true, config: testConfig({ maxAttempts: 1, hasApiKey: false }) },
+      vaultKeys: { typesafe: FAKE_KEY },
+      env: {},
+      jevFetch: fetchImpl as unknown as typeof fetch,
+    });
+
+    const response = await h.evaluate();
+    expect(JSON.stringify(response.json())).not.toContain(FAKE_KEY);
+    const row = (await h.db.query("SELECT * FROM decision_evaluations")).rows[0];
+    expect(JSON.stringify(row)).not.toContain(FAKE_KEY);
+    const events = JSON.stringify(await decisionEvents(h.store, h.run.id));
+    expect(events).not.toContain(FAKE_KEY);
+    const stored = JSON.stringify(await h.audit.listByRun(h.run.id));
+    expect(stored).not.toContain(FAKE_KEY);
+  });
+});
+
+describe("non-jev engines never read the credential vault (docs/26 §11)", () => {
+  it("does not query the vault for a disabled engine or the off kill switch", async () => {
+    const reads: Array<{ userId: string; provider: string }> = [];
+    const disabled = await harness({
+      load: { ok: true, config: testConfig({ engine: "disabled", mode: "shadow" }) },
+      vaultKeys: { typesafe: FAKE_KEY },
+      vaultReads: reads,
+    });
+    expect((await disabled.evaluate()).json()).toMatchObject({ status: "disabled" });
+
+    const off = await harness({
+      load: { ok: true, config: testConfig({ mode: "off" }) },
+      vaultKeys: { typesafe: FAKE_KEY },
+      vaultReads: reads,
+    });
+    expect((await off.evaluate()).json()).toMatchObject({ status: "disabled" });
+
+    expect(reads).toHaveLength(0);
+    expect(disabled.buildCalls).toHaveLength(0);
+    expect(off.buildCalls).toHaveLength(0);
+  });
+
+  it("does not query the vault for the mock engine and leaves `hasApiKey` untouched", async () => {
+    const reads: Array<{ userId: string; provider: string }> = [];
+    const h = await harness({
+      load: { ok: true, config: testConfig({ engine: "mock", mode: "shadow", hasApiKey: false }) },
+      vaultKeys: { typesafe: FAKE_KEY },
+      vaultReads: reads,
+    });
+
+    expect((await h.evaluate()).json()).toMatchObject({ status: "completed" });
+    expect(reads).toHaveLength(0);
+    expect(h.engineConfigs[0].hasApiKey).toBe(false);
+  });
+});
+
 describe("GET /api/runs/:runId/decisions (docs/26 §8.2)", () => {
   it("is owner-scoped like the other run routes", async () => {
     const h = await harness();
@@ -752,7 +940,7 @@ describe("decisionEngineStatus (/api/config/status)", () => {
     const configured = decisionEngineStatus(
       loadDecisionEngineConfig({ PI_DECISION_ENGINE: "jev", PI_JEV_MODE: "shadow", TYPESAFE_API_KEY: FAKE_KEY, PI_JEV_BASE_URL: "https://user:pass@internal.example" }),
     );
-    expect(configured).toEqual({ engine: "jev", mode: "shadow", configured: true, policyVersion: "review-triage-v1" });
+    expect(configured).toEqual({ engine: "jev", mode: "shadow", configured: true, keySource: "env", policyVersion: "review-triage-v1" });
     const serialized = JSON.stringify(configured);
     expect(serialized).not.toContain(FAKE_KEY);
     expect(serialized).not.toContain("internal.example");
@@ -767,6 +955,63 @@ describe("decisionEngineStatus (/api/config/status)", () => {
       configured: false,
       policyVersion: null,
       reason: "missing_credentials",
+    });
+  });
+
+  it("reports a vault-backed jev config as configured with keySource=vault", () => {
+    const loaded = loadDecisionEngineConfig(
+      { PI_DECISION_ENGINE: "jev", PI_JEV_MODE: "shadow" },
+      { allowMissingApiKey: true },
+    );
+    const status = decisionEngineStatus(loaded, { vaultKey: true });
+    expect(status).toEqual({
+      engine: "jev",
+      mode: "shadow",
+      configured: true,
+      keySource: "vault",
+      policyVersion: "review-triage-v1",
+    });
+    expect(JSON.stringify(status)).not.toContain(FAKE_KEY);
+  });
+
+  it("prefers keySource=vault over the platform env key, and degrades to missing_credentials without either", () => {
+    const both = loadDecisionEngineConfig(
+      { PI_DECISION_ENGINE: "jev", PI_JEV_MODE: "shadow", TYPESAFE_API_KEY: FAKE_KEY },
+      { allowMissingApiKey: true },
+    );
+    const vaultWins = decisionEngineStatus(both, { vaultKey: true });
+    expect(vaultWins).toMatchObject({ configured: true, keySource: "vault" });
+    expect(JSON.stringify(vaultWins)).not.toContain(FAKE_KEY);
+
+    const envOnly = decisionEngineStatus(both, { vaultKey: false });
+    expect(envOnly).toMatchObject({ configured: true, keySource: "env" });
+
+    const none = loadDecisionEngineConfig(
+      { PI_DECISION_ENGINE: "jev", PI_JEV_MODE: "shadow" },
+      { allowMissingApiKey: true },
+    );
+    expect(decisionEngineStatus(none, { vaultKey: false })).toEqual({
+      engine: "disabled",
+      mode: "off",
+      configured: false,
+      policyVersion: null,
+      reason: "missing_credentials",
+    });
+  });
+
+  it("never reports a key source for disabled/mock, even with a vault key present", () => {
+    expect(decisionEngineStatus(loadDecisionEngineConfig({}), { vaultKey: true })).toEqual({
+      engine: "disabled",
+      mode: "off",
+      configured: false,
+      policyVersion: "review-triage-v1",
+    });
+    const mock = loadDecisionEngineConfig({ PI_DECISION_ENGINE: "mock", TYPESAFE_API_KEY: FAKE_KEY });
+    expect(decisionEngineStatus(mock, { vaultKey: true })).toEqual({
+      engine: "mock",
+      mode: "off",
+      configured: false,
+      policyVersion: "review-triage-v1",
     });
   });
 

@@ -7,7 +7,10 @@
  * typo their way into sending data somewhere unexpected.
  *
  * `TYPESAFE_API_KEY` is presence-only here: the config carries `hasApiKey`, never
- * the value (the adapter reads the secret at call time). Error details never
+ * the value (the adapter reads the secret at call time). A deployer may also
+ * leave it unset and store the key in the credential vault instead; the
+ * decision route then recomputes key availability per request (see
+ * `allowMissingApiKey`). Error details never
  * echo any variable value, so a mis-typed key can never reach a log.
  */
 
@@ -37,6 +40,20 @@ export const DECISION_ENGINE_DEFAULTS = {
 export type LoadDecisionEngineConfigResult =
   | { ok: true; config: DecisionEngineConfig }
   | { ok: false; reason: FallbackReason; detail: string };
+
+export interface LoadDecisionEngineConfigOptions {
+  /**
+   * When true, `engine=jev` loads even without `TYPESAFE_API_KEY` in the
+   * environment because the key can be resolved per run from the credential
+   * vault (docs/26 §11 "现有 secret 管理能力"). The caller is then responsible
+   * for the AT-JEV-003 preflight — the evaluate route and `decisionEngineStatus`
+   * report `missing_credentials` when neither the vault nor the env resolves.
+   *
+   * Defaults to false so the pure env loader keeps its strict contract for every
+   * other caller (and its documented unit tests).
+   */
+  allowMissingApiKey?: boolean;
+}
 
 const ENGINE_VALUES = ["disabled", "mock", "jev"] as const;
 const MODE_VALUES = ["off", "shadow", "assist", "enforce"] as const;
@@ -110,9 +127,14 @@ function describeIssues(error: z.ZodError): string {
  * Loads and strictly validates the decision-plane configuration.
  *
  * Failure reasons are limited to the standard enum: parse failures are
- * `invalid_configuration`; `engine=jev` without a key is `missing_credentials`.
+ * `invalid_configuration`; `engine=jev` without a key is `missing_credentials`
+ * unless the caller opts into resolving the key at runtime
+ * (`allowMissingApiKey`, e.g. from the per-user credential vault).
  */
-export function loadDecisionEngineConfig(env: NodeJS.ProcessEnv): LoadDecisionEngineConfigResult {
+export function loadDecisionEngineConfig(
+  env: NodeJS.ProcessEnv,
+  options: LoadDecisionEngineConfigOptions = {},
+): LoadDecisionEngineConfigResult {
   const baseUrl = raw(env, "PI_JEV_BASE_URL") ?? DECISION_ENGINE_DEFAULTS.baseUrl;
   const hasApiKey = raw(env, "TYPESAFE_API_KEY") !== undefined;
 
@@ -145,7 +167,7 @@ export function loadDecisionEngineConfig(env: NodeJS.ProcessEnv): LoadDecisionEn
     };
   }
 
-  if (values.PI_DECISION_ENGINE === "jev" && !hasApiKey) {
+  if (values.PI_DECISION_ENGINE === "jev" && !hasApiKey && !options.allowMissingApiKey) {
     return {
       ok: false,
       reason: "missing_credentials",

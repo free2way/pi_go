@@ -29,6 +29,13 @@ export const MAX_RETRIES = 1;
 
 export interface JevDeps extends EngineDeps {
   fetchImpl?: typeof fetch;
+  /**
+   * Additive key seam: when provided (production wires it to the credential
+   * vault, falling back to `TYPESAFE_API_KEY`), it is the ONLY key source. When
+   * absent the adapter keeps reading `process.env.TYPESAFE_API_KEY` at call time.
+   * The returned value never leaves this module.
+   */
+  resolveApiKey?: () => string | undefined;
 }
 
 export interface ProviderQuestion {
@@ -96,6 +103,13 @@ function readApiKey(): string | undefined {
   const trimmed = value === undefined ? "" : String(value).trim();
   return trimmed === "" ? undefined : trimmed;
 }
+
+/**
+ * The key source for one engine instance: the injected resolver (vault-first,
+ * env fallback) when present, otherwise the process environment. It is read at
+ * every call so a rotated vault credential takes effect without a restart.
+ */
+export type ApiKeyResolver = () => string | undefined;
 
 export interface CircuitBreakerOptions {
   threshold?: number;
@@ -273,6 +287,7 @@ function failureEvaluation(input: FailureEvaluationInput): DecisionEvaluation {
 export function createJevEngine(config: DecisionEngineConfig, deps: JevDeps = {}): DecisionEngine {
   const now = deps.now ?? (() => new Date());
   const fetchImpl = deps.fetchImpl ?? fetch;
+  const resolveApiKey: ApiKeyResolver = deps.resolveApiKey ?? readApiKey;
   const endpoint = `${config.baseUrl.replace(/\/+$/, "")}/v1/systemone`;
 
   return {
@@ -281,7 +296,7 @@ export function createJevEngine(config: DecisionEngineConfig, deps: JevDeps = {}
       const fail = (reason: FallbackReason, detail: string, status?: DecisionStatus) =>
         failureEvaluation({ request, config, now, startedAt, reason, detail, status });
 
-      const apiKey = readApiKey();
+      const apiKey = resolveApiKey();
       if (!apiKey) return fail("missing_credentials", "no TypeSafe API key is configured");
 
       const limits = checkPayloadLimits(request.state, request.questions, {
