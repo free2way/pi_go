@@ -58,6 +58,33 @@ describe("provider probe", () => {
     expect(await probe({ provider: "jev", apiKey: "bad-key" })).toMatchObject({ ok: false, code: "PROBE_UNAUTHORIZED" });
   });
 
+  it("reads TypeSafe's `name`-keyed model list (live /v1/models carries name, not id)", async () => {
+    // `GET https://api.typesafe.ai/v1/models` → {"models":[{"name","description","release_date"}]}.
+    // Keying on `id` alone yielded zero models for a verified-live key.
+    const probe = createProviderProbe({
+      env: { PI_JEV_BASE_URL: "https://jev.example" } as NodeJS.ProcessEnv,
+      fetchImpl: (async () =>
+        jsonResponse({
+          models: [
+            { name: "jev-latest", description: "General-purpose system one model.", release_date: "2026-09-15" },
+            { name: "jev-1.13.0", description: "Pinned release.", release_date: "2026-09-15" },
+          ],
+        })) as unknown as typeof fetch,
+    });
+    expect(await probe({ provider: "typesafe", apiKey: "live-key" })).toMatchObject({
+      ok: true,
+      models: ["jev-latest", "jev-1.13.0"],
+    });
+  });
+
+  it("keeps preferring `id` when a provider reports both fields", async () => {
+    const probe = createProviderProbe({
+      env: { PI_PROVIDER_PROBE_BASE_URL: "https://provider.example/v1" } as NodeJS.ProcessEnv,
+      fetchImpl: (async () => jsonResponse({ data: [{ id: "by-id", name: "by-name" }] })) as unknown as typeof fetch,
+    });
+    expect(await probe({ provider: "deepseek", apiKey: "secret-key" })).toMatchObject({ ok: true, models: ["by-id"] });
+  });
+
   it("returns the provider model ids on a successful probe (AT-MODEL-001/004)", async () => {
     const calls: string[] = [];
     const probe = createProviderProbe({

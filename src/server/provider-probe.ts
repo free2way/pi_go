@@ -211,7 +211,15 @@ export function createProviderProbe(options: ProviderProbeOptions = {}): Provide
           `[probe-diag] provider=${provider} http=${response.status} topLevel=[${shape}] parsed=${rawList.length} firstItemKeys=[${firstItem}]`,
         );
       }
-      const models = rawList.map((item) => String(objectOrUndefined(item)?.id || "").trim()).filter(Boolean);
+      // `/v1/models` items are provider-specific: OpenAI-style lists carry `id`,
+      // TypeSafe System One carries `name` (verified against the live
+      // `GET https://api.typesafe.ai/v1/models` OpenAPI schema). Accept both.
+      const models = rawList
+        .map((item) => {
+          const record = objectOrUndefined(item);
+          return String(record?.id ?? record?.name ?? "").trim();
+        })
+        .filter(Boolean);
       const capabilities = extractCapabilities(rawList);
       return capabilities ? { ok: true, models, capabilities } : { ok: true, models };
     } catch (error) {

@@ -230,6 +230,48 @@ describe("jev engine — retry table", () => {
     expect(evaluation.detail).toMatch(/schema=[0-9a-f]{64}/);
   });
 
+  it("logs the validation loc/msg for a live 422 only with PI_JEV_DIAG=1, never an echoed input", async () => {
+    // A live 422 is otherwise indistinguishable by field; FastAPI returns
+    // `{"detail":[{"loc","msg","type","input"}]}` and may echo the offending
+    // value, so the diagnostic reads loc/msg/type and nothing else.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const body = {
+        detail: [
+          {
+            loc: ["body", "questions", "q_score", "criteria"],
+            msg: "Field required",
+            type: "missing",
+            input: { echoed: "SECRET-ECHO-MUST-NOT-BE-LOGGED" },
+          },
+        ],
+      };
+      process.env.PI_JEV_DIAG = "1";
+      const withDiag = createJevEngine(config(), {
+        fetchImpl: (async () => json(body, 422)) as unknown as typeof fetch,
+      });
+      const evaluation = await withDiag.evaluate(request());
+      expect(evaluation.fallbackReason).toBe("contract_invalid");
+      const logged = warn.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(logged).toContain("loc=body.questions.q_score.criteria");
+      expect(logged).toContain("msg=Field required");
+      expect(logged).not.toContain(API_KEY);
+      expect(logged).not.toContain("SECRET-ECHO-MUST-NOT-BE-LOGGED");
+      expect(logged).not.toContain("echoed");
+
+      warn.mockClear();
+      delete process.env.PI_JEV_DIAG;
+      const withoutDiag = createJevEngine(config({ model: "jev-quiet" }), {
+        fetchImpl: (async () => json(body, 422)) as unknown as typeof fetch,
+      });
+      expect((await withoutDiag.evaluate(request({ evaluationId: "de_quiet" }))).fallbackReason).toBe("contract_invalid");
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.PI_JEV_DIAG;
+      warn.mockRestore();
+    }
+  });
+
   it("does not retry an other 4xx", async () => {
     const fetchImpl = vi.fn(async () => json({ error: "bad request" }, 400));
     const engine = createJevEngine(config(), { fetchImpl: fetchImpl as unknown as typeof fetch });

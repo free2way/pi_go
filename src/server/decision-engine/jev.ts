@@ -281,6 +281,43 @@ function failureEvaluation(input: FailureEvaluationInput): DecisionEvaluation {
 }
 
 /**
+ * Safe summary of a provider error response for the temporary `PI_JEV_DIAG`
+ * diagnostic: HTTP-level field NAMES plus validation locations/messages only.
+ * FastAPI's `HTTPValidationError.detail[]` carries `loc`/`msg`/`type`, but some
+ * errors also echo the offending `input` — those keys are never read here, so
+ * no `state`, question or credential content can reach the log.
+ */
+async function describeProviderError(response: Response): Promise<string> {
+  const text = await response.text();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text) as unknown;
+  } catch {
+    parsed = undefined;
+  }
+  const record =
+    parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : undefined;
+  if (!record) return `bodyKind=${typeof parsed} len=${text.length}`;
+  const parts: string[] = [];
+  const detail = record.detail;
+  if (Array.isArray(detail)) {
+    for (const item of detail.slice(0, 8)) {
+      const entry = item && typeof item === "object" ? (item as Record<string, unknown>) : undefined;
+      if (!entry) continue;
+      const loc = Array.isArray(entry.loc) ? entry.loc.map((value) => String(value)).join(".") : "-";
+      parts.push(`loc=${loc} msg=${String(entry.msg ?? "").slice(0, 120)} type=${String(entry.type ?? "")}`);
+    }
+  } else if (typeof detail === "string") {
+    parts.push(`detail=${detail.slice(0, 160)}`);
+  }
+  for (const key of ["error", "message", "error_type"]) {
+    const value = record[key];
+    if (typeof value === "string") parts.push(`${key}=${value.slice(0, 160)}`);
+  }
+  return `keys=[${Object.keys(record).join(",")}] ${parts.join(" | ")}`;
+}
+
+/**
  * Creates the Jev engine. It never throws: every failure becomes a structured
  * fallback/rejected evaluation so the caller's existing flow keeps running.
  */
@@ -289,6 +326,7 @@ export function createJevEngine(config: DecisionEngineConfig, deps: JevDeps = {}
   const fetchImpl = deps.fetchImpl ?? fetch;
   const resolveApiKey: ApiKeyResolver = deps.resolveApiKey ?? readApiKey;
   const endpoint = `${config.baseUrl.replace(/\/+$/, "")}/v1/systemone`;
+  const diag = process.env.PI_JEV_DIAG === "1";
 
   return {
     evaluate: async (request: DecisionRequest, callerSignal?: AbortSignal): Promise<DecisionEvaluation> => {
@@ -403,6 +441,14 @@ export function createJevEngine(config: DecisionEngineConfig, deps: JevDeps = {}
           }
 
           const status = response.status;
+          if (diag) {
+            // Temporary, env-gated (`PI_JEV_DIAG=1`) diagnostic: a live 422 is
+            // otherwise indistinguishable by field. `describeProviderError` logs
+            // only validation locations/messages and top-level field names — it
+            // never logs `input`/`ctx`/`state`/the payload or anything key-derived.
+            const described = await describeProviderError(response).catch(() => "body-unreadable");
+            console.warn(`[jev-diag] HTTP ${status} ${described}`);
+          }
           if (status === 401 || status === 403) {
             breaker.onAuthFailure();
             return fail("authentication_failed", `provider rejected the credentials (HTTP ${status})`);
