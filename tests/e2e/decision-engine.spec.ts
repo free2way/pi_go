@@ -435,16 +435,17 @@ test.describe("JEV 决策平面 shadow 契约", () => {
       // 不落审计行、不写事件（docs/26 §6.3.1）。这条分支必须显式断言「零证据」，
       // 否则会把「什么都没发生」误判成通过。
       // ---------------------------------------------------------------------
-      const unresolved = (run.findings ?? []).filter((finding) => !finding.resolved).length;
+      const findings = run.findings ?? [];
+      const unresolved = findings.filter((finding) => !finding.resolved).length;
       test.info().annotations.push({
         type: "findings",
-        description: `run=${runId} findings=${(run.findings ?? []).length} unresolved=${unresolved}`,
+        description: `run=${runId} findings=${findings.length} unresolved=${unresolved}`,
       });
       const decisionWaitMs = Number(envValue("PI_E2E_DECISION_SETTLE_MS") ?? 60_000);
       let events: RunEvent[] = [];
       let decisions: DecisionProjection[] = [];
 
-      if (unresolved === 0) {
+      if (findings.length === 0) {
         // 让 gateway 有机会落盘（若它错误地评估了），再断言它确实没有。
         await new Promise((resolve) => setTimeout(resolve, Math.min(decisionWaitMs, 20_000)));
         events = await getRunEvents(request, runId);
@@ -452,11 +453,11 @@ test.describe("JEV 决策平面 shadow 契约", () => {
         const decisionEvents = events.filter((event) => event.type.startsWith("decision."));
         expect(
           decisionEvents,
-          `无未解决 findings 时不应有任何决策事件（实测：${decisionEvents.map((event) => event.type).join(", ")}；事件流：\n${events.map(describeEvent).join("\n")}）`,
+          `该运行从未有过 finding，因此无任何可问内容，不应产生决策事件（实测：${decisionEvents.map((event) => event.type).join(", ")}；事件流：\n${events.map(describeEvent).join("\n")}）`,
         ).toEqual([]);
         expect(
           decisions.filter((decision) => decision.kind === "review_triage"),
-          "无未解决 findings 时不应写入 review_triage 审计行（空 questions 会被 provider 拒绝为 422）",
+          "无 findings 时不应写入 review_triage 审计行（空 questions 会被 provider 拒绝为 422）",
         ).toEqual([]);
         const verdict = events.filter(
           (event) => event.type === "review.approved" || event.type === "review.changes_requested",
@@ -477,7 +478,7 @@ test.describe("JEV 决策平面 shadow 契约", () => {
             return requestedCount > 0 && requestedCount === outcomeCount && decisions.some((d) => d.kind === "review_triage");
           },
           {
-            message: `Run ${runId} 到达终态后 ${decisionWaitMs}ms 内仍未出现完整的决策证据（至少一行 review_triage 审计 + 成对的 decision.requested/completed|fallback）。reason=构建里 worker 的审核调用点（docs/26 §9.1）没有调用 POST /api/internal/decisions/evaluate，或 worker 自身未设置 PI_JEV_MODE（src/worker/decision-triage.ts 在 worker 进程读 PI_JEV_MODE）。该运行 unresolved=${unresolved}，因此必须产生证据。已见事件类型：${[...new Set(events.map((e) => e.type))].join(", ")}`,
+            message: `Run ${runId} 到达终态后 ${decisionWaitMs}ms 内仍未出现完整的决策证据（至少一行 review_triage 审计 + 成对的 decision.requested/completed|fallback）。reason=构建里 worker 的审核调用点（docs/26 §9.1）没有调用 POST /api/internal/decisions/evaluate，或 worker 自身未设置 PI_JEV_MODE（src/worker/decision-triage.ts 在 worker 进程读 PI_JEV_MODE）。该运行有 findings=${findings.length}（未解决 ${unresolved}），按选取策略必须产生决策证据。已见事件类型：${[...new Set(events.map((e) => e.type))].join(", ")}`,
             timeout: decisionWaitMs,
             intervals: [1_000, 2_000, 5_000],
           },
