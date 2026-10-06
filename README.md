@@ -159,10 +159,11 @@ docs/                产品规格、验收矩阵、架构决策和诊断报告
 
 ### 当前审核结论
 
-仓库已通过 v0.26.4 的自动化发布门禁和本地真库验收。当前仍有两个建议在生产验收前处理：
+仓库已通过 v0.26.4 的自动化发布门禁和本地真库验收。验收进程退出后的清理阶段又复现了一个门禁未捕获的取消竞态；当前有三个事项应在生产验收前处理：
 
-1. Decision Brief 的“改动范围”门禁尚未持久化业务允许路径；目前只能可靠拦截生成物和脏文件。
-2. Decision Brief 在所有终态都会展开并显示动作按钮，前端应按状态限制“继续开发 / 接受交付”，避免对已完成或已取消任务发出无效请求。
+1. 取消仍在执行的 Demo Run 时存在状态竞态，异常分支可能再次写入 `failed`，导致 Web 进程因 `cancelled → failed` 非法迁移而退出。
+2. Decision Brief 的“改动范围”门禁尚未持久化业务允许路径；目前只能可靠拦截生成物和脏文件。
+3. Decision Brief 在所有终态都会展开并显示动作按钮，前端应按状态限制“继续开发 / 接受交付”，避免对已完成或已取消任务发出无效请求。
 
 完整证据与文件定位见 [v0.26.4 代码审核与验收报告](docs/23-code-review-v0.26.4.md)。
 
@@ -262,10 +263,11 @@ docs/                Product, architecture, acceptance and diagnostic documents
 
 ### Review status
 
-The v0.26.4 release gate and local PostgreSQL-backed acceptance suite pass. Two items remain before production sign-off:
+The v0.26.4 release gate and local PostgreSQL-backed acceptance suite pass. During post-suite cleanup, a cancellation race not covered by the gate was reproduced. Three items remain before production sign-off:
 
-1. Decision Brief does not yet persist business-specific allowed paths, so its scope gate can currently guarantee generated/dirty-file exclusion but not full requirement-level scope.
-2. Decision Brief action buttons should be state-gated so completed, failed or cancelled runs cannot issue invalid continue/accept requests.
+1. Cancelling an active Demo Run can race its background transition; the error path may then attempt `cancelled → failed` and terminate the Web process with an unhandled state-transition error.
+2. Decision Brief does not yet persist business-specific allowed paths, so its scope gate can currently guarantee generated/dirty-file exclusion but not full requirement-level scope.
+3. Decision Brief action buttons should be state-gated so completed, failed or cancelled runs cannot issue invalid continue/accept requests.
 
 See the [v0.26.4 code review and acceptance report](docs/23-code-review-v0.26.4.md) for evidence and exact file locations.
 

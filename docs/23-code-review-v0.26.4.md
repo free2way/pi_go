@@ -5,11 +5,18 @@
 
 ## 结论
 
-**有条件通过。** 多模型路由、多 Agent 编排、独立 Reviewer、确定性检查、敏捷实体、人工审批与发布 Hook 的主链路已经形成；发布门禁和本地真库验收通过。以下两个产品级缺口不阻断本次仓库交付，但应在生产验收签字前关闭。
+**有条件通过。** 多模型路由、多 Agent 编排、独立 Reviewer、确定性检查、敏捷实体、人工审批与发布 Hook 的主链路已经形成；发布门禁和本地真库验收通过。验收进程结束后的清理阶段又复现了一个门禁未捕获的取消竞态。以下三个产品级缺口不阻断本次仓库交付，但 P1-1 必须在生产验收签字前关闭。
 
 ## 主要发现
 
-### P1：Decision Brief 的业务范围门禁可能产生假绿
+### P1-1：取消 Demo Run 的竞态可能终止 Web 进程
+
+- 位置：`src/server/demo-runner.ts:76-97`、`src/server/demo-runner.ts:243-246`
+- 复现：浏览器验收取消仍在执行的 Demo Run 后，后台流程在读状态与更新状态之间遇到取消；第一次更新抛出 `InvalidStateTransitionError`，catch 又尝试把 `cancelled` 更新为 `failed`，第二次异常未被处理，Node.js 进程退出。
+- 影响：默认启用 Demo 模式的 Web 服务可被一次正常取消操作触发拒绝服务；严格验收门禁在浏览器进程结束时即判定通过，没有等待后台 Demo 协程收敛，因此漏检。
+- 建议：把取消视为幂等终态；状态更新失败后重新读取最新状态，若为 `cancelled` 立即返回。catch 中的失败写入必须使用条件更新或捕获 `InvalidStateTransitionError`。增加“在 emit 读取后、update 前取消”的确定性竞态测试，并让 E2E 在取消后等待健康检查。
+
+### P1-2：Decision Brief 的业务范围门禁可能产生假绿
 
 - 位置：`src/server/decision-brief.ts:184-193`
 - 证据：服务端构造 Decision Brief 输入时固定传入 `allowedPaths: null`。
@@ -43,11 +50,11 @@
 | PostgreSQL concurrency check | PASS，19 / 19 |
 | Playwright 浏览器验收 | PASS，17 passed / 9 个生产环境场景 skipped |
 
-严格验收中的生产专用身份、真实 Provider 凭据与外部发布目标，需要在生产环境另行验证；本地通过不替代生产签字。
+门禁汇总为 8 passed / 0 failed / 0 skipped，但浏览器套件结束后的延迟异常复现了 P1-1，因此该 PASS 不能覆盖 Demo 取消竞态。严格验收中的生产专用身份、真实 Provider 凭据与外部发布目标，需要在生产环境另行验证；本地通过不替代生产签字。
 
 ## 验收建议
 
 - 仓库交付：**通过**。
 - 多 Agent 主链路：**通过**。
-- 生产上线：**有条件通过**，须完成 P1，并建议同步完成 P2。
+- 生产上线：**暂不签字**，须先完成 P1-1；P1-2 应在业务范围门禁作为验收依据前完成，并建议同步完成 P2。
 - GitHub 同步：以本报告对应提交为基线；推送后应在远端 CI 再运行 `npm run gate:release`，生产候选环境运行 `npm run gate:acceptance`。
