@@ -148,6 +148,8 @@ web 进程没有任何工作区文件系统读取或 `git` 子进程——`src/s
   只记录字段名/定位，默认关闭。
 - **无可问内容不发调用**：本轮没有未解决 findings 时，构造器不产出批次，路由返回业务安全
   no-op（`payload_rejected` / `nothing to triage`），零外发、零审计行（provider 侧空 `questions` 是 422）。
+  若运行**有过** findings 但都已解决，则按"未解决优先、全量兜底"策略评估完整 findings 集
+  （内部 `resolved` 不外发），保证 shadow 阶段持续有校准样本。
 - 上线真实调用前需完成供应商准入与合规评审（docs/26 §14.3）。生产当前为 `jev`+`shadow`（只记录、
   不改判，3s 预算 + 熔断兜底）；演示环境维持文档约定的 `mock`+`shadow`（无网络）。
 - 验收：`tests/e2e/decision-engine.spec.ts`（部署未启用时精确跳过）；离线用例覆盖配置/脱敏/

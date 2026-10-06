@@ -178,12 +178,23 @@ export function diffChangeStats(diff: string | null | undefined): ReviewTriageSt
   return { files, addedLines, deletedLines, diffComplete };
 }
 
-/** Unresolved findings in a stable order (severity, then stable key). */
+/**
+ * The findings this run's triage asks about, in a stable order (severity, then
+ * stable key). Unresolved findings come first — they are the actionable set —
+ * and when a round has none (everything already fixed, or an approved round)
+ * the run's complete finding set is used instead, so shadow calibration still
+ * gets its samples instead of going silent. `resolved` is never projected into
+ * the outbound state (see `findingProjection`), so the fallback does not bias
+ * the answers.
+ */
 export function selectReviewFindings(run: Run): Finding[] {
-  return (run.findings ?? [])
-    .filter((finding) => !finding.resolved)
-    .slice()
-    .sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity] || findingStableKey(a).localeCompare(findingStableKey(b)));
+  const stableOrder = (findings: Finding[]): Finding[] =>
+    findings
+      .slice()
+      .sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity] || findingStableKey(a).localeCompare(findingStableKey(b)));
+  const all = run.findings ?? [];
+  const unresolved = stableOrder(all.filter((finding) => !finding.resolved));
+  return unresolved.length > 0 ? unresolved : stableOrder(all);
 }
 
 function taskSummaryOf(run: Run): string {
@@ -329,10 +340,10 @@ export function buildReviewTriageBatches(input: ReviewTriageInput, limits: Revie
     maxBytes: limits.maxBytes ?? DECISION_ENGINE_DEFAULTS.maxStateBytes,
   };
   const allFindings = selectReviewFindings(input.run);
-  // Nothing unresolved ⇒ nothing to ask. An empty `questions` object is invalid
-  // for the provider (`minProperties: 1`; verified live as HTTP 422
-  // `loc=body.questions … too_short`), so no batch is produced at all and the
-  // caller returns a business-safe no-op without any outbound call or audit row.
+  // Nothing to ask at all (a run that never had a finding) ⇒ no batch. An empty
+  // `questions` object is invalid for the provider (`minProperties: 1`; verified
+  // live as HTTP 422 `loc=body.questions … too_short`), so no batch is produced
+  // and the caller returns a business-safe no-op without any outbound call.
   if (allFindings.length === 0) return [];
   const chunkSize = Math.max(1, Math.floor(input.maxFindings));
   const chunks: Finding[][] = [];

@@ -333,6 +333,11 @@ GET /api/runs/:runId/decisions
 限制：
 
 - 默认最多 50 个 findings；更多内容按稳定顺序分批，任一批失败不影响 review 主流程。
+- **选取策略（2026-10-06 定稿）**：优先取**未解决**的 findings；若本轮没有任何未解决项
+  （全部已修复，或 approved 轮次），改为取该运行的**完整 findings 集**作为兜底，让 shadow
+  阶段持续攒到校准样本；两者皆空（从未有过 finding）⇒ 不发起调用（provider 侧空 `questions`
+  是 422）。排序恒为严重度、再按稳定 key。内部 `resolved` 字段**永不进入外发状态**，
+  因此兜底不会让模型"知道"问题已修。
 - 不发送完整 diff、完整文件内容、终端日志、环境变量、凭据或绝对本机路径。
 - `taskSummary`、AC 和 excerpt 都必须经过 secret/PII redaction。
 - 超出 payload 上限时先裁剪非关键摘要；仍超限则 fallback，不静默截断问题定义。

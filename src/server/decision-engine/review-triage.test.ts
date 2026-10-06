@@ -215,13 +215,23 @@ describe("review-triage request", () => {
     expect(buildReviewTriageRequest(input(run))).toEqual(batches[0].request);
   });
 
-  it("produces no batch when the run has no unresolved findings (empty questions are invalid)", () => {
-    // Live evidence (prod, v0.27.13): a run whose findings were all resolved was
-    // still dispatched with `questions: {}`, and TypeSafe answered
-    // `HTTP 422 loc=body.questions msg=Dictionary should have at least 1 item
-    // after validation, not 0 type=too_short`. Nothing to ask ⇒ no request.
+  it("falls back to the resolved findings when nothing is unresolved (shadow coverage)", () => {
+    // Policy: unresolved findings are the primary target; an approved round whose
+    // findings were all fixed still gets evaluated, so shadow calibration keeps
+    // collecting samples instead of going silent. `resolved` is never projected.
+    const run = makeRun({ findings: [finding({ resolved: true })] });
+    const batches = buildReviewTriageBatches(input(run));
+    expect(batches).toHaveLength(1);
+    expect(Object.keys(batches[0].request.questions)).toHaveLength(4);
+    expect(JSON.stringify(batches[0].request.state)).not.toContain("resolved");
+  });
+
+  it("produces no batch when the run never had a finding (empty questions are invalid)", () => {
+    // Live evidence (prod, v0.27.13): a run with no findings was dispatched with
+    // `questions: {}` and TypeSafe answered `HTTP 422 loc=body.questions
+    // msg=Dictionary should have at least 1 item after validation, not 0
+    // type=too_short`. Nothing to ask ⇒ no request.
     expect(buildReviewTriageBatches(input(makeRun({ findings: [] })))).toEqual([]);
-    expect(buildReviewTriageBatches(input(makeRun({ findings: [finding({ resolved: true })] })))).toEqual([]);
   });
 });
 
