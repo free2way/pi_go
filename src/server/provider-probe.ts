@@ -193,6 +193,24 @@ export function createProviderProbe(options: ProviderProbeOptions = {}): Provide
         | { data?: unknown; models?: unknown }
         | undefined;
       const rawList = Array.isArray(body?.data) ? body!.data : Array.isArray(body?.models) ? body!.models : [];
+      // Temporary, env-gated diagnostic (`PI_PROBE_DIAG=1`): a provider whose
+      // `/models` shape differs from `data[]/models[].id` verifies live but
+      // yields an empty list. Logs field NAMES, types and entry counts only —
+      // never a value, never anything derived from the key.
+      if (env.PI_PROBE_DIAG === "1") {
+        const shape =
+          body && typeof body === "object" && !Array.isArray(body)
+            ? Object.entries(body as Record<string, unknown>)
+                .map(([key, value]) => `${key}:${Array.isArray(value) ? `array(${value.length})` : typeof value}`)
+                .join(", ")
+            : Array.isArray(body)
+              ? `array(${body.length})`
+              : typeof body;
+        const firstItem = Array.isArray(body?.data) && body.data[0] ? Object.keys(objectOrUndefined(body.data[0]) ?? {}).join("|") : "-";
+        console.warn(
+          `[probe-diag] provider=${provider} http=${response.status} topLevel=[${shape}] parsed=${rawList.length} firstItemKeys=[${firstItem}]`,
+        );
+      }
       const models = rawList.map((item) => String(objectOrUndefined(item)?.id || "").trim()).filter(Boolean);
       const capabilities = extractCapabilities(rawList);
       return capabilities ? { ok: true, models, capabilities } : { ok: true, models };
