@@ -18,6 +18,6 @@ EXPOSE 3100
 CMD ["node", "dist/server/index.js"]
 
 # 工作区/仓库校验需要 git（与 Dockerfile.worker 保持一致；此前缺失会导致
-default branch/dirty 校验失败并把工作区标记 invalid）
+# 分支/dirty 校验失败并把工作区标记 invalid）
 RUN apt-get update && apt-get install -y --no-install-recommends git \
   && rm -rf /var/lib/apt/lists/*
