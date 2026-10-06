@@ -39,6 +39,18 @@ describe("providerIdsForCards (decision-plane provider visibility)", () => {
     expect(providerIdsForCards({ models: [model("deepseek", "deepseek/chat")] }, undefined)).toEqual(["deepseek"]);
     expect(providerIdsForCards(undefined, credentials(DECISION_PROVIDER_ID))).toEqual(["typesafe"]);
   });
+
+  it("offers the decision-plane card before any credential exists (first-run entry point)", () => {
+    // A deployment that reports a decision engine must let the operator store the
+    // key even though `typesafe` has no catalogue models and no stored credential.
+    expect(providerIdsForCards({ models: [model("deepseek", "deepseek/chat")] }, credentials("deepseek"), { engine: "mock" }))
+      .toEqual(["deepseek", "typesafe"]);
+    expect(providerIdsForCards({ models: [] }, undefined, { engine: "disabled" })).toEqual(["typesafe"]);
+  });
+
+  it("omits the decision-plane card when the deployment reports no decision engine", () => {
+    expect(providerIdsForCards({ models: [model("deepseek", "deepseek/chat")] }, credentials("deepseek"))).toEqual(["deepseek"]);
+  });
 });
 
 describe("providerIdentity", () => {

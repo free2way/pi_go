@@ -29,18 +29,24 @@ export interface ProviderIdentity {
 }
 
 /**
- * A card is rendered for every provider in `catalogue ∪ stored credentials`.
- * Providers that have a credential but no catalogue models (the decision-plane
- * `typesafe` key, which never enters the developer/reviewer catalog) must stay
- * visible — otherwise a saved key could never be rotated or deleted.
+ * A card is rendered for every provider in `catalogue ∪ stored credentials`,
+ * plus the decision-plane provider whenever the deployment reports a decision
+ * engine. Providers that have a credential but no catalogue models (the
+ * decision-plane `typesafe` key, which never enters the developer/reviewer
+ * catalog) must stay visible — otherwise a saved key could never be rotated or
+ * deleted. The decision provider is added even without a stored credential:
+ * `typesafe` has no catalogue models, so on a fresh deployment there would
+ * otherwise be no card at all and the operator could never enter the key.
  * Ordering follows the catalogue so the existing cards stay where they were.
  */
 export function providerIdsForCards(
   catalog: Pick<ModelCatalogResponse, "models"> | undefined,
   status: Pick<CredentialStatus, "providers"> | undefined,
+  decisionEngine?: Pick<DecisionEngineStatus, "engine"> | undefined,
 ): string[] {
   const ids = (catalog?.models ?? []).map((entry) => entry.provider);
   for (const item of status?.providers ?? []) ids.push(item.provider);
+  if (decisionEngine) ids.push(DECISION_PROVIDER_ID);
   return [...new Set(ids)];
 }
 
@@ -114,7 +120,7 @@ export function ModelsPage({ config, onChanged }: { config?: ModelsPageConfig; o
 
   useEffect(() => { void load(); }, [load]);
 
-  const providers = providerIdsForCards(catalog, status);
+  const providers = providerIdsForCards(catalog, status, config?.decisionEngine);
   const credentialFor = (provider: string) => status?.providers.find((item) => item.provider === provider);
 
   const saveProvider = async (provider: string) => {
