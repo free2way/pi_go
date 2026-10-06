@@ -140,8 +140,16 @@ web 进程没有任何工作区文件系统读取或 `git` 子进程——`src/s
   级回退**：取 key 的顺序为 该用户 vault（`typesafe` → `jev` 别名）→ 环境变量；部署未启用引擎时
   不读 vault、零外呼。
 - **存 key ≠ 启用**：卡片会显示部署侧引擎/模式，未启用时明确提示还需部署侧
-  `PI_DECISION_ENGINE=jev`（保存凭据不会打开决策平面）。
-- 上线真实调用前需完成供应商准入与合规评审（docs/26 §14.3）。
+  `PI_DECISION_ENGINE=jev`（保存凭据不会打开决策平面）。缺凭据时状态仍如实报告
+  `engine=jev / configured=false / reason=missing_credentials`，不会伪装成「引擎未启用」。
+- **线上契约已实测校准**（docs/26 §6.3.1）：2026-10-06 在 prod（`jev`+`shadow`）完成首次真实调用，
+  `status=completed`、`resolvedModel=jev-1.13.0`、24 条回答、886ms/4238+986 tok、`applied_outcome=none`、
+  `estimated_cost_usd` 仍为 NULL。排查契约漂移用 `PI_JEV_DIAG=1`（引擎）与 `PI_PROBE_DIAG=1`（探测），
+  只记录字段名/定位，默认关闭。
+- **无可问内容不发调用**：本轮没有未解决 findings 时，构造器不产出批次，路由返回业务安全
+  no-op（`payload_rejected` / `nothing to triage`），零外发、零审计行（provider 侧空 `questions` 是 422）。
+- 上线真实调用前需完成供应商准入与合规评审（docs/26 §14.3）。生产当前为 `jev`+`shadow`（只记录、
+  不改判，3s 预算 + 熔断兜底）；演示环境维持文档约定的 `mock`+`shadow`（无网络）。
 - 验收：`tests/e2e/decision-engine.spec.ts`（部署未启用时精确跳过）；离线用例覆盖配置/脱敏/
   载荷上限/响应映射/重试熔断/策略不可变规则。
 

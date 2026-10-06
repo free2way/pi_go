@@ -186,6 +186,25 @@ export interface DecisionEngine {
 
 任何未知类型、缺失字段、非有限数字、概率越界、选项不在白名单内，都视为协议错误并进入 fallback。
 
+#### 6.3.1 线上契约（2026-10-06 实测校准）
+
+上表是三型映射，但**字段名以线上为准**——它们与本设计早期假设不同，已在真实调用中逐一校正
+（依据 `GET https://api.typesafe.ai/openapi.json`，并由 2026-10-06 prod shadow 真实调用验证：
+`status=completed`、`resolvedModel=jev-1.13.0`、24 条回答、886ms/4238+986 tok）：
+
+| 线上对象 | 字段 | 说明 |
+| --- | --- | --- |
+| `POST /v1/systemone` 请求 | `{state, model, questions}` | `questions` 为**对象**且 `minProperties: 1`：**空问题集是 422**（`loc=body.questions … too_short`）。无未解决 findings ⇒ 不发起调用 |
+| `NoulAnswer` | `{type:"noul", noul: 0..1}` | P(是/真) 字段名是 **`noul`**；`certainty` 仍在本地推导 `|p-0.5|·2`，provider 不提供 confidence |
+| `ChoiceAnswer` | `{type:"choice", choice, confidence, probabilities}` | `probabilities` 按**选项名**索引 |
+| `ScoreAnswer` | `{type:"score", score, confidence, legend, probabilities}` | `score` 是 0..levels-1 量纲的加权均值（可含小数）；`legend`/`probabilities` 按**位置下标字符串**（`"0"`,`"1"`）索引，需翻译回本地 level 名 |
+| `SystemOneResponse` | `{model, answers:{<问题名>:Answer}, usage:{input_tokens, output_tokens}}` | `model` 是解析后的真实版本（别名 `jev-latest` → `jev-1.13.0`） |
+| `GET /v1/models` | `{models:[{name, description, release_date}]}` | 条目字段是 **`name`**（不是 OpenAI 的 `id`），探测解析需同时接受两者 |
+
+排查契约漂移：`PI_JEV_DIAG=1` 让适配器在非 2xx 时记录 HTTP 状态、顶层字段名与
+`detail[].loc/msg/type`（不读 `input`/`ctx`/`state`，不含任何密文）；`PI_PROBE_DIAG=1` 同理记录
+`/models` 响应形状。两者默认关闭。
+
 ## 7. 代码落点
 
 建议新增以下模块：
