@@ -209,3 +209,57 @@ describe("mapProviderResponse — contract_invalid cases (never partial)", () =>
     expect(result.ok).toBe(false);
   });
 });
+
+/**
+ * The live System One shapes, taken verbatim from the published OpenAPI at
+ * `GET https://api.typesafe.ai/openapi.json`. The first real production call
+ * (2026-10-06) was rejected locally as `malformed noul answer` while the
+ * provider had answered HTTP 200 — these cases pin the real field names.
+ */
+describe("mapProviderResponse — live System One contract", () => {
+  const liveAnswers = {
+    q_prob: { type: "noul", noul: 0.98 },
+    q_choice: { type: "choice", choice: "material", confidence: 0.9, probabilities: { none: 0.05, possible: 0.05, material: 0.9 } },
+    q_score: {
+      type: "score",
+      score: 2.4,
+      confidence: 0.8,
+      legend: { "0": "no", "1": "low", "2": "med", "3": "high" },
+      probabilities: { "0": 0.05, "1": 0.1, "2": 0.35, "3": 0.5 },
+    },
+  };
+
+  it("accepts `noul` as P(true) and derives certainty locally", () => {
+    const result = mapProviderResponse(response(liveAnswers), request);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const answer = result.answers.find((a) => a.questionId === "q_prob")!;
+    expect(answer).toMatchObject({ type: "probability", probability: 0.98, value: true });
+    expect(answer.certainty).toBeCloseTo(0.96, 6);
+  });
+
+  it("accepts the documented ScoreAnswer with `legend` and position-keyed probabilities", () => {
+    const result = mapProviderResponse(response(liveAnswers), request);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const answer = result.answers.find((a) => a.questionId === "q_score")!;
+    // 2.4 on the 0..levels-1 scale, nearest level = index 2 ("medium").
+    expect(answer).toMatchObject({ type: "score", value: "medium", weightedScore: 2.4 });
+    expect(answer.probabilities).toEqual({ none: 0.05, low: 0.1, medium: 0.35, high: 0.5 });
+  });
+
+  it("still rejects an answer that carries neither `noul` nor `probability`", () => {
+    const result = mapProviderResponse(response({ ...liveAnswers, q_prob: { type: "noul" } }), request);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.detail).toContain("q_prob");
+  });
+
+  it("rejects a positional score key outside the requested rubric", () => {
+    const result = mapProviderResponse(
+      response({ ...liveAnswers, q_score: { ...liveAnswers.q_score, probabilities: { "0": 0.2, "9": 0.8 } } }),
+      request,
+    );
+    expect(result.ok).toBe(false);
+  });
+});

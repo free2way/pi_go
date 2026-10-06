@@ -26,15 +26,23 @@ const distribution = z.record(z.string(), probability);
 
 const optionalKind = z.string().optional();
 
-/** Noul (yes/no): the provider reports only P(true). */
+/**
+ * Noul (yes/no): the provider reports only P(true) — as `noul` in the live
+ * System One contract (`NoulAnswer{type,noul}`), with `probability` kept as an
+ * alias for older fixtures. Exactly one of the two must be present.
+ */
 export const noulAnswerSchema = z
   .object({
     type: optionalKind,
-    probability,
+    noul: probability.optional(),
+    probability: probability.optional(),
     value: z.boolean().optional(),
     confidence: probability.optional(),
   })
-  .strict();
+  .strict()
+  .refine((data) => data.noul !== undefined || data.probability !== undefined, {
+    message: "noul answer needs `noul` or `probability`",
+  });
 
 /** Choice: chosen option + full distribution + confidence. */
 export const choiceAnswerSchema = z
@@ -48,7 +56,11 @@ export const choiceAnswerSchema = z
   })
   .strict();
 
-/** Score: probability-weighted value across the ordered levels + confidence. */
+/**
+ * Score: probability-weighted value across the ordered levels + confidence.
+ * The live answer also carries a `legend` (`{"0": "low", "1": "high"}`) that
+ * maps the requested rubric onto the same position keys as `probabilities`.
+ */
 export const scoreAnswerSchema = z
   .object({
     type: optionalKind,
@@ -56,6 +68,7 @@ export const scoreAnswerSchema = z
     weighted_score: z.number().optional(),
     probabilities: distribution.optional(),
     distribution: distribution.optional(),
+    legend: z.record(z.string(), z.unknown()).optional(),
     confidence: probability,
   })
   .strict();
@@ -119,7 +132,9 @@ function mapProbability(questionId: string, raw: unknown): { ok: true; answer: D
   if (!parsed.success) return { ok: false, detail: `${questionId}: malformed noul answer` };
   const kindError = kindMatches(questionId, parsed.data.type, ["noul", "probability"]);
   if (kindError) return { ok: false, detail: kindError };
-  const p = parsed.data.probability;
+  // Live contract reports `noul`; `probability` stays accepted for fixtures.
+  const p = parsed.data.noul ?? parsed.data.probability;
+  if (p === undefined) return { ok: false, detail: `${questionId}: missing probability` };
   return {
     ok: true,
     answer: {
@@ -181,7 +196,21 @@ function mapScore(
   if (!Number.isFinite(weightedScore)) return { ok: false, detail: `${questionId}: non-finite score` };
   const levels = question.levels.map((level) => level.value);
   if (levels.length < 2) return { ok: false, detail: `${questionId}: score question needs at least two levels` };
-  const dist = distributionOf(questionId, data.probabilities, data.distribution, levels, "level");
+  // TypeSafe keys score probabilities and `legend` by POSITION ("0","1",…) — the
+  // order of the criteria array we sent — not by our level names. Translate the
+  // positional form back to the level values we defined; a literal level name
+  // (older fixtures) still resolves unchanged.
+  const byPosition = (record: Record<string, number> | undefined) =>
+    record === undefined
+      ? undefined
+      : Object.fromEntries(
+          Object.entries(record).map(([key, value]) => {
+            const index = Number(key);
+            const positional = /^\d+$/.test(key) && Number.isInteger(index) && index >= 0 && index < levels.length;
+            return [positional ? levels[index] : key, value];
+          }),
+        );
+  const dist = distributionOf(questionId, byPosition(data.probabilities), byPosition(data.distribution), levels, "level");
   if (!dist.ok) return dist;
 
   // Levels are ordered low→high; `weightedScore` is the position scale
