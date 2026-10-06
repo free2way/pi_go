@@ -42,7 +42,7 @@ import { createTestDb } from "./test-db.js";
 const INTERNAL_TOKEN = "internal-worker-token-for-tests";
 const OWNER = "owner-a";
 /** A credential and a raw-state marker that must never reach a response or a row. */
-const FAKE_KEY = "sk-live-DO-NOT-LEAK-0123456789abcdef";
+const FAKE_KEY = "sk-DUMMY-DO-NOT-LEAK-0123456789abcdef";
 const RAW_STATE_MARKER = "SECRET-DIFF-SNIPPET-DO-NOT-LEAK";
 
 const directories: string[] = [];
@@ -272,7 +272,7 @@ describe("POST /api/internal/decisions/evaluate (docs/26 §8.1)", () => {
     });
     expect(sessionOnly.statusCode).toBe(401);
 
-    const wrongToken = await h.evaluate({ headers: { authorization: "Bearer not-the-internal-token" } });
+    const wrongToken = await h.evaluate({ headers: { authorization: "Bearer DUMMY-not-the-internal-token" } });
     expect(wrongToken.statusCode).toBe(401);
 
     expect(h.engineCalls).toHaveLength(0);

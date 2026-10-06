@@ -129,7 +129,7 @@ describe("review-triage state projection", () => {
   });
 
   it("redacts secrets and PII in every free-text field", () => {
-    const secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789";
+    const secret = "sk-DUMMYabcdefghijklmnopqrstuvwxyz0123";
     const run = makeRun({
       task: `use ${secret} for the deploy`,
       findings: [finding({ evidence: `key=${secret}`, requiredChange: "email admin@example.com" })],

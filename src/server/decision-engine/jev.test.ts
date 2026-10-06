@@ -11,7 +11,7 @@ import {
   resetDecisionCircuitBreakers,
 } from "./jev.js";
 
-const API_KEY = "sk-unit-test-key-never-logged";
+const API_KEY = "sk-DUMMY-unit-test-key-never-logged";
 
 const config = (overrides: Partial<DecisionEngineConfig> = {}): DecisionEngineConfig => ({
   engine: "jev",

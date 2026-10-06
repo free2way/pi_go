@@ -19,9 +19,9 @@ import {
 
 describe("redactText — secrets", () => {
   it.each([
-    ["aws key", "AKIAIOSFODNN7EXAMPLE", "aws_access_key"],
+    ["aws key", "AKIAIOSFODNN7DUMMY01", "aws_access_key"],
     ["github token", `ghp_${"A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"}`, "github_token"],
-    ["openai key", "sk-abcdefghijklmnopqrstuvwxyz0123456789", "openai_key"],
+    ["openai key", "sk-DUMMYabcdefghijklmnopqrstuvwxyz0123", "openai_key"],
     ["slack token", "xoxb-1234567890-abcdefghijkl", "slack_token"],
     ["google key", "AIzaSyDUMMY-not-a-real-key0000000000000", "google_api_key"],
   ])("redacts a %s", (_name, secret, rule) => {
@@ -33,11 +33,11 @@ describe("redactText — secrets", () => {
   });
 
   it("redacts JWT and Authorization headers", () => {
-    const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
-    const text = `token=${jwt}\nAuthorization: Bearer abc123def456ghi789`;
+    const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dummy";
+    const text = `token=${jwt}\nAuthorization: Bearer DUMMY-token-abc123def456`;
     const redacted = redactText(text);
     expect(redacted).not.toContain(jwt);
-    expect(redacted).not.toContain("abc123def456ghi789");
+    expect(redacted).not.toContain("DUMMY-token-abc123def456");
     expect(redacted).toContain("Authorization: [redacted]");
   });
 
@@ -48,9 +48,9 @@ describe("redactText — secrets", () => {
   });
 
   it("redacts private key blocks", () => {
-    const pem = ["-----BEGIN RSA PRIVATE KEY-----", "MIIEowIBAAKCAQEA", "-----END RSA PRIVATE KEY-----"].join("\n");
+    const pem = ["-----BEGIN RSA PRIVATE KEY-----", "DUMMY-MIIEowIBAAKCAQEA", "-----END RSA PRIVATE KEY-----"].join("\n");
     const redacted = redactText(`key:\n${pem}`);
-    expect(redacted).not.toContain("MIIEowIBAAKCAQEA");
+    expect(redacted).not.toContain("DUMMY-MIIEowIBAAKCAQEA");
     expect(redacted).toContain(REDACTED);
   });
 
@@ -93,12 +93,12 @@ describe("redactText — secrets", () => {
 describe("redactDeep", () => {
   it("redacts nested strings and preserves shape", () => {
     const input = {
-      run: { taskSummary: "use key sk-abcdefghijklmnopqrstuvwxyz0123456789" },
+      run: { taskSummary: "use key sk-DUMMYabcdefghijklmnopqrstuvwxyz0123" },
       findings: [{ title: "ok", evidence: "mail admin@example.com" }],
       counts: [1, 2, 3],
     };
     const output = redactDeep(input);
-    expect(output.run.taskSummary).not.toContain("sk-abcdefghijklmnopqrstuvwxyz0123456789");
+    expect(output.run.taskSummary).not.toContain("sk-DUMMYabcdefghijklmnopqrstuvwxyz0123");
     expect(output.findings[0].evidence).not.toContain("admin@example.com");
     expect(output.counts).toEqual([1, 2, 3]);
     expect(Object.keys(output.findings[0])).toEqual(["title", "evidence"]);
@@ -125,7 +125,7 @@ describe("canonicalJson + hashes", () => {
   });
 
   it("hashes the redacted form, so two states differing only by a secret collide", () => {
-    const withSecret = stateHash({ note: "key sk-abcdefghijklmnopqrstuvwxyz0123456789" });
+    const withSecret = stateHash({ note: "key sk-DUMMYabcdefghijklmnopqrstuvwxyz0123" });
     const redacted = stateHash({ note: "key [redacted]" });
     expect(withSecret).toBe(redacted);
   });
@@ -218,9 +218,9 @@ describe("stateManifest", () => {
 
 describe("redactExcerpt", () => {
   it("caps at 300 chars after redaction", () => {
-    const excerpt = redactExcerpt(`prefix sk-abcdefghijklmnopqrstuvwxyz0123456789 ${"z".repeat(500)}`);
+    const excerpt = redactExcerpt(`prefix sk-DUMMYabcdefghijklmnopqrstuvwxyz0123 ${"z".repeat(500)}`);
     expect(excerpt.length).toBeLessThanOrEqual(300);
-    expect(excerpt).not.toContain("sk-abcdefghijklmnopqrstuvwxyz0123456789");
+    expect(excerpt).not.toContain("sk-DUMMYabcdefghijklmnopqrstuvwxyz0123");
   });
 
   it("trims and tolerates null", () => {
