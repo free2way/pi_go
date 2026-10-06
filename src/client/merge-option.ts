@@ -5,6 +5,8 @@
  * checkbox shows. Kept React-free so it is unit-testable.
  */
 
+import { DEFAULT_LOCALE, t, type Locale } from "../shared/i18n";
+
 export interface MergeOptionState {
   /** Always rendered so the reason is visible; hidden only if a future flag says so. */
   show: boolean;
@@ -14,14 +16,14 @@ export interface MergeOptionState {
   hint: string;
 }
 
-export function mergeOptionState(user?: { isAdmin?: boolean } | null): MergeOptionState {
+export function mergeOptionState(user?: { isAdmin?: boolean } | null, locale: Locale = DEFAULT_LOCALE): MergeOptionState {
   if (user?.isAdmin) return { show: true, disabled: false, hint: "" };
   if (!user) {
-    return { show: true, disabled: true, hint: "仅管理员可以合并到工作区默认分支（正在确认账户角色…）。" };
+    return { show: true, disabled: true, hint: t(locale, "merge.optionLoading") };
   }
   return {
     show: true,
     disabled: true,
-    hint: "仅管理员可以合并到工作区默认分支；如需该操作，请让管理员在「账户管理」中调整你的角色。",
+    hint: t(locale, "merge.optionDenied"),
   };
 }

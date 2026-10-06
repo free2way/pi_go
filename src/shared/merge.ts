@@ -1,3 +1,5 @@
+import { DEFAULT_LOCALE, t, type Locale } from "./i18n";
+
 /**
  * A2 — pure merge planning shared by the web server (admin gate + response
  * shaping) and the worker (the actual Git commands). Keeping the decision logic
@@ -57,10 +59,18 @@ export function mergeRestoreFields(input: { restored?: unknown; restoreError?: u
   return fields;
 }
 
-/** Human-readable line for the run detail's merge/approve area. */
-export function describeMergeRestore(input: MergeRestoreFields): string | undefined {
-  if (input.restored === true) return "工作区已恢复原分支";
-  if (input.restored === false) return `工作区恢复失败，需人工处理${input.restoreError ? `：${input.restoreError}` : ""}`;
+/**
+ * Human-readable line for the run detail's merge/approve area. The copy is
+ * client-visible, so it is rendered from the catalog; `locale` defaults to 中文
+ * to keep the server-side callers and existing tests unchanged.
+ */
+export function describeMergeRestore(input: MergeRestoreFields, locale: Locale = DEFAULT_LOCALE): string | undefined {
+  if (input.restored === true) return t(locale, "merge.restored");
+  if (input.restored === false) {
+    return input.restoreError
+      ? t(locale, "merge.restoreFailedDetail", { detail: input.restoreError })
+      : t(locale, "merge.restoreFailed");
+  }
   return undefined;
 }
 

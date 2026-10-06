@@ -40,6 +40,14 @@ describe("verificationBadge (AUD-08)", () => {
     expect(verificationBadge(model({ verification: "unchecked" })).tone).toBe("warn");
   });
 
+  it("falls back to the English catalog copy", () => {
+    expect(verificationBadge(model({ verification: "operator_asserted" }), "en").label).toBe("Unverified (operator asserted)");
+    expect(verificationBadge(model({ verification: "live" }), "en").title).toContain("live /models probe");
+    expect(modelCapabilityHint(model({ verification: "live", capabilitiesVerified: true, capabilities: { contextWindow: 64_000 } }), "en")?.label)
+      .toBe("Capabilities · runtime");
+    expect(availabilityLabel(model({ available: false, unavailableReason: "credential_missing" }), "en")).toBe("No credential");
+  });
+
   it("derives the state for responses that predate the field", () => {
     expect(modelVerificationState(model({ verified: true }))).toBe("live");
     expect(modelVerificationState(model({ asserted: true, verified: false }))).toBe("operator_asserted");

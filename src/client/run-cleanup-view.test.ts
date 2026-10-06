@@ -39,6 +39,14 @@ describe("cleanup outcome labels (B6)", () => {
     expect(summarizeCleanupStorage([{ storage: "removed" }, { storage: "kept" }, { storage: "kept" }])).toBe("运行目录：已删除 1 个，保留 2 个");
   });
 
+  it("renders the confirmations in English", () => {
+    const message = batchCleanupConfirmMessage({ count: 2, deleteRunDirectory: true }, "en");
+    expect(message).toContain("Clean up the 2 selected finished run(s)?");
+    expect(message).toContain("run directory/worktree is deleted");
+    expect(summarizeCleanupStorage([{ storage: "removed" }], "en")).toContain("1 deleted");
+    expect(cleanupStorageDetailLines([{ runId: "run_1", storage: "kept" }], 10, "en")[0]).toContain("Run directory kept");
+  });
+
   it("lists bounded per-run detail lines", () => {
     const results = Array.from({ length: 12 }, (_, index) => ({ runId: `run_${index}`.padEnd(20, "0"), storage: (index % 2 === 0 ? "removed" : "kept") as "removed" | "kept" }));
     expect(cleanupStorageDetailLines(results)).toHaveLength(10);

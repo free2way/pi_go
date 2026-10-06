@@ -884,3 +884,10 @@ button.agile-metrics-row:hover strong { color: #c3d274; }
 @media (max-width: 900px) {
   .decision-gates { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
+
+/* Language selector (docs/23-i18n.md): small topbar control, 中文 / English. */
+.locale-select { height: 26px; border-radius: 8px; border: 1px solid var(--line); background: #0d1014; color: #c3cad1; font-size: 10px; padding: 0 6px; outline: none; cursor: pointer; }
+.locale-select:hover { border-color: #353d46; color: var(--text); }
+@media (max-width: 720px) {
+  .locale-select { font-size: 11px; }
+}

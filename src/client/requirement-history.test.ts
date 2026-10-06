@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Run } from "../shared/types";
-import { copyTextForRun, humanNoteKindLabel, humanNotesOf, requirementSummary, runStateLabels } from "./requirement-history";
+import { copyTextForRun, humanNoteKindKey, humanNoteKindLabel, humanNotesOf, requirementSummary, runStateKey, runStateLabel } from "./requirement-history";
+import { t } from "../shared/i18n";
 
 describe("requirement-history helpers (需求历史)", () => {
   it("collapses multi-line requirements and truncates with an ellipsis", () => {
@@ -17,6 +18,8 @@ describe("requirement-history helpers (需求历史)", () => {
     expect(humanNoteKindLabel("approve_accept")).toBe("接受交付");
     expect(humanNoteKindLabel("resume")).toBe("恢复下一轮");
     expect(humanNoteKindLabel("reject")).toBe("拒绝交付");
+    expect(humanNoteKindKey("reopen")).toBe("note.kind.reopen");
+    expect(humanNoteKindLabel("resume", "en")).toBe("Resume next round");
   });
 
   it("reads missing humanNotes as an empty list", () => {
@@ -29,8 +32,12 @@ describe("requirement-history helpers (需求历史)", () => {
     expect(copyTextForRun({ title: "", task: "只有需求" })).toBe("只有需求");
   });
 
-  it("covers all nine run states with labels", () => {
-    expect(Object.keys(runStateLabels)).toHaveLength(9);
-    expect(runStateLabels.needs_human).toBe("需要人工处理");
+  it("covers all nine run states with catalog keys", () => {
+    const states = ["queued", "preparing", "developing", "checking", "reviewing", "completed", "needs_human", "failed", "cancelled"] as const;
+    expect(states.map((state) => runStateKey(state))).toHaveLength(9);
+    expect(new Set(states.map((state) => runStateKey(state))).size).toBe(9);
+    expect(runStateKey("needs_human")).toBe("run.state.needs_human");
+    expect(runStateLabel("needs_human")).toBe("需要人工处理");
+    expect(t("en", runStateKey("needs_human"))).toBe("Needs human intervention");
   });
 });

@@ -57,6 +57,16 @@ describe("system-status-view: labels and rows", () => {
     expect(storageLabel(undefined)).toBe(SYSTEM_UNKNOWN);
   });
 
+  it("renders the same labels in English", () => {
+    expect(databaseLabel({ status: "ok" }, "en")).toBe("Healthy");
+    expect(workerLabel({ status: "unreachable" }, "en")).toBe("Unreachable");
+    expect(storageLabel("critical", "en")).toBe("Critically low");
+    expect(formatAge(90_000, "en")).toBe("1 min");
+    expect(formatVersion("  ", "en")).toBe("Unknown");
+    expect(failureCategoryLabel("storage", "en")).toBe("Storage error");
+    expect(jobStateRows({ queued: 1 }, "en")[0].label).toBe("Queued");
+  });
+
   it("summarises active runs", () => {
     expect(activeRunsSummary({ queued: 2, preparing: 1, developing: 4, checking: 1, reviewing: 2, total: 10 }))
       .toBe("活跃 10（排队 2 · 准备 1 · 开发 4 · 检查 1 · 审核 2）");

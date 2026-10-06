@@ -1,9 +1,9 @@
-import { BOARD_COLUMNS, boardColumnFor, RELEASE_DEPLOY_STALE_MS, STORY_ESTIMATE_LABELS, STORY_PRIORITY_LABELS, type AgileStory, type BoardColumnId, type ReleaseDeployRecord } from "../shared/agile";
+import { BOARD_COLUMNS, boardColumnFor, RELEASE_DEPLOY_STALE_MS, type AgileStory, type BoardColumnId, type ReleaseDeployRecord, type ReleaseStatus, type SprintStatus, type StoryPriority, type StoryStatus } from "../shared/agile";
 import type { ReleaseRetrospective, ReleaseSummary } from "../shared/agile-metrics";
+import { DEFAULT_LOCALE, t, type Locale, type MessageKey } from "../shared/i18n";
 
 export interface BoardColumnGroup {
   id: BoardColumnId;
-  label: string;
   stories: AgileStory[];
 }
 
@@ -11,9 +11,13 @@ export interface BoardColumnGroup {
 export function groupStoriesByColumn(stories: AgileStory[]): BoardColumnGroup[] {
   return BOARD_COLUMNS.map((column) => ({
     id: column.id,
-    label: column.label,
     stories: stories.filter((story) => boardColumnFor(story.status) === column.id),
   }));
+}
+
+/** Catalog key for a board column's label (the label itself lives in the catalog). */
+export function boardColumnKey(id: BoardColumnId): MessageKey {
+  return `agile.board.${id}` as MessageKey;
 }
 
 /** One textarea line per acceptance criterion / definition-of-done item. */
@@ -21,13 +25,34 @@ export function splitLines(value: string): string[] {
   return value.split("\n").map((line) => line.trim()).filter(Boolean);
 }
 
-export function priorityLabel(priority: AgileStory["priority"]): string {
-  return STORY_PRIORITY_LABELS[priority] ?? priority;
+const PRIORITY_KEYS: Record<StoryPriority, MessageKey> = {
+  must: "agile.priority.must",
+  should: "agile.priority.should",
+  could: "agile.priority.could",
+  wont: "agile.priority.wont",
+};
+
+export function priorityKey(priority: AgileStory["priority"]): MessageKey {
+  return PRIORITY_KEYS[priority] ?? "common.unknown";
 }
 
-export function estimateLabel(estimate: number | null): string {
-  if (estimate === null) return "未估算";
-  return STORY_ESTIMATE_LABELS[estimate] ?? `${estimate} 点`;
+export function priorityLabel(priority: AgileStory["priority"], locale: Locale = DEFAULT_LOCALE): string {
+  return t(locale, priorityKey(priority));
+}
+
+const ESTIMATE_VALUES = [1, 2, 3, 5, 8, 13];
+
+/** Catalog key for an estimate, or `null` for a value outside the scale. */
+export function estimateKey(estimate: number | null): MessageKey | null {
+  if (estimate === null) return "agile.estimate.none";
+  if (ESTIMATE_VALUES.includes(estimate)) return `agile.estimate.${estimate}` as MessageKey;
+  return null;
+}
+
+export function estimateLabel(estimate: number | null, locale: Locale = DEFAULT_LOCALE): string {
+  const key = estimateKey(estimate);
+  if (key) return t(locale, key);
+  return t(locale, "agile.points", { count: estimate ?? 0 });
 }
 
 /** Story reference shown on cards: `AUTH-3` using its index within the project. */
@@ -68,13 +93,65 @@ export function releaseExportFilename(summary: Pick<ReleaseSummary, "version" | 
   return `release-${safe || summary.releaseId}-retrospective.json`;
 }
 
+const STORY_STATUS_KEYS: Record<StoryStatus, MessageKey> = {
+  backlog: "agile.storyStatus.backlog",
+  ready: "agile.storyStatus.ready",
+  in_progress: "agile.storyStatus.in_progress",
+  in_review: "agile.storyStatus.in_review",
+  awaiting_acceptance: "agile.storyStatus.awaiting_acceptance",
+  done: "agile.storyStatus.done",
+  blocked: "agile.storyStatus.blocked",
+};
+
+export function storyStatusKey(status: StoryStatus): MessageKey {
+  return STORY_STATUS_KEYS[status] ?? "common.unknown";
+}
+
+export function storyStatusLabel(status: StoryStatus, locale: Locale = DEFAULT_LOCALE): string {
+  return t(locale, storyStatusKey(status));
+}
+
+const SPRINT_STATUS_KEYS: Record<SprintStatus, MessageKey> = {
+  planned: "agile.sprintStatus.planned",
+  active: "agile.sprintStatus.active",
+  closed: "agile.sprintStatus.closed",
+};
+
+export function sprintStatusKey(status: SprintStatus): MessageKey {
+  return SPRINT_STATUS_KEYS[status] ?? "common.unknown";
+}
+
+const RELEASE_STATUS_KEYS: Record<ReleaseStatus, MessageKey> = {
+  planned: "agile.releaseStatus.planned",
+  in_progress: "agile.releaseStatus.in_progress",
+  released: "agile.releaseStatus.released",
+  cancelled: "agile.releaseStatus.cancelled",
+};
+
+export function releaseStatusKey(status: ReleaseStatus): MessageKey {
+  return RELEASE_STATUS_KEYS[status] ?? "common.unknown";
+}
+
+const DEPLOY_STATUS_KEYS: Record<ReleaseDeployRecord["status"], MessageKey> = {
+  not_configured: "agile.deployStatus.not_configured",
+  unsupported: "agile.deployStatus.unsupported",
+  pending: "agile.deployStatus.pending",
+  ok: "agile.deployStatus.ok",
+  failed: "agile.deployStatus.failed",
+};
+
+export function deployStatusKey(status: ReleaseDeployRecord["status"]): MessageKey {
+  return DEPLOY_STATUS_KEYS[status] ?? "common.unknown";
+}
+
 export type ReleaseDeployAction = "publish" | "retry" | "waiting" | "done";
 
-export const RELEASE_DEPLOY_ACTION_LABELS: Record<ReleaseDeployAction, string> = {
-  publish: "发布",
-  retry: "重试部署",
-  waiting: "部署进行中",
-  done: "已发布",
+/** Catalog keys for the deploy button (labels live in the catalog). */
+export const RELEASE_DEPLOY_ACTION_KEYS: Record<ReleaseDeployAction, MessageKey> = {
+  publish: "agile.deployAction.publish",
+  retry: "agile.deployAction.retry",
+  waiting: "agile.deployAction.waiting",
+  done: "agile.deployAction.done",
 };
 
 /**

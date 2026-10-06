@@ -70,6 +70,12 @@ describe("mergeRestoreFields (R)", () => {
 });
 
 describe("describeMergeRestore (R)", () => {
+  it("renders the restore line in the selected language", () => {
+    expect(describeMergeRestore({ restored: true }, "en")).toBe("Workspace restored to the original branch");
+    expect(describeMergeRestore({ restored: false, restoreError: "checkout failed" }, "en"))
+      .toContain("checkout failed");
+  });
+
   it("renders restored vs failed, and nothing when absent", () => {
     expect(describeMergeRestore({ restored: true })).toBe("工作区已恢复原分支");
     expect(describeMergeRestore({ restored: false })).toBe("工作区恢复失败，需人工处理");

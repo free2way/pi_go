@@ -62,7 +62,7 @@ const app = Fastify({
 });
 const port = Number(process.env.PORT || 3100);
 const host = process.env.HOST || "localhost";
-const webVersion = process.env.PI_WEB_VERSION?.trim() || "0.26.7";
+const webVersion = process.env.PI_WEB_VERSION?.trim() || "0.27.0";
 const demoMode = process.env.PI_DEMO_MODE !== "false";
 const realRunsEnabled = process.env.PI_REAL_RUNS_ENABLED === "true";
 const workerUrl = process.env.PI_WORKER_URL || "http://worker:3200";

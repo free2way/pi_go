@@ -9,15 +9,17 @@
  */
 
 import type { DecisionBrief } from "../shared/decision-brief";
+import { DEFAULT_LOCALE, t, type Locale, type MessageKey } from "../shared/i18n";
 
 export type DecisionNavTab = "checks" | "review" | "diff";
 export type DecisionGateId = DecisionBrief["gates"][number]["id"];
 
-export const decisionGateLabels: Record<DecisionGateId, string> = {
-  checks: "检查",
-  blocking: "阻断问题",
-  scope: "范围",
-  acceptance: "验收覆盖",
+/** Catalog keys for the four gate labels (the labels live in the catalog). */
+export const decisionGateKeys: Record<DecisionGateId, MessageKey> = {
+  checks: "decision.gate.checks",
+  blocking: "decision.gate.blocking",
+  scope: "decision.gate.scope",
+  acceptance: "decision.gate.acceptance",
 };
 
 /** Where a non-green gate sends the operator to inspect the underlying data. */
@@ -35,8 +37,13 @@ export function decisionBriefTone(brief: DecisionBrief): DecisionTone {
   return brief.recommendation.action === "accept" ? "accept" : "continue";
 }
 
-export function decisionBriefHeading(brief: DecisionBrief): string {
-  return decisionBriefTone(brief) === "accept" ? "决策摘要 · 可以接受交付" : "决策摘要 · 建议继续开发";
+/** Catalog key for the heading, chosen by the tone. */
+export function decisionBriefHeadingKey(brief: DecisionBrief): MessageKey {
+  return decisionBriefTone(brief) === "accept" ? "decision.headingAccept" : "decision.headingContinue";
+}
+
+export function decisionBriefHeading(brief: DecisionBrief, locale: Locale = DEFAULT_LOCALE): string {
+  return t(locale, decisionBriefHeadingKey(brief));
 }
 
 /** The anchor next to the run title is expanded only for a terminal run. */
@@ -44,32 +51,39 @@ export function decisionBriefExpanded(state: string, collapsed: boolean, termina
   return terminalStates.includes(state) && !collapsed;
 }
 
+export type DecisionRemainingGroupKind = "ac" | "unknown" | "unmapped";
+
 export interface DecisionRemainingGroup {
-  label: string;
+  kind: DecisionRemainingGroupKind;
+  /** The mapped AC/DoD label when `kind === "ac"`; undefined otherwise. */
+  ac?: string;
   items: DecisionBrief["remaining"];
 }
 
-/** Bucket label for findings whose relevance to the story could not be ruled out. */
-export const UNRESOLVED_RELEVANCE_LABEL = "相关性未确认";
-/** Bucket label for findings the matcher holds explicit out-of-scope proof for. */
-export const UNMAPPED_AC_LABEL = "未映射到 AC";
+/** Catalog key used for buckets that are not a concrete AC/DoD label. */
+export function decisionRemainingGroupKey(kind: DecisionRemainingGroupKind): MessageKey | undefined {
+  if (kind === "unknown") return "decision.group.unresolvedRelevance";
+  if (kind === "unmapped") return "decision.group.unmappedAc";
+  return undefined;
+}
 
 /**
  * Groups remaining findings by their mapped AC/DoD label, preserving order.
  * Findings with no confident label are split by *why*: relevance that could not
  * be ruled out is a blocking state (`unknown`), so it must not be lumped in
- * with findings proven unrelated to the story.
+ * with findings proven unrelated to the story. Returns locale-neutral buckets —
+ * the component renders the label from the catalog.
  */
 export function groupRemainingByAc(remaining: DecisionBrief["remaining"]): DecisionRemainingGroup[] {
-  const groups = new Map<string, DecisionBrief["remaining"]>();
+  const groups = new Map<string, DecisionRemainingGroup>();
   for (const item of remaining) {
-    const label = item.ac
-      ?? (item.relevance === "unknown" ? UNRESOLVED_RELEVANCE_LABEL : UNMAPPED_AC_LABEL);
-    const list = groups.get(label);
-    if (list) list.push(item);
-    else groups.set(label, [item]);
+    const kind: DecisionRemainingGroupKind = item.ac ? "ac" : item.relevance === "unknown" ? "unknown" : "unmapped";
+    const key = item.ac ?? kind;
+    const existing = groups.get(key);
+    if (existing) existing.items.push(item);
+    else groups.set(key, { kind, ...(item.ac ? { ac: item.ac } : {}), items: [item] });
   }
-  return [...groups.entries()].map(([label, items]) => ({ label, items }));
+  return [...groups.values()];
 }
 
 /** Tab (+ finding anchor) a gate's "定位" action should open. */
@@ -102,10 +116,12 @@ export function decisionBriefActionRequest(brief: DecisionBrief, action: Decisio
   return { mode: "continue", note: brief.recommendation.note };
 }
 
-export function continueConfirmMessage(title: string, note: string): string {
-  return `继续开发「${title}」？\n\n将带上建议备注：\n${note}`;
+export function continueConfirmMessage(title: string, note: string, locale: Locale = DEFAULT_LOCALE): string {
+  return t(locale, "decision.continueConfirm", { title, note });
 }
 
-export function acceptConfirmMessage(title: string, remainingCount: number): string {
-  return `${remainingCount > 0 ? `仍有 ${remainingCount} 条未解决意见，将记录为已知接受。\n\n` : ""}确认接受「${title}」的交付？`;
+export function acceptConfirmMessage(title: string, remainingCount: number, locale: Locale = DEFAULT_LOCALE): string {
+  return remainingCount > 0
+    ? t(locale, "decision.acceptConfirmWithOpen", { title, count: remainingCount })
+    : t(locale, "decision.acceptConfirm", { title });
 }

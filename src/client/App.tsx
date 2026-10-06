@@ -59,11 +59,13 @@ import {
   Zap,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { chatChannelLabels, chatCounts, chatMessageView, chatMessagesFromEvents, chatParticipantLabels, chatTabs, filterChatMessages, isReviewMessage, messageFindings, reworkBranchDetails, reworkBranchRounds, type ChatTab, type ReworkBranchDetail } from "../shared/chat";
+import { DEFAULT_LOCALE, intlLocale, localizeError, type Locale } from "../shared/i18n";
+import { useT, type TFunction } from "./i18n";
+import { chatCounts, chatMessageView, chatMessagesFromEvents, chatTabs, filterChatMessages, isReviewMessage, messageFindings, reworkBranchDetails, reworkBranchRounds, type ChatTab, type ReworkBranchDetail } from "../shared/chat";
 import { describeMergeRestore, mergeRestoreFields } from "../shared/merge";
 import { findingFingerprint } from "../shared/finding-fingerprint";
 import type { DecisionBrief } from "../shared/decision-brief";
-import { branchStatus, currentRoundStatus, roundStatuses, roundStatusMeta, roundStatusTooltip, type RoundStatus } from "../shared/round-status";
+import { branchStatus, currentRoundStatus, roundStatuses, roundStatusMeta, type RoundStatus } from "../shared/round-status";
 import type { ChatMessage, ConfigStatus, CurrentUser, Finding, ModelCatalogResponse, RoundSummary, Run, RunArtifact, RunEvent, RunMode, RunRoleUsage, RunState, Workspace } from "../shared/types";
 import type { ModelTemplate } from "../shared/agile";
 import { api } from "./api";
@@ -72,19 +74,20 @@ import {
   continueConfirmMessage,
   decisionBriefActionRequest,
   decisionBriefExpanded,
-  decisionBriefHeading,
+  decisionBriefHeadingKey,
   decisionBriefTone,
   gateNavTarget,
   groupRemainingByAc,
-  decisionGateLabels,
+  decisionGateKeys,
+  decisionRemainingGroupKey,
 } from "./decision-brief-view";
 import { AgilePage } from "./AgilePage";
 import { HistoryPage } from "./HistoryPage";
-import { runStateLabels, requirementSummary } from "./requirement-history";
+import { requirementSummary, runStateKey } from "./requirement-history";
 import { batchCleanupConfirmMessage, cleanupFinishedConfirmMessage, cleanupStorageDetailLines, summarizeCleanupStorage } from "./run-cleanup-view";
 import { MAX_BUFFERED_EVENTS, deferredNonBlockingNotice, mergeRunEvents, shouldAcceptRun } from "./run-events";
 import { createRunSelectionGuard, eventsForRun, isRunSelected, pickSelectedRun } from "./run-selection";
-import { reworkBranchDetailsFromSummaries, resolveReworkRounds, resolveRoundStatuses } from "./rounds-view";
+import { reworkBranchDetailsFromSummaries, resolveReworkRounds, resolveRoundStatuses, roundStatusKey } from "./rounds-view";
 import { reworkBranchLayout, reworkBranchPath, type ReworkSide } from "./rework-layout";
 import { ModelsPage } from "./ModelsPage";
 import { mergeOptionState } from "./merge-option";
@@ -127,20 +130,31 @@ const iconForKind = {
 };
 
 /**
- * Compact round-workflow badge: Chinese label + semantic colour + a tooltip
+ * Compact round-workflow badge: localized label + semantic colour + a tooltip
  * carrying the check/finding counts. Reused by the pipeline round marker and
  * every rework branch label.
  */
+function roundTooltipText(t: TFunction, status: RoundStatus): string {
+  return t("roundStatus.tooltip", {
+    passed: status.checks.passed,
+    failed: status.checks.failed,
+    total: status.findings.total,
+    resolved: status.findings.resolved,
+  });
+}
+
 function RoundStatusBadge({ status, includeRound = false, className }: {
   status: RoundStatus;
   includeRound?: boolean;
   className?: string;
 }) {
+  const { t } = useT();
   const meta = roundStatusMeta[status.status];
-  const tooltip = `${includeRound ? `第 ${status.round} 轮 · ` : ""}${meta.label} · ${roundStatusTooltip(status)}`;
+  const label = t(roundStatusKey(status.status));
+  const tooltip = `${includeRound ? `${t("topology.round", { round: status.round })} · ` : ""}${label} · ${roundTooltipText(t, status)}`;
   return (
     <span className={`round-status round-status-${meta.tone}${className ? ` ${className}` : ""}`} title={tooltip}>
-      {meta.label}
+      {label}
     </span>
   );
 }
@@ -170,12 +184,32 @@ function FlowCard({ data }: NodeProps<Node<FlowNodeData>>) {
 }
 
 const nodeTypes = { flowCard: FlowCard };
+// React Flow can receive a fresh controlled-node array whenever SSE data
+// changes. The cards have a fixed visual size, so seed it explicitly: without
+// this, a same-size DOM node may not fire ResizeObserver again and React Flow
+// keeps the replacement node hidden with no edges until another resize.
+const flowCardDimensions = {
+  initialWidth: 176,
+  initialHeight: 73,
+  // Seed the six fixed handle bounds too. React Flow replaces these with DOM
+  // measurements when available, but edges can render immediately—and remain
+  // renderable when a same-size controlled node replacement emits no resize.
+  handles: [
+    { id: "main-target", type: "target", position: Position.Left, x: -3, y: 33.5, width: 6, height: 6 },
+    { id: "main-source", type: "source", position: Position.Right, x: 173, y: 33.5, width: 6, height: 6 },
+    { id: "bottom-target", type: "target", position: Position.Bottom, x: 49.8, y: 70, width: 6, height: 6 },
+    { id: "bottom-source", type: "source", position: Position.Bottom, x: 120.2, y: 70, width: 6, height: 6 },
+    { id: "top-target", type: "target", position: Position.Top, x: 49.8, y: -3, width: 6, height: 6 },
+    { id: "top-source", type: "source", position: Position.Top, x: 120.2, y: -3, width: 6, height: 6 },
+  ],
+} satisfies Pick<Node<FlowNodeData>, "initialWidth" | "initialHeight" | "handles">;
 
 // Renders a rework branch that dips above or below the main pipeline instead of
 // travelling back along the original path. `data.side` selects the direction
 // (and therefore which pair of handles the edge uses); `data.offset` is the
 // dip magnitude produced by `reworkBranchLayout`.
 function ReworkEdge({ id, sourceX, sourceY, targetX, targetY, markerEnd, style, data }: EdgeProps) {
+  const { t } = useT();
   const label = typeof data?.label === "string" ? data.label : "";
   const side: ReworkSide = data?.side === "above" ? "above" : "below";
   const offset = typeof data?.offset === "number" ? data.offset : 96;
@@ -194,7 +228,7 @@ function ReworkEdge({ id, sourceX, sourceY, targetX, targetY, markerEnd, style, 
   const roundStatusTip = typeof data?.roundStatusTooltip === "string" ? data.roundStatusTooltip : undefined;
   const title = round === undefined
     ? undefined
-    : `${roundStatus ? `${roundStatusMeta[roundStatus.status].label} · ${roundStatusTip ?? roundStatusTooltip(roundStatus)}\n` : ""}查看第 ${round} 轮返修原因`;
+    : `${roundStatus ? `${t(roundStatusKey(roundStatus.status))} · ${roundStatusTip ?? roundTooltipText(t, roundStatus)}\n` : ""}${t("topology.reworkReason", { round })}`;
   return (
     <>
       <BaseEdge id={id} path={edgePath} markerEnd={markerEnd} style={style} />
@@ -232,9 +266,14 @@ interface FlowOptions {
    * event-derived model is used (older server / failed request).
    */
   roundSummaries?: RoundSummary[];
+  /** Bound translator; without one the flow falls back to the message keys. */
+  t?: TFunction;
 }
 
+const identityT: TFunction = (key) => String(key);
+
 function flowForRun(run?: Run, events: RunEvent[] = [], options: FlowOptions = {}): { nodes: Node<FlowNodeData>[]; edges: Edge[] } {
+  const t = options.t ?? identityT;
   const currentOrder = run ? stateOrder[run.state] : -1;
   // Per-round workflow status powers the badge on the pipeline's round marker
   // and on every rework branch. Later rounds override earlier ones, so the
@@ -253,17 +292,19 @@ function flowForRun(run?: Run, events: RunEvent[] = [], options: FlowOptions = {
   };
   const nodes: Node<FlowNodeData>[] = [
     {
+      ...flowCardDimensions,
       id: "task",
       type: "flowCard",
       position: { x: 16, y: 72 },
-      data: { label: "任务准备", caption: "Git worktree", kind: "task", status: statusAt(0) },
+      data: { label: t("flow.task.label"), caption: "Git worktree", kind: "task", status: statusAt(0) },
     },
     {
+      ...flowCardDimensions,
       id: "developer",
       type: "flowCard",
       position: { x: 245, y: 72 },
       data: {
-        label: run && (run.plan?.tasks.length || 0) > 1 ? `DeepSeek ×${run.plan?.tasks.length}` : "DeepSeek 开发",
+        label: run && (run.plan?.tasks.length || 0) > 1 ? t("flow.developer.multi", { count: run.plan?.tasks.length ?? 0 }) : t("flow.developer.label"),
         caption: run?.plan ? `${run.plan.complexity} · ${run.plan.strategy}` : run?.developer.model || "developer agent",
         kind: "developer",
         status: statusAt(1),
@@ -274,44 +315,48 @@ function flowForRun(run?: Run, events: RunEvent[] = [], options: FlowOptions = {
       },
     },
     {
+      ...flowCardDimensions,
       id: "checks",
       type: "flowCard",
       position: { x: 474, y: 72 },
-      data: { label: "质量检查", caption: "lint · types · tests", kind: "checks", status: statusAt(2) },
+      data: { label: t("flow.checks.label"), caption: "lint · types · tests", kind: "checks", status: statusAt(2) },
     },
     {
+      ...flowCardDimensions,
       id: "reviewer",
       type: "flowCard",
       position: { x: 703, y: 72 },
       data: {
-        label: "OpenAI 审核",
+        label: t("flow.reviewer.label"),
         caption: run?.reviewer.model || "review agent",
         kind: "reviewer",
         status: statusAt(3),
       },
     },
     {
+      ...flowCardDimensions,
       id: "complete",
       type: "flowCard",
       position: { x: 932, y: 72 },
       data: {
-        label: run?.state === "needs_human" ? "人工介入" : "交付完成",
+        label: run?.state === "needs_human" ? t("flow.complete.human") : t("flow.complete.done"),
         caption: run?.state === "completed" ? "checks + review passed" : "approval gate",
         kind: "complete",
         status: statusAt(4),
       },
     },
     {
+      ...flowCardDimensions,
       id: "release",
       type: "flowCard",
       position: { x: 1161, y: 72 },
       data: {
-        label: run?.release?.status === "succeeded" ? "发布成功" : "代码发布",
+        label: run?.release?.status === "succeeded" ? t("flow.release.succeeded") : t("flow.release.label"),
         caption: run?.release
           ? `${run.release.environment} · ${run.release.status}`
           : run?.merge
-            ? "等待发布审批"
-            : "等待合并",
+            ? t("flow.release.awaitingPublish")
+            : t("flow.release.awaitingMerge"),
         kind: "release",
         status: !run || run.state !== "completed" || !run.merge
           ? "waiting"
@@ -349,6 +394,7 @@ function flowForRun(run?: Run, events: RunEvent[] = [], options: FlowOptions = {
     // opens), not the returned round's terminal `已退回返修`; clicks still open the
     // returned round's ReworkDetail via `round`/`onSelect`.
     const branch = branchStatus(statuses, round);
+    const branchTip = branch.status ? roundTooltipText(t, branch.status) : undefined;
     const active = options.selectedReworkRound === round;
     edges.push({
       id: `rework-${round}`,
@@ -358,12 +404,12 @@ function flowForRun(run?: Run, events: RunEvent[] = [], options: FlowOptions = {
       targetHandle: side === "above" ? "top-target" : "bottom-target",
       type: "rework",
       data: {
-        label: `round ${round} · 返修`,
+        label: t("flow.rework.label", { round }),
         side,
         offset,
         round,
         roundStatus: branch.status,
-        roundStatusTooltip: branch.tooltip,
+        roundStatusTooltip: branchTip,
         active,
         onSelect: options.onReworkSelect,
       },
@@ -389,7 +435,8 @@ function Logo() {
 }
 
 function StatusPill({ state }: { state: RunState }) {
-  return <span className={`status-pill status-${state}`}><i />{runStateLabels[state]}</span>;
+  const { t } = useT();
+  return <span className={`status-pill status-${state}`}><i />{t(runStateKey(state))}</span>;
 }
 
 function ProviderStatus({ label, provider, model, ready, icon: Icon }: {
@@ -399,11 +446,12 @@ function ProviderStatus({ label, provider, model, ready, icon: Icon }: {
   ready: boolean;
   icon: typeof Bot;
 }) {
+  const { t } = useT();
   return (
     <div className="provider-row">
       <div className={`provider-icon ${provider}`}><Icon size={16} /></div>
       <div className="provider-copy"><span>{label}</span><strong>{model}</strong></div>
-      <span className={`connection-dot ${ready ? "ready" : "missing"}`} title={ready ? "凭据已配置" : "凭据未配置"} />
+      <span className={`connection-dot ${ready ? "ready" : "missing"}`} title={t(ready ? "provider.credentialConfigured" : "provider.credentialMissing")} />
     </div>
   );
 }
@@ -416,9 +464,10 @@ function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, onGoWor
   recentRuns: Run[];
   onGoWorkspaces: () => void;
 }) {
-  const [title, setTitle] = useState("修复并发刷新竞态");
+  const { t, locale } = useT();
+  const [title, setTitle] = useState(() => t("createRun.demoTitle"));
   const [repository, setRepository] = useState("demo/auth-service");
-  const [task, setTask] = useState("修复 token 并发刷新导致的重复请求问题，补充失败清理与并发回归测试，确保 lint、类型检查和单元测试全部通过。");
+  const [task, setTask] = useState(() => t("createRun.demoTask"));
   const [mode, setMode] = useState<RunMode>("demo");
   const [checks, setChecks] = useState("npm test");
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
@@ -453,8 +502,8 @@ function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, onGoWor
       };
       setDeveloperModelId(pick(modelResult.defaultDeveloper, "developer"));
       setReviewerModelId(pick(modelResult.defaultReviewer, "reviewer"));
-    }).catch((cause) => setError((cause as Error).message));
-  }, [open, config?.realRunsAvailable]);
+    }).catch((cause) => setError(localizeError(locale, cause as { code?: string; message?: string })));
+  }, [open, config?.realRunsAvailable, locale]);
 
   if (!open) return null;
   const selectedWorkspace = workspaces.find((item) => item.id === workspaceId);
@@ -487,7 +536,7 @@ function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, onGoWor
       onCreated(run);
       onClose();
     } catch (cause) {
-      setError((cause as Error).message);
+      setError(localizeError(locale, cause as { code?: string; message?: string }));
     } finally {
       setSubmitting(false);
     }
@@ -496,35 +545,35 @@ function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, onGoWor
     <div className="modal-backdrop" onMouseDown={onClose}>
       <form className="modal" onSubmit={submit} onMouseDown={(event) => event.stopPropagation()}>
         <div className="modal-head">
-          <div><span className="eyebrow">NEW WORKFLOW</span><h2>创建开发任务</h2></div>
+          <div><span className="eyebrow">NEW WORKFLOW</span><h2>{t("createRun.title")}</h2></div>
           <button className="icon-button" type="button" onClick={onClose}><X size={18} /></button>
         </div>
         <div className="mode-picker">
-          <button type="button" className={mode === "demo" ? "active" : ""} onClick={() => { setMode("demo"); setRepository("demo/auth-service"); }}><Sparkles size={14} />流程演示</button>
-          <button type="button" className={mode === "real" ? "active" : ""} disabled={!config?.realRunsAvailable} onClick={() => setMode("real")}><Code2 size={14} />真实开发</button>
+          <button type="button" className={mode === "demo" ? "active" : ""} onClick={() => { setMode("demo"); setRepository("demo/auth-service"); }}><Sparkles size={14} />{t("createRun.modeDemo")}</button>
+          <button type="button" className={mode === "real" ? "active" : ""} disabled={!config?.realRunsAvailable} onClick={() => setMode("real")}><Code2 size={14} />{t("createRun.modeReal")}</button>
         </div>
         <div className="demo-notice">
-          {mode === "demo" ? <><Sparkles size={16} />演示事件不会调用模型或修改仓库。</> : <><ShieldCheck size={16} />真实任务将在隔离 Git worktree 中修改代码，不会自动推送或合并。</>}
+          {mode === "demo" ? <><Sparkles size={16} />{t("createRun.demoNotice")}</> : <><ShieldCheck size={16} />{t("createRun.realNotice")}</>}
         </div>
-        <label>任务名称<input value={title} onChange={(event) => setTitle(event.target.value)} /></label>
+        <label>{t("createRun.name")}<input value={title} onChange={(event) => setTitle(event.target.value)} /></label>
         {mode === "real" ? (
           workspaces.length === 0 ? (
             <div className="workspace-empty-notice">
               <AlertTriangle size={15} />
-              <div><strong>还没有注册工作区</strong><span>真实任务只能选择已注册且健康的工作区，请先在工作区页面注册或克隆一个仓库。</span></div>
-              <button type="button" className="button secondary" onClick={onGoWorkspaces}>前往工作区</button>
+              <div><strong>{t("createRun.noWorkspaces")}</strong><span>{t("createRun.noWorkspacesHint")}</span></div>
+              <button type="button" className="button secondary" onClick={onGoWorkspaces}>{t("createRun.goWorkspaces")}</button>
             </div>
           ) : (
             <>
-              <label>开发工作区<select value={workspaceId} onChange={(event) => selectWorkspace(event.target.value)}>
+              <label>{t("createRun.workspace")}<select value={workspaceId} onChange={(event) => selectWorkspace(event.target.value)}>
                 {workspaces.map((workspace) => (
                   <option value={workspace.id} key={workspace.id}>
-                    {workspace.name} · {workspace.git?.branch || "—"}{workspace.git?.dirty ? " · 有未提交修改" : ""}
+                    {workspace.name} · {workspace.git?.branch || "—"}{workspace.git?.dirty ? t("createRun.dirtySuffix") : ""}
                   </option>
                 ))}
               </select></label>
               {templates.length > 0 && (
-                <label>模板
+                <label>{t("createRun.template")}
                   <select value="" onChange={(event) => {
                     const template = templates.find((item) => item.id === event.target.value);
                     if (!template || !models) return;
@@ -535,7 +584,7 @@ function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, onGoWor
                     if (developer) setDeveloperModelId(developer);
                     if (reviewer) setReviewerModelId(reviewer);
                   }}>
-                    <option value="">选择模板填入模型…</option>
+                    <option value="">{t("createRun.templatePlaceholder")}</option>
                     {templates.map((template) => (
                       <option value={template.id} key={template.id}>
                         {template.name} · {template.developerModel.model} / {template.reviewerModel.model}
@@ -544,33 +593,33 @@ function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, onGoWor
                   </select>
                 </label>
               )}
-              <label>开发模型<select value={developerModelId} onChange={(event) => setDeveloperModelId(event.target.value)}>
+              <label>{t("createRun.developerModel")}<select value={developerModelId} onChange={(event) => setDeveloperModelId(event.target.value)}>
                 {(models?.models ?? []).filter((entry) => entry.roles.includes("developer")).map((entry) => (
-                  <option value={entry.id} key={entry.id} disabled={!entry.available}>{entry.label} · {entry.model}{entry.available ? "" : "（缺凭据）"}</option>
+                  <option value={entry.id} key={entry.id} disabled={!entry.available}>{entry.label} · {entry.model}{entry.available ? "" : t("createRun.missingCredentialSuffix")}</option>
                 ))}
               </select></label>
-              <label>审核模型<select value={reviewerModelId} onChange={(event) => setReviewerModelId(event.target.value)}>
+              <label>{t("createRun.reviewerModel")}<select value={reviewerModelId} onChange={(event) => setReviewerModelId(event.target.value)}>
                 {(models?.models ?? []).filter((entry) => entry.roles.includes("reviewer")).map((entry) => (
-                  <option value={entry.id} key={entry.id} disabled={!entry.available}>{entry.label} · {entry.model}{entry.available ? "" : "（缺凭据）"}</option>
+                  <option value={entry.id} key={entry.id} disabled={!entry.available}>{entry.label} · {entry.model}{entry.available ? "" : t("createRun.missingCredentialSuffix")}</option>
                 ))}
               </select></label>
               {selectedDirty && (
                 <div className="dirty-warning">
                   <AlertTriangle size={15} />
                   <div>
-                    <strong>工作区存在未提交修改</strong>
-                    <span>真实任务默认拒绝在 dirty 仓库上启动。请先提交或清理，然后刷新 Git 状态。</span>
+                    <strong>{t("createRun.dirtyTitle")}</strong>
+                    <span>{t("createRun.dirtyHint")}</span>
                     {selectedWorkspace?.git?.dirtyFiles?.length ? <code>{selectedWorkspace.git.dirtyFiles.slice(0, 5).join(" · ")}{selectedWorkspace.git.dirtyFiles.length > 5 ? " …" : ""}</code> : null}
                   </div>
                 </div>
               )}
             </>
           )
-        ) : <label>仓库<input value={repository} onChange={(event) => setRepository(event.target.value)} /></label>}
-        <label>需求与验收条件<textarea rows={5} value={task} onChange={(event) => setTask(event.target.value)} /></label>
+        ) : <label>{t("createRun.repository")}<input value={repository} onChange={(event) => setRepository(event.target.value)} /></label>}
+        <label>{t("createRun.task")}<textarea rows={5} value={task} onChange={(event) => setTask(event.target.value)} /></label>
         {recentRuns.length > 0 && (
           <div className="recent-requirements">
-            <span className="eyebrow">最近需求 · 点击填入</span>
+            <span className="eyebrow">{t("createRun.recent")}</span>
             <div className="recent-list">
               {recentRuns.slice(0, 5).map((item) => (
                 <button
@@ -587,12 +636,12 @@ function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, onGoWor
             </div>
           </div>
         )}
-        {mode === "real" && <label>检查命令（每行一个）<textarea rows={3} value={checks} onChange={(event) => setChecks(event.target.value)} placeholder="npm test" /></label>}
+        {mode === "real" && <label>{t("createRun.checks")}<textarea rows={3} value={checks} onChange={(event) => setChecks(event.target.value)} placeholder="npm test" /></label>}
         {error && <div className="form-error">{error}</div>}
         <div className="modal-actions">
-          <button type="button" className="button secondary" onClick={onClose}>取消</button>
+          <button type="button" className="button secondary" onClick={onClose}>{t("common.cancel")}</button>
           <button type="submit" className="button primary" disabled={submitting || (mode === "real" && (!workspaceId || selectedDirty || !developerModelId || !reviewerModelId))}>
-            {submitting ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}{mode === "real" ? "开始真实开发" : "运行演示"}
+            {submitting ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}{t(mode === "real" ? "createRun.submitReal" : "createRun.submitDemo")}
           </button>
         </div>
       </form>
@@ -601,10 +650,11 @@ function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, onGoWor
 }
 
 function ActivityPanel({ events }: { events: RunEvent[] }) {
+  const { t } = useT();
   // Chat entries have their own transcript panel; the activity feed stays a
   // pure orchestration timeline instead of duplicating every chat message.
   const activity = events.filter((event) => event.type !== "chat.message");
-  if (!activity.length) return <EmptyPanel icon={Activity} text="等待事件" />;
+  if (!activity.length) return <EmptyPanel icon={Activity} text={t("activity.empty")} />;
   return (
     <div className="timeline">
       {[...activity].reverse().map((event) => (
@@ -621,12 +671,13 @@ function ActivityPanel({ events }: { events: RunEvent[] }) {
 }
 
 function ReviewPanel({ findings, highlightKey }: { findings: Finding[]; highlightKey?: string | null }) {
+  const { t } = useT();
   // 决策摘要: scroll the target finding into view when a red gate item links here.
   useEffect(() => {
     if (!highlightKey) return;
     document.getElementById(`finding-${highlightKey}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [highlightKey]);
-  if (!findings.length) return <EmptyPanel icon={ShieldCheck} text="尚无审核问题" />;
+  if (!findings.length) return <EmptyPanel icon={ShieldCheck} text={t("review.empty")} />;
   return (
     <div className="finding-list">
       {findings.map((item) => {
@@ -635,7 +686,7 @@ function ReviewPanel({ findings, highlightKey }: { findings: Finding[]; highligh
           <article id={`finding-${key}`} className={`finding finding-${item.severity}${key === highlightKey ? " finding-flagged" : ""}`} key={item.id}>
             <div className="finding-head">
               <span>{item.severity}</span>
-              {item.resolved && <em><Check size={12} />已解决</em>}
+              {item.resolved && <em><Check size={12} />{t("review.resolved")}</em>}
             </div>
             <h4>{item.title}</h4>
             <code>{item.file}:{item.line}</code>
@@ -649,7 +700,8 @@ function ReviewPanel({ findings, highlightKey }: { findings: Finding[]; highligh
 }
 
 function SubAgentsPanel({ run }: { run: Run }) {
-  if (!run.plan) return <EmptyPanel icon={Bot} text="主 Agent 尚未生成任务计划" />;
+  const { t } = useT();
+  if (!run.plan) return <EmptyPanel icon={Bot} text={t("agents.empty")} />;
   return (
     <div className="agent-plan">
       <div className="agent-plan-summary"><span>{run.plan.complexity} · {run.plan.strategy}</span><p>{run.plan.rationale}</p></div>
@@ -670,6 +722,7 @@ function SubAgentsPanel({ run }: { run: Run }) {
 }
 
 function DiffPanel({ run, artifacts, mergeRequestConfigured }: { run: Run; artifacts: RunArtifact[]; mergeRequestConfigured?: boolean }) {
+  const { t, locale } = useT();
   const diffArtifact = artifacts.find((artifact) => artifact.artifactId === "diff");
   // A1: the export route always resolves the authoritative patch (artifact,
   // inline diff, or a worker regeneration), so it is preferred over the raw
@@ -683,10 +736,10 @@ function DiffPanel({ run, artifacts, mergeRequestConfigured }: { run: Run; artif
     try {
       const result = await api.createMergeRequest(run.id);
       setMrState("done");
-      setMrMessage(result.mergeRequest.url ? `已创建合并请求：${result.mergeRequest.url}` : "已创建合并请求");
+      setMrMessage(result.mergeRequest.url ? t("diff.mrCreatedWithUrl", { url: result.mergeRequest.url }) : t("diff.mrCreated"));
     } catch (cause) {
       setMrState("error");
-      setMrMessage((cause as Error).message);
+      setMrMessage(localizeError(locale, cause as { code?: string; message?: string }));
     }
   };
   return (
@@ -694,29 +747,29 @@ function DiffPanel({ run, artifacts, mergeRequestConfigured }: { run: Run; artif
       <div className="artifact-bar">
         {diffArtifact ? (
           <a className="button secondary" href={api.artifactDownloadUrl(run.id, "diff")} download>
-            <Download size={14} />下载完整 Diff (.patch)
+            <Download size={14} />{t("diff.download")}
             <em>{diffArtifact.bytes} bytes · {diffArtifact.sha256?.slice(0, 12)}</em>
           </a>
         ) : null}
         {diffArtifact || run.diff ? (
           <a className="button secondary" href={exportUrl} download>
-            <Download size={14} />导出补丁 (.patch)
+            <Download size={14} />{t("diff.exportPatch")}
           </a>
         ) : null}
         {mergeRequestConfigured ? (
           <button type="button" className="button secondary" disabled={mrState === "busy"} onClick={() => void createMergeRequest()}>
-            {mrState === "busy" ? <LoaderCircle className="spin" size={14} /> : <GitPullRequestArrow size={14} />}创建合并请求
+            {mrState === "busy" ? <LoaderCircle className="spin" size={14} /> : <GitPullRequestArrow size={14} />}{t("diff.createMr")}
           </button>
         ) : null}
         {diffArtifact?.baseSha ? <code className="artifact-base">base {diffArtifact.baseSha.slice(0, 10)}</code> : null}
-        <span className="artifact-hint">页面预览可能被截断；完整内容以制品下载为准。</span>
+        <span className="artifact-hint">{t("diff.previewHint")}</span>
       </div>
       {mrMessage ? <div className={mrState === "error" ? "form-error" : "artifact-hint"}>{mrMessage}</div> : null}
       {run.diff ? (
         <pre className="diff-view">{run.diff.split("\n").map((line, index) => (
           <span className={line.startsWith("+") ? "diff-add" : line.startsWith("-") ? "diff-remove" : line.startsWith("@@") ? "diff-hunk" : ""} key={`${index}-${line}`}>{line}{"\n"}</span>
         ))}</pre>
-      ) : <EmptyPanel icon={FileCode2} text="尚无代码变更" />}
+      ) : <EmptyPanel icon={FileCode2} text={t("diff.empty")} />}
     </div>
   );
 }
@@ -726,6 +779,7 @@ function DiffPanel({ run, artifacts, mergeRequestConfigured }: { run: Run; artif
  * checks summary and usage, with a copy button for the full JSON.
  */
 function AcceptancePanel({ run }: { run: Run }) {
+  const { t, locale } = useT();
   const [copied, setCopied] = useState(false);
   const snapshot = run.acceptance;
   if (!snapshot) return null;
@@ -741,18 +795,18 @@ function AcceptancePanel({ run }: { run: Run }) {
   return (
     <section className="panel acceptance-panel">
       <div className="panel-head">
-        <div><span className="eyebrow">ACCEPTANCE SNAPSHOT</span><h3>验收快照</h3></div>
+        <div><span className="eyebrow">ACCEPTANCE SNAPSHOT</span><h3>{t("acceptance.title")}</h3></div>
         <button type="button" className="button secondary" onClick={() => void copy()}>
-          {copied ? <Check size={14} /> : <Copy size={14} />}{copied ? "已复制" : "复制 JSON"}
+          {copied ? <Check size={14} /> : <Copy size={14} />}{copied ? t("common.copied") : t("acceptance.copyJson")}
         </button>
       </div>
       <div className="acceptance-grid">
-        <div><span>受理人</span><strong>{snapshot.acceptedBy}</strong><small>{formatClock(snapshot.acceptedAt)}</small></div>
-        <div><span>已解决 / 待处理意见</span><strong>{snapshot.findings.resolved.count} / {snapshot.findings.remaining.count}</strong><small>{snapshot.acknowledgedOpenFindings ? "已确认接受未解决意见" : "无未解决意见"}</small></div>
-        <div><span>检查</span><strong>{snapshot.checks.passed} 通过 / {snapshot.checks.failed} 失败</strong><small>共 {snapshot.checks.total} 项</small></div>
-        <div><span>Diff 制品</span><strong>{snapshot.diff.sha256 ? snapshot.diff.sha256.slice(0, 12) : "未知"}</strong><small>{snapshot.diff.bytes === null ? "字节数未知" : `${snapshot.diff.bytes} bytes`}</small></div>
-        <div><span>模型调用 / 成本</span><strong>{snapshot.usage.modelCalls} 次 · ${snapshot.usage.estimatedCost.toFixed(3)}</strong><small>输入 {compactNumber(snapshot.usage.inputTokens)} · 输出 {compactNumber(snapshot.usage.outputTokens)}</small></div>
-        <div><span>验收备注</span><strong>{snapshot.note ?? "无"}</strong><small>{run.merge ? `已合并 ${run.merge.commit.slice(0, 10)} → ${run.merge.targetBranch}` : "未合并"}</small></div>
+        <div><span>{t("acceptance.acceptedBy")}</span><strong>{snapshot.acceptedBy}</strong><small>{formatClock(snapshot.acceptedAt, locale)}</small></div>
+        <div><span>{t("acceptance.findings")}</span><strong>{snapshot.findings.resolved.count} / {snapshot.findings.remaining.count}</strong><small>{t(snapshot.acknowledgedOpenFindings ? "acceptance.acknowledged" : "acceptance.noOpenFindings")}</small></div>
+        <div><span>{t("acceptance.checks")}</span><strong>{t("acceptance.checksValue", { passed: snapshot.checks.passed, failed: snapshot.checks.failed })}</strong><small>{t("acceptance.checksTotal", { total: snapshot.checks.total })}</small></div>
+        <div><span>{t("acceptance.diff")}</span><strong>{snapshot.diff.sha256 ? snapshot.diff.sha256.slice(0, 12) : t("common.unknown")}</strong><small>{snapshot.diff.bytes === null ? t("acceptance.bytesUnknown") : `${snapshot.diff.bytes} bytes`}</small></div>
+        <div><span>{t("acceptance.usage")}</span><strong>{t("acceptance.usageValue", { calls: snapshot.usage.modelCalls, cost: snapshot.usage.estimatedCost.toFixed(3) })}</strong><small>{t("acceptance.usageTokens", { input: compactNumber(snapshot.usage.inputTokens), output: compactNumber(snapshot.usage.outputTokens) })}</small></div>
+        <div><span>{t("acceptance.note")}</span><strong>{snapshot.note ?? t("acceptance.none")}</strong><small>{run.merge ? t("acceptance.merged", { commit: run.merge.commit.slice(0, 10), branch: run.merge.targetBranch }) : t("acceptance.notMerged")}</small></div>
       </div>
     </section>
   );
@@ -765,13 +819,15 @@ function AcceptancePanel({ run }: { run: Run }) {
  * snapshot's "remaining" list; this line makes the deferral explicit.
  */
 function DeferredNonBlockingNotice({ events }: { events: RunEvent[] }) {
+  const { t, locale } = useT();
   const notice = useMemo(() => deferredNonBlockingNotice(events), [events]);
   if (!notice) return null;
-  const ids = notice.ids.slice(0, 8).join("、");
+  const ids = notice.ids.slice(0, 8).join(locale === "en" ? ", " : "、");
+  const [open, close] = locale === "en" ? [" (", ")"] : ["（", "）"];
   return (
     <div className="review-scope-note">
-      第 {notice.round} 轮按「只修阻断项」范围受理：{notice.count} 个非阻断问题（medium/low）已记录但不阻断完成
-      {notice.ids.length > 0 ? `（${ids}${notice.ids.length > 8 ? "…" : ""}）` : ""}
+      {t("review.deferred", { round: notice.round, count: notice.count })}
+      {notice.ids.length > 0 ? `${open}${ids}${notice.ids.length > 8 ? "…" : ""}${close}` : ""}
     </div>
   );
 }
@@ -783,6 +839,7 @@ function ReleasePanel({ run, user, configured, onUpdated }: {
   configured?: boolean;
   onUpdated: (run: Run) => void;
 }) {
+  const { t, locale } = useT();
   const [environment, setEnvironment] = useState("production");
   const [busy, setBusy] = useState<"" | "merge" | "publish">("");
   const [error, setError] = useState("");
@@ -802,80 +859,81 @@ function ReleasePanel({ run, user, configured, onUpdated }: {
   const canRetry = release?.status === "failed" || stalePublishing;
   const inProgress = (release?.status === "publishing" || release?.status === "triggered") && !stalePublishing;
   const merge = async () => {
-    if (!window.confirm(`确认把任务「${run.title}」审核通过的 commit 合并到工作区默认分支？\n\n此操作不会自动发布。`)) return;
+    if (!window.confirm(t("release.mergeConfirm", { title: run.title }))) return;
     setBusy("merge");
     setError("");
     try {
       onUpdated(await api.mergeRun(run.id, { confirm: true }));
     } catch (cause) {
-      setError((cause as Error).message);
+      setError(localizeError(locale, cause as { code?: string; message?: string }));
     } finally {
       setBusy("");
     }
   };
   const publish = async () => {
     const target = release?.environment ?? environment.trim();
-    if (!target) return setError("请输入发布环境");
-    if (!window.confirm(`确认发布任务「${run.title}」？\n\ncommit：${run.merge?.commit.slice(0, 12)}\n环境：${target}\n\n发布与合并是独立动作，失败后可使用同一幂等标识重试。`)) return;
+    if (!target) return setError(t("release.environmentRequired"));
+    if (!window.confirm(t("release.publishConfirm", { title: run.title, commit: run.merge?.commit.slice(0, 12) ?? "—", environment: target }))) return;
     setBusy("publish");
     setError("");
     try {
       onUpdated(await api.publishRun(run.id, { environment: target, confirm: true, ...(canRetry ? { retry: true } : {}) }));
     } catch (cause) {
-      setError((cause as Error).message);
+      setError(localizeError(locale, cause as { code?: string; message?: string }));
     } finally {
       setBusy("");
     }
   };
 
   const statusLabel = !release
-    ? run.merge ? "已合并，等待发布审批" : "等待合并审批"
+    ? run.merge ? t("release.statusMergedAwaiting") : t("release.statusAwaitingMerge")
     : release.status === "succeeded"
-      ? "发布成功"
+      ? t("release.statusSucceeded")
       : release.status === "failed"
-        ? "发布失败"
+        ? t("release.statusFailed")
         : release.status === "triggered"
-          ? "已触发，等待部署回调"
-          : "发布中";
+          ? t("release.statusTriggered")
+          : t("release.statusPublishing");
 
   return (
     <section className="panel release-panel">
       <div className="panel-head">
-        <div><span className="eyebrow">CODE RELEASE</span><h3>代码发布</h3></div>
+        <div><span className="eyebrow">CODE RELEASE</span><h3>{t("release.title")}</h3></div>
         <span className={`release-status release-${release?.status ?? (run.merge ? "ready" : "waiting")}`}>{statusLabel}</span>
       </div>
       <div className="release-grid">
-        <div><span>审核快照</span><strong>{run.reviewSnapshot?.slice(0, 12) ?? run.baseSha?.slice(0, 12) ?? "未知"}</strong></div>
-        <div><span>合并结果</span><strong>{run.merge ? `${run.merge.commit.slice(0, 12)} → ${run.merge.targetBranch}` : "未合并"}</strong></div>
-        <div><span>发布环境</span><strong>{release?.environment ?? environment}</strong></div>
-        <div><span>幂等标识</span><strong>{release?.deliveryId ?? "发布时生成"}</strong></div>
+        <div><span>{t("release.reviewSnapshot")}</span><strong>{run.reviewSnapshot?.slice(0, 12) ?? run.baseSha?.slice(0, 12) ?? t("common.unknown")}</strong></div>
+        <div><span>{t("release.mergeResult")}</span><strong>{run.merge ? `${run.merge.commit.slice(0, 12)} → ${run.merge.targetBranch}` : t("release.notMerged")}</strong></div>
+        <div><span>{t("release.environment")}</span><strong>{release?.environment ?? environment}</strong></div>
+        <div><span>{t("release.deliveryId")}</span><strong>{release?.deliveryId ?? t("release.deliveryIdGenerated")}</strong></div>
       </div>
       {release?.detail ? <p className="release-detail">{release.detail}</p> : null}
-      {release?.url ? <a className="release-link" href={release.url} target="_blank" rel="noreferrer">查看部署详情 <ArrowUpRight size={13} /></a> : null}
+      {release?.url ? <a className="release-link" href={release.url} target="_blank" rel="noreferrer">{t("release.viewDeploy")} <ArrowUpRight size={13} /></a> : null}
       {error ? <div className="form-error">{error}</div> : null}
       {user?.isAdmin ? (
         <div className="release-actions">
           {!run.merge ? (
             <button type="button" className="button secondary" disabled={Boolean(busy)} onClick={() => void merge()}>
-              {busy === "merge" ? <LoaderCircle className="spin" size={14} /> : <GitBranch size={14} />}合并审核代码
+              {busy === "merge" ? <LoaderCircle className="spin" size={14} /> : <GitBranch size={14} />}{t("release.mergeAction")}
             </button>
           ) : null}
           {run.merge && release?.status !== "succeeded" ? (
             <>
-              {!release ? <input aria-label="发布环境" value={environment} maxLength={64} onChange={(event) => setEnvironment(event.target.value)} disabled={Boolean(busy)} /> : null}
+              {!release ? <input aria-label={t("release.environment")} value={environment} maxLength={64} onChange={(event) => setEnvironment(event.target.value)} disabled={Boolean(busy)} /> : null}
               <button type="button" className="button primary" disabled={Boolean(busy) || inProgress || configured === false} onClick={() => void publish()}>
-                {busy === "publish" || inProgress ? <LoaderCircle className="spin" size={14} /> : <Rocket size={14} />}{canRetry ? "重试发布" : inProgress ? "发布处理中" : "确认发布"}
+                {busy === "publish" || inProgress ? <LoaderCircle className="spin" size={14} /> : <Rocket size={14} />}{t(canRetry ? "release.retry" : inProgress ? "release.inProgress" : "release.confirm")}
               </button>
             </>
           ) : null}
-          {configured === false ? <small className="release-config-hint">发布钩子或 webhook 凭据尚未配置。</small> : null}
+          {configured === false ? <small className="release-config-hint">{t("release.notConfigured")}</small> : null}
         </div>
-      ) : <small className="release-config-hint">只有管理员可以执行合并和发布。</small>}
+      ) : <small className="release-config-hint">{t("release.adminOnly")}</small>}
     </section>
   );
 }
 
 function ChecksPanel({ run }: { run: Run }) {
+  const { t } = useT();
   return (
     <div className="check-list">
       {run.checks.map((check) => (
@@ -884,7 +942,7 @@ function ChecksPanel({ run }: { run: Run }) {
             {check.status === "passed" ? <Check size={14} /> : check.status === "running" ? <LoaderCircle className="spin" size={14} /> : <CircleDot size={14} />}
           </span>
           <div><strong>{check.name}</strong><code>{check.command}</code></div>
-          <span className="check-exit" title="进程退出码">{check.exitCode === undefined ? "exit —" : `exit ${check.exitCode}`}</span>
+          <span className="check-exit" title={t("checks.exitCodeTitle")}>{check.exitCode === undefined ? "exit —" : `exit ${check.exitCode}`}</span>
           <span>{check.durationMs ? `${(check.durationMs / 1000).toFixed(1)}s` : "—"}</span>
         </div>
       ))}
@@ -894,6 +952,7 @@ function ChecksPanel({ run }: { run: Run }) {
 
 /** GAP-04: per-run budget limits vs. current spend, remaining calls/cost. */
 function BudgetPanel({ run }: { run: Run }) {
+  const { t } = useT();
   const budget = run.budget;
   const usedTokens = run.usage.totalTokens ?? run.usage.inputTokens + run.usage.outputTokens;
   const usedCost = run.usage.estimatedCost;
@@ -901,10 +960,10 @@ function BudgetPanel({ run }: { run: Run }) {
   const usedSeconds = Math.round(run.durationMs / 1000);
   const remaining = (limit: number, used: number) => (limit > 0 ? Math.max(0, limit - used) : null);
   const rows = [
-    { label: "Tokens", limit: budget?.maxTokens ?? 0, used: usedTokens, remaining: remaining(budget?.maxTokens ?? 0, usedTokens), unit: "" },
-    { label: "成本 (USD)", limit: budget?.maxCostUsd ?? 0, used: usedCost, remaining: remaining(budget?.maxCostUsd ?? 0, usedCost), unit: "$" },
-    { label: "模型调用次数", limit: budget?.maxModelCalls ?? 0, used: usedCalls, remaining: remaining(budget?.maxModelCalls ?? 0, usedCalls), unit: "" },
-    { label: "时长 (秒)", limit: budget?.maxDurationSeconds ?? 0, used: usedSeconds, remaining: remaining(budget?.maxDurationSeconds ?? 0, usedSeconds), unit: "" },
+    { label: t("budget.tokens"), limit: budget?.maxTokens ?? 0, used: usedTokens, remaining: remaining(budget?.maxTokens ?? 0, usedTokens), unit: "" },
+    { label: t("budget.cost"), limit: budget?.maxCostUsd ?? 0, used: usedCost, remaining: remaining(budget?.maxCostUsd ?? 0, usedCost), unit: "$" },
+    { label: t("budget.modelCalls"), limit: budget?.maxModelCalls ?? 0, used: usedCalls, remaining: remaining(budget?.maxModelCalls ?? 0, usedCalls), unit: "" },
+    { label: t("budget.duration"), limit: budget?.maxDurationSeconds ?? 0, used: usedSeconds, remaining: remaining(budget?.maxDurationSeconds ?? 0, usedSeconds), unit: "" },
   ];
   const format = (value: number, unit: string) => `${unit}${unit === "$" ? value.toFixed(3) : compactNumber(value)}`;
   const roles: RunRoleUsage[] = run.usageRoles ?? [];
@@ -916,13 +975,16 @@ function BudgetPanel({ run }: { run: Run }) {
       .sort((a, b) => (a.lastAt < b.lastAt ? 1 : -1));
     const latest = summaries[0];
     if (latest) {
-      return `${latest.sessionId}${latest.resumed ? " · 复用" : " · 新建"}（${latest.calls} 次调用 · ${latest.rounds.map((round) => `R${round}`).join("/")}）`;
+      const rounds = latest.rounds.map((round) => `R${round}`).join("/");
+      const kind = t(latest.resumed ? "budget.sessionReused" : "budget.sessionNew");
+      const detail = t("budget.sessionDetail", { calls: latest.calls, rounds });
+      return `${latest.sessionId} · ${kind}（${detail}）`;
     }
     const base = run.id.replaceAll("_", "-");
     if (role === "developer") return `${base}-developer`;
     if (role === "integrator") return `${base}-integrator`;
     if (role === "sub-agent") return `${base}-sub-<taskId>`;
-    return "无独立会话（--no-session）";
+    return t("budget.noSession");
   };
   return (
     <div className="budget-panel">
@@ -930,14 +992,14 @@ function BudgetPanel({ run }: { run: Run }) {
         {rows.map((row) => (
           <div className="budget-row" key={row.label}>
             <span>{row.label}</span>
-            <strong>{format(row.used, row.unit)}{row.limit > 0 ? <em> / {format(row.limit, row.unit)}</em> : <em> / 未设置上限</em>}</strong>
-            <small>{row.remaining === null ? "未设置上限" : `剩余 ${format(row.remaining, row.unit)}`}</small>
+            <strong>{format(row.used, row.unit)}{row.limit > 0 ? <em> / {format(row.limit, row.unit)}</em> : <em> / {t("budget.noLimit")}</em>}</strong>
+            <small>{row.remaining === null ? t("budget.noLimit") : t("budget.remaining", { value: format(row.remaining, row.unit) })}</small>
           </div>
         ))}
       </div>
       <div className="budget-roles">
         <div className="budget-roles-head"><span>AGENT</span><span>MODEL</span><span>CALLS</span><span>TOKENS</span><span>COST</span></div>
-        {roles.length === 0 && <div className="budget-empty">尚无按 Agent 统计的用量（演示任务不产生真实用量）。</div>}
+        {roles.length === 0 && <div className="budget-empty">{t("budget.empty")}</div>}
         {roles.map((entry) => (
           <div className="budget-roles-row" key={`${entry.role}-${entry.provider}-${entry.model}`}>
             <span><strong>{entry.role}</strong><code>{sessionFor(entry.role)}</code></span>
@@ -947,16 +1009,16 @@ function BudgetPanel({ run }: { run: Run }) {
             <span>${entry.estimatedCost.toFixed(3)}</span>
           </div>
         ))}
-        {(run.usageUnknownCalls ?? 0) > 0 && <div className="budget-unknown">有 {run.usageUnknownCalls} 次调用的 provider 用量无法确认，未计入费用。</div>}
+        {(run.usageUnknownCalls ?? 0) > 0 && <div className="budget-unknown">{t("budget.unknownCalls", { count: run.usageUnknownCalls ?? 0 })}</div>}
       </div>
     </div>
   );
 }
 
-function participantName(participant: ChatMessage["from"], run: Run) {
+function participantName(participant: ChatMessage["from"], run: Run, t: TFunction) {
   if (participant === "developer") return run.developer.model;
   if (participant === "reviewer") return run.reviewer.model;
-  return chatParticipantLabels[participant];
+  return t(`chat.participant.${participant}`);
 }
 
 function participantInitials(participant: ChatMessage["from"]) {
@@ -975,6 +1037,7 @@ function ChatMessageItem({ message, run, expanded, onToggle, canJumpToRound, onJ
   canJumpToRound: boolean;
   onJumpToRound: (round: number) => void;
 }) {
+  const { t, locale } = useT();
   const [copied, setCopied] = useState(false);
   const view = useMemo(() => chatMessageView(message, expanded), [message, expanded]);
   const findings = useMemo(() => messageFindings(message), [message]);
@@ -997,24 +1060,24 @@ function ChatMessageItem({ message, run, expanded, onToggle, canJumpToRound, onJ
       <span className="chat-avatar">{message.agent ? message.agent.slice(0, 2) : participantInitials(message.from)}</span>
       <div className="chat-bubble">
         <div className="chat-meta">
-          <strong>{message.agent ?? participantName(message.from, run)}</strong>
+          <strong>{message.agent ?? participantName(message.from, run, t)}</strong>
           <ArrowRight size={11} />
-          <span>{participantName(message.to, run)}</span>
-          <em className={`chat-channel-tag tag-${message.channel}`}>{chatChannelLabels[message.channel]}</em>
+          <span>{participantName(message.to, run, t)}</span>
+          <em className={`chat-channel-tag tag-${message.channel}`}>{t(`chat.channel.${message.channel}`)}</em>
           <em className="chat-round">R{message.round}</em>
-          <time>{formatClock(message.at)}</time>
-          <button type="button" className="chat-copy" title="复制这条消息的完整内容" onClick={() => void copy()}>
-            {copied ? <Check size={11} /> : <Copy size={11} />}{copied ? "已复制" : "复制"}
+          <time>{formatClock(message.at, locale)}</time>
+          <button type="button" className="chat-copy" title={t("chat.copyTitle")} onClick={() => void copy()}>
+            {copied ? <Check size={11} /> : <Copy size={11} />}{copied ? t("common.copied") : t("common.copy")}
           </button>
           {canJumpToRound && (
-            <button type="button" className="chat-copy" title={`跳到第 ${message.round} 轮工作流拓扑`} onClick={() => onJumpToRound(message.round)}>
-              <CornerDownLeft size={11} />跳到该轮拓扑
+            <button type="button" className="chat-copy" title={t("chat.jumpTopologyTitle", { round: message.round })} onClick={() => onJumpToRound(message.round)}>
+              <CornerDownLeft size={11} />{t("chat.jumpTopology")}
             </button>
           )}
         </div>
         {findings.length > 0 && (
           <div className="chat-findings">
-            <div className="chat-findings-head">{findings.length} 项审核发现</div>
+            <div className="chat-findings-head">{t("chat.findingsCount", { count: findings.length })}</div>
             {findings.map((item, index) => (
               <article className={`chat-finding sev-${item.severity}`} key={item.id ?? index}>
                 <div className="chat-finding-head">
@@ -1033,7 +1096,7 @@ function ChatMessageItem({ message, run, expanded, onToggle, canJumpToRound, onJ
         {!structuredOnly && view.collapsible && (
           <button type="button" className="chat-toggle" aria-expanded={view.expanded} onClick={() => onToggle(message.id, !view.expanded)}>
             <ChevronDown size={12} className={view.expanded ? "chat-toggle-open" : ""} />
-            {view.expanded ? "收起" : `展开完整内容（${(view.bytes / 1024).toFixed(1)} KB）`}
+            {view.expanded ? t("chat.collapse") : t("chat.expand", { size: (view.bytes / 1024).toFixed(1) })}
           </button>
         )}
       </div>
@@ -1046,17 +1109,18 @@ function ReworkDetail({ detail, onJumpToChat, onClose }: {
   onJumpToChat: (round: number) => void;
   onClose: () => void;
 }) {
+  const { t } = useT();
   const severities = (["critical", "high", "medium", "low"] as const).filter((severity) => detail.summary.bySeverity[severity] > 0);
   const hidden = detail.summary.total - detail.summary.top.length;
   return (
-    <aside className="rework-detail" role="dialog" aria-label={`第 ${detail.round} 轮返修`}>
+    <aside className="rework-detail" role="dialog" aria-label={t("rework.aria", { round: detail.round })}>
       <div className="rework-detail-head">
-        <strong>第 {detail.round} 轮返修</strong>
-        <button type="button" className="rework-close" title="关闭" onClick={onClose}><X size={13} /></button>
+        <strong>{t("rework.title", { round: detail.round })}</strong>
+        <button type="button" className="rework-close" title={t("common.close")} onClick={onClose}><X size={13} /></button>
       </div>
       <p className="rework-reason">{detail.reason}</p>
       <div className="rework-summary">
-        <span>共 {detail.summary.total} 项发现</span>
+        <span>{t("rework.total", { total: detail.summary.total })}</span>
         {severities.map((severity) => (
           <em key={severity} className={`fsev fsev-${severity}`}>{severity} {detail.summary.bySeverity[severity]}</em>
         ))}
@@ -1071,10 +1135,10 @@ function ReworkDetail({ detail, onJumpToChat, onClose }: {
             </li>
           ))}
         </ul>
-      ) : <p className="rework-empty">本轮没有结构化发现记录。</p>}
-      {hidden > 0 && <p className="rework-more">另有 {hidden} 项未在此列出，详见协作对话日志。</p>}
+      ) : <p className="rework-empty">{t("rework.empty")}</p>}
+      {hidden > 0 && <p className="rework-more">{t("rework.more", { count: hidden })}</p>}
       <button type="button" className="button secondary" onClick={() => onJumpToChat(detail.round)}>
-        <CornerDownLeft size={13} />跳到该轮协作对话
+        <CornerDownLeft size={13} />{t("rework.jumpChat")}
       </button>
     </aside>
   );
@@ -1090,6 +1154,7 @@ function ChatLog({ messages, run, activeTab, onTabChange, roundFilter, onClearRo
   reworkRounds: ReadonlySet<number>;
   onJumpToRound: (round: number) => void;
 }) {
+  const { t } = useT();
   const counts = useMemo(() => chatCounts(messages), [messages]);
   const visible = useMemo(() => {
     const filtered = filterChatMessages(messages, activeTab);
@@ -1105,12 +1170,12 @@ function ChatLog({ messages, run, activeTab, onTabChange, roundFilter, onClearRo
       <div className="chat-head">
         <div className="chat-title">
           <span className="eyebrow">AGENT CONVERSATION</span>
-          <h3><MessagesSquare size={15} />协作对话日志</h3>
+          <h3><MessagesSquare size={15} />{t("chat.title")}</h3>
         </div>
-        <div className="chat-tabs" role="tablist" aria-label="对话筛选">
+        <div className="chat-tabs" role="tablist" aria-label={t("chat.filterAria")}>
           {roundFilter !== null && (
-            <button type="button" className="chat-round-filter" title="清除轮次筛选" onClick={onClearRoundFilter}>
-              仅看第 {roundFilter} 轮<X size={11} />
+            <button type="button" className="chat-round-filter" title={t("chat.clearRoundFilter")} onClick={onClearRoundFilter}>
+              {t("chat.onlyRound", { round: roundFilter })}<X size={11} />
             </button>
           )}
           {chatTabs.map((tab) => (
@@ -1120,17 +1185,17 @@ function ChatLog({ messages, run, activeTab, onTabChange, roundFilter, onClearRo
               aria-selected={activeTab === tab.id}
               className={activeTab === tab.id ? "active" : ""}
               key={tab.id}
-              title={tab.hint}
+              title={t(`chat.tab.${tab.id}.hint`)}
               onClick={() => onTabChange(tab.id)}
             >
-              {tab.label}<em>{counts[tab.id]}</em>
+              {t(`chat.tab.${tab.id}`)}<em>{counts[tab.id]}</em>
             </button>
           ))}
         </div>
       </div>
       <div className="chat-body">
         {visible.length === 0 ? (
-          <EmptyPanel icon={MessagesSquare} text={roundFilter !== null ? `第 ${roundFilter} 轮暂无对话` : activeTab === "all" ? "等待 Agent 对话" : "该分类暂无对话"} />
+          <EmptyPanel icon={MessagesSquare} text={roundFilter !== null ? t("chat.emptyRound", { round: roundFilter }) : activeTab === "all" ? t("chat.emptyWaiting") : t("chat.emptyCategory")} />
         ) : (
           <div className="chat-stream">
             {visible.map((message) => (
@@ -1179,6 +1244,7 @@ function DecisionBriefCard({
   onOpenFinding: (key: string) => void;
   onOpenTab: (tab: Tab) => void;
 }) {
+  const { t } = useT();
   const findingsByKey = useMemo(
     () => new Map(run.findings.map((finding) => [finding.fingerprint ?? findingFingerprint(finding), finding])),
     [run.findings],
@@ -1192,7 +1258,7 @@ function DecisionBriefCard({
       <button type="button" className="decision-brief-head" aria-expanded={open} onClick={onToggle}>
         <div className="decision-brief-title">
           <span className="eyebrow">DECISION BRIEF</span>
-          <h3>{decisionBriefHeading(brief)}</h3>
+          <h3>{t(decisionBriefHeadingKey(brief))}</h3>
         </div>
         <div className="decision-stop">
           <em>{stop.code}</em>
@@ -1208,7 +1274,7 @@ function DecisionBriefCard({
               return (
                 <div className={`decision-gate decision-gate-${gate.status}`} key={gate.id}>
                   <span className="decision-gate-light" />
-                  <strong>{decisionGateLabels[gate.id]}</strong>
+                  <strong>{t(decisionGateKeys[gate.id])}</strong>
                   <small>{gate.detail}</small>
                   {gate.status !== "green" ? (
                     <button
@@ -1219,7 +1285,7 @@ function DecisionBriefCard({
                         else onOpenTab(target.tab);
                       }}
                     >
-                      定位<ArrowRight size={12} />
+                      {t("decision.locate")}<ArrowRight size={12} />
                     </button>
                   ) : null}
                 </div>
@@ -1228,32 +1294,36 @@ function DecisionBriefCard({
           </div>
           {groups.length > 0 ? (
             <div className="decision-remaining">
-              {groups.map(({ label, items }) => (
+              {groups.map((group) => {
+                const groupKey = decisionRemainingGroupKey(group.kind);
+                const label = group.ac ?? (groupKey ? t(groupKey) : group.kind);
+                return (
                 <div className="decision-group" key={label}>
                   <span className="decision-group-label">{label}</span>
-                  {items.map((item) => {
+                  {group.items.map((item) => {
                     const finding = findingsByKey.get(item.key);
                     return (
-                      <button type="button" className="decision-finding" key={item.key} title="定位到审核问题" onClick={() => onOpenFinding(item.key)}>
+                      <button type="button" className="decision-finding" key={item.key} title={t("decision.locateFindingTitle")} onClick={() => onOpenFinding(item.key)}>
                         <span className={`decision-sev decision-sev-${item.severity}`}>{item.severity}</span>
                         <span className="decision-finding-title">{finding?.title ?? item.key}</span>
-                        {item.streak > 0 ? <em>已返修 {item.streak} 次未解决</em> : null}
-                        {!item.evidenceOk ? <em className="decision-suspect">疑似误报</em> : null}
+                        {item.streak > 0 ? <em>{t("decision.streak", { count: item.streak })}</em> : null}
+                        {!item.evidenceOk ? <em className="decision-suspect">{t("decision.suspected")}</em> : null}
                       </button>
                     );
                   })}
                 </div>
-              ))}
+                );
+              })}
             </div>
           ) : null}
           <div className="decision-reco">
             <p><ShieldCheck size={14} />{brief.recommendation.note}</p>
             <div className="decision-actions">
               <button type="button" className="button primary" onClick={() => onContinue(brief.recommendation.note)}>
-                <Play size={15} />继续开发
+                <Play size={15} />{t("decision.continue")}
               </button>
               <button type="button" className="button primary" onClick={onAccept}>
-                <CheckCircle2 size={15} />接受交付
+                <CheckCircle2 size={15} />{t("decision.accept")}
               </button>
             </div>
           </div>
@@ -1264,13 +1334,14 @@ function DecisionBriefCard({
 }
 
 function HumanInterventionPanel({ run, events, user, onUpdated, draftNote }: { run: Run; events: RunEvent[]; user?: CurrentUser; onUpdated: (run: Run) => void; draftNote?: string }) {
+  const { t, locale } = useT();
   const [instruction, setInstruction] = useState("");
   const [busy, setBusy] = useState<"" | "resume" | "review" | "terminate" | "continue" | "approve" | "reject">("");
   const [error, setError] = useState("");
   const [mergeNotice, setMergeNotice] = useState("");
   // A2: admin-only merge on accept; the server enforces the admin check, and the
   // UI mirrors it so a non-admin is never offered an action that can only 403.
-  const mergeOption = mergeOptionState(user);
+  const mergeOption = mergeOptionState(user, locale);
   const [mergeIntoWorkspace, setMergeIntoWorkspace] = useState(false);
   // Convergence guardrail: the operator can narrow the continued round to the
   // blocking (critical/high) findings so medium/low notes no longer loop.
@@ -1281,11 +1352,11 @@ function HumanInterventionPanel({ run, events, user, onUpdated, draftNote }: { r
   const eventNotice = useMemo(() => {
     const failure = [...events].reverse().find((event) => event.type === "run.merge_failed");
     return failure
-      ? describeMergeRestore(mergeRestoreFields({ restored: failure.meta?.restored, restoreError: failure.meta?.restoreError }))
+      ? describeMergeRestore(mergeRestoreFields({ restored: failure.meta?.restored, restoreError: failure.meta?.restoreError }), locale)
       : undefined;
-  }, [events]);
+  }, [events, locale]);
   const restoreNotice = mergeNotice || eventNotice;
-  const restoreFailed = restoreNotice?.startsWith("工作区恢复失败") ?? false;
+  const restoreFailed = restoreNotice?.startsWith(t("merge.restoreFailed")) ?? false;
 
   // If the merge option is (or becomes) unavailable, never send a stale `true`.
   useEffect(() => {
@@ -1300,10 +1371,10 @@ function HumanInterventionPanel({ run, events, user, onUpdated, draftNote }: { r
   const act = async (kind: "resume" | "review" | "terminate" | "continue" | "approve" | "reject") => {
     setError("");
     setMergeNotice("");
-    if (kind === "terminate" && !window.confirm(`终止任务「${run.title}」？\n\n任务会标记为已取消；代码与 worktree 全部保留，不会自动合并。`)) return;
-    if (kind === "reject" && !window.confirm(`拒绝任务「${run.title}」的交付？\n\n任务将标记为已取消；代码与 worktree 全部保留。`)) return;
+    if (kind === "terminate" && !window.confirm(t("human.terminateConfirm", { title: run.title }))) return;
+    if (kind === "reject" && !window.confirm(t("human.rejectConfirm", { title: run.title }))) return;
     if (kind === "approve" && !window.confirm(
-      `${unresolved > 0 ? `任务「${run.title}」仍有 ${unresolved} 条未解决意见。\n\n确认接受交付？这些意见会被记录为已知接受，不会继续修复。` : `确认通过任务「${run.title}」的交付？`}${mergeIntoWorkspace ? "\n\n已勾选「合并到工作区默认分支」：将先合并再完成（冲突会被拒绝，工作区保持不变）。" : "\n\nworktree 中的代码不会自动推送或合并。"}`,
+      `${unresolved > 0 ? t("human.approveConfirmOpen", { title: run.title, count: unresolved }) : t("human.approveConfirmOk", { title: run.title })}${mergeIntoWorkspace ? t("human.approveMergeSuffix") : t("human.approveNoMergeSuffix")}`,
     )) return;
     setBusy(kind);
     try {
@@ -1327,10 +1398,10 @@ function HumanInterventionPanel({ run, events, user, onUpdated, draftNote }: { r
         onUpdated(await api.cancelRun(run.id));
       }
     } catch (cause) {
-      const failure = cause as Error & { body?: Record<string, unknown> };
-      setError(failure.message);
+      const failure = cause as Error & { code?: string; body?: Record<string, unknown> };
+      setError(localizeError(locale, failure, failure.message));
       // R: surface the workspace-restore state even before the event list refreshes.
-      const immediate = describeMergeRestore(mergeRestoreFields({ restored: failure.body?.restored, restoreError: failure.body?.restoreError }));
+      const immediate = describeMergeRestore(mergeRestoreFields({ restored: failure.body?.restored, restoreError: failure.body?.restoreError }), locale);
       if (immediate) setMergeNotice(immediate);
     } finally {
       setBusy("");
@@ -1340,59 +1411,58 @@ function HumanInterventionPanel({ run, events, user, onUpdated, draftNote }: { r
   return (
     <section className="human-panel">
       <div className="human-panel-head">
-        <div><span className="eyebrow">HUMAN IN THE LOOP</span><h3>需要人工处理</h3></div>
+        <div><span className="eyebrow">HUMAN IN THE LOOP</span><h3>{t("human.title")}</h3></div>
         <span className="human-reason">{run.summary}</span>
       </div>
-      <p className="human-hint">
-        当前有 {unresolved} 条未解决意见，代码保留在服务器 worktree（未自动提交或合并）。选择「继续开发」会带着未解决意见回到开发再跑一轮；选择「接受交付」会直接完成交付（仍有未解决意见时会先二次确认），也可以直接编辑 worktree 后「恢复下一轮」（会记录恢复点 HEAD 与人工指令）、「重试审核」让 Reviewer 复查当前代码，或「拒绝」终止交付。
-      </p>
-      <label>人工指令 / 审批备注（可选，随恢复或审批记录）
-        <textarea rows={3} value={instruction} onChange={(event) => setInstruction(event.target.value)} placeholder="例如：优先修复凭据隔离问题；其余按审核意见逐条处理。" disabled={Boolean(busy)} />
+      <p className="human-hint">{t("human.hint", { count: unresolved })}</p>
+      <label>{t("human.instruction")}
+        <textarea rows={3} value={instruction} onChange={(event) => setInstruction(event.target.value)} placeholder={t("human.instructionPlaceholder")} disabled={Boolean(busy)} />
       </label>
       {mergeOption.show && (
         <label className="merge-option" title={mergeOption.hint || undefined}>
           <input type="checkbox" checked={mergeIntoWorkspace} onChange={(event) => setMergeIntoWorkspace(event.target.checked)} disabled={Boolean(busy) || mergeOption.disabled} />
-          审批通过后合并到工作区默认分支（仅管理员；冲突会被拒绝且不修改工作区）
+          {t("human.mergeOption")}
         </label>
       )}
       {mergeOption.disabled && mergeOption.hint && <div className="merge-option-hint">{mergeOption.hint}</div>}
-      <label className="review-scope-option">「继续开发」的审核范围
+      <label className="review-scope-option">{t("human.reviewScope")}
         <select value={reviewScope} onChange={(event) => setReviewScope(event.target.value === "blocking" ? "blocking" : "all")} disabled={Boolean(busy)}>
-          <option value="all">修复全部问题</option>
-          <option value="blocking">只修阻断项(critical/high)</option>
+          <option value="all">{t("human.scopeAll")}</option>
+          <option value="blocking">{t("human.scopeBlocking")}</option>
         </select>
       </label>
       {restoreNotice && <div className={`merge-notice ${restoreFailed ? "merge-notice-warn" : ""}`}>{restoreNotice}</div>}
       {error && <div className="form-error">{error}</div>}
       <div className="human-actions">
         <button type="button" className="button primary" disabled={Boolean(busy)} onClick={() => void act("continue")}>
-          {busy === "continue" ? <LoaderCircle className="spin" size={15} /> : <Play size={15} />}继续开发
+          {busy === "continue" ? <LoaderCircle className="spin" size={15} /> : <Play size={15} />}{t("decision.continue")}
         </button>
         <button type="button" className="button primary" disabled={Boolean(busy)} onClick={() => void act("approve")}>
-          {busy === "approve" ? <LoaderCircle className="spin" size={15} /> : <CheckCircle2 size={15} />}接受交付
+          {busy === "approve" ? <LoaderCircle className="spin" size={15} /> : <CheckCircle2 size={15} />}{t("decision.accept")}
         </button>
         <button type="button" className="button secondary" disabled={Boolean(busy)} onClick={() => void act("resume")}>
-          {busy === "resume" ? <LoaderCircle className="spin" size={15} /> : <RotateCcw size={15} />}恢复下一轮
+          {busy === "resume" ? <LoaderCircle className="spin" size={15} /> : <RotateCcw size={15} />}{t("human.resume")}
         </button>
         <button type="button" className="button secondary" disabled={Boolean(busy)} onClick={() => void act("review")}>
-          {busy === "review" ? <LoaderCircle className="spin" size={15} /> : <ShieldCheck size={15} />}重试审核
+          {busy === "review" ? <LoaderCircle className="spin" size={15} /> : <ShieldCheck size={15} />}{t("human.retryReview")}
         </button>
         <button type="button" className="button danger-text" disabled={Boolean(busy)} onClick={() => void act("reject")}>
-          {busy === "reject" ? <LoaderCircle className="spin" size={15} /> : <XCircle size={15} />}拒绝交付
+          {busy === "reject" ? <LoaderCircle className="spin" size={15} /> : <XCircle size={15} />}{t("human.reject")}
         </button>
         <button type="button" className="button danger-text" disabled={Boolean(busy)} onClick={() => void act("terminate")}>
-          {busy === "terminate" ? <LoaderCircle className="spin" size={15} /> : <Square size={14} />}终止
+          {busy === "terminate" ? <LoaderCircle className="spin" size={15} /> : <Square size={14} />}{t("human.terminate")}
         </button>
       </div>
     </section>
   );
 }
 
-const formatClock = (date: string) => new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(new Date(date));
+const formatClock = (date: string, locale: Locale = DEFAULT_LOCALE) => new Intl.DateTimeFormat(intlLocale(locale), { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(new Date(date));
 const formatDuration = (ms: number) => ms ? `${Math.floor(ms / 60_000)}m ${Math.floor((ms % 60_000) / 1000)}s` : "—";
 const compactNumber = (value: number) => value > 999 ? `${(value / 1000).toFixed(1)}k` : String(value);
 
 export function App() {
+  const { t, locale, setLocale, locales, localeLabels } = useT();
   const [runs, setRuns] = useState<Run[]>([]);
   const [selectedId, setSelectedId] = useState<string>();
   const [run, setRun] = useState<Run>();
@@ -1539,15 +1609,15 @@ export function App() {
   const eventReworkDetails = useMemo(() => reworkBranchDetails(events, activeRun?.findings ?? []), [events, activeRun?.findings]);
   const reworkDetails = useMemo(
     () => (roundSummaries
-      ? reworkBranchDetailsFromSummaries(roundSummaries, activeRun?.findings ?? [], eventReworkDetails)
+      ? reworkBranchDetailsFromSummaries(roundSummaries, activeRun?.findings ?? [], eventReworkDetails, locale)
       : eventReworkDetails),
-    [roundSummaries, activeRun?.findings, eventReworkDetails],
+    [roundSummaries, activeRun?.findings, eventReworkDetails, locale],
   );
   const reworkRounds = useMemo(() => new Set(reworkDetails.map((detail) => detail.round)), [reworkDetails]);
   const selectedRework = reworkRound === null ? undefined : reworkDetails.find((detail) => detail.round === reworkRound);
   const flow = useMemo(
-    () => flowForRun(activeRun, events, { selectedReworkRound: reworkRound, onReworkSelect: handleReworkSelect, roundSummaries }),
-    [activeRun, events, reworkRound, handleReworkSelect, roundSummaries],
+    () => flowForRun(activeRun, events, { selectedReworkRound: reworkRound, onReworkSelect: handleReworkSelect, roundSummaries, t }),
+    [activeRun, events, reworkRound, handleReworkSelect, roundSummaries, t],
   );
   const chatMessages = useMemo(() => chatMessagesFromEvents(events), [events]);
   const running = runs.filter((item) => !terminalStates.includes(item.state)).length;
@@ -1572,23 +1642,23 @@ export function App() {
   const handleBriefContinue = useCallback(async (note: string) => {
     if (!activeRun || !decisionBrief) return;
     setBriefDraft(note);
-    if (!window.confirm(continueConfirmMessage(activeRun.title, note))) return;
+    if (!window.confirm(continueConfirmMessage(activeRun.title, note, locale))) return;
     try {
       applyAccept(await api.approveRun(activeRun.id, decisionBriefActionRequest(decisionBrief, "continue")));
     } catch (cause) {
-      window.alert(`继续开发失败：${(cause as Error).message}`);
+      window.alert(t("alert.continueFailed", { message: localizeError(locale, cause as { code?: string; message?: string }) }));
     }
-  }, [activeRun, decisionBrief, applyAccept]);
+  }, [activeRun, decisionBrief, applyAccept, locale, t]);
 
   const handleBriefAccept = useCallback(async () => {
     if (!activeRun || !decisionBrief) return;
-    if (!window.confirm(acceptConfirmMessage(activeRun.title, decisionBrief.remaining.length))) return;
+    if (!window.confirm(acceptConfirmMessage(activeRun.title, decisionBrief.remaining.length, locale))) return;
     try {
       applyAccept(await api.approveRun(activeRun.id, decisionBriefActionRequest(decisionBrief, "accept")));
     } catch (cause) {
-      window.alert(`接受交付失败：${(cause as Error).message}`);
+      window.alert(t("alert.acceptFailed", { message: localizeError(locale, cause as { code?: string; message?: string }) }));
     }
-  }, [activeRun, decisionBrief, applyAccept]);
+  }, [activeRun, decisionBrief, applyAccept, locale, t]);
 
   const openBriefTarget = useCallback((nextTab: Tab, key?: string) => {
     setTab(nextTab);
@@ -1613,39 +1683,39 @@ export function App() {
   const handleCleanup = async () => {
     // B6: state exactly what is removed. The server deletes the run directory by
     // default, so the old "worktree 保留" wording was wrong.
-    if (!window.confirm(cleanupFinishedConfirmMessage({ olderThanDays: 7, deleteRunDirectory: true }))) return;
+    if (!window.confirm(cleanupFinishedConfirmMessage({ olderThanDays: 7, deleteRunDirectory: true }, locale))) return;
     try {
       const result = await api.cleanupRuns({ olderThanDays: 7, deleteRunDirectory: true });
       await refreshRuns();
-      window.alert(`已清理 ${result.deleted ?? 0} 个已结束任务。`);
+      window.alert(t("alert.cleaned", { count: result.deleted ?? 0 }));
     } catch (cause) {
-      window.alert(`清理失败：${(cause as Error).message}`);
+      window.alert(t("alert.cleanupFailed", { message: localizeError(locale, cause as { code?: string; message?: string }) }));
     }
   };
 
   const handleDelete = async (target: Run) => {
     if (!terminalStates.includes(target.state)) {
-      window.alert("任务仍在运行，请先点击右上角「停止」，结束后再删除。");
+      window.alert(t("alert.runningDelete"));
       return;
     }
-    if (!window.confirm(`删除任务「${target.title}」？任务记录与事件会一并删除（代码仍保留在服务器 worktree）。`)) return;
+    if (!window.confirm(t("alert.deleteConfirm", { title: target.title }))) return;
     try {
       await api.deleteRun(target.id);
       const next = await api.runs();
       setRuns(next);
       if (selectedId === target.id) setSelectedId(next[0]?.id);
     } catch (cause) {
-      window.alert(`删除失败：${(cause as Error).message}`);
+      window.alert(t("alert.deleteFailed", { message: localizeError(locale, cause as { code?: string; message?: string }) }));
     }
   };
 
   /** B1: reopen a completed run (owner-confirmed; the server allows admins freely). */
   const handleReopen = async (target: Run) => {
-    if (!window.confirm(`重新打开任务「${target.title}」？\n\n任务会回到「需要人工处理」，分支与 worktree 保持原样。`)) return;
+    if (!window.confirm(t("alert.reopenConfirm", { title: target.title }))) return;
     try {
       applyRun(await api.reopenRun(target.id, { confirm: true }));
     } catch (cause) {
-      window.alert(`重新打开失败：${(cause as Error).message}`);
+      window.alert(t("alert.reopenFailed", { message: localizeError(locale, cause as { code?: string; message?: string }) }));
     }
   };
 
@@ -1664,25 +1734,28 @@ export function App() {
     const ids = selected.map((item) => item.id);
     if (ids.length === 0) return;
     if (action === "cleanup") {
-      if (!window.confirm(batchCleanupConfirmMessage({ count: ids.length, deleteRunDirectory: batchDeleteRunDirectory }))) return;
+      if (!window.confirm(batchCleanupConfirmMessage({ count: ids.length, deleteRunDirectory: batchDeleteRunDirectory }, locale))) return;
     } else if (action === "accept") {
       const openCount = selected.reduce((total, item) => total + item.findings.filter((finding) => !finding.resolved).length, 0);
-      if (!window.confirm(`批量接受 ${ids.length} 个任务的交付？${openCount > 0 ? `\n\n其中共有 ${openCount} 条未解决意见将被记录为已知接受。` : ""}`)) return;
-    } else if (!window.confirm(`将选中的 ${ids.length} 个任务退回开发再跑一轮？`)) return;
+      if (!window.confirm(t("alert.batchAcceptConfirm", { count: ids.length, openFindings: openCount > 0 ? t("alert.batchAcceptOpenFindings", { count: openCount }) : "" }))) return;
+    } else if (!window.confirm(t("alert.batchContinueConfirm", { count: ids.length }))) return;
     setBatchBusy(true);
     try {
       const summary = await api.batchRuns({ action, runIds: ids, acknowledgeOpenFindings: true, deleteRunDirectory: action === "cleanup" ? batchDeleteRunDirectory : undefined });
       await refreshRuns();
       const failed = summary.results.filter((result) => !result.ok);
-      const label = action === "accept" ? "接受交付" : action === "continue" ? "继续开发" : "清理";
+      const label = t(action === "accept" ? "decision.accept" : action === "continue" ? "decision.continue" : "batch.cleanup");
       // B6: the cleanup summary reports each run's on-disk outcome.
       const storage = action === "cleanup"
-        ? `\n${summarizeCleanupStorage(summary.results)}${summary.results.length ? `\n${cleanupStorageDetailLines(summary.results).join("\n")}` : ""}`
+        ? `\n${summarizeCleanupStorage(summary.results, locale)}${summary.results.length ? `\n${cleanupStorageDetailLines(summary.results, 10, locale).join("\n")}` : ""}`
         : "";
-      window.alert(`批量${label}完成：成功 ${summary.succeeded}，失败 ${summary.failed}${storage}${failed.length ? `\n${failed.slice(0, 5).map((result) => `${result.runId.slice(0, 12)}：${result.error ?? result.code ?? "失败"}`).join("\n")}` : ""}`);
+      const failures = failed.length
+        ? `\n${failed.slice(0, 5).map((result) => `${result.runId.slice(0, 12)}：${localizeError(locale, { code: result.code, message: result.error }, t("common.failed"))}`).join("\n")}`
+        : "";
+      window.alert(t("alert.batchDone", { label, succeeded: summary.succeeded, failed: summary.failed, storage, failures }));
       setBatchSelected(new Set());
     } catch (cause) {
-      window.alert(`批量操作失败：${(cause as Error).message}`);
+      window.alert(t("alert.batchFailed", { message: localizeError(locale, cause as { code?: string; message?: string }) }));
     } finally {
       setBatchBusy(false);
     }
@@ -1695,47 +1768,47 @@ export function App() {
         {/* UI: compact top block (create + nav + routing) scrolls on its own so the
             runs list below can claim the remaining sidebar height. */}
         <div className="sidebar-nav-scroll">
-        <button className="new-run" onClick={() => setCreateOpen(true)}><Plus size={17} />新建任务<span>⌘ K</span></button>
+        <button className="new-run" onClick={() => setCreateOpen(true)}><Plus size={17} />{t("nav.newRun")}<span>⌘ K</span></button>
         <nav className="primary-nav">
-          <button type="button" className={view === "run" ? "active" : ""} onClick={() => setView("run")}><GitBranch size={16} />工作流</button>
-          <button type="button" className={view === "history" ? "active" : ""} onClick={() => setView("history")}><History size={16} />需求历史</button>
-          <button type="button" className={view === "agile" ? "active" : ""} onClick={() => setView("agile")}><ClipboardList size={16} />敏捷</button>
-          <button type="button" className={view === "workspaces" ? "active" : ""} onClick={() => setView("workspaces")}><FolderGit2 size={16} />工作区</button>
-          <button type="button" className={view === "models" ? "active" : ""} onClick={() => setView("models")}><Cpu size={16} />模型与凭据</button>
+          <button type="button" className={view === "run" ? "active" : ""} onClick={() => setView("run")}><GitBranch size={16} />{t("nav.workflow")}</button>
+          <button type="button" className={view === "history" ? "active" : ""} onClick={() => setView("history")}><History size={16} />{t("nav.history")}</button>
+          <button type="button" className={view === "agile" ? "active" : ""} onClick={() => setView("agile")}><ClipboardList size={16} />{t("nav.agile")}</button>
+          <button type="button" className={view === "workspaces" ? "active" : ""} onClick={() => setView("workspaces")}><FolderGit2 size={16} />{t("nav.workspaces")}</button>
+          <button type="button" className={view === "models" ? "active" : ""} onClick={() => setView("models")}><Cpu size={16} />{t("nav.models")}</button>
           {/* SYS-01: this used to be a dead `#system` anchor into the sidebar deployment card; it now opens the system status dashboard. */}
-          <button type="button" className={view === "system" ? "active" : ""} onClick={() => setView("system")}><Activity size={16} />系统状态</button>
+          <button type="button" className={view === "system" ? "active" : ""} onClick={() => setView("system")}><Activity size={16} />{t("nav.system")}</button>
           {/* 账户管理: admin-only; non-admins never see the entry (direct navigation shows the explicit 仅管理员可见 state). */}
-          {user?.isAdmin && <button type="button" className={view === "accounts" ? "active" : ""} onClick={() => setView("accounts")}><Users size={16} />账户管理</button>}
+          {user?.isAdmin && <button type="button" className={view === "accounts" ? "active" : ""} onClick={() => setView("accounts")}><Users size={16} />{t("nav.accounts")}</button>}
           </nav>
           {config && <div className="providers-card" id="models">
             <div className="providers-title"><span>AGENT ROUTING</span><Zap size={13} /></div>
-            <ProviderStatus label="开发" provider={config.developer.provider} model={config.developer.model} ready={config.developer.credentialConfigured} icon={Code2} />
-            <ProviderStatus label="审核" provider={config.reviewer.provider} model={config.reviewer.model} ready={config.reviewer.credentialConfigured} icon={ShieldCheck} />
-            <button className="manage-credentials" type="button" onClick={() => setView("models")}><KeyRound size={13} />配置或轮换个人 Key</button>
-            <div className={`credential-warning ${config.realRunsAvailable ? "runner-ready" : ""}`}><AlertTriangle size={13} />{config.realRunsAvailable ? "真实执行已启用" : "真实执行尚未启用"}</div>
+            <ProviderStatus label={t("role.developer")} provider={config.developer.provider} model={config.developer.model} ready={config.developer.credentialConfigured} icon={Code2} />
+            <ProviderStatus label={t("role.reviewer")} provider={config.reviewer.provider} model={config.reviewer.model} ready={config.reviewer.credentialConfigured} icon={ShieldCheck} />
+            <button className="manage-credentials" type="button" onClick={() => setView("models")}><KeyRound size={13} />{t("nav.configureKeys")}</button>
+            <div className={`credential-warning ${config.realRunsAvailable ? "runner-ready" : ""}`}><AlertTriangle size={13} />{t(config.realRunsAvailable ? "config.realReady" : "config.realNotReady")}</div>
           </div>}
         </div>
         {/* 最近任务: bottom region, grows to fill the remaining sidebar height. The
             section head stays pinned; only .run-list scrolls. */}
-        <section className="sidebar-runs" aria-label="最近任务">
-        <div className="sidebar-section-head"><span>最近任务</span><span className="sidebar-head-actions"><Search size={14} /><button className="sidebar-cleanup" type="button" title="清理 7 天前已结束的任务" onClick={() => void handleCleanup()}><Trash2 size={13} /></button></span></div>
+        <section className="sidebar-runs" aria-label={t("nav.recentRuns")}>
+        <div className="sidebar-section-head"><span>{t("nav.recentRuns")}</span><span className="sidebar-head-actions"><Search size={14} /><button className="sidebar-cleanup" type="button" title={t("nav.cleanupTitle")} onClick={() => void handleCleanup()}><Trash2 size={13} /></button></span></div>
         {batchSelected.size > 0 && (
           <div className="batch-bar">
-            <span>已选 {batchSelected.size} 个</span>
-            <button type="button" className="button secondary" disabled={batchBusy} onClick={() => void handleBatch("accept")}>接受交付</button>
-            <button type="button" className="button secondary" disabled={batchBusy} onClick={() => void handleBatch("continue")}>继续开发</button>
-            <label className="batch-cleanup-option" title="选中后，清理会同时删除服务器上的运行目录/worktree；取消勾选则只删除运行记录与制品。">
+            <span>{t("batch.selected", { count: batchSelected.size })}</span>
+            <button type="button" className="button secondary" disabled={batchBusy} onClick={() => void handleBatch("accept")}>{t("decision.accept")}</button>
+            <button type="button" className="button secondary" disabled={batchBusy} onClick={() => void handleBatch("continue")}>{t("decision.continue")}</button>
+            <label className="batch-cleanup-option" title={t("batch.deleteRunDirectoryTitle")}>
               <input type="checkbox" checked={batchDeleteRunDirectory} disabled={batchBusy} onChange={(event) => setBatchDeleteRunDirectory(event.target.checked)} />
-              清理时删除运行目录
+              {t("batch.deleteRunDirectory")}
             </label>
-            <button type="button" className="button danger-text" disabled={batchBusy} onClick={() => void handleBatch("cleanup")}>清理</button>
-            <button type="button" className="button secondary" disabled={batchBusy} onClick={() => setBatchSelected(new Set())}>取消</button>
+            <button type="button" className="button danger-text" disabled={batchBusy} onClick={() => void handleBatch("cleanup")}>{t("batch.cleanup")}</button>
+            <button type="button" className="button secondary" disabled={batchBusy} onClick={() => setBatchSelected(new Set())}>{t("common.cancel")}</button>
           </div>
         )}
         <div className="run-list">
           {runs.map((item) => (
             <div className={`run-item ${selectedId === item.id ? "selected" : ""}`} key={item.id}>
-              <label className="run-select" title="选择以进行批量操作">
+              <label className="run-select" title={t("batch.selectTitle")}>
                 <input type="checkbox" checked={batchSelected.has(item.id)} onChange={() => toggleBatch(item.id)} />
               </label>
               <button className="run-item-main" onClick={() => { setSelectedId(item.id); setSidebarOpen(false); setView("run"); }}>
@@ -1743,15 +1816,15 @@ export function App() {
                 <span><strong>{item.title}</strong><small>{item.repository} · R{item.round}</small></span>
                 <ChevronRight size={14} className="run-item-chevron" />
               </button>
-              <button className="run-item-delete" title="删除任务" onClick={() => void handleDelete(item)}>
+              <button className="run-item-delete" title={t("batch.deleteRunTitle")} onClick={() => void handleDelete(item)}>
                 <Trash2 size={13} />
               </button>
             </div>
           ))}
-          {!runs.length && !loading && <div className="sidebar-empty">还没有任务</div>}
+          {!runs.length && !loading && <div className="sidebar-empty">{t("nav.empty")}</div>}
         </div>
         </section>
-        <div className="account-footer"><div><span className="system-dot" /><strong>{user?.email || "正在验证账户"}</strong><small>Pi {config?.piVersion || "—"}</small></div><a href="/cdn-cgi/access/logout" title="退出登录"><LogOut size={15} /></a></div>
+        <div className="account-footer"><div><span className="system-dot" /><strong>{user?.email || t("account.verifying")}</strong><small>Pi {config?.piVersion || "—"}</small></div><a href="/cdn-cgi/access/logout" title={t("account.logout")}><LogOut size={15} /></a></div>
       </aside>
 
       <main className="main-content">
@@ -1759,22 +1832,31 @@ export function App() {
           <button className="icon-button mobile-only" onClick={() => setSidebarOpen(true)}><Menu size={19} /></button>
           <div className="breadcrumb">
             {view === "workspaces"
-              ? <><span>WORKSPACES</span><ChevronRight size={13} /><strong>工作区</strong></>
+              ? <><span>WORKSPACES</span><ChevronRight size={13} /><strong>{t("nav.workspaces")}</strong></>
               : view === "models"
-                ? <><span>MODELS</span><ChevronRight size={13} /><strong>模型与凭据</strong></>
+                ? <><span>MODELS</span><ChevronRight size={13} /><strong>{t("nav.models")}</strong></>
                 : view === "system"
-                  ? <><span>SYSTEM</span><ChevronRight size={13} /><strong>系统状态</strong></>
+                  ? <><span>SYSTEM</span><ChevronRight size={13} /><strong>{t("nav.system")}</strong></>
                   : view === "history"
-                    ? <><span>HISTORY</span><ChevronRight size={13} /><strong>需求历史</strong></>
+                    ? <><span>HISTORY</span><ChevronRight size={13} /><strong>{t("nav.history")}</strong></>
                     : view === "agile"
-                      ? <><span>AGILE</span><ChevronRight size={13} /><strong>敏捷</strong></>
+                      ? <><span>AGILE</span><ChevronRight size={13} /><strong>{t("nav.agile")}</strong></>
                       : view === "accounts"
-                        ? <><span>ACCOUNTS</span><ChevronRight size={13} /><strong>账户管理</strong></>
+                        ? <><span>ACCOUNTS</span><ChevronRight size={13} /><strong>{t("nav.accounts")}</strong></>
                         : <><span>WORKFLOWS</span><ChevronRight size={13} /><strong>{activeRun?.id.slice(0, 12) || "OVERVIEW"}</strong></>}
           </div>
           <div className="topbar-actions">
-            {view === "run" && (activeRun?.mode === "demo" ? <span className="demo-chip"><Sparkles size={13} />演示数据</span> : activeRun && <span className="demo-chip real-chip"><Code2 size={13} />真实工作区</span>)}
-            {view === "run" && activeRun && !terminalStates.includes(activeRun.state) && <button className="button danger-small" onClick={() => void api.cancelRun(activeRun.id)}><Square size={12} />停止</button>}
+            {view === "run" && (activeRun?.mode === "demo" ? <span className="demo-chip"><Sparkles size={13} />{t("run.demoChip")}</span> : activeRun && <span className="demo-chip real-chip"><Code2 size={13} />{t("run.realChip")}</span>)}
+            {view === "run" && activeRun && !terminalStates.includes(activeRun.state) && <button className="button danger-small" onClick={() => void api.cancelRun(activeRun.id)}><Square size={12} />{t("run.stop")}</button>}
+            <select
+              className="locale-select"
+              aria-label={t("locale.label")}
+              title={t("locale.label")}
+              value={locale}
+              onChange={(event) => setLocale(event.target.value === "en" ? "en" : "zh")}
+            >
+              {locales.map((item) => <option key={item} value={item}>{localeLabels[item]}</option>)}
+            </select>
             <button className="icon-button"><PanelRightClose size={17} /></button>
           </div>
         </header>
@@ -1795,15 +1877,15 @@ export function App() {
           selectedId ? (
             <section className="run-loading">
               <LoaderCircle className="spin" size={22} />
-              <span>正在加载任务详情…</span>
+              <span>{t("run.loading")}</span>
             </section>
           ) : (
             <section className="welcome-state">
               <div className="welcome-orbit"><div><Bot size={32} /></div><i /><i /><i /></div>
               <span className="eyebrow">MULTI-MODEL ENGINEERING</span>
-              <h1>让开发与审核<br />形成可靠闭环</h1>
-              <p>DeepSeek 编写代码，OpenAI 独立审核。每次退回、检查与复审都有迹可循。</p>
-              <button className="button primary large" onClick={() => setCreateOpen(true)}><Play size={17} />创建开发工作流</button>
+              <h1>{t("welcome.titleLine1")}<br />{t("welcome.titleLine2")}</h1>
+              <p>{t("welcome.subtitle")}</p>
+              <button className="button primary large" onClick={() => setCreateOpen(true)}><Play size={17} />{t("welcome.cta")}</button>
             </section>
           )
         ) : (
@@ -1818,7 +1900,7 @@ export function App() {
                 <span>REVIEW ROUND</span><strong>{activeRun.round}<em>/ {activeRun.maxRounds}</em></strong>
                 {activeRun.state === "completed" && !activeRun.merge && !activeRun.release && (
                   <button type="button" className="button secondary reopen-button" onClick={() => void handleReopen(activeRun)}>
-                    <RotateCcw size={14} />重新打开
+                    <RotateCcw size={14} />{t("run.reopen")}
                   </button>
                 )}
               </div>
@@ -1865,15 +1947,15 @@ export function App() {
             />
 
             <section className="metrics-grid">
-              <div className="metric"><span><Activity size={14} />状态</span><strong>{runStateLabels[activeRun.state]}</strong><small>{running} 个任务运行中</small></div>
-              <div className="metric"><span><Clock3 size={14} />耗时</span><strong>{formatDuration(activeRun.durationMs)}</strong><small>端到端执行时间</small></div>
-              <div className="metric"><span><Braces size={14} />Tokens</span><strong>{compactNumber(activeRun.usage.inputTokens + activeRun.usage.outputTokens)}</strong><small>输入 {compactNumber(activeRun.usage.inputTokens)} · 输出 {compactNumber(activeRun.usage.outputTokens)}</small></div>
-              <div className="metric"><span><Zap size={14} />估算成本</span><strong>${activeRun.usage.estimatedCost.toFixed(3)}</strong><small>{activeRun.mode === "demo" ? "演示估算值" : "当前统计值"}</small></div>
+              <div className="metric"><span><Activity size={14} />{t("metrics.state")}</span><strong>{t(runStateKey(activeRun.state))}</strong><small>{t("metrics.running", { count: running })}</small></div>
+              <div className="metric"><span><Clock3 size={14} />{t("metrics.duration")}</span><strong>{formatDuration(activeRun.durationMs)}</strong><small>{t("metrics.durationHint")}</small></div>
+              <div className="metric"><span><Braces size={14} />Tokens</span><strong>{compactNumber(activeRun.usage.inputTokens + activeRun.usage.outputTokens)}</strong><small>{t("metrics.tokensHint", { input: compactNumber(activeRun.usage.inputTokens), output: compactNumber(activeRun.usage.outputTokens) })}</small></div>
+              <div className="metric"><span><Zap size={14} />{t("metrics.cost")}</span><strong>${activeRun.usage.estimatedCost.toFixed(3)}</strong><small>{t(activeRun.mode === "demo" ? "metrics.costDemo" : "metrics.costCurrent")}</small></div>
             </section>
 
             <div className="content-grid">
               <section className="panel flow-panel" id="workflow-topology">
-                <div className="panel-head"><div><span className="eyebrow">LIVE ORCHESTRATION</span><h3>工作流拓扑</h3></div><div className="live-indicator"><i />LIVE</div></div>
+                <div className="panel-head"><div><span className="eyebrow">LIVE ORCHESTRATION</span><h3>{t("topology.title")}</h3></div><div className="live-indicator"><i />LIVE</div></div>
                 <div className="flow-wrap">
                   {/* Keyed by run id so each run mounts a fresh React Flow
                       instance: `fitView` only runs on mount, so reusing the
@@ -1893,12 +1975,12 @@ export function App() {
               <section className="panel detail-panel">
                 <div className="detail-tabs">
                   {([
-                    ["activity", "活动", Activity],
+                    ["activity", t("topology.tabs.activity"), Activity],
                     ["agents", `Agents ${activeRun.plan?.tasks.length || ""}`, Bot],
-                    ["review", `审核 ${activeRun.findings.length || ""}`, ShieldCheck],
+                    ["review", `${t("topology.tabs.review")} ${activeRun.findings.length || ""}`, ShieldCheck],
                     ["diff", "Diff", FileCode2],
-                    ["checks", "检查", ListChecks],
-                    ["budget", "预算与用量", Braces],
+                    ["checks", t("topology.tabs.checks"), ListChecks],
+                    ["budget", t("topology.tabs.budget"), Braces],
                   ] as const).map(([key, label, Icon]) => (
                     <button className={tab === key ? "active" : ""} key={key} onClick={() => setTab(key)}><Icon size={14} />{label}</button>
                   ))}

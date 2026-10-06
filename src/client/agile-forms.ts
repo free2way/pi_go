@@ -1,5 +1,6 @@
 import { RELEASE_STATUSES, type ReleaseStatus, type RunBudget } from "../shared/agile";
 import type { ModelSelection } from "../shared/types";
+import { DEFAULT_LOCALE, t, type Locale, type MessageKey } from "../shared/i18n";
 
 /**
  * Sprint 4 follow-up: pure builders for the 「模板管理」/「发布管理」 forms.
@@ -10,6 +11,9 @@ import type { ModelSelection } from "../shared/types";
  * parallelism) so a typo never costs a round-trip. They return data exactly as
  * the `/api/templates` and `/api/releases` routes expect it, which keeps the
  * JSX thin and lets the rules be unit-tested without a DOM.
+ *
+ * Every message comes from the shared catalog; the optional `locale` parameter
+ * (default 中文) keeps the existing tests and call sites meaningful.
  */
 
 /** Parse a `provider::model` picker value, mirroring the run/story forms. */
@@ -55,26 +59,28 @@ function parseBudgetField(raw: string): number | undefined | null {
  * to 0 (the schema requires all four numbers together); `maxParallel` is always
  * sent (null = 默认) so editing can clear it.
  */
-export function buildTemplateInput(values: TemplateFormValues): TemplateInputResult {
+export function buildTemplateInput(values: TemplateFormValues, locale: Locale = DEFAULT_LOCALE): TemplateInputResult {
   const name = values.name.trim();
-  if (!name) return { ok: false, message: "请填写模板名称" };
-  if (name.length > 120) return { ok: false, message: "模板名称最多 120 个字符" };
+  if (!name) return { ok: false, message: t(locale, "agile.error.formTemplateName") };
+  if (name.length > 120) return { ok: false, message: t(locale, "agile.error.formTemplateNameLength") };
   const developerModel = parseModelSelection(values.developerModel);
   const reviewerModel = parseModelSelection(values.reviewerModel);
-  if (!developerModel) return { ok: false, message: "请选择开发模型" };
-  if (!reviewerModel) return { ok: false, message: "请选择审核模型" };
+  if (!developerModel) return { ok: false, message: t(locale, "agile.error.formDeveloperModel") };
+  if (!reviewerModel) return { ok: false, message: t(locale, "agile.error.formReviewerModel") };
 
-  const fields = [
-    { label: "预算 Token", key: "maxTokens" as const, raw: values.budgetTokens },
-    { label: "预算成本（$）", key: "maxCostUsd" as const, raw: values.budgetCostUsd },
-    { label: "模型调用", key: "maxModelCalls" as const, raw: values.budgetModelCalls },
-    { label: "时长（秒）", key: "maxDurationSeconds" as const, raw: values.budgetDurationSeconds },
+  const fields: Array<{ labelKey: MessageKey; key: keyof RunBudget; raw: string }> = [
+    { labelKey: "agile.error.budgetTokens", key: "maxTokens", raw: values.budgetTokens },
+    { labelKey: "agile.error.budgetCost", key: "maxCostUsd", raw: values.budgetCostUsd },
+    { labelKey: "agile.error.budgetCalls", key: "maxModelCalls", raw: values.budgetModelCalls },
+    { labelKey: "agile.error.budgetSeconds", key: "maxDurationSeconds", raw: values.budgetDurationSeconds },
   ];
   const budget: RunBudget = { maxTokens: 0, maxCostUsd: 0, maxModelCalls: 0, maxDurationSeconds: 0 };
   let budgetGiven = false;
   for (const field of fields) {
     const parsed = parseBudgetField(field.raw);
-    if (parsed === null) return { ok: false, message: `${field.label} 必须是非负数字` };
+    if (parsed === null) {
+      return { ok: false, message: t(locale, "agile.error.formBudgetNumber", { field: t(locale, field.labelKey) }) };
+    }
     if (parsed !== undefined) {
       budgetGiven = true;
       budget[field.key] = parsed;
@@ -84,7 +90,7 @@ export function buildTemplateInput(values: TemplateFormValues): TemplateInputRes
   let maxParallel: number | null = null;
   if (values.maxParallel.trim() !== "") {
     const parsed = Number(values.maxParallel);
-    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 32) return { ok: false, message: "最大并行需为 1–32 的整数" };
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 32) return { ok: false, message: t(locale, "agile.error.formMaxParallel") };
     maxParallel = parsed;
   }
 
@@ -112,39 +118,39 @@ export type ReleaseInputResult =
   | { ok: false; message: string };
 
 /** Normalize the create/edit body shared by `POST` and `PATCH /api/releases`. */
-export function buildReleaseInput(values: ReleaseFormValues): ReleaseInputResult {
+export function buildReleaseInput(values: ReleaseFormValues, locale: Locale = DEFAULT_LOCALE): ReleaseInputResult {
   const name = values.name.trim();
   const version = values.version.trim();
-  if (!name) return { ok: false, message: "请填写发布名称" };
-  if (name.length > 120) return { ok: false, message: "发布名称最多 120 个字符" };
-  if (!version) return { ok: false, message: "请填写版本号" };
-  if (version.length > 80) return { ok: false, message: "版本号最多 80 个字符" };
-  if (values.notes.length > 4_000) return { ok: false, message: "备注最多 4000 个字符" };
-  if (!RELEASE_STATUSES.includes(values.status)) return { ok: false, message: "发布状态无效" };
-  if (values.storyIds.length > 200) return { ok: false, message: "单个发布最多关联 200 个故事" };
+  if (!name) return { ok: false, message: t(locale, "agile.error.formReleaseName") };
+  if (name.length > 120) return { ok: false, message: t(locale, "agile.error.formReleaseNameLength") };
+  if (!version) return { ok: false, message: t(locale, "agile.error.formReleaseVersion") };
+  if (version.length > 80) return { ok: false, message: t(locale, "agile.error.formReleaseVersionLength") };
+  if (values.notes.length > 4_000) return { ok: false, message: t(locale, "agile.error.formReleaseNotesLength") };
+  if (!RELEASE_STATUSES.includes(values.status)) return { ok: false, message: t(locale, "agile.error.formReleaseStatus") };
+  if (values.storyIds.length > 200) return { ok: false, message: t(locale, "agile.error.formReleaseStories") };
   return {
     ok: true,
     input: { name, version, notes: values.notes.trim(), status: values.status, storyIds: values.storyIds },
   };
 }
 
+/** Codes this helper renders itself; everything else defers to `localizeError`. */
+const FORM_ERROR_KEYS: Record<string, MessageKey> = {
+  TEMPLATE_NAME_TAKEN: "agile.error.TEMPLATE_NAME_TAKEN",
+  TEMPLATE_NOT_FOUND: "agile.error.TEMPLATE_NOT_FOUND",
+  RELEASE_NOT_FOUND: "agile.error.RELEASE_NOT_FOUND",
+  PROJECT_NOT_FOUND: "agile.error.PROJECT_NOT_FOUND",
+};
+
 /**
- * Map an API failure to Chinese copy. The server's own message is preferred; the
- * known agile codes only supply a fallback when the body carried none. In
- * particular a 409 `TEMPLATE_NAME_TAKEN` becomes an actionable hint.
+ * Map an API failure to localized copy. The server's own message is preferred
+ * when it carried one (it may name the offending value); the known agile codes
+ * only supply a fallback. In particular a 409 `TEMPLATE_NAME_TAKEN` becomes an
+ * actionable hint.
  */
-export function agileFormErrorMessage(cause: unknown, fallback: string): string {
+export function agileFormErrorMessage(cause: unknown, fallback: string, locale: Locale = DEFAULT_LOCALE): string {
   const error = cause as { code?: string; message?: string } | undefined;
-  switch (error?.code) {
-    case "TEMPLATE_NAME_TAKEN":
-      return error.message || "模板名称已存在，请换一个名称";
-    case "TEMPLATE_NOT_FOUND":
-      return "模板不存在或已被删除";
-    case "RELEASE_NOT_FOUND":
-      return "发布不存在或已被删除";
-    case "PROJECT_NOT_FOUND":
-      return "项目不存在或已被删除";
-    default:
-      return error?.message || fallback;
-  }
+  const key = error?.code ? FORM_ERROR_KEYS[error.code] : undefined;
+  if (key) return error?.message || t(locale, key);
+  return error?.message || fallback;
 }

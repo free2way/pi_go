@@ -1,44 +1,30 @@
 import { BarChart3, ClipboardList, Copy, Download, LayoutTemplate, ListChecks, LoaderCircle, Pencil, Plus, Rocket, RotateCcw, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { applyModelTemplate, RELEASE_STATUSES, STORY_PRIORITIES, STORY_STATUSES, STORY_STATUS_LABELS, type AgileProject, type AgileRelease, type AgileSprint, type AgileStory, type ModelTemplate, type ReleaseDeployRecord, type ReleaseStatus, type StoryDetail, type StoryPriority, type StoryStatus } from "../shared/agile";
+import { DEFAULT_LOCALE, intlLocale, localizeError, t, type Locale, type MessageKey } from "../shared/i18n";
+import { useT } from "./i18n";
+import { runStateKey } from "./requirement-history";
+import { applyModelTemplate, RELEASE_STATUSES, STORY_PRIORITIES, STORY_STATUSES, type AgileProject, type AgileRelease, type AgileSprint, type AgileStory, type ModelTemplate, type ReleaseDeployRecord, type ReleaseStatus, type StoryDetail, type StoryPriority, type StoryStatus } from "../shared/agile";
 import type { AgileMetricsResponse, ReleaseRetrospective, ReleaseSummary } from "../shared/agile-metrics";
-import type { ConfigStatus, ModelCatalogResponse, RunState, Workspace } from "../shared/types";
+import type { ConfigStatus, ModelCatalogResponse, Workspace } from "../shared/types";
 import { api } from "./api";
 import { agileFormErrorMessage, buildReleaseInput, buildTemplateInput, parseModelSelection } from "./agile-forms";
-import { columnPoints, estimateLabel, groupStoriesByColumn, priorityLabel, RELEASE_DEPLOY_ACTION_LABELS, releaseDeployAction, releaseExportFilename, releaseExportJson, splitLines, storyReference } from "./agile-view";
+import { boardColumnKey, columnPoints, estimateLabel, groupStoriesByColumn, priorityKey, priorityLabel, RELEASE_DEPLOY_ACTION_KEYS, releaseDeployAction, releaseExportFilename, releaseExportJson, splitLines, storyReference, storyStatusKey } from "./agile-view";
 
-const runStateLabels: Record<RunState, string> = {
-  queued: "排队中",
-  preparing: "准备中",
-  developing: "开发中",
-  checking: "检查中",
-  reviewing: "审核中",
-  completed: "已完成",
-  needs_human: "需要人工",
-  failed: "失败",
-  cancelled: "已取消",
-};
+/** Catalog key for the sprint/release/deploy badges (labels live in the catalog). */
+const sprintStatusKey = (status: AgileSprint["status"]): MessageKey => `agile.sprintStatus.${status}` as MessageKey;
+const releaseStatusKey = (status: AgileRelease["status"]): MessageKey => `agile.releaseStatus.${status}` as MessageKey;
+const deployStatusKey = (status: ReleaseDeployRecord["status"]): MessageKey => `agile.deployStatus.${status}` as MessageKey;
 
-const sprintStatusLabels: Record<AgileSprint["status"], string> = { planned: "已计划", active: "进行中", closed: "已关闭" };
-const releaseStatusLabels: Record<AgileRelease["status"], string> = { planned: "已计划", in_progress: "进行中", released: "已发布", cancelled: "已取消" };
-const deployStatusLabels: Record<ReleaseDeployRecord["status"], string> = {
-  not_configured: "未配置部署钩子",
-  unsupported: "部署钩子类型不支持",
-  pending: "部署进行中（等待回调）",
-  ok: "部署成功",
-  failed: "部署失败",
-};
-
-const formatTime = (value: string) =>
-  new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(value));
+const formatTime = (value: string, locale: Locale = DEFAULT_LOCALE) =>
+  new Intl.DateTimeFormat(intlLocale(locale), { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(value));
 
 /** Compact human duration for cycle times (seconds in). */
-function formatDuration(seconds: number): string {
+function formatDuration(seconds: number, locale: Locale = DEFAULT_LOCALE): string {
   if (!Number.isFinite(seconds) || seconds <= 0) return "0";
-  if (seconds >= 86_400) return `${(seconds / 86_400).toFixed(1)} 天`;
-  if (seconds >= 3_600) return `${(seconds / 3_600).toFixed(1)} 小时`;
-  if (seconds >= 60) return `${Math.round(seconds / 60)} 分`;
-  return `${Math.round(seconds)} 秒`;
+  if (seconds >= 86_400) return t(locale, "agile.duration.days", { value: (seconds / 86_400).toFixed(1) });
+  if (seconds >= 3_600) return t(locale, "agile.duration.hours", { value: (seconds / 3_600).toFixed(1) });
+  if (seconds >= 60) return t(locale, "agile.duration.minutes", { value: Math.round(seconds / 60) });
+  return t(locale, "agile.duration.seconds", { value: Math.round(seconds) });
 }
 
 function parseModel(value: string): { provider: string; model: string } | undefined {
@@ -47,6 +33,7 @@ function parseModel(value: string): { provider: string; model: string } | undefi
 
 /** Sprint 3 batch 1: project/story planning on top of the existing run engine. */
 export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpenRun: (runId: string) => void }) {
+  const { t, locale } = useT();
   const [projects, setProjects] = useState<AgileProject[]>([]);
   const [projectId, setProjectId] = useState("");
   const [stories, setStories] = useState<AgileStory[]>([]);
@@ -133,11 +120,11 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
       setProjects(result.projects);
       setProjectId((current) => current || result.projects[0]?.id || "");
     } catch (cause) {
-      setError((cause as Error).message || "加载项目失败");
+      setError(localizeError(locale, cause as { code?: string; message?: string }, t("agile.error.loadProjects")));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [locale, t]);
 
   const loadProjectData = useCallback(async (id: string) => {
     try {
@@ -146,9 +133,9 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
       setSprints(sprintResult.sprints);
       setReleases(releaseResult.releases);
     } catch (cause) {
-      setError((cause as Error).message || "加载故事失败");
+      setError(localizeError(locale, cause as { code?: string; message?: string }, t("agile.error.loadStories")));
     }
-  }, []);
+  }, [locale, t]);
 
   useEffect(() => {
     void loadProjects();
@@ -182,9 +169,9 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
     let cancelled = false;
     void api.story(selectedId)
       .then((result) => { if (!cancelled) setDetail(result); })
-      .catch((cause) => { if (!cancelled) setError((cause as Error).message || "加载故事详情失败"); });
+      .catch((cause) => { if (!cancelled) setError(localizeError(locale, cause as { code?: string; message?: string }, t("agile.error.loadStory"))); });
     return () => { cancelled = true; };
-  }, [selectedId]);
+  }, [selectedId, locale, t]);
 
   // Sprint 4: 度量 panel data. Re-fetched when the panel opens or the sprint
   // picker changes; read-only and scoped to the current project.
@@ -194,10 +181,10 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
     setMetricsLoading(true);
     void api.agileMetrics({ projectId, sprintId: metricsSprintId || undefined })
       .then((result) => { if (!cancelled) setMetrics(result); })
-      .catch((cause) => { if (!cancelled) setError((cause as Error).message || "加载度量失败"); })
+      .catch((cause) => { if (!cancelled) setError(localizeError(locale, cause as { code?: string; message?: string }, t("agile.error.loadMetrics"))); })
       .finally(() => { if (!cancelled) setMetricsLoading(false); });
     return () => { cancelled = true; };
-  }, [panel, projectId, metricsSprintId]);
+  }, [panel, projectId, metricsSprintId, locale, t]);
 
   // Sprint 4 core: 发布回顾 panel data. Read-only, owner-scoped; the picker
   // defaults to the first release of the project and refetches on switch.
@@ -217,10 +204,10 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
         setReleaseSummary(summary);
         setReleaseRetrospective(retrospective);
       })
-      .catch((cause) => { if (!cancelled) setError((cause as Error).message || "加载发布汇总失败"); })
+      .catch((cause) => { if (!cancelled) setError(localizeError(locale, cause as { code?: string; message?: string }, t("agile.error.loadRelease"))); })
       .finally(() => { if (!cancelled) setReleaseLoading(false); });
     return () => { cancelled = true; };
-  }, [panel, projectId, releaseDetailId, releases]);
+  }, [panel, projectId, releaseDetailId, releases, locale, t]);
 
   const visibleStories = useMemo(
     () => stories.filter((story) => {
@@ -231,7 +218,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
     [stories, sprintFilter],
   );
   const columns = useMemo(() => groupStoriesByColumn(visibleStories), [visibleStories]);
-  const sprintLabel = useCallback((id: string | null) => sprints.find((sprint) => sprint.id === id)?.name ?? "未分配", [sprints]);
+  const sprintLabel = useCallback((id: string | null) => sprints.find((sprint) => sprint.id === id)?.name ?? t("agile.unassigned"), [sprints, t]);
   const metricsView = useMemo(() => {
     if (!metrics) return undefined;
     return metricsSprintId
@@ -251,7 +238,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
       setProjectKey("");
       setPanel("none");
     } catch (cause) {
-      setError((cause as Error).message || "创建项目失败");
+      setError(localizeError(locale, cause as { code?: string; message?: string }, t("agile.error.createProject")));
     } finally {
       setBusy("");
     }
@@ -259,7 +246,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
 
   const createSprint = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!projectId) { setError("请先创建或选择项目"); return; }
+    if (!projectId) { setError(t("agile.error.selectProjectFirst")); return; }
     setBusy("sprint");
     setError("");
     try {
@@ -269,7 +256,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
       setSprintGoal("");
       setPanel("none");
     } catch (cause) {
-      setError((cause as Error).message || "创建冲刺失败");
+      setError(localizeError(locale, cause as { code?: string; message?: string }, t("agile.error.createSprint")));
     } finally {
       setBusy("");
     }
@@ -305,7 +292,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
       budgetModelCalls: templateBudgetCalls,
       budgetDurationSeconds: templateBudgetSeconds,
       maxParallel: templateMaxParallel,
-    });
+    }, locale);
     if (!built.ok) { setError(built.message); return; }
     setBusy("template");
     setError("");
@@ -321,21 +308,21 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
       setTemplateBudgetSeconds("");
       setTemplateMaxParallel("");
     } catch (cause) {
-      setError(agileFormErrorMessage(cause, "创建模板失败"));
+      setError(agileFormErrorMessage(cause, t("agile.error.createTemplate"), locale));
     } finally {
       setBusy("");
     }
   };
 
   const removeTemplate = async (template: ModelTemplate) => {
-    if (!window.confirm(`删除模板「${template.name}」？已使用该模板的故事不受影响。`)) return;
+    if (!window.confirm(t("agile.template.deleteConfirm", { name: template.name }))) return;
     setBusy(`delete-template:${template.id}`);
     setError("");
     try {
       await api.deleteTemplate(template.id);
       setTemplates((current) => current.filter((item) => item.id !== template.id));
     } catch (cause) {
-      setError(agileFormErrorMessage(cause, "删除模板失败"));
+      setError(agileFormErrorMessage(cause, t("agile.error.deleteTemplate"), locale));
     } finally {
       setBusy("");
     }
@@ -343,7 +330,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
 
   const createStory = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!projectId) { setError("请先创建或选择项目"); return; }
+    if (!projectId) { setError(t("agile.error.selectProjectFirst")); return; }
     setBusy("story");
     setError("");
     const budgetGiven = [budgetTokens, budgetCost, budgetCalls, budgetSeconds].some((value) => value.trim() !== "");
@@ -379,7 +366,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
       setPanel("none");
       setSelectedId(story.id);
     } catch (cause) {
-      setError((cause as Error).message || "创建故事失败");
+      setError(localizeError(locale, cause as { code?: string; message?: string }, t("agile.error.createStory")));
     } finally {
       setBusy("");
     }
@@ -393,7 +380,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
       setStories((current) => current.map((item) => (item.id === story.id ? updated : item)));
       if (selectedId === story.id) setDetail((current) => (current ? { ...current, ...updated } : current));
     } catch (cause) {
-      setError((cause as Error).message || "更新状态失败");
+      setError(localizeError(locale, cause as { code?: string; message?: string }, t("agile.error.patchStatus")));
     } finally {
       setBusy("");
     }
@@ -401,7 +388,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
 
   const submit = async (story: StoryDetail) => {
     const mode = config?.realRunsAvailable ? "real" : "demo";
-    if (mode === "real" && !window.confirm(`将故事「${story.title}」提交为真实运行？\n\n任务文本会包含描述、验收标准与完成定义，检查命令来自所选工作区。`)) return;
+    if (mode === "real" && !window.confirm(t("agile.detail.submitConfirm", { title: story.title }))) return;
     setBusy(`submit:${story.id}`);
     setError("");
     try {
@@ -410,21 +397,21 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
       setStories((current) => current.map((item) => (item.id === result.story.id ? result.story : item)));
       setSelectedId(result.story.id);
     } catch (cause) {
-      setError((cause as Error).message || "提交为运行失败");
+      setError(localizeError(locale, cause as { code?: string; message?: string }, t("agile.error.submitStory")));
     } finally {
       setBusy("");
     }
   };
 
   const removeStory = async (story: AgileStory) => {
-    if (!window.confirm(`删除故事「${story.title}」？已链接的运行不会被删除，只会解除关联。`)) return;
+    if (!window.confirm(t("agile.detail.deleteConfirm", { title: story.title }))) return;
     setBusy(`delete:${story.id}`);
     try {
       await api.deleteStory(story.id);
       setStories((current) => current.filter((item) => item.id !== story.id));
       if (selectedId === story.id) { setSelectedId(""); setDetail(undefined); }
     } catch (cause) {
-      setError((cause as Error).message || "删除故事失败");
+      setError(localizeError(locale, cause as { code?: string; message?: string }, t("agile.error.deleteStory")));
     } finally {
       setBusy("");
     }
@@ -436,7 +423,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
       const updated = await api.patchSprint(sprint.id, { status });
       setSprints((current) => current.map((item) => (item.id === sprint.id ? updated : item)));
     } catch (cause) {
-      setError((cause as Error).message || "更新冲刺失败");
+      setError(localizeError(locale, cause as { code?: string; message?: string }, t("agile.error.patchSprint")));
     } finally {
       setBusy("");
     }
@@ -465,8 +452,8 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
 
   const saveRelease = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!projectId) { setError("请先创建或选择项目"); return; }
-    const built = buildReleaseInput({ name: releaseName, version: releaseVersion, notes: releaseNotes, status: releaseStatus, storyIds: releaseStoryIds });
+    if (!projectId) { setError(t("agile.error.selectProjectFirst")); return; }
+    const built = buildReleaseInput({ name: releaseName, version: releaseVersion, notes: releaseNotes, status: releaseStatus, storyIds: releaseStoryIds }, locale);
     if (!built.ok) { setError(built.message); return; }
     const editing = releaseManageId !== "";
     setBusy("release");
@@ -481,14 +468,14 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
       }
       resetReleaseForm();
     } catch (cause) {
-      setError(agileFormErrorMessage(cause, editing ? "更新发布失败" : "创建发布失败"));
+      setError(agileFormErrorMessage(cause, t(editing ? "agile.error.updateRelease" : "agile.error.createRelease"), locale));
     } finally {
       setBusy("");
     }
   };
 
   const removeRelease = async (release: AgileRelease) => {
-    if (!window.confirm(`删除发布「${release.version} · ${release.name}」？已关联的故事不会被删除，只会解除关联。`)) return;
+    if (!window.confirm(t("agile.releaseManage.deleteConfirm", { version: release.version, name: release.name }))) return;
     setBusy(`delete-release:${release.id}`);
     setError("");
     try {
@@ -497,7 +484,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
       if (releaseManageId === release.id) resetReleaseForm();
       if (releaseDetailId === release.id) { setReleaseDetailId(""); setReleaseSummary(undefined); setReleaseRetrospective(undefined); }
     } catch (cause) {
-      setError(agileFormErrorMessage(cause, "删除发布失败"));
+      setError(agileFormErrorMessage(cause, t("agile.error.deleteRelease"), locale));
     } finally {
       setBusy("");
     }
@@ -522,7 +509,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
     } catch (cause) {
       const error = cause as { message?: string; body?: { blocked?: Array<{ storyId: string; title: string; reason: string }> } };
       setPublishBlocked(error.body?.blocked ?? []);
-      setPublishError(error.message || "无法发布");
+      setPublishError(localizeError(locale, error, t("agile.error.publishPreview")));
     } finally {
       setPublishBusy(false);
     }
@@ -552,7 +539,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
     } catch (cause) {
       const error = cause as { message?: string; body?: { blocked?: Array<{ storyId: string; title: string; reason: string }> } };
       setPublishBlocked(error.body?.blocked ?? []);
-      setPublishError(error.message || "发布失败");
+      setPublishError(localizeError(locale, error, t("agile.error.publish")));
     } finally {
       setPublishBusy(false);
     }
@@ -560,9 +547,9 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
 
   // ------------------------------------------------ Kanban blocked-management
   const blockStory = async (story: AgileStory) => {
-    const reason = window.prompt(`标记「${story.title}」为阻塞，请填写原因：`, "");
+    const reason = window.prompt(t("agile.detail.blockPrompt", { title: story.title }), "");
     if (reason === null) return;
-    if (!reason.trim()) { setError("标记阻塞需要填写原因"); return; }
+    if (!reason.trim()) { setError(t("agile.detail.blockReasonRequired")); return; }
     setBusy(`block:${story.id}`);
     setError("");
     try {
@@ -570,7 +557,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
       setStories((current) => current.map((item) => (item.id === updated.id ? updated : item)));
       setDetail((current) => (current && current.id === updated.id ? updated : current));
     } catch (cause) {
-      setError(agileFormErrorMessage(cause, "标记阻塞失败"));
+      setError(agileFormErrorMessage(cause, t("agile.error.block"), locale));
     } finally {
       setBusy("");
     }
@@ -584,7 +571,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
       setStories((current) => current.map((item) => (item.id === updated.id ? updated : item)));
       setDetail((current) => (current && current.id === updated.id ? updated : current));
     } catch (cause) {
-      setError(agileFormErrorMessage(cause, "解除阻塞失败"));
+      setError(agileFormErrorMessage(cause, t("agile.error.unblock"), locale));
     } finally {
       setBusy("");
     }
@@ -600,7 +587,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
       setStories((current) => current.map((item) => (item.id === updated.id ? updated : item)));
       setDetail((current) => (current && current.id === updated.id ? updated : current));
     } catch (cause) {
-      setError(agileFormErrorMessage(cause, "重新打开失败"));
+      setError(agileFormErrorMessage(cause, t("agile.error.reopen"), locale));
     } finally {
       setBusy("");
     }
@@ -632,9 +619,9 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
       } catch {
         copied = false;
       }
-      setReleaseExportNote(copied ? `已下载 ${filename}，并已复制到剪贴板` : `已下载 ${filename}`);
+      setReleaseExportNote(t(copied ? "agile.releaseExport.copied" : "agile.releaseExport.downloaded", { filename }));
     } catch (cause) {
-      setReleaseExportNote((cause as Error).message || "导出失败");
+      setReleaseExportNote(localizeError(locale, cause as { code?: string; message?: string }, t("agile.error.export")));
     } finally {
       setReleaseExporting(false);
     }
@@ -645,108 +632,108 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
       <section className="ws-heading">
         <div>
           <span className="eyebrow">AGILE PLANNING</span>
-          <h1>敏捷</h1>
-          <p>以项目、用户故事与冲刺组织需求，并把一个「就绪」的故事提交为运行。运行仍是唯一的执行单元：一条故事可以关联多次运行（修复 / 重试），故事状态由最近一次运行自动回写。</p>
+          <h1>{t("nav.agile")}</h1>
+          <p>{t("agile.subtitle")}</p>
         </div>
         <div className="ws-heading-actions">
-          <button className="button secondary" onClick={() => { setPanel(panel === "project" ? "none" : "project"); setError(""); }}><Plus size={15} />新建项目</button>
-          <button className="button secondary" disabled={!projectId} onClick={() => { setPanel(panel === "sprint" ? "none" : "sprint"); setError(""); }}><Plus size={15} />新建冲刺</button>
-          <button className="button secondary" disabled={!projectId} onClick={() => { setPanel(panel === "story" ? "none" : "story"); setError(""); }}><Plus size={15} />新建故事</button>
-          <button className={`button secondary ${panel === "templates" ? "active" : ""}`} onClick={() => { setPanel(panel === "templates" ? "none" : "templates"); setError(""); }}><LayoutTemplate size={15} />模板管理</button>
-          <button className={`button secondary ${panel === "metrics" ? "active" : ""}`} disabled={!projectId} onClick={() => { setPanel(panel === "metrics" ? "none" : "metrics"); setError(""); }}><BarChart3 size={15} />度量</button>
-          <button className={`button secondary ${panel === "release" ? "active" : ""}`} disabled={!projectId || releases.length === 0} onClick={() => { setPanel(panel === "release" ? "none" : "release"); setError(""); }}><Rocket size={15} />发布回顾</button>
-          <button className={`button secondary ${panel === "releases" ? "active" : ""}`} disabled={!projectId} onClick={() => { setPanel(panel === "releases" ? "none" : "releases"); setError(""); }}><Pencil size={15} />发布管理</button>
+          <button className="button secondary" onClick={() => { setPanel(panel === "project" ? "none" : "project"); setError(""); }}><Plus size={15} />{t("agile.newProject")}</button>
+          <button className="button secondary" disabled={!projectId} onClick={() => { setPanel(panel === "sprint" ? "none" : "sprint"); setError(""); }}><Plus size={15} />{t("agile.newSprint")}</button>
+          <button className="button secondary" disabled={!projectId} onClick={() => { setPanel(panel === "story" ? "none" : "story"); setError(""); }}><Plus size={15} />{t("agile.newStory")}</button>
+          <button className={`button secondary ${panel === "templates" ? "active" : ""}`} onClick={() => { setPanel(panel === "templates" ? "none" : "templates"); setError(""); }}><LayoutTemplate size={15} />{t("agile.templates")}</button>
+          <button className={`button secondary ${panel === "metrics" ? "active" : ""}`} disabled={!projectId} onClick={() => { setPanel(panel === "metrics" ? "none" : "metrics"); setError(""); }}><BarChart3 size={15} />{t("agile.metrics")}</button>
+          <button className={`button secondary ${panel === "release" ? "active" : ""}`} disabled={!projectId || releases.length === 0} onClick={() => { setPanel(panel === "release" ? "none" : "release"); setError(""); }}><Rocket size={15} />{t("agile.releaseReview")}</button>
+          <button className={`button secondary ${panel === "releases" ? "active" : ""}`} disabled={!projectId} onClick={() => { setPanel(panel === "releases" ? "none" : "releases"); setError(""); }}><Pencil size={15} />{t("agile.releaseManage")}</button>
         </div>
       </section>
 
       <div className="ws-forms">
         {panel === "project" && (
           <form className="ws-form" onSubmit={createProject}>
-            <div className="ws-form-head"><div><span className="eyebrow">NEW PROJECT</span><h3>新建项目</h3></div><button className="icon-button" type="button" onClick={() => setPanel("none")}><X size={16} /></button></div>
-            <p className="ws-form-help">项目用于分组故事。前缀是故事编号的短标识（2–10 位，字母开头，如 <code>AUTH</code>），同一用户下不可重复。</p>
-            <label>项目名称<input value={projectName} onChange={(event) => setProjectName(event.target.value)} placeholder="认证服务" autoFocus /></label>
-            <label>项目前缀<input value={projectKey} onChange={(event) => setProjectKey(event.target.value.toUpperCase())} placeholder="AUTH" /></label>
+            <div className="ws-form-head"><div><span className="eyebrow">NEW PROJECT</span><h3>{t("agile.projectForm.title")}</h3></div><button className="icon-button" type="button" onClick={() => setPanel("none")}><X size={16} /></button></div>
+            <p className="ws-form-help">{t("agile.projectForm.help")}</p>
+            <label>{t("agile.projectForm.name")}<input value={projectName} onChange={(event) => setProjectName(event.target.value)} placeholder={t("agile.projectForm.namePlaceholder")} autoFocus /></label>
+            <label>{t("agile.projectForm.key")}<input value={projectKey} onChange={(event) => setProjectKey(event.target.value.toUpperCase())} placeholder="AUTH" /></label>
             <div className="ws-form-actions">
-              <button type="button" className="button secondary" onClick={() => setPanel("none")}>取消</button>
+              <button type="button" className="button secondary" onClick={() => setPanel("none")}>{t("common.cancel")}</button>
               <button type="submit" className="button primary" disabled={busy === "project" || !projectName.trim() || projectKey.trim().length < 2}>
-                {busy === "project" ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />}创建
+                {busy === "project" ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />}{t("agile.projectForm.create")}
               </button>
             </div>
           </form>
         )}
         {panel === "sprint" && (
           <form className="ws-form" onSubmit={createSprint}>
-            <div className="ws-form-head"><div><span className="eyebrow">NEW SPRINT</span><h3>新建冲刺</h3></div><button className="icon-button" type="button" onClick={() => setPanel("none")}><X size={16} /></button></div>
-            <p className="ws-form-help">冲刺属于当前项目；故事通过「分配冲刺」加入，未分配的故事留在待办。</p>
-            <label>冲刺名称<input value={sprintName} onChange={(event) => setSprintName(event.target.value)} placeholder="Sprint 1" autoFocus /></label>
-            <label>冲刺目标<input value={sprintGoal} onChange={(event) => setSprintGoal(event.target.value)} placeholder="完成登录限流与并发刷新" /></label>
+            <div className="ws-form-head"><div><span className="eyebrow">NEW SPRINT</span><h3>{t("agile.sprintForm.title")}</h3></div><button className="icon-button" type="button" onClick={() => setPanel("none")}><X size={16} /></button></div>
+            <p className="ws-form-help">{t("agile.sprintForm.help")}</p>
+            <label>{t("agile.sprintForm.name")}<input value={sprintName} onChange={(event) => setSprintName(event.target.value)} placeholder="Sprint 1" autoFocus /></label>
+            <label>{t("agile.sprintForm.goal")}<input value={sprintGoal} onChange={(event) => setSprintGoal(event.target.value)} placeholder={t("agile.sprintForm.goalPlaceholder")} /></label>
             <div className="ws-form-actions">
-              <button type="button" className="button secondary" onClick={() => setPanel("none")}>取消</button>
+              <button type="button" className="button secondary" onClick={() => setPanel("none")}>{t("common.cancel")}</button>
               <button type="submit" className="button primary" disabled={busy === "sprint" || !sprintName.trim()}>
-                {busy === "sprint" ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />}创建
+                {busy === "sprint" ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />}{t("agile.projectForm.create")}
               </button>
             </div>
           </form>
         )}
         {panel === "story" && (
           <form className="ws-form" onSubmit={createStory}>
-            <div className="ws-form-head"><div><span className="eyebrow">NEW STORY</span><h3>新建用户故事</h3></div><button className="icon-button" type="button" onClick={() => setPanel("none")}><X size={16} /></button></div>
-            <label>标题<input value={storyTitle} onChange={(event) => setStoryTitle(event.target.value)} placeholder="实现登录限流" autoFocus /></label>
-            <label>描述<textarea rows={3} value={storyDescription} onChange={(event) => setStoryDescription(event.target.value)} placeholder="要解决的问题与背景" /></label>
-            <label>验收标准（每行一条）<textarea rows={3} value={storyCriteria} onChange={(event) => setStoryCriteria(event.target.value)} placeholder={"超过阈值返回 429\n并发刷新只触发一次"} /></label>
-            <label>完成定义（每行一条）<textarea rows={2} value={storyDod} onChange={(event) => setStoryDod(event.target.value)} placeholder={"单元测试通过\n无新增 lint 问题"} /></label>
+            <div className="ws-form-head"><div><span className="eyebrow">NEW STORY</span><h3>{t("agile.storyForm.title")}</h3></div><button className="icon-button" type="button" onClick={() => setPanel("none")}><X size={16} /></button></div>
+            <label>{t("agile.storyForm.titleField")}<input value={storyTitle} onChange={(event) => setStoryTitle(event.target.value)} placeholder={t("agile.storyForm.titlePlaceholder")} autoFocus /></label>
+            <label>{t("agile.storyForm.description")}<textarea rows={3} value={storyDescription} onChange={(event) => setStoryDescription(event.target.value)} placeholder={t("agile.storyForm.descriptionPlaceholder")} /></label>
+            <label>{t("agile.storyForm.criteria")}<textarea rows={3} value={storyCriteria} onChange={(event) => setStoryCriteria(event.target.value)} placeholder={t("agile.storyForm.criteriaPlaceholder")} /></label>
+            <label>{t("agile.storyForm.dod")}<textarea rows={2} value={storyDod} onChange={(event) => setStoryDod(event.target.value)} placeholder={t("agile.storyForm.dodPlaceholder")} /></label>
             <div className="agile-form-row">
-              <label>优先级
+              <label>{t("agile.storyForm.priority")}
                 <select value={storyPriority} onChange={(event) => setStoryPriority(event.target.value as StoryPriority)}>
                   {STORY_PRIORITIES.map((value) => <option key={value} value={value}>{priorityLabel(value)}</option>)}
                 </select>
               </label>
-              <label>估算（点）
+              <label>{t("agile.storyForm.estimate")}
                 <select value={storyEstimate} onChange={(event) => setStoryEstimate(event.target.value)}>
-                  <option value="">未估算</option>
+                  <option value="">{t("agile.estimate.none")}</option>
                   {[1, 2, 3, 5, 8, 13].map((value) => <option key={value} value={value}>{estimateLabel(value)}</option>)}
                 </select>
               </label>
             </div>
             <div className="agile-form-row">
-              <label>工作区
+              <label>{t("agile.storyForm.workspace")}
                 <select value={storyWorkspace} onChange={(event) => setStoryWorkspace(event.target.value)}>
-                  <option value="">未指定</option>
+                  <option value="">{t("agile.notSpecified")}</option>
                   {workspaces.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspace.name}</option>)}
                 </select>
               </label>
-              <label>冲刺
+              <label>{t("agile.storyForm.sprint")}
                 <select value={storySprint} onChange={(event) => setStorySprint(event.target.value)}>
-                  <option value="">未分配（待办）</option>
+                  <option value="">{t("agile.unassignedTodo")}</option>
                   {sprints.map((sprint) => <option key={sprint.id} value={sprint.id}>{sprint.name}</option>)}
                 </select>
               </label>
             </div>
             <div className="agile-form-row">
-              <label>模板
+              <label>{t("agile.storyForm.template")}
                 <select value={storyTemplate} onChange={(event) => applyStoryTemplate(event.target.value)}>
-                  <option value="">不使用</option>
+                  <option value="">{t("agile.storyForm.templateNone")}</option>
                   {templates.map((template) => (
                     <option key={template.id} value={template.id}>{template.name} · {template.developerModel.model} / {template.reviewerModel.model}</option>
                   ))}
                 </select>
               </label>
-              <label>最大并行
-                <input inputMode="numeric" value={storyMaxParallel} onChange={(event) => setStoryMaxParallel(event.target.value)} placeholder="默认" />
+              <label>{t("agile.storyForm.maxParallel")}
+                <input inputMode="numeric" value={storyMaxParallel} onChange={(event) => setStoryMaxParallel(event.target.value)} placeholder={t("agile.storyForm.defaultPlaceholder")} />
               </label>
             </div>
             <div className="agile-form-row">
-              <label>开发模型
+              <label>{t("agile.storyForm.developerModel")}
                 <select value={storyDeveloper} onChange={(event) => setStoryDeveloper(event.target.value)}>
-                  <option value="">默认</option>
+                  <option value="">{t("agile.storyForm.defaultOption")}</option>
                   {(models?.models ?? []).filter((entry) => entry.roles.includes("developer")).map((entry) => (
                     <option key={`${entry.provider}::${entry.model}`} value={`${entry.provider}::${entry.model}`}>{entry.label} · {entry.model}</option>
                   ))}
                 </select>
               </label>
-              <label>审核模型
+              <label>{t("agile.storyForm.reviewerModel")}
                 <select value={storyReviewer} onChange={(event) => setStoryReviewer(event.target.value)}>
-                  <option value="">默认</option>
+                  <option value="">{t("agile.storyForm.defaultOption")}</option>
                   {(models?.models ?? []).filter((entry) => entry.roles.includes("reviewer")).map((entry) => (
                     <option key={`${entry.provider}::${entry.model}`} value={`${entry.provider}::${entry.model}`}>{entry.label} · {entry.model}</option>
                   ))}
@@ -754,15 +741,15 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
               </label>
             </div>
             <div className="agile-form-row agile-budget-row">
-              <label>预算 Token<input inputMode="numeric" value={budgetTokens} onChange={(event) => setBudgetTokens(event.target.value)} placeholder="不限" /></label>
-              <label>预算成本（$）<input inputMode="decimal" value={budgetCost} onChange={(event) => setBudgetCost(event.target.value)} placeholder="不限" /></label>
-              <label>模型调用<input inputMode="numeric" value={budgetCalls} onChange={(event) => setBudgetCalls(event.target.value)} placeholder="不限" /></label>
-              <label>时长（秒）<input inputMode="numeric" value={budgetSeconds} onChange={(event) => setBudgetSeconds(event.target.value)} placeholder="不限" /></label>
+              <label>{t("agile.storyForm.budgetTokens")}<input inputMode="numeric" value={budgetTokens} onChange={(event) => setBudgetTokens(event.target.value)} placeholder={t("agile.storyForm.unlimited")} /></label>
+              <label>{t("agile.storyForm.budgetCost")}<input inputMode="decimal" value={budgetCost} onChange={(event) => setBudgetCost(event.target.value)} placeholder={t("agile.storyForm.unlimited")} /></label>
+              <label>{t("agile.storyForm.budgetCalls")}<input inputMode="numeric" value={budgetCalls} onChange={(event) => setBudgetCalls(event.target.value)} placeholder={t("agile.storyForm.unlimited")} /></label>
+              <label>{t("agile.storyForm.budgetSeconds")}<input inputMode="numeric" value={budgetSeconds} onChange={(event) => setBudgetSeconds(event.target.value)} placeholder={t("agile.storyForm.unlimited")} /></label>
             </div>
             <div className="ws-form-actions">
-              <button type="button" className="button secondary" onClick={() => setPanel("none")}>取消</button>
+              <button type="button" className="button secondary" onClick={() => setPanel("none")}>{t("common.cancel")}</button>
               <button type="submit" className="button primary" disabled={busy === "story" || storyTitle.trim().length < 2}>
-                {busy === "story" ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />}创建故事
+                {busy === "story" ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />}{t("agile.storyForm.createStory")}
               </button>
             </div>
           </form>
@@ -770,58 +757,58 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
       </div>
 
       {error && <div className="form-error">{error}</div>}
-      {loading && <div className="ws-empty"><LoaderCircle className="spin" size={20} /><span>正在加载敏捷数据…</span></div>}
+      {loading && <div className="ws-empty"><LoaderCircle className="spin" size={20} /><span>{t("agile.loading")}</span></div>}
       {!loading && projects.length === 0 && (
-        <div className="ws-empty"><ClipboardList size={26} /><strong>还没有项目</strong><span>先新建一个项目，再在其中创建用户故事与冲刺。</span></div>
+        <div className="ws-empty"><ClipboardList size={26} /><strong>{t("agile.noProjects")}</strong><span>{t("agile.noProjectsHint")}</span></div>
       )}
 
       {projects.length > 0 && (
         <>
           <div className="agile-toolbar">
-            <label>项目
+            <label>{t("agile.project")}
               <select value={projectId} onChange={(event) => setProjectId(event.target.value)}>
                 {projects.map((project) => <option key={project.id} value={project.id}>{project.key} · {project.name}</option>)}
               </select>
             </label>
-            <label>冲刺
+            <label>{t("agile.sprint")}
               <select value={sprintFilter} onChange={(event) => setSprintFilter(event.target.value)}>
-                <option value="all">全部</option>
-                <option value="none">未分配</option>
-                {sprints.map((sprint) => <option key={sprint.id} value={sprint.id}>{sprint.name}（{sprintStatusLabels[sprint.status]}）</option>)}
+                <option value="all">{t("agile.all")}</option>
+                <option value="none">{t("agile.unassigned")}</option>
+                {sprints.map((sprint) => <option key={sprint.id} value={sprint.id}>{sprint.name} · {t(sprintStatusKey(sprint.status))}</option>)}
               </select>
             </label>
             {selectedProject?.description && <span className="agile-hint">{selectedProject.description}</span>}
           </div>
 
           <section className="panel agile-board">
-            <div className="panel-head"><div><span className="eyebrow">SPRINT BOARD</span><h3>Sprint 看板</h3></div><ListChecks size={15} /></div>
+            <div className="panel-head"><div><span className="eyebrow">SPRINT BOARD</span><h3>{t("agile.board.title")}</h3></div><ListChecks size={15} /></div>
             <div className="agile-columns">
               {columns.map((column) => (
                 <div className="agile-column" key={column.id}>
-                  <header><span>{column.label}</span><em>{column.stories.length}{columnPoints(column) > 0 ? ` · ${columnPoints(column)} 点` : ""}</em></header>
+                  <header><span>{t(boardColumnKey(column.id))}</span><em>{column.stories.length}{columnPoints(column) > 0 ? ` · ${t("agile.points", { count: columnPoints(column) })}` : ""}</em></header>
                   {column.stories.map((story) => (
                     <div key={story.id} className={`agile-card ${selectedId === story.id ? "selected" : ""}`}>
                       <button type="button" className="agile-card-main" onClick={() => setSelectedId(story.id)}>
                         <strong>{story.title}</strong>
                         <span className="agile-card-meta">
-                          <em className={`agile-priority priority-${story.priority}`}>{priorityLabel(story.priority)}</em>
-                          <small>{estimateLabel(story.estimate)}</small>
+                          <em className={`agile-priority priority-${story.priority}`}>{t(priorityKey(story.priority))}</em>
+                          <small>{estimateLabel(story.estimate, locale)}</small>
                         </span>
                         <small className="agile-card-sprint">{sprintLabel(story.sprintId)}</small>
                       </button>
                       {story.status === "blocked" && (
-                        <span className="agile-blocked-badge" title={story.blockedReason ?? "阻塞"}>
-                          阻塞{story.blockedReason ? `：${story.blockedReason}` : ""}
+                        <span className="agile-blocked-badge" title={story.blockedReason ?? t("agile.blocked")}>
+                          {story.blockedReason ? t("agile.blockedWithReason", { reason: story.blockedReason }) : t("agile.blocked")}
                         </span>
                       )}
                       <div className="agile-card-actions">
                         {story.status !== "blocked"
-                          ? <button type="button" disabled={busy === `block:${story.id}`} onClick={() => void blockStory(story)}>标记阻塞</button>
-                          : <button type="button" disabled={busy === `unblock:${story.id}`} onClick={() => void unblockStory(story)}>解除阻塞</button>}
+                          ? <button type="button" disabled={busy === `block:${story.id}`} onClick={() => void blockStory(story)}>{t("agile.block")}</button>
+                          : <button type="button" disabled={busy === `unblock:${story.id}`} onClick={() => void unblockStory(story)}>{t("agile.unblock")}</button>}
                       </div>
                     </div>
                   ))}
-                  {column.stories.length === 0 && <div className="agile-column-empty">暂无</div>}
+                  {column.stories.length === 0 && <div className="agile-column-empty">{t("agile.none")}</div>}
                 </div>
               ))}
             </div>
@@ -829,48 +816,48 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
 
           <div className="agile-grid">
             <section className="panel">
-              <div className="panel-head"><div><span className="eyebrow">STORY LIST</span><h3>故事列表</h3></div><ClipboardList size={15} /></div>
+              <div className="panel-head"><div><span className="eyebrow">STORY LIST</span><h3>{t("agile.storyList.title")}</h3></div><ClipboardList size={15} /></div>
               <div className="agile-story-list">
                 {visibleStories.map((story, index) => (
                   <div className={`agile-story-row ${selectedId === story.id ? "selected" : ""}`} key={story.id}>
                     <button type="button" className="agile-story-main" onClick={() => setSelectedId(story.id)}>
                       <code>{storyReference(selectedProject?.key ?? "STORY", index)}</code>
-                      <span><strong>{story.title}</strong><small>{STORY_STATUS_LABELS[story.status]} · {sprintLabel(story.sprintId)}</small></span>
+                      <span><strong>{story.title}</strong><small>{t(storyStatusKey(story.status))} · {sprintLabel(story.sprintId)}</small></span>
                     </button>
                     <div className="agile-story-actions">
-                      {story.status !== "ready" && <button type="button" disabled={busy === `status:${story.id}`} onClick={() => void patchStatus(story, "ready")}>标为就绪</button>}
+                      {story.status !== "ready" && <button type="button" disabled={busy === `status:${story.id}`} onClick={() => void patchStatus(story, "ready")}>{t("agile.markReady")}</button>}
                       <button type="button" className="danger" disabled={busy === `delete:${story.id}`} onClick={() => void removeStory(story)}><Trash2 size={12} /></button>
                     </div>
                   </div>
                 ))}
-                {visibleStories.length === 0 && <div className="ws-empty"><span>当前筛选下没有故事。</span></div>}
+                {visibleStories.length === 0 && <div className="ws-empty"><span>{t("agile.emptyFiltered")}</span></div>}
               </div>
             </section>
 
             <section className="panel">
-              <div className="panel-head"><div><span className="eyebrow">SPRINTS &amp; RELEASES</span><h3>冲刺与发布</h3></div><Rocket size={15} /></div>
+              <div className="panel-head"><div><span className="eyebrow">SPRINTS &amp; RELEASES</span><h3>{t("agile.sprintsReleases.title")}</h3></div><Rocket size={15} /></div>
               <div className="agile-sprint-list">
                 {sprints.map((sprint) => (
                   <div className="agile-sprint-row" key={sprint.id}>
-                    <span><strong>{sprint.name}</strong><small>{sprintStatusLabels[sprint.status]}{sprint.goal ? ` · ${sprint.goal}` : ""}</small></span>
+                    <span><strong>{sprint.name}</strong><small>{t(sprintStatusKey(sprint.status))}{sprint.goal ? ` · ${sprint.goal}` : ""}</small></span>
                     <div>
-                      {sprint.status !== "active" && <button type="button" disabled={busy === `sprint:${sprint.id}`} onClick={() => void setSprintStatus(sprint, "active")}>开始</button>}
-                      {sprint.status === "active" && <button type="button" disabled={busy === `sprint:${sprint.id}`} onClick={() => void setSprintStatus(sprint, "closed")}>关闭</button>}
+                      {sprint.status !== "active" && <button type="button" disabled={busy === `sprint:${sprint.id}`} onClick={() => void setSprintStatus(sprint, "active")}>{t("agile.sprint.start")}</button>}
+                      {sprint.status === "active" && <button type="button" disabled={busy === `sprint:${sprint.id}`} onClick={() => void setSprintStatus(sprint, "closed")}>{t("agile.sprint.close")}</button>}
                     </div>
                   </div>
                 ))}
-                {sprints.length === 0 && <div className="agile-hint">还没有冲刺；故事默认留在待办。</div>}
+                {sprints.length === 0 && <div className="agile-hint">{t("agile.sprint.empty")}</div>}
               </div>
               <div className="agile-release-list">
                 {releases.map((release) => (
                   <div className="agile-release-row" key={release.id}>
                     <code>{release.version}</code>
                     <span>{release.name}</span>
-                    <small>{releaseStatusLabels[release.status]} · {release.storyIds.length} 个故事</small>
-                    <button type="button" onClick={() => { setReleaseDetailId(release.id); setPanel("release"); setError(""); }}>回顾</button>
+                    <small>{t(releaseStatusKey(release.status))} · {t("agile.storyCount", { count: release.storyIds.length })}</small>
+                    <button type="button" onClick={() => { setReleaseDetailId(release.id); setPanel("release"); setError(""); }}>{t("agile.review")}</button>
                   </div>
                 ))}
-                {releases.length === 0 && <div className="agile-hint">还没有发布记录。</div>}
+                {releases.length === 0 && <div className="agile-hint">{t("agile.release.empty")}</div>}
               </div>
             </section>
           </div>
@@ -879,24 +866,24 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
 
       {panel === "templates" && (
         <section className="panel agile-metrics agile-templates">
-          <div className="panel-head"><div><span className="eyebrow">MODEL TEMPLATES</span><h3>模板管理</h3></div><LayoutTemplate size={15} /></div>
+          <div className="panel-head"><div><span className="eyebrow">MODEL TEMPLATES</span><h3>{t("agile.template.title")}</h3></div><LayoutTemplate size={15} /></div>
           <div className="agile-metrics-body">
             <form className="ws-form" onSubmit={createTemplate}>
-              <div className="ws-form-head"><div><span className="eyebrow">NEW TEMPLATE</span><h3>新建模板</h3></div></div>
-              <p className="ws-form-help">模板保存一组「开发模型 + 审核模型」，可选附带预算与并行度；在<strong>新建故事</strong>时选择即可一键填充。模板属于当前账号，同名不可重复。</p>
-              <label>模板名称<input value={templateName} onChange={(event) => setTemplateName(event.target.value)} placeholder="快速组合" autoFocus /></label>
+              <div className="ws-form-head"><div><span className="eyebrow">NEW TEMPLATE</span><h3>{t("agile.template.new")}</h3></div></div>
+              <p className="ws-form-help">{t("agile.template.help")}</p>
+              <label>{t("agile.template.name")}<input value={templateName} onChange={(event) => setTemplateName(event.target.value)} placeholder={t("agile.template.namePlaceholder")} autoFocus /></label>
               <div className="agile-form-row">
-                <label>开发模型
+                <label>{t("agile.storyForm.developerModel")}
                   <select value={templateDeveloper} onChange={(event) => setTemplateDeveloper(event.target.value)}>
-                    <option value="">请选择</option>
+                    <option value="">{t("agile.template.pleaseSelect")}</option>
                     {(models?.models ?? []).filter((entry) => entry.roles.includes("developer")).map((entry) => (
                       <option key={`${entry.provider}::${entry.model}`} value={`${entry.provider}::${entry.model}`}>{entry.label} · {entry.model}</option>
                     ))}
                   </select>
                 </label>
-                <label>审核模型
+                <label>{t("agile.storyForm.reviewerModel")}
                   <select value={templateReviewer} onChange={(event) => setTemplateReviewer(event.target.value)}>
-                    <option value="">请选择</option>
+                    <option value="">{t("agile.template.pleaseSelect")}</option>
                     {(models?.models ?? []).filter((entry) => entry.roles.includes("reviewer")).map((entry) => (
                       <option key={`${entry.provider}::${entry.model}`} value={`${entry.provider}::${entry.model}`}>{entry.label} · {entry.model}</option>
                     ))}
@@ -904,32 +891,32 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
                 </label>
               </div>
               <div className="agile-form-row agile-budget-row">
-                <label>预算 Token<input inputMode="numeric" value={templateBudgetTokens} onChange={(event) => setTemplateBudgetTokens(event.target.value)} placeholder="不限" /></label>
-                <label>预算成本（$）<input inputMode="decimal" value={templateBudgetCost} onChange={(event) => setTemplateBudgetCost(event.target.value)} placeholder="不限" /></label>
-                <label>模型调用<input inputMode="numeric" value={templateBudgetCalls} onChange={(event) => setTemplateBudgetCalls(event.target.value)} placeholder="不限" /></label>
-                <label>时长（秒）<input inputMode="numeric" value={templateBudgetSeconds} onChange={(event) => setTemplateBudgetSeconds(event.target.value)} placeholder="不限" /></label>
+                <label>{t("agile.storyForm.budgetTokens")}<input inputMode="numeric" value={templateBudgetTokens} onChange={(event) => setTemplateBudgetTokens(event.target.value)} placeholder={t("agile.storyForm.unlimited")} /></label>
+                <label>{t("agile.storyForm.budgetCost")}<input inputMode="decimal" value={templateBudgetCost} onChange={(event) => setTemplateBudgetCost(event.target.value)} placeholder={t("agile.storyForm.unlimited")} /></label>
+                <label>{t("agile.storyForm.budgetCalls")}<input inputMode="numeric" value={templateBudgetCalls} onChange={(event) => setTemplateBudgetCalls(event.target.value)} placeholder={t("agile.storyForm.unlimited")} /></label>
+                <label>{t("agile.storyForm.budgetSeconds")}<input inputMode="numeric" value={templateBudgetSeconds} onChange={(event) => setTemplateBudgetSeconds(event.target.value)} placeholder={t("agile.storyForm.unlimited")} /></label>
               </div>
               <div className="agile-form-row">
-                <label>最大并行<input inputMode="numeric" value={templateMaxParallel} onChange={(event) => setTemplateMaxParallel(event.target.value)} placeholder="默认（1–32）" /></label>
+                <label>{t("agile.template.maxParallel")}<input inputMode="numeric" value={templateMaxParallel} onChange={(event) => setTemplateMaxParallel(event.target.value)} placeholder={t("agile.template.maxParallelPlaceholder")} /></label>
                 <span />
               </div>
               <div className="ws-form-actions">
                 <button type="submit" className="button primary" disabled={busy === "template" || !templateName.trim() || !templateDeveloper || !templateReviewer}>
-                  {busy === "template" ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />}创建模板
+                  {busy === "template" ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />}{t("agile.template.create")}
                 </button>
               </div>
             </form>
             <div className="agile-manage-list">
-              <h4>已有模板（{templates.length}）</h4>
+              <h4>{t("agile.template.existing", { count: templates.length })}</h4>
               {templates.map((template) => (
                 <div className="agile-release-row" key={template.id}>
                   <span>{template.name}</span>
                   <code>{template.developerModel.provider}:{template.developerModel.model} / {template.reviewerModel.provider}:{template.reviewerModel.model}</code>
-                  <small>{template.budget ? `预算 ${template.budget.maxCostUsd} · ${template.budget.maxTokens} tok` : "无预算"}{template.maxParallel !== null ? ` · 并行 ${template.maxParallel}` : ""}</small>
-                  <button type="button" className="danger" disabled={busy === `delete-template:${template.id}`} onClick={() => void removeTemplate(template)}><Trash2 size={12} />删除</button>
+                  <small>{template.budget ? t("agile.template.budget", { cost: template.budget.maxCostUsd, tokens: template.budget.maxTokens }) : t("agile.template.noBudget")}{template.maxParallel !== null ? ` · ${t("agile.template.parallel", { count: template.maxParallel })}` : ""}</small>
+                  <button type="button" className="danger" disabled={busy === `delete-template:${template.id}`} onClick={() => void removeTemplate(template)}><Trash2 size={12} />{t("common.delete")}</button>
                 </div>
               ))}
-              {templates.length === 0 && <div className="agile-hint">还没有模板。创建后可在「新建故事」的模板下拉中选用，它会自动填入开发/审核模型与预算。</div>}
+              {templates.length === 0 && <div className="agile-hint">{t("agile.template.empty")}</div>}
             </div>
           </div>
         </section>
@@ -937,59 +924,59 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
 
       {panel === "metrics" && (
         <section className="panel agile-metrics">
-          <div className="panel-head"><div><span className="eyebrow">SPRINT METRICS</span><h3>度量</h3></div><BarChart3 size={15} /></div>
+          <div className="panel-head"><div><span className="eyebrow">SPRINT METRICS</span><h3>{t("agile.metrics.title")}</h3></div><BarChart3 size={15} /></div>
           <div className="agile-metrics-body">
             <div className="agile-toolbar">
-              <label>冲刺
+              <label>{t("agile.sprint")}
                 <select value={metricsSprintId} onChange={(event) => setMetricsSprintId(event.target.value)}>
-                  <option value="">项目汇总</option>
+                  <option value="">{t("agile.metrics.projectSummary")}</option>
                   {sprints.map((sprint) => <option key={sprint.id} value={sprint.id}>{sprint.name}</option>)}
                 </select>
               </label>
-              <span className="agile-hint">只读聚合：完成故事的成本/周期、返工率、审核发现与运行结果。</span>
+              <span className="agile-hint">{t("agile.metrics.hint")}</span>
             </div>
-            {metricsLoading && <div className="ws-empty"><LoaderCircle className="spin" size={18} /><span>正在计算度量…</span></div>}
-            {!metricsLoading && !metricsView && <div className="agile-hint">该范围下还没有故事。</div>}
+            {metricsLoading && <div className="ws-empty"><LoaderCircle className="spin" size={18} /><span>{t("agile.metrics.loading")}</span></div>}
+            {!metricsLoading && !metricsView && <div className="agile-hint">{t("agile.metrics.empty")}</div>}
             {!metricsLoading && metricsView && (
               <>
                 <div className="metrics-grid agile-metrics-grid">
-                  <div className="metric"><span>完成故事</span><strong>{metricsView.stories.completed}/{metricsView.stories.total}</strong><small>完成 = 已验收</small></div>
-                  <div className="metric"><span>返工率</span><strong>{(metricsView.rework.rate * 100).toFixed(0)}%</strong><small>{metricsView.rework.reworked}/{metricsView.rework.completed} 有返修</small></div>
-                  <div className="metric"><span>成本 / 完成故事</span><strong>${metricsView.costPerCompletedStory.toFixed(3)}</strong><small>合计 ${metricsView.usage.cost.toFixed(3)}</small></div>
-                  <div className="metric"><span>周期 中位 / P90</span><strong>{formatDuration(metricsView.cycleTime.medianSeconds)} / {formatDuration(metricsView.cycleTime.p90Seconds)}</strong><small>{metricsView.cycleTime.samples} 个样本</small></div>
+                  <div className="metric"><span>{t("agile.metrics.completedStories")}</span><strong>{metricsView.stories.completed}/{metricsView.stories.total}</strong><small>{t("agile.metrics.completedHint")}</small></div>
+                  <div className="metric"><span>{t("agile.metrics.reworkRate")}</span><strong>{(metricsView.rework.rate * 100).toFixed(0)}%</strong><small>{t("agile.metrics.reworked", { reworked: metricsView.rework.reworked, completed: metricsView.rework.completed })}</small></div>
+                  <div className="metric"><span>{t("agile.metrics.costPerStory")}</span><strong>${metricsView.costPerCompletedStory.toFixed(3)}</strong><small>{t("agile.metrics.totalCost", { cost: metricsView.usage.cost.toFixed(3) })}</small></div>
+                  <div className="metric"><span>{t("agile.metrics.cycleMedianP90")}</span><strong>{formatDuration(metricsView.cycleTime.medianSeconds, locale)} / {formatDuration(metricsView.cycleTime.p90Seconds, locale)}</strong><small>{t("agile.metrics.samples", { count: metricsView.cycleTime.samples })}</small></div>
                 </div>
                 <div className="agile-metrics-cols">
                   <div>
-                    <h4>故事状态</h4>
+                    <h4>{t("agile.metrics.storyStatus")}</h4>
                     {STORY_STATUSES.map((status) => (
-                      <div className="agile-metrics-row" key={status}><span>{STORY_STATUS_LABELS[status]}</span><strong>{metricsView.stories.byStatus[status]}</strong></div>
+                      <div className="agile-metrics-row" key={status}><span>{t(storyStatusKey(status))}</span><strong>{metricsView.stories.byStatus[status]}</strong></div>
                     ))}
                   </div>
                   <div>
-                    <h4>运行结果</h4>
-                    <div className="agile-metrics-row"><span>已完成</span><strong>{metricsView.runOutcomes.completed}</strong></div>
-                    <div className="agile-metrics-row"><span>需要人工</span><strong>{metricsView.runOutcomes.needs_human}</strong></div>
-                    <div className="agile-metrics-row"><span>已取消</span><strong>{metricsView.runOutcomes.cancelled}</strong></div>
-                    <div className="agile-metrics-row"><span>失败</span><strong>{metricsView.runOutcomes.failed}</strong></div>
+                    <h4>{t("agile.metrics.runOutcomes")}</h4>
+                    <div className="agile-metrics-row"><span>{t("agile.metrics.runCompleted")}</span><strong>{metricsView.runOutcomes.completed}</strong></div>
+                    <div className="agile-metrics-row"><span>{t("agile.metrics.runNeedsHuman")}</span><strong>{metricsView.runOutcomes.needs_human}</strong></div>
+                    <div className="agile-metrics-row"><span>{t("agile.metrics.runCancelled")}</span><strong>{metricsView.runOutcomes.cancelled}</strong></div>
+                    <div className="agile-metrics-row"><span>{t("agile.metrics.runFailed")}</span><strong>{metricsView.runOutcomes.failed}</strong></div>
                   </div>
                   <div>
-                    <h4>用量与审核</h4>
-                    <div className="agile-metrics-row"><span>模型调用</span><strong>{metricsView.usage.modelCalls}</strong></div>
-                    <div className="agile-metrics-row"><span>Token 输入/输出</span><strong>{metricsView.usage.inputTokens} / {metricsView.usage.outputTokens}</strong></div>
-                    <div className="agile-metrics-row"><span>缓存读取</span><strong>{metricsView.usage.cacheReadTokens}</strong></div>
-                    <div className="agile-metrics-row"><span>发现 已解决/合计</span><strong>{metricsView.reviewFindings.resolved}/{metricsView.reviewFindings.total}</strong></div>
-                    <div className="agile-metrics-row"><span>未收敛事件</span><strong>{metricsView.reviewFindings.notConverging}</strong></div>
+                    <h4>{t("agile.metrics.usageAndReview")}</h4>
+                    <div className="agile-metrics-row"><span>{t("agile.metrics.modelCalls")}</span><strong>{metricsView.usage.modelCalls}</strong></div>
+                    <div className="agile-metrics-row"><span>{t("agile.metrics.tokensInOut")}</span><strong>{metricsView.usage.inputTokens} / {metricsView.usage.outputTokens}</strong></div>
+                    <div className="agile-metrics-row"><span>{t("agile.metrics.cacheRead")}</span><strong>{metricsView.usage.cacheReadTokens}</strong></div>
+                    <div className="agile-metrics-row"><span>{t("agile.metrics.findingsResolved")}</span><strong>{metricsView.reviewFindings.resolved}/{metricsView.reviewFindings.total}</strong></div>
+                    <div className="agile-metrics-row"><span>{t("agile.metrics.notConverging")}</span><strong>{metricsView.reviewFindings.notConverging}</strong></div>
                   </div>
                 </div>
                 {!metricsSprintId && metrics && metrics.sprints.length > 1 && (
                   <div className="agile-metrics-sprints">
-                    <h4>各冲刺</h4>
-                    <div className="agile-metrics-row agile-metrics-head"><span>冲刺</span><strong>完成/总数</strong><strong>周期中位</strong><strong>返工率</strong><strong>成本</strong></div>
+                    <h4>{t("agile.metrics.sprints")}</h4>
+                    <div className="agile-metrics-row agile-metrics-head"><span>{t("agile.metrics.col.sprint")}</span><strong>{t("agile.metrics.col.completedTotal")}</strong><strong>{t("agile.metrics.col.cycleMedian")}</strong><strong>{t("agile.metrics.col.reworkRate")}</strong><strong>{t("agile.metrics.col.cost")}</strong></div>
                     {metrics.sprints.map((sprint) => (
                       <button type="button" className="agile-metrics-row" key={sprint.sprintId} onClick={() => setMetricsSprintId(sprint.sprintId)}>
                         <span>{sprint.name}</span>
                         <strong>{sprint.stories.completed}/{sprint.stories.total}</strong>
-                        <strong>{formatDuration(sprint.cycleTime.medianSeconds)}</strong>
+                        <strong>{formatDuration(sprint.cycleTime.medianSeconds, locale)}</strong>
                         <strong>{(sprint.rework.rate * 100).toFixed(0)}%</strong>
                         <strong>${sprint.usage.cost.toFixed(3)}</strong>
                       </button>
@@ -1004,84 +991,84 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
 
       {panel === "release" && (
         <section className="panel agile-metrics agile-release">
-          <div className="panel-head"><div><span className="eyebrow">RELEASE SUMMARY</span><h3>发布回顾</h3></div><Rocket size={15} /></div>
+          <div className="panel-head"><div><span className="eyebrow">RELEASE SUMMARY</span><h3>{t("agile.releaseReview.title")}</h3></div><Rocket size={15} /></div>
           <div className="agile-metrics-body">
             <div className="agile-toolbar">
-              <label>发布
+              <label>{t("agile.releaseReview.release")}
                 <select value={releaseDetailId} onChange={(event) => setReleaseDetailId(event.target.value)}>
                   {releases.map((release) => <option key={release.id} value={release.id}>{release.version} · {release.name}</option>)}
                 </select>
               </label>
               <button type="button" className="button secondary" disabled={!releaseSummary || !releaseRetrospective || releaseExporting} onClick={() => void exportRetrospective()}>
-                {releaseExporting ? <LoaderCircle className="spin" size={15} /> : <Download size={15} />}导出回顾 (JSON)
+                {releaseExporting ? <LoaderCircle className="spin" size={15} /> : <Download size={15} />}{t("agile.releaseReview.export")}
               </button>
-              <button type="button" className="button secondary" disabled={!releaseSummary || !releaseRetrospective} onClick={() => { void navigator.clipboard?.writeText(releaseExportJson({ summary: releaseSummary!, retrospective: releaseRetrospective! })).then(() => setReleaseExportNote("已复制回顾 JSON 到剪贴板")).catch(() => setReleaseExportNote("复制失败，请使用导出按钮")); }}>
-                <Copy size={15} />复制
+              <button type="button" className="button secondary" disabled={!releaseSummary || !releaseRetrospective} onClick={() => { void navigator.clipboard?.writeText(releaseExportJson({ summary: releaseSummary!, retrospective: releaseRetrospective! })).then(() => setReleaseExportNote(t("agile.releaseReview.copiedClipboard"))).catch(() => setReleaseExportNote(t("agile.releaseReview.copyFailed"))); }}>
+                <Copy size={15} />{t("common.copy")}
               </button>
-              <span className="agile-hint">只读汇总：故事结果、成本/Token、模型组合、合并与部署记录，以及周期/返工回顾。</span>
+              <span className="agile-hint">{t("agile.releaseReview.hint")}</span>
             </div>
             {releaseExportNote && <div className="agile-hint">{releaseExportNote}</div>}
             {releaseSummary && (
               <div className="agile-metrics-sprints">
-                <h4>发布状态</h4>
+                <h4>{t("agile.releaseReview.status")}</h4>
                 <div className="agile-metrics-row">
-                  <span>{releaseStatusLabels[releaseSummary.status]}{releaseSummary.releasedAt ? ` · ${formatTime(releaseSummary.releasedAt)} 由 ${releaseSummary.releasedBy ?? "未知"}` : " · 尚未发布"}</span>
-                  <strong>{releaseSummary.deploy ? `部署 ${deployStatusLabels[releaseSummary.deploy.status]}${releaseSummary.deploy.detail ? `（${releaseSummary.deploy.detail}）` : ""}` : "无部署记录"}</strong>
+                  <span>{t(releaseStatusKey(releaseSummary.status))}{releaseSummary.releasedAt ? ` · ${t("agile.releaseReview.releasedBy", { time: formatTime(releaseSummary.releasedAt, locale), name: releaseSummary.releasedBy ?? t("common.unknown") })}` : ` · ${t("agile.releaseReview.notReleased")}`}</span>
+                  <strong>{releaseSummary.deploy ? (releaseSummary.deploy.detail ? t("agile.releaseReview.deployedDetail", { status: t(deployStatusKey(releaseSummary.deploy.status)), detail: releaseSummary.deploy.detail }) : t("agile.releaseReview.deployed", { status: t(deployStatusKey(releaseSummary.deploy.status)) })) : t("agile.releaseReview.noDeploy")}</strong>
                 </div>
               </div>
             )}
-            {releaseLoading && <div className="ws-empty"><LoaderCircle className="spin" size={18} /><span>正在计算发布汇总…</span></div>}
-            {!releaseLoading && releases.length === 0 && <div className="agile-hint">当前项目还没有发布记录。</div>}
+            {releaseLoading && <div className="ws-empty"><LoaderCircle className="spin" size={18} /><span>{t("agile.releaseReview.loading")}</span></div>}
+            {!releaseLoading && releases.length === 0 && <div className="agile-hint">{t("agile.releaseReview.empty")}</div>}
             {!releaseLoading && releaseSummary && releaseRetrospective && (
               <>
                 <div className="metrics-grid agile-metrics-grid">
-                  <div className="metric"><span>完成故事</span><strong>{releaseSummary.totals.done}/{releaseSummary.totals.stories}</strong><small>未开始 {releaseSummary.totals.notStarted}</small></div>
-                  <div className="metric"><span>进行中</span><strong>{releaseSummary.totals.inProgress}</strong><small>开发 / 审核 / 待验收</small></div>
-                  <div className="metric"><span>阻塞</span><strong>{releaseSummary.totals.blocked}</strong><small>关联运行 {releaseSummary.totals.runs}</small></div>
-                  <div className="metric"><span>成本 / 完成故事</span><strong>${releaseRetrospective.costPerCompletedStory.toFixed(3)}</strong><small>合计 ${releaseSummary.usage.cost.toFixed(3)}</small></div>
+                  <div className="metric"><span>{t("agile.metrics.completedStories")}</span><strong>{releaseSummary.totals.done}/{releaseSummary.totals.stories}</strong><small>{t("agile.releaseReview.notStarted", { count: releaseSummary.totals.notStarted })}</small></div>
+                  <div className="metric"><span>{t("agile.releaseReview.inProgress")}</span><strong>{releaseSummary.totals.inProgress}</strong><small>{t("agile.releaseReview.inProgressHint")}</small></div>
+                  <div className="metric"><span>{t("agile.releaseReview.blocked")}</span><strong>{releaseSummary.totals.blocked}</strong><small>{t("agile.releaseReview.linkedRuns", { count: releaseSummary.totals.runs })}</small></div>
+                  <div className="metric"><span>{t("agile.metrics.costPerStory")}</span><strong>${releaseRetrospective.costPerCompletedStory.toFixed(3)}</strong><small>{t("agile.metrics.totalCost", { cost: releaseSummary.usage.cost.toFixed(3) })}</small></div>
                 </div>
                 <div className="agile-metrics-cols">
                   <div>
-                    <h4>周期与返工</h4>
-                    <div className="agile-metrics-row"><span>周期 中位</span><strong>{formatDuration(releaseRetrospective.cycleTime.medianSeconds)}</strong></div>
-                    <div className="agile-metrics-row"><span>周期 P90</span><strong>{formatDuration(releaseRetrospective.cycleTime.p90Seconds)}</strong></div>
-                    <div className="agile-metrics-row"><span>周期样本</span><strong>{releaseRetrospective.cycleTime.samples}</strong></div>
-                    <div className="agile-metrics-row"><span>返工率</span><strong>{(releaseRetrospective.rework.rate * 100).toFixed(0)}%</strong></div>
+                    <h4>{t("agile.releaseReview.cycleAndRework")}</h4>
+                    <div className="agile-metrics-row"><span>{t("agile.releaseReview.cycleMedian")}</span><strong>{formatDuration(releaseRetrospective.cycleTime.medianSeconds, locale)}</strong></div>
+                    <div className="agile-metrics-row"><span>{t("agile.releaseReview.cycleP90")}</span><strong>{formatDuration(releaseRetrospective.cycleTime.p90Seconds, locale)}</strong></div>
+                    <div className="agile-metrics-row"><span>{t("agile.releaseReview.cycleSamples")}</span><strong>{releaseRetrospective.cycleTime.samples}</strong></div>
+                    <div className="agile-metrics-row"><span>{t("agile.metrics.reworkRate")}</span><strong>{(releaseRetrospective.rework.rate * 100).toFixed(0)}%</strong></div>
                   </div>
                   <div>
-                    <h4>用量</h4>
-                    <div className="agile-metrics-row"><span>模型调用</span><strong>{releaseSummary.usage.modelCalls}</strong></div>
-                    <div className="agile-metrics-row"><span>Token 输入/输出</span><strong>{releaseSummary.usage.inputTokens} / {releaseSummary.usage.outputTokens}</strong></div>
-                    <div className="agile-metrics-row"><span>缓存读取</span><strong>{releaseSummary.usage.cacheReadTokens}</strong></div>
-                    <div className="agile-metrics-row"><span>关联运行</span><strong>{releaseSummary.usage.runs}</strong></div>
+                    <h4>{t("agile.releaseReview.usage")}</h4>
+                    <div className="agile-metrics-row"><span>{t("agile.metrics.modelCalls")}</span><strong>{releaseSummary.usage.modelCalls}</strong></div>
+                    <div className="agile-metrics-row"><span>{t("agile.metrics.tokensInOut")}</span><strong>{releaseSummary.usage.inputTokens} / {releaseSummary.usage.outputTokens}</strong></div>
+                    <div className="agile-metrics-row"><span>{t("agile.metrics.cacheRead")}</span><strong>{releaseSummary.usage.cacheReadTokens}</strong></div>
+                    <div className="agile-metrics-row"><span>{t("agile.releaseReview.linkedRunsLabel")}</span><strong>{releaseSummary.usage.runs}</strong></div>
                   </div>
                   <div>
-                    <h4>审核</h4>
-                    <div className="agile-metrics-row"><span>发现 已解决/合计</span><strong>{releaseRetrospective.reviewFindings.resolved}/{releaseRetrospective.reviewFindings.total}</strong></div>
-                    <div className="agile-metrics-row"><span>退回事件</span><strong>{releaseRetrospective.reviewTrend.reduce((count, point) => count + point.changesRequested, 0)}</strong></div>
-                    <div className="agile-metrics-row"><span>未收敛运行</span><strong>{releaseRetrospective.notConvergingRuns}</strong></div>
-                    <div className="agile-metrics-row"><span>未收敛事件</span><strong>{releaseRetrospective.reviewFindings.notConverging}</strong></div>
+                    <h4>{t("agile.releaseReview.review")}</h4>
+                    <div className="agile-metrics-row"><span>{t("agile.metrics.findingsResolved")}</span><strong>{releaseRetrospective.reviewFindings.resolved}/{releaseRetrospective.reviewFindings.total}</strong></div>
+                    <div className="agile-metrics-row"><span>{t("agile.releaseReview.returnedEvents")}</span><strong>{releaseRetrospective.reviewTrend.reduce((count, point) => count + point.changesRequested, 0)}</strong></div>
+                    <div className="agile-metrics-row"><span>{t("agile.releaseReview.notConvergingRuns")}</span><strong>{releaseRetrospective.notConvergingRuns}</strong></div>
+                    <div className="agile-metrics-row"><span>{t("agile.metrics.notConverging")}</span><strong>{releaseRetrospective.reviewFindings.notConverging}</strong></div>
                   </div>
                 </div>
 
                 <div className="agile-metrics-sprints">
-                  <h4>故事结果</h4>
-                  <div className="agile-metrics-row agile-metrics-head"><span>故事</span><strong>状态</strong><strong>运行/轮次</strong><strong>发现</strong><strong>成本</strong></div>
+                  <h4>{t("agile.releaseReview.storyResults")}</h4>
+                  <div className="agile-metrics-row agile-metrics-head"><span>{t("agile.releaseReview.col.story")}</span><strong>{t("agile.releaseReview.col.status")}</strong><strong>{t("agile.releaseReview.col.runsRounds")}</strong><strong>{t("agile.releaseReview.col.findings")}</strong><strong>{t("agile.releaseReview.col.cost")}</strong></div>
                   {releaseSummary.stories.map((story) => (
                     <div className="agile-metrics-row" key={story.storyId}>
-                      <span>{story.title}{story.acceptance ? " · 已验收" : ""}{story.blockedReason ? ` · ${story.blockedReason}` : ""}</span>
-                      <strong>{STORY_STATUS_LABELS[story.status]}</strong>
-                      <strong>{story.runs}{story.latest ? ` · 第 ${story.latest.round}/${story.latest.maxRounds} 轮` : ""}</strong>
+                      <span>{story.title}{story.acceptance ? ` · ${t("agile.releaseReview.accepted")}` : ""}{story.blockedReason ? ` · ${story.blockedReason}` : ""}</span>
+                      <strong>{t(storyStatusKey(story.status))}</strong>
+                      <strong>{story.runs}{story.latest ? ` · ${t("agile.releaseReview.roundOf", { round: story.latest.round, max: story.latest.maxRounds })}` : ""}</strong>
                       <strong>{story.findings.resolved}/{story.findings.total}</strong>
                       <strong>${story.cost.toFixed(4)}</strong>
                     </div>
                   ))}
-                  {releaseSummary.stories.length === 0 && <div className="agile-hint">该发布还没有关联故事。</div>}
+                  {releaseSummary.stories.length === 0 && <div className="agile-hint">{t("agile.releaseReview.noStories")}</div>}
                 </div>
 
                 <div className="agile-metrics-sprints">
-                  <h4>模型组合</h4>
-                  <div className="agile-metrics-row agile-metrics-head"><span>开发 / 审核</span><strong>运行</strong><strong>故事</strong><strong /><strong /></div>
+                  <h4>{t("agile.releaseReview.modelCombos")}</h4>
+                  <div className="agile-metrics-row agile-metrics-head"><span>{t("agile.releaseReview.col.devReview")}</span><strong>{t("agile.releaseReview.col.runs")}</strong><strong>{t("agile.releaseReview.col.story")}</strong><strong /><strong /></div>
                   {releaseSummary.modelCombinations.map((combo) => (
                     <div className="agile-metrics-row" key={`${combo.developer.provider}::${combo.developer.model}|${combo.reviewer.provider}::${combo.reviewer.model}`}>
                       <span>{combo.developer.provider}:{combo.developer.model} / {combo.reviewer.provider}:{combo.reviewer.model}</span>
@@ -1091,36 +1078,36 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
                       <strong />
                     </div>
                   ))}
-                  {releaseSummary.modelCombinations.length === 0 && <div className="agile-hint">还没有关联运行的模型组合。</div>}
+                  {releaseSummary.modelCombinations.length === 0 && <div className="agile-hint">{t("agile.releaseReview.noCombos")}</div>}
                 </div>
 
                 <div className="agile-metrics-sprints">
-                  <h4>合并与部署</h4>
-                  <div className="agile-metrics-row agile-metrics-head"><span>运行</span><strong>类型</strong><strong>目标</strong><strong>状态</strong><strong>时间</strong></div>
+                  <h4>{t("agile.releaseReview.mergeDeploy")}</h4>
+                  <div className="agile-metrics-row agile-metrics-head"><span>{t("agile.releaseReview.col.runs")}</span><strong>{t("agile.releaseReview.col.type")}</strong><strong>{t("agile.releaseReview.col.target")}</strong><strong>{t("agile.releaseReview.col.status")}</strong><strong>{t("agile.releaseReview.col.time")}</strong></div>
                   {releaseSummary.merges.map((merge) => (
                     <div className="agile-metrics-row" key={`merge-${merge.runId}`}>
                       <span title={merge.commit}>{merge.runId.slice(0, 12)}</span>
-                      <strong>合并 ({merge.strategy})</strong>
+                      <strong>{t("agile.releaseReview.merge", { strategy: merge.strategy })}</strong>
                       <strong>{merge.targetBranch}</strong>
                       <strong>{merge.commit.slice(0, 7)}</strong>
-                      <strong>{formatTime(merge.mergedAt)}</strong>
+                      <strong>{formatTime(merge.mergedAt, locale)}</strong>
                     </div>
                   ))}
                   {releaseSummary.deployments.map((deploy) => (
                     <div className="agile-metrics-row" key={`deploy-${deploy.runId}-${deploy.commit}`}>
                       <span title={deploy.commit}>{deploy.runId.slice(0, 12)}</span>
-                      <strong>部署 ({deploy.kind})</strong>
+                      <strong>{t("agile.releaseReview.deploy", { kind: deploy.kind })}</strong>
                       <strong>{deploy.environment}</strong>
                       <strong>{deploy.status}{deploy.url ? ` · ${deploy.url}` : ""}</strong>
-                      <strong>{formatTime(deploy.finishedAt ?? deploy.requestedAt)}</strong>
+                      <strong>{formatTime(deploy.finishedAt ?? deploy.requestedAt, locale)}</strong>
                     </div>
                   ))}
-                  {releaseSummary.merges.length === 0 && releaseSummary.deployments.length === 0 && <div className="agile-hint">没有合并或部署记录。</div>}
+                  {releaseSummary.merges.length === 0 && releaseSummary.deployments.length === 0 && <div className="agile-hint">{t("agile.releaseReview.noMergeDeploy")}</div>}
                 </div>
 
                 <div className="agile-metrics-sprints">
-                  <h4>审核趋势</h4>
-                  <div className="agile-metrics-row agile-metrics-head"><span>故事</span><strong>发现 已解决/合计</strong><strong>退回</strong><strong>未收敛</strong><strong /></div>
+                  <h4>{t("agile.releaseReview.reviewTrend")}</h4>
+                  <div className="agile-metrics-row agile-metrics-head"><span>{t("agile.releaseReview.col.story")}</span><strong>{t("agile.metrics.findingsResolved")}</strong><strong>{t("agile.releaseReview.col.returned")}</strong><strong>{t("agile.releaseReview.col.notConverging")}</strong><strong /></div>
                   {releaseRetrospective.reviewTrend.map((point) => (
                     <div className="agile-metrics-row" key={`trend-${point.storyId}`}>
                       <span>{point.title}</span>
@@ -1130,18 +1117,18 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
                       <strong />
                     </div>
                   ))}
-                  {releaseRetrospective.reviewTrend.length === 0 && <div className="agile-hint">没有可统计的审核记录。</div>}
+                  {releaseRetrospective.reviewTrend.length === 0 && <div className="agile-hint">{t("agile.releaseReview.noReviewRecords")}</div>}
                 </div>
 
                 <div className="agile-metrics-sprints">
-                  <h4>阻塞故事（{releaseRetrospective.blockedStories.length}）</h4>
+                  <h4>{t("agile.releaseReview.blockedStories", { count: releaseRetrospective.blockedStories.length })}</h4>
                   {releaseRetrospective.blockedStories.map((story) => (
                     <div className="agile-metrics-row" key={`blocked-${story.storyId}`}>
                       <span>{story.title}</span>
-                      <strong>{story.state ? `${runStateLabels[story.state]} · ` : ""}{story.reason}</strong>
+                      <strong>{story.state ? `${t(runStateKey(story.state))} · ` : ""}{story.reason}</strong>
                     </div>
                   ))}
-                  {releaseRetrospective.blockedStories.length === 0 && <div className="agile-hint">没有阻塞故事。</div>}
+                  {releaseRetrospective.blockedStories.length === 0 && <div className="agile-hint">{t("agile.releaseReview.noBlockedStories")}</div>}
                 </div>
               </>
             )}
@@ -1151,45 +1138,45 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
 
       {panel === "releases" && (
         <section className="panel agile-metrics agile-release-manage">
-          <div className="panel-head"><div><span className="eyebrow">RELEASE MANAGEMENT</span><h3>发布管理</h3></div><Pencil size={15} /></div>
+          <div className="panel-head"><div><span className="eyebrow">RELEASE MANAGEMENT</span><h3>{t("agile.releaseManage.title")}</h3></div><Pencil size={15} /></div>
           <div className="agile-metrics-body">
             <form className="ws-form" onSubmit={saveRelease}>
               <div className="ws-form-head">
-                <div><span className="eyebrow">{releaseManageId ? "EDIT RELEASE" : "NEW RELEASE"}</span><h3>{releaseManageId ? "编辑发布" : "新建发布"}</h3></div>
+                <div><span className="eyebrow">{releaseManageId ? "EDIT RELEASE" : "NEW RELEASE"}</span><h3>{t(releaseManageId ? "agile.releaseManage.edit" : "agile.releaseManage.new")}</h3></div>
                 {releaseManageId && <button className="icon-button" type="button" onClick={resetReleaseForm}><X size={16} /></button>}
               </div>
-              <p className="ws-form-help">发布把一组故事归入同一个交付版本；「发布回顾」会汇总这些故事的运行结果、成本与合并记录。关联关系可随时调整，不会改动故事本身。</p>
+              <p className="ws-form-help">{t("agile.releaseManage.help")}</p>
               <div className="agile-form-row">
-                <label>版本号<input value={releaseVersion} onChange={(event) => setReleaseVersion(event.target.value)} placeholder="v1.2.0" /></label>
-                <label>发布名称<input value={releaseName} onChange={(event) => setReleaseName(event.target.value)} placeholder="结账体验" /></label>
+                <label>{t("agile.releaseManage.version")}<input value={releaseVersion} onChange={(event) => setReleaseVersion(event.target.value)} placeholder="v1.2.0" /></label>
+                <label>{t("agile.releaseManage.name")}<input value={releaseName} onChange={(event) => setReleaseName(event.target.value)} placeholder={t("agile.releaseManage.namePlaceholder")} /></label>
               </div>
               <div className="agile-form-row">
-                <label>状态
+                <label>{t("agile.releaseManage.status")}
                   <select value={releaseStatus} onChange={(event) => setReleaseStatus(event.target.value as ReleaseStatus)}>
-                    {RELEASE_STATUSES.map((value) => <option key={value} value={value}>{releaseStatusLabels[value]}</option>)}
+                    {RELEASE_STATUSES.map((value) => <option key={value} value={value}>{t(releaseStatusKey(value))}</option>)}
                   </select>
                 </label>
-                <span className="agile-hint agile-release-picker-hint">勾选下方故事即加入发布，取消勾选即移出；{releaseStoryIds.length} 个已关联。</span>
+                <span className="agile-hint agile-release-picker-hint">{t("agile.releaseManage.pickerHint", { count: releaseStoryIds.length })}</span>
               </div>
-              <label>备注<textarea rows={2} value={releaseNotes} onChange={(event) => setReleaseNotes(event.target.value)} placeholder="本次发布的范围与注意事项" /></label>
+              <label>{t("agile.releaseManage.notes")}<textarea rows={2} value={releaseNotes} onChange={(event) => setReleaseNotes(event.target.value)} placeholder={t("agile.releaseManage.notesPlaceholder")} /></label>
               <div className="agile-release-story-picker">
                 {stories.map((story) => (
                   <label className="agile-check" key={story.id}>
                     <input type="checkbox" checked={releaseStoryIds.includes(story.id)} onChange={() => toggleReleaseStory(story.id)} />
-                    <span>{story.title}<small>{STORY_STATUS_LABELS[story.status]}</small></span>
+                    <span>{story.title}<small>{t(storyStatusKey(story.status))}</small></span>
                   </label>
                 ))}
-                {stories.length === 0 && <div className="agile-hint">当前项目还没有故事。</div>}
+                {stories.length === 0 && <div className="agile-hint">{t("agile.releaseManage.noStories")}</div>}
               </div>
               <div className="ws-form-actions">
-                {releaseManageId && <button type="button" className="button secondary" onClick={resetReleaseForm}>取消编辑</button>}
+                {releaseManageId && <button type="button" className="button secondary" onClick={resetReleaseForm}>{t("agile.releaseManage.cancelEdit")}</button>}
                 <button type="submit" className="button primary" disabled={busy === "release" || !releaseName.trim() || !releaseVersion.trim()}>
-                  {busy === "release" ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />}{releaseManageId ? "保存" : "创建"}
+                  {busy === "release" ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />}{t(releaseManageId ? "common.save" : "common.create")}
                 </button>
               </div>
             </form>
             <div className="agile-manage-list">
-              <h4>已有发布（{releases.length}）</h4>
+              <h4>{t("agile.releaseManage.existing", { count: releases.length })}</h4>
               {releases.map((release) => {
                 // A failed or timed-out deploy stays retryable even though the
                 // release itself is already marked `released`.
@@ -1198,14 +1185,14 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
                 <div className={`agile-release-row ${releaseManageId === release.id ? "selected" : ""}`} key={release.id}>
                   <code>{release.version}</code>
                   <span>{release.name}</span>
-                  <small>{releaseStatusLabels[release.status]} · {release.storyIds.length} 个故事{release.deploy ? ` · 部署 ${deployStatusLabels[release.deploy.status]}` : ""}</small>
-                  <button type="button" disabled={deployAction === "done" || deployAction === "waiting"} onClick={() => void openPublish(release)}><Rocket size={12} />{RELEASE_DEPLOY_ACTION_LABELS[deployAction]}</button>
-                  <button type="button" disabled={release.status === "released"} onClick={() => editRelease(release)}><Pencil size={12} />编辑</button>
-                  <button type="button" className="danger" disabled={busy === `delete-release:${release.id}`} onClick={() => void removeRelease(release)}><Trash2 size={12} />删除</button>
+                  <small>{release.deploy ? t("agile.releaseManage.rowMetaDeploy", { status: t(releaseStatusKey(release.status)), count: release.storyIds.length, deploy: t(deployStatusKey(release.deploy.status)) }) : t("agile.releaseManage.rowMeta", { status: t(releaseStatusKey(release.status)), count: release.storyIds.length })}</small>
+                  <button type="button" disabled={deployAction === "done" || deployAction === "waiting"} onClick={() => void openPublish(release)}><Rocket size={12} />{t(RELEASE_DEPLOY_ACTION_KEYS[deployAction])}</button>
+                  <button type="button" disabled={release.status === "released"} onClick={() => editRelease(release)}><Pencil size={12} />{t("common.edit")}</button>
+                  <button type="button" className="danger" disabled={busy === `delete-release:${release.id}`} onClick={() => void removeRelease(release)}><Trash2 size={12} />{t("common.delete")}</button>
                 </div>
                 );
               })}
-              {releases.length === 0 && <div className="agile-hint">还没有发布记录。填写上方表单创建第一个发布。</div>}
+              {releases.length === 0 && <div className="agile-hint">{t("agile.releaseManage.empty")}</div>}
             </div>
           </div>
         </section>
@@ -1214,24 +1201,24 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
       {publishTarget && (
         <section className="panel agile-publish-confirm">
           <div className="panel-head">
-            <div><span className="eyebrow">PUBLISH RELEASE</span><h3>发布「{publishTarget.version} · {publishTarget.name}」</h3></div>
+            <div><span className="eyebrow">PUBLISH RELEASE</span><h3>{t("agile.publish.title", { version: publishTarget.version, name: publishTarget.name })}</h3></div>
             <button className="icon-button" type="button" onClick={closePublish}><X size={16} /></button>
           </div>
-          <p className="ws-form-help">发布需要管理员权限，且会把该版本标记为「已发布」且不可再编辑。若配置了 <code>PI_POST_MERGE_DEPLOY_HOOK</code>，确认后会立即触发部署钩子；异步（HTTP 202）部署在回调到达前保持「部署进行中」，失败或回调超时都会如实记录并可显式重试。</p>
+          <p className="ws-form-help">{t("agile.publish.help")}</p>
           {publishError && <div className="form-error">{publishError}</div>}
           {publishBlocked.length > 0 && (
             <div className="agile-blocked-list">
-              <strong>以下故事仍处于阻塞，需先解除阻塞：</strong>
+              <strong>{t("agile.publish.blockedTitle")}</strong>
               <ul>{publishBlocked.map((item) => <li key={item.storyId}>{item.title} — {item.reason}</li>)}</ul>
             </div>
           )}
-          {publishBusy && <div className="ws-empty"><LoaderCircle className="spin" size={18} /><span>正在校验发布…</span></div>}
-          {!publishBusy && publishReady && <div className="agile-hint">{publishTarget.deploy?.status === "failed" || releaseDeployAction(publishTarget.deploy) === "retry" ? "上次部署未成功，确认将开始一次新的部署重试（不会重复触发成功中的部署）。" : "发布前校验通过，可确认发布。"}</div>}
-          <label>发布备注<textarea rows={2} value={publishNote} onChange={(event) => setPublishNote(event.target.value)} placeholder="本次发布说明（可选）" /></label>
+          {publishBusy && <div className="ws-empty"><LoaderCircle className="spin" size={18} /><span>{t("agile.publish.validating")}</span></div>}
+          {!publishBusy && publishReady && <div className="agile-hint">{t(publishTarget.deploy?.status === "failed" || releaseDeployAction(publishTarget.deploy) === "retry" ? "agile.publish.retryHint" : "agile.publish.readyHint")}</div>}
+          <label>{t("agile.publish.note")}<textarea rows={2} value={publishNote} onChange={(event) => setPublishNote(event.target.value)} placeholder={t("agile.publish.notePlaceholder")} /></label>
           <div className="ws-form-actions">
-            <button type="button" className="button secondary" onClick={closePublish}>取消</button>
+            <button type="button" className="button secondary" onClick={closePublish}>{t("common.cancel")}</button>
             <button type="button" className="button primary" disabled={publishBusy || !publishReady} onClick={() => void confirmPublish()}>
-              {publishBusy ? <LoaderCircle className="spin" size={15} /> : <Rocket size={15} />}{releaseDeployAction(publishTarget.deploy) === "retry" ? "确认重试部署" : "确认发布"}
+              {publishBusy ? <LoaderCircle className="spin" size={15} /> : <Rocket size={15} />}{t(releaseDeployAction(publishTarget.deploy) === "retry" ? "agile.publish.confirmRetry" : "agile.publish.confirm")}
             </button>
           </div>
         </section>
@@ -1241,57 +1228,57 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
         <section className="panel agile-detail">
           <div className="panel-head">
             <div><span className="eyebrow">STORY DETAIL</span><h3>{detail.title}</h3></div>
-            <span className={`agile-status status-${detail.status}`}>{STORY_STATUS_LABELS[detail.status]}</span>
+            <span className={`agile-status status-${detail.status}`}>{t(storyStatusKey(detail.status))}</span>
           </div>
           <div className="agile-detail-meta">
-            <div><span>优先级</span><strong>{priorityLabel(detail.priority)}</strong></div>
-            <div><span>估算</span><strong>{estimateLabel(detail.estimate)}</strong></div>
-            <div><span>冲刺</span><strong>{sprintLabel(detail.sprintId)}</strong></div>
-            <div><span>工作区</span><strong>{workspaces.find((workspace) => workspace.id === detail.workspaceId)?.name ?? "未指定"}</strong></div>
+            <div><span>{t("agile.detail.priority")}</span><strong>{t(priorityKey(detail.priority))}</strong></div>
+            <div><span>{t("agile.detail.estimate")}</span><strong>{estimateLabel(detail.estimate, locale)}</strong></div>
+            <div><span>{t("agile.detail.sprint")}</span><strong>{sprintLabel(detail.sprintId)}</strong></div>
+            <div><span>{t("agile.detail.workspace")}</span><strong>{workspaces.find((workspace) => workspace.id === detail.workspaceId)?.name ?? t("agile.notSpecified")}</strong></div>
           </div>
           {detail.description && <p className="agile-detail-text">{detail.description}</p>}
           <div className="agile-detail-lists">
-            <div><h4>验收标准</h4>{detail.acceptanceCriteria.length ? <ol>{detail.acceptanceCriteria.map((item, index) => <li key={index}>{item}</li>)}</ol> : <em>未填写</em>}</div>
-            <div><h4>完成定义</h4>{detail.definitionOfDone.length ? <ul>{detail.definitionOfDone.map((item, index) => <li key={index}>{item}</li>)}</ul> : <em>未填写</em>}</div>
+            <div><h4>{t("agile.detail.criteria")}</h4>{detail.acceptanceCriteria.length ? <ol>{detail.acceptanceCriteria.map((item, index) => <li key={index}>{item}</li>)}</ol> : <em>{t("agile.detail.notFilled")}</em>}</div>
+            <div><h4>{t("agile.detail.dod")}</h4>{detail.definitionOfDone.length ? <ul>{detail.definitionOfDone.map((item, index) => <li key={index}>{item}</li>)}</ul> : <em>{t("agile.detail.notFilled")}</em>}</div>
           </div>
 
           <div className="agile-detail-runs">
-            <h4>关联运行（{detail.runs.length}）</h4>
-            {detail.runs.length === 0 && <div className="agile-hint">还没有关联运行。将故事标为「就绪」后可提交为运行。</div>}
+            <h4>{t("agile.detail.linkedRuns", { count: detail.runs.length })}</h4>
+            {detail.runs.length === 0 && <div className="agile-hint">{t("agile.detail.noRuns")}</div>}
             {detail.runs.map((entry) => (
               <div className="agile-run-row" key={entry.runId}>
                 <button type="button" onClick={() => onOpenRun(entry.runId)}><code>{entry.runId.slice(0, 12)}</code></button>
-                <span className={`agile-run-state state-${entry.state}`}>{runStateLabels[entry.state]}</span>
-                <span>第 {entry.round} 轮</span>
-                <span>意见 {entry.findings.resolved}/{entry.findings.total}</span>
-                <span>检查 {entry.checks.passed}/{entry.checks.passed + entry.checks.failed}</span>
-                <span>成本 ${entry.cost.toFixed(4)}</span>
-                <small>{formatTime(entry.updatedAt)}</small>
+                <span className={`agile-run-state state-${entry.state}`}>{t(runStateKey(entry.state))}</span>
+                <span>{t("agile.detail.round", { round: entry.round })}</span>
+                <span>{t("agile.detail.findings", { resolved: entry.findings.resolved, total: entry.findings.total })}</span>
+                <span>{t("agile.detail.checks", { passed: entry.checks.passed, total: entry.checks.passed + entry.checks.failed })}</span>
+                <span>{t("agile.detail.cost", { cost: entry.cost.toFixed(4) })}</span>
+                <small>{formatTime(entry.updatedAt, locale)}</small>
               </div>
             ))}
           </div>
 
           <div className="agile-detail-actions">
-            {detail.status !== "ready" && detail.status !== "blocked" && <button type="button" className="button secondary" disabled={busy === `status:${detail.id}`} onClick={() => void patchStatus(detail, "ready")}>标为就绪</button>}
+            {detail.status !== "ready" && detail.status !== "blocked" && <button type="button" className="button secondary" disabled={busy === `status:${detail.id}`} onClick={() => void patchStatus(detail, "ready")}>{t("agile.markReady")}</button>}
             {detail.status !== "blocked"
-              ? <button type="button" className="button secondary" disabled={busy === `block:${detail.id}`} onClick={() => void blockStory(detail)}>标记阻塞</button>
-              : <button type="button" className="button secondary" disabled={busy === `unblock:${detail.id}`} onClick={() => void unblockStory(detail)}>解除阻塞</button>}
+              ? <button type="button" className="button secondary" disabled={busy === `block:${detail.id}`} onClick={() => void blockStory(detail)}>{t("agile.block")}</button>
+              : <button type="button" className="button secondary" disabled={busy === `unblock:${detail.id}`} onClick={() => void unblockStory(detail)}>{t("agile.unblock")}</button>}
             {detail.status !== "blocked" && (detail.runs[0]?.state === "failed" || detail.runs[0]?.state === "cancelled") && (
               <button type="button" className="button secondary" disabled={busy === `reopen:${detail.id}`} onClick={() => void reopenStory(detail)}>
-                {busy === `reopen:${detail.id}` ? <LoaderCircle className="spin" size={15} /> : <RotateCcw size={15} />}重新打开
+                {busy === `reopen:${detail.id}` ? <LoaderCircle className="spin" size={15} /> : <RotateCcw size={15} />}{t("run.reopen")}
               </button>
             )}
             <button type="button" className="button primary" disabled={detail.status !== "ready" || busy === `submit:${detail.id}`} onClick={() => void submit(detail)}>
-              {busy === `submit:${detail.id}` ? <LoaderCircle className="spin" size={15} /> : <Rocket size={15} />}提交为运行
+              {busy === `submit:${detail.id}` ? <LoaderCircle className="spin" size={15} /> : <Rocket size={15} />}{t("agile.detail.submit")}
             </button>
             <span className="agile-hint">
               {detail.status !== "ready"
-                ? "只有「就绪」状态的故事可以提交为运行。"
+                ? t("agile.detail.hintNotReady")
                 : detail.runs[0]?.state === "failed" || detail.runs[0]?.state === "cancelled"
-                  ? "最近一次运行已失败/取消，故事已回到「就绪」，可直接重新提交，或点「重新打开」记录一次显式重开。"
+                  ? t("agile.detail.hintReopen")
                   : config?.realRunsAvailable
-                    ? "将以真实运行执行，检查命令来自所选工作区。"
-                    : "真实执行未启用（缺少模型 Key），将以演示模式提交。"}
+                    ? t("agile.detail.hintReal")
+                    : t("agile.detail.hintDemo")}
             </span>
           </div>
         </section>

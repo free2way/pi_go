@@ -40,6 +40,12 @@ export default defineConfig({
   reporter: process.env.CI ? [["list"], ["html", { open: "never" }]] : [["list"]],
   use: {
     baseURL,
+    // The suite drives the Chinese UI, so the browser must not advertise an
+    // English preference: the app resolves its locale from `navigator.languages`
+    // when localStorage holds no explicit choice (docs/23-i18n.md). Pin zh-CN to
+    // keep the existing selectors stable; a spec that exercises the English UI
+    // can set `localStorage["pigo.locale"] = "en"` before navigating.
+    locale: "zh-CN",
     extraHTTPHeaders: { "x-pigo-dev-email": devEmail },
     trace: "retain-on-failure",
     screenshot: "only-on-failure",

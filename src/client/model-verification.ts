@@ -1,4 +1,5 @@
 import type { CredentialVerificationState, ModelInfo } from "../shared/types";
+import { DEFAULT_LOCALE, t, type Locale, type MessageKey } from "../shared/i18n";
 
 /**
  * AUD-08: presentation rules for credential/model verification.
@@ -8,13 +9,16 @@ import type { CredentialVerificationState, ModelInfo } from "../shared/types";
  * and the operator asserted the key works) or `unchecked`. The UI must never
  * collapse the asserted/unchecked cases into a "verified" badge, so the mapping
  * lives here as a pure function that can be unit tested without a DOM.
+ *
+ * Copy lives in the shared catalog; an optional `locale` (default 中文) keeps
+ * every existing call site and test meaningful.
  */
 
-/** Fallback copy used only when the server did not send `verificationLabel`. */
-export const VERIFICATION_FALLBACK_LABEL: Record<CredentialVerificationState, string> = {
-  live: "已验证",
-  operator_asserted: "未校验（操作者断言）",
-  unchecked: "未校验",
+/** Catalog keys for the fallback copy, used only when the server sent no label. */
+export const VERIFICATION_FALLBACK_KEYS: Record<CredentialVerificationState, MessageKey> = {
+  live: "models.verified",
+  operator_asserted: "models.asserted",
+  unchecked: "models.unchecked",
 };
 
 export type VerificationTone = "ok" | "warn";
@@ -46,23 +50,26 @@ export function modelVerificationState(entry: Pick<ModelInfo, "verification" | "
   return "unchecked";
 }
 
-export function verificationBadge(entry: VerificationInput): VerificationBadge {
+export function verificationBadge(entry: VerificationInput, locale: Locale = DEFAULT_LOCALE): VerificationBadge {
   const state = modelVerificationState({
     verification: entry.verification,
     asserted: entry.asserted,
     verified: entry.verified,
   });
-  const label = entry.verificationLabel?.trim() || VERIFICATION_FALLBACK_LABEL[state];
+  // A server-provided label wins: it is server-generated copy (docs/23 boundary).
+  const label = entry.verificationLabel?.trim() || t(locale, VERIFICATION_FALLBACK_KEYS[state]);
   const title =
     state === "live"
-      ? "该 provider 凭据已通过实时 /models 探测"
+      ? t(locale, "models.verifyLiveTitle")
       : state === "operator_asserted"
-        ? "探针已关闭，操作者断言该 Key 可用；未经实时校验，不代表已验证"
-        : "该 provider 凭据尚未通过实时校验";
+        ? t(locale, "models.verifyAssertedTitle")
+        : t(locale, "models.verifyUncheckedTitle");
   return { state, label, tone: state === "live" ? "ok" : "warn", title };
 }
 
 export interface CapabilityHint {
+  /** Catalog key of the hint label (the component may render it directly). */
+  labelKey: MessageKey;
   label: string;
   runtimeVerified: boolean;
   title: string;
@@ -76,37 +83,41 @@ export interface CapabilityHint {
  */
 export function modelCapabilityHint(
   entry: Pick<ModelInfo, "capabilities" | "capabilitiesVerified" | "contextWindow" | "maxOutputTokens" | "verification" | "asserted" | "verified">,
+  locale: Locale = DEFAULT_LOCALE,
 ): CapabilityHint | undefined {
   const hasCapabilities = entry.capabilities != null || entry.contextWindow !== undefined || entry.maxOutputTokens !== undefined;
   if (!hasCapabilities) return undefined;
   const runtimeVerified = entry.capabilitiesVerified === true && modelVerificationState(entry) === "live";
   if (runtimeVerified) {
     return {
-      label: "能力·运行时",
+      labelKey: "models.capabilityRuntime",
+      label: t(locale, "models.capabilityRuntime"),
       runtimeVerified: true,
-      title: "上下文窗口/输出上限等能力参数由 provider 运行时探测确认",
+      title: t(locale, "models.capabilityRuntimeTitle"),
     };
   }
   return {
-    label: "能力·目录",
+    labelKey: "models.capabilityCatalog",
+    label: t(locale, "models.capabilityCatalog"),
     runtimeVerified: false,
-    title: "能力参数来自静态目录默认值，未经运行时探测确认",
+    title: t(locale, "models.capabilityCatalogTitle"),
   };
 }
 
 /** Availability copy kept separate from the verification badge. */
 export function availabilityLabel(
   entry: Pick<ModelInfo, "available" | "unavailableReason">,
+  locale: Locale = DEFAULT_LOCALE,
 ): string {
-  if (entry.available) return "可用";
+  if (entry.available) return t(locale, "models.available");
   switch (entry.unavailableReason) {
     case "credential_missing":
-      return "缺凭据";
+      return t(locale, "models.unavailable.credential_missing");
     case "model_unverified":
-      return "模型未校验";
+      return t(locale, "models.unavailable.model_unverified");
     case "role_restricted":
-      return "角色受限";
+      return t(locale, "models.unavailable.role_restricted");
     default:
-      return "待校验";
+      return t(locale, "models.unavailable.pending");
   }
 }

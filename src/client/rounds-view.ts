@@ -1,6 +1,37 @@
 import type { Finding, RoundSummary } from "../shared/types";
 import type { RoundStatus, RoundWorkflowStatus } from "../shared/round-status";
 import { findingsForRound, summarizeFindings, type ReworkBranchDetail } from "../shared/chat";
+import { DEFAULT_LOCALE, t, type Locale, type MessageKey } from "../shared/i18n";
+
+/** Catalog key for each per-round workflow status (labels live in the catalog). */
+const ROUND_STATUS_KEYS: Record<RoundWorkflowStatus, MessageKey> = {
+  approved: "roundStatus.approved",
+  changes_requested: "roundStatus.changes_requested",
+  interrupted: "roundStatus.interrupted",
+  reviewing: "roundStatus.reviewing",
+  checking: "roundStatus.checking",
+  developing: "roundStatus.developing",
+  planned: "roundStatus.planned",
+};
+
+/** Locale-neutral status label key, so shared/round-status stays text-free. */
+export function roundStatusKey(status: RoundWorkflowStatus): MessageKey {
+  return ROUND_STATUS_KEYS[status] ?? "roundStatus.planned";
+}
+
+export function roundStatusLabel(status: RoundWorkflowStatus, locale: Locale = DEFAULT_LOCALE): string {
+  return t(locale, roundStatusKey(status));
+}
+
+/** Localized version of `roundStatusTooltip` (checks/findings counts). */
+export function roundStatusTooltipText(status: RoundStatus, locale: Locale = DEFAULT_LOCALE): string {
+  return t(locale, "roundStatus.tooltip", {
+    passed: status.checks.passed,
+    failed: status.checks.failed,
+    total: status.findings.total,
+    resolved: status.findings.resolved,
+  });
+}
 
 /**
  * 拓扑轮次模型 — client-side shaping of the server's per-round summaries.
@@ -92,6 +123,7 @@ export function reworkBranchDetailsFromSummaries(
   summaries: RoundSummary[],
   findings: Finding[] = [],
   fallbackDetails: ReworkBranchDetail[] = [],
+  locale: Locale = DEFAULT_LOCALE,
 ): ReworkBranchDetail[] {
   const byRound = new Map(fallbackDetails.map((detail) => [detail.round, detail]));
   const rounds = reworkRoundsFromSummaries(summaries, fallbackDetails.map((detail) => detail.round));
@@ -100,7 +132,7 @@ export function reworkBranchDetailsFromSummaries(
     const eventDetail = byRound.get(round);
     const roundFindings = findingsForRound(findings, round);
     const effective = roundFindings.length > 0 ? roundFindings : (eventDetail?.findings ?? []);
-    const reason = summary?.reason?.trim() ? summary.reason : (eventDetail?.reason || "（未记录退回原因）");
+    const reason = summary?.reason?.trim() ? summary.reason : (eventDetail?.reason || t(locale, "rework.noReason"));
     const at = eventDetail?.at ?? summary?.finishedAt;
     return {
       round,

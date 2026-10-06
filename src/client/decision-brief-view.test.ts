@@ -1,12 +1,16 @@
 import { describe, expect, it } from "vitest";
 import { buildDecisionBrief, type DecisionBrief } from "../shared/decision-brief";
+import { t } from "../shared/i18n";
 import {
   acceptConfirmMessage,
   continueConfirmMessage,
   decisionBriefActionRequest,
   decisionBriefExpanded,
   decisionBriefHeading,
+  decisionBriefHeadingKey,
   decisionBriefTone,
+  decisionGateKeys,
+  decisionRemainingGroupKey,
   gateNavTarget,
   groupRemainingByAc,
 } from "./decision-brief-view";
@@ -30,7 +34,9 @@ const unknown: DecisionBrief = buildDecisionBrief({});
 describe("decision brief view · three-state rendering", () => {
   it("turns an all-green brief into an accept card", () => {
     expect(decisionBriefTone(green)).toBe("accept");
+    expect(decisionBriefHeadingKey(green)).toBe("decision.headingAccept");
     expect(decisionBriefHeading(green)).toContain("可以接受交付");
+    expect(decisionBriefHeading(green, "en")).toContain("can be accepted");
   });
 
   it("turns a red or unknown brief into a continue card", () => {
@@ -38,6 +44,7 @@ describe("decision brief view · three-state rendering", () => {
     expect(decisionBriefHeading(red)).toContain("建议继续开发");
     expect(decisionBriefTone(unknown)).toBe("continue");
     expect(decisionBriefHeading(unknown)).toContain("建议继续开发");
+    expect(decisionBriefHeading(unknown, "en")).toContain("continue development");
   });
 
   it("expands only for a terminal run and respects an explicit collapse", () => {
@@ -57,10 +64,18 @@ describe("decision brief view · three-state rendering", () => {
       diffFiles: ["src/a.ts"],
     });
     const groups = groupRemainingByAc(brief.remaining);
-    expect(groups.map((group) => group.label)).toEqual(["相关性未确认", "AC#1", "未映射到 AC"]);
+    expect(groups.map((group) => group.kind)).toEqual(["unknown", "ac", "unmapped"]);
+    expect(groups[1].ac).toBe("AC#1");
+    expect(groups.map((group) => group.ac ?? t("zh", decisionRemainingGroupKey(group.kind)!)))
+      .toEqual(["相关性未确认", "AC#1", "未映射到 AC"]);
     expect(groups[1].items[0].streak).toBe(0);
     expect(groups[0].items[0].relevance).toBe("unknown");
     expect(groups[2].items[0].relevance).toBe("irrelevant");
+  });
+
+  it("exposes catalog keys for the gate labels", () => {
+    expect(t("zh", decisionGateKeys.blocking)).toBe("阻断问题");
+    expect(t("en", decisionGateKeys.blocking)).toBe("Blocking findings");
   });
 });
 
@@ -95,5 +110,7 @@ describe("decision brief view · one-click actions", () => {
     expect(decisionBriefActionRequest(red, "accept")).toEqual({ mode: "accept", acknowledgeOpenFindings: true });
     expect(acceptConfirmMessage("任务", 2)).toContain("2 条未解决意见");
     expect(acceptConfirmMessage("任务", 0)).not.toContain("未解决意见");
+    expect(acceptConfirmMessage("Task", 2, "en")).toContain("2 unresolved finding(s)");
+    expect(continueConfirmMessage("Task", "note", "en")).toContain("drafted note");
   });
 });

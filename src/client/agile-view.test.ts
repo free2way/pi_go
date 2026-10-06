@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import { RELEASE_DEPLOY_STALE_MS } from "../shared/agile.js";
 import { deriveStoryStatus, type AgileStory } from "../shared/agile";
 import type { ReleaseRetrospective, ReleaseSummary } from "../shared/agile-metrics";
-import { columnPoints, estimateLabel, groupStoriesByColumn, priorityLabel, releaseDeployAction, releaseExportFilename, releaseExportJson, splitLines, storyReference } from "./agile-view";
+import { columnPoints, estimateKey, estimateLabel, groupStoriesByColumn, priorityKey, priorityLabel, releaseDeployAction, releaseExportFilename, releaseExportJson, splitLines, storyReference, boardColumnKey, RELEASE_DEPLOY_ACTION_KEYS } from "./agile-view";
+import { t } from "../shared/i18n";
 
 function story(overrides: Partial<AgileStory>): AgileStory {
   return {
@@ -39,7 +40,10 @@ describe("groupStoriesByColumn", () => {
       story({ status: "done" }),
       story({ status: "blocked" }),
     ]);
-    expect(groups.map((group) => group.label)).toEqual(["待办", "开发中", "审核中", "待验收", "完成", "阻塞"]);
+    expect(groups.map((group) => group.id)).toEqual(["todo", "in_progress", "in_review", "awaiting_acceptance", "done", "blocked"]);
+    // Column labels are rendered from the catalog, not baked into the helper.
+    expect(groups.map((group) => t("zh", boardColumnKey(group.id)))).toEqual(["待办", "开发中", "审核中", "待验收", "完成", "阻塞"]);
+    expect(t("en", boardColumnKey("todo"))).toBe("To do");
     expect(groups.map((group) => group.stories.length)).toEqual([2, 1, 1, 1, 1, 1]);
   });
 
@@ -64,9 +68,15 @@ describe("agile view helpers", () => {
   });
 
   it("labels priorities and estimates, including the unestimated case", () => {
+    expect(priorityKey("must")).toBe("agile.priority.must");
     expect(priorityLabel("must")).toBe("必须");
+    expect(priorityLabel("must", "en")).toBe("Must");
+    expect(estimateKey(5)).toBe("agile.estimate.5");
+    expect(estimateKey(null)).toBe("agile.estimate.none");
+    expect(estimateKey(99)).toBeNull();
     expect(estimateLabel(5)).toContain("5 点");
     expect(estimateLabel(null)).toBe("未估算");
+    expect(estimateLabel(99)).toBe("99 点");
   });
 
   it("builds a story reference from the project key and 1-based index", () => {
@@ -151,5 +161,10 @@ describe("releaseDeployAction", () => {
     expect(releaseDeployAction({ status: "ok", detail: "HTTP 200", at: "2026-01-02T00:00:00.000Z" }, now)).toBe("done");
     expect(releaseDeployAction({ status: "not_configured", detail: "未配置", at: "2026-01-02T00:00:00.000Z" }, now)).toBe("done");
     expect(releaseDeployAction({ status: "unsupported", detail: "无效", at: "2026-01-02T00:00:00.000Z" }, now)).toBe("done");
+  });
+
+  it("exposes catalog keys for the publish button", () => {
+    expect(t("zh", RELEASE_DEPLOY_ACTION_KEYS.retry)).toBe("重试部署");
+    expect(t("en", RELEASE_DEPLOY_ACTION_KEYS.retry)).toBe("Retry deploy");
   });
 });

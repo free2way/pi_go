@@ -1,22 +1,34 @@
 import type { HumanNote, HumanNoteKind, Run, RunState } from "../shared/types";
+import { DEFAULT_LOCALE, intlLocale, t, type Locale, type MessageKey } from "../shared/i18n";
 
 /**
  * 需求历史: pure formatting helpers for the searchable requirement history view.
  * Kept free of React/DOM so they can be unit tested directly.
  */
 
-/** Chinese state labels shared by the history view and the run dashboard. */
-export const runStateLabels: Record<RunState, string> = {
-  queued: "排队中",
-  preparing: "准备工作区",
-  developing: "开发中",
-  checking: "检查中",
-  reviewing: "审核中",
-  completed: "已通过",
-  needs_human: "需要人工处理",
-  failed: "失败",
-  cancelled: "已取消",
+/**
+ * Locale-neutral label keys shared by the history view and the run dashboard.
+ * The rendered text lives in the shared catalog, not here.
+ */
+const RUN_STATE_KEYS: Record<RunState, MessageKey> = {
+  queued: "run.state.queued",
+  preparing: "run.state.preparing",
+  developing: "run.state.developing",
+  checking: "run.state.checking",
+  reviewing: "run.state.reviewing",
+  completed: "run.state.completed",
+  needs_human: "run.state.needs_human",
+  failed: "run.state.failed",
+  cancelled: "run.state.cancelled",
 };
+
+export function runStateKey(state: RunState): MessageKey {
+  return RUN_STATE_KEYS[state] ?? "common.unknown";
+}
+
+export function runStateLabel(state: RunState, locale: Locale = DEFAULT_LOCALE): string {
+  return t(locale, runStateKey(state));
+}
 
 /** Every state the history filter offers, in dashboard order. */
 export const RUN_STATE_OPTIONS: RunState[] = [
@@ -36,16 +48,20 @@ export function humanNotesOf(run: Pick<Run, "humanNotes">): HumanNote[] {
   return Array.isArray(run.humanNotes) ? run.humanNotes : [];
 }
 
-const NOTE_KIND_LABELS: Record<HumanNoteKind, string> = {
-  approve_continue: "继续开发",
-  approve_accept: "接受交付",
-  resume: "恢复下一轮",
-  reject: "拒绝交付",
-  reopen: "重新打开",
+const NOTE_KIND_KEYS: Record<HumanNoteKind, MessageKey> = {
+  approve_continue: "note.kind.approve_continue",
+  approve_accept: "note.kind.approve_accept",
+  resume: "note.kind.resume",
+  reject: "note.kind.reject",
+  reopen: "note.kind.reopen",
 };
 
-export function humanNoteKindLabel(kind: HumanNoteKind): string {
-  return NOTE_KIND_LABELS[kind] ?? String(kind);
+export function humanNoteKindKey(kind: HumanNoteKind): MessageKey {
+  return NOTE_KIND_KEYS[kind] ?? "common.unknown";
+}
+
+export function humanNoteKindLabel(kind: HumanNoteKind, locale: Locale = DEFAULT_LOCALE): string {
+  return t(locale, humanNoteKindKey(kind));
 }
 
 /** Collapses a multi-line requirement into one line, truncated for the list row. */
@@ -63,13 +79,13 @@ export function copyTextForRun(run: Pick<Run, "title" | "task">): string {
 }
 
 /**
- * Short local timestamp for the history list/detail. Uses a fixed zh-CN shape
- * (month/day + 24h clock) so both rows read consistently.
+ * Short local timestamp for the history list/detail. Uses a fixed
+ * month/day + 24h shape so both rows read consistently in every locale.
  */
-export function formatHistoryTime(at: string): string {
+export function formatHistoryTime(at: string, locale: Locale = DEFAULT_LOCALE): string {
   const date = new Date(at);
   if (Number.isNaN(date.getTime())) return at;
-  return new Intl.DateTimeFormat("zh-CN", {
+  return new Intl.DateTimeFormat(intlLocale(locale), {
     year: "numeric",
     month: "2-digit",
     day: "2-digit",

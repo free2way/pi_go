@@ -60,6 +60,16 @@ describe("buildReleaseInput", () => {
     expect(result).toEqual({ ok: true, input: { name: "结账", version: "v1.2.0", notes: "上线", status: "in_progress", storyIds: ["s1", "s2"] } });
   });
 
+  it("renders the validation copy in English", () => {
+    expect(buildTemplateInput({ ...templateValues, name: "" }, "en")).toEqual({ ok: false, message: "Enter a template name" });
+    expect(buildTemplateInput({ ...templateValues, budgetCostUsd: "abc" }, "en")).toEqual({
+      ok: false,
+      message: "Cost budget ($) must be a non-negative number",
+    });
+    expect(buildReleaseInput({ name: "", version: "v1", notes: "", status: "planned", storyIds: [] }, "en").ok).toBe(false);
+    expect(agileFormErrorMessage({ code: "TEMPLATE_NOT_FOUND" }, "fallback", "en")).toBe("The template does not exist or was deleted");
+  });
+
   it("requires both a name and a version", () => {
     expect(buildReleaseInput({ name: "", version: "v1", notes: "", status: "planned", storyIds: [] })).toEqual({ ok: false, message: "请填写发布名称" });
     expect(buildReleaseInput({ name: "结账", version: "  ", notes: "", status: "planned", storyIds: [] })).toEqual({ ok: false, message: "请填写版本号" });

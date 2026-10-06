@@ -13,7 +13,9 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import type { ConfigStatus, Run, Workspace } from "../shared/types";
+import { DEFAULT_LOCALE, intlLocale, t, type Locale } from "../shared/i18n";
 import { api } from "./api";
+import { useT } from "./i18n";
 
 const namePattern = /^[A-Za-z0-9._-]{1,80}$/;
 
@@ -22,48 +24,49 @@ function isValidName(value: string): boolean {
   return namePattern.test(value) && value !== "." && value !== "..";
 }
 
-function describeError(cause: unknown): string {
-  const code = (cause as { code?: string }).code;
-  switch (code) {
+function describeError(cause: unknown, locale: Locale = DEFAULT_LOCALE): string {
+  const error = cause as { code?: string; message?: string };
+  switch (error.code) {
     case "WORKSPACE_EXISTS":
-      return "同名工作区或目录已存在。若目录中已有其他内容，PiGO 不会覆盖；请换一个名称，或用「注册已有目录」登记它。";
+      return t(locale, "workspace.error.WORKSPACE_EXISTS");
     case "WORKSPACE_NOT_FOUND":
-      return "工作区不存在，可能已被解除注册。";
+      return t(locale, "workspace.error.WORKSPACE_NOT_FOUND");
     case "WORKSPACE_OUTSIDE_ROOT":
-      return "路径越界：只能使用受控根目录内的相对路径，符号链接同样不允许指向根目录之外。";
+      return t(locale, "workspace.error.WORKSPACE_OUTSIDE_ROOT");
     case "WORKSPACE_INVALID": {
-      const raw = (cause as Error).message || "";
-      if (raw.includes("does not exist")) return "目录不存在：请确认相对路径正确，且位于受控项目根目录内。";
-      if (raw.includes("Not a Git repository")) return "该目录不是有效的 Git 仓库（缺少 .git）。";
-      if (raw.includes("Invalid workspace name")) return "名称不合法：只能包含字母、数字、点、连字符和下划线（1–80 个字符）。";
-      if (raw.includes("Invalid workspace path")) return "路径不合法：只允许受控项目根目录内的相对路径，不允许 ../ 或绝对路径。";
-      return raw || "目录校验失败：需要受控项目根目录内有效的 Git 仓库。";
+      const raw = error.message || "";
+      if (raw.includes("does not exist")) return t(locale, "workspace.error.WORKSPACE_INVALID_DIR_MISSING");
+      if (raw.includes("Not a Git repository")) return t(locale, "workspace.error.WORKSPACE_INVALID_NOT_GIT");
+      if (raw.includes("Invalid workspace name")) return t(locale, "workspace.error.WORKSPACE_INVALID_NAME");
+      if (raw.includes("Invalid workspace path")) return t(locale, "workspace.error.WORKSPACE_INVALID_PATH");
+      return t(locale, "workspace.error.WORKSPACE_INVALID");
     }
     case "WORKSPACES_DISABLED":
-      return "服务器未启用工作区功能（PI_WORKSPACES_ENABLED=false）。";
+      return t(locale, "workspace.error.WORKSPACES_DISABLED");
     case "WORKSPACE_READ_ONLY":
-      return "只读授权：只有工作区所有者、管理员或拥有写权限的成员可以修改默认检查、刷新元数据或解除注册。";
+      return t(locale, "workspace.error.WORKSPACE_READ_ONLY");
     default:
-      return (cause as Error).message || "操作失败，请稍后重试。";
+      return error.message || t(locale, "workspace.error.generic");
   }
 }
 
-const formatTime = (date: string | null) =>
+const formatTime = (date: string | null, locale: Locale = DEFAULT_LOCALE) =>
   date
-    ? new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(date))
+    ? new Intl.DateTimeFormat(intlLocale(locale), { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(date))
     : "—";
 
-const statusLabel: Record<Workspace["status"], string> = {
-  active: "已就绪",
-  invalid: "校验失败",
-  unregistered: "已解除注册",
-};
+const statusKeys = {
+  active: "workspace.status.active",
+  invalid: "workspace.status.invalid",
+  unregistered: "workspace.status.unregistered",
+} as const satisfies Record<Workspace["status"], string>;
 
 export function WorkspacesPage({ config, runs, onOpenCredentials }: {
   config?: ConfigStatus;
   runs: Run[];
   onOpenCredentials: () => void;
 }) {
+  const { t, locale } = useT();
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
@@ -86,11 +89,11 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
       const result = await api.workspaces();
       setWorkspaces(result.workspaces);
     } catch (cause) {
-      setLoadError(describeError(cause));
+      setLoadError(describeError(cause, locale));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [locale]);
 
   useEffect(() => { void load(); }, [load]);
 
@@ -107,7 +110,7 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
       setPanel("none");
       await load();
     } catch (cause) {
-      setFormError(describeError(cause));
+      setFormError(describeError(cause, locale));
     } finally {
       setSubmitting(false);
     }
@@ -117,7 +120,7 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
     event.preventDefault();
     const name = cloneName.trim();
     if (!isValidName(name)) {
-      setFormError("名称只能包含字母、数字、点、连字符与下划线（1–80 个字符）。");
+      setFormError(t("workspace.invalidName"));
       return;
     }
     setSubmitting(true);
@@ -129,7 +132,7 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
       setPanel("none");
       await load();
     } catch (cause) {
-      setFormError(describeError(cause));
+      setFormError(describeError(cause, locale));
     } finally {
       setSubmitting(false);
     }
@@ -139,7 +142,7 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
     event.preventDefault();
     const name = createName.trim();
     if (!isValidName(name)) {
-      setFormError("名称只能包含字母、数字、点、连字符与下划线（1–80 个字符）。");
+      setFormError(t("workspace.invalidName"));
       return;
     }
     setSubmitting(true);
@@ -150,7 +153,7 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
       setPanel("none");
       await load();
     } catch (cause) {
-      setFormError(describeError(cause));
+      setFormError(describeError(cause, locale));
     } finally {
       setSubmitting(false);
     }
@@ -162,7 +165,7 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
       const updated = await api.refreshWorkspace(workspace.id);
       setWorkspaces((current) => current.map((item) => (item.id === updated.id ? updated : item)));
     } catch (cause) {
-      window.alert(`刷新失败：${describeError(cause)}`);
+      window.alert(t("workspace.refreshFailed", { message: describeError(cause, locale) }));
       await load();
     } finally {
       setPendingId("");
@@ -170,13 +173,13 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
   };
 
   const unregister = async (workspace: Workspace) => {
-    if (!window.confirm(`解除注册「${workspace.name}」？\n\n只解除注册：源代码目录、历史任务与制品都会保留，稍后可以重新注册。`)) return;
+    if (!window.confirm(t("workspace.unregisterConfirm", { name: workspace.name }))) return;
     setPendingId(workspace.id);
     try {
       await api.unregisterWorkspace(workspace.id);
       await load();
     } catch (cause) {
-      window.alert(`解除注册失败：${describeError(cause)}`);
+      window.alert(t("workspace.unregisterFailed", { message: describeError(cause, locale) }));
     } finally {
       setPendingId("");
     }
@@ -199,7 +202,7 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
       setWorkspaces((current) => current.map((item) => (item.id === updated.id ? updated : item)));
       setEditingId("");
     } catch (cause) {
-      setFormError(describeError(cause));
+      setFormError(describeError(cause, locale));
     } finally {
       setSavingEdit(false);
     }
@@ -210,23 +213,23 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
       <section className="ws-heading">
         <div>
           <span className="eyebrow">SERVER WORKSPACES</span>
-          <h1>工作区</h1>
-          <p>在 Worker 主机的受控根目录中新建工作区目录、注册已有 Git 仓库，或从 Git URL 克隆到服务器。真实任务将在隔离的 worktree 中执行，不会改动源目录。</p>
+          <h1>{t("nav.workspaces")}</h1>
+          <p>{t("workspace.subtitle")}</p>
         </div>
         <div className="ws-heading-actions">
-          <button className="button secondary" onClick={() => { setPanel(panel === "create" ? "none" : "create"); setFormError(""); }}><FolderPlus size={15} />新建工作区目录</button>
-          <button className="button secondary" onClick={() => { setPanel(panel === "register" ? "none" : "register"); setFormError(""); }}><Plus size={15} />注册已有目录</button>
-          <button className="button secondary" onClick={() => { setPanel(panel === "clone" ? "none" : "clone"); setFormError(""); }}><GitBranch size={15} />从 Git 克隆</button>
+          <button className="button secondary" onClick={() => { setPanel(panel === "create" ? "none" : "create"); setFormError(""); }}><FolderPlus size={15} />{t("workspace.newDir")}</button>
+          <button className="button secondary" onClick={() => { setPanel(panel === "register" ? "none" : "register"); setFormError(""); }}><Plus size={15} />{t("workspace.registerExisting")}</button>
+          <button className="button secondary" onClick={() => { setPanel(panel === "clone" ? "none" : "clone"); setFormError(""); }}><GitBranch size={15} />{t("workspace.clone")}</button>
         </div>
       </section>
 
       <div className={`ws-strip ${config?.realRunsAvailable ? "is-ready" : ""}`}>
         {config?.realRunsAvailable ? <Check size={14} /> : <AlertTriangle size={14} />}
         <div>
-          <strong>{config?.realRunsAvailable ? "真实执行已启用" : "尚未配置模型 Key"}</strong>
-          <span>{config?.realRunsAvailable ? "工作区可以直接用于创建真实任务。" : "浏览、注册与刷新工作区不需要 Key；仅真实任务执行需要配置个人模型 Key。"}</span>
+          <strong>{config?.realRunsAvailable ? t("config.realReady") : t("workspace.noKey")}</strong>
+          <span>{config?.realRunsAvailable ? t("workspace.readyHint") : t("workspace.noKeyHint")}</span>
         </div>
-        {!config?.realRunsAvailable && <button type="button" onClick={onOpenCredentials}>配置个人 Key</button>}
+        {!config?.realRunsAvailable && <button type="button" onClick={onOpenCredentials}>{t("workspace.configureKey")}</button>}
       </div>
 
       {panel !== "none" && (
@@ -234,20 +237,20 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
           {panel === "create" && (
             <form className="ws-form" onSubmit={submitCreate}>
               <div className="ws-form-head">
-                <div><span className="eyebrow">NEW WORKSPACE DIRECTORY</span><h3>新建工作区目录</h3></div>
+                <div><span className="eyebrow">NEW WORKSPACE DIRECTORY</span><h3>{t("workspace.newDir")}</h3></div>
                 <button className="icon-button" type="button" onClick={() => setPanel("none")}><X size={16} /></button>
               </div>
               <p className="ws-form-help">
-                在 Worker 主机的受控项目根目录（<code>PI_WORKSPACE_ROOT/projects</code>，容器内默认为 <code>/workspace/projects</code>）下创建目录并初始化为空的 Git 仓库，然后自动注册为工作区。<strong>目录建在 Worker 主机上，不是你本机的目录。</strong>同名目录已存在且含其他内容时会报错，不会覆盖。新建的是空仓库，需先推入或提交至少一次代码后才能用于真实任务。
+                {t("workspace.createHelp1")}<code>PI_WORKSPACE_ROOT/projects</code>{t("workspace.createHelp2")}<code>/workspace/projects</code>{t("workspace.createHelp3")}<strong>{t("workspace.createHelpStrong")}</strong>{t("workspace.createHelp4")}
               </p>
-              <label>工作区名称
+              <label>{t("workspace.name")}
                 <input value={createName} onChange={(event) => setCreateName(event.target.value)} placeholder="my-new-repo" autoFocus />
               </label>
               {formError && <div className="form-error">{formError}</div>}
               <div className="ws-form-actions">
-                <button type="button" className="button secondary" onClick={() => setPanel("none")}>取消</button>
+                <button type="button" className="button secondary" onClick={() => setPanel("none")}>{t("common.cancel")}</button>
                 <button type="submit" className="button primary" disabled={submitting || !createName.trim()}>
-                  {submitting ? <LoaderCircle className="spin" size={15} /> : <FolderPlus size={15} />}创建并注册
+                  {submitting ? <LoaderCircle className="spin" size={15} /> : <FolderPlus size={15} />}{t("workspace.createAndRegister")}
                 </button>
               </div>
             </form>
@@ -255,18 +258,18 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
           {panel === "register" && (
             <form className="ws-form" onSubmit={submitRegister}>
               <div className="ws-form-head">
-                <div><span className="eyebrow">REGISTER EXISTING</span><h3>注册已有目录</h3></div>
+                <div><span className="eyebrow">REGISTER EXISTING</span><h3>{t("workspace.registerExisting")}</h3></div>
                 <button className="icon-button" type="button" onClick={() => setPanel("none")}><X size={16} /></button>
               </div>
-              <p className="ws-form-help">相对受控项目根目录（PI_WORKSPACE_ROOT/projects）的路径。只登记引用：不复制、不 checkout、不修改源仓库。</p>
-              <label>相对路径
+              <p className="ws-form-help">{t("workspace.registerHelp")}</p>
+              <label>{t("workspace.relativePath")}
                 <input value={relativePath} onChange={(event) => setRelativePath(event.target.value)} placeholder="my-repo" autoFocus />
               </label>
               {formError && <div className="form-error">{formError}</div>}
               <div className="ws-form-actions">
-                <button type="button" className="button secondary" onClick={() => setPanel("none")}>取消</button>
+                <button type="button" className="button secondary" onClick={() => setPanel("none")}>{t("common.cancel")}</button>
                 <button type="submit" className="button primary" disabled={submitting || !relativePath.trim()}>
-                  {submitting ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />}注册工作区
+                  {submitting ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />}{t("workspace.registerAction")}
                 </button>
               </div>
             </form>
@@ -274,21 +277,21 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
           {panel === "clone" && (
             <form className="ws-form" onSubmit={submitClone}>
               <div className="ws-form-head">
-                <div><span className="eyebrow">CLONE FROM GIT</span><h3>从 Git 克隆</h3></div>
+                <div><span className="eyebrow">CLONE FROM GIT</span><h3>{t("workspace.clone")}</h3></div>
                 <button className="icon-button" type="button" onClick={() => setPanel("none")}><X size={16} /></button>
               </div>
-              <p className="ws-form-help">支持 HTTPS 与 SSH 地址。克隆到服务器受控根目录并注册为工作区；URL 中的凭据不会以明文保存。</p>
+              <p className="ws-form-help">{t("workspace.cloneHelp")}</p>
               <label>Git URL
                 <input value={cloneUrl} onChange={(event) => setCloneUrl(event.target.value)} placeholder="https://github.com/org/repo.git" autoFocus />
               </label>
-              <label>工作区名称
+              <label>{t("workspace.name")}
                 <input value={cloneName} onChange={(event) => setCloneName(event.target.value)} placeholder="my-repo" />
               </label>
               {formError && <div className="form-error">{formError}</div>}
               <div className="ws-form-actions">
-                <button type="button" className="button secondary" onClick={() => setPanel("none")}>取消</button>
+                <button type="button" className="button secondary" onClick={() => setPanel("none")}>{t("common.cancel")}</button>
                 <button type="submit" className="button primary" disabled={submitting || !cloneUrl.trim() || !cloneName.trim()}>
-                  {submitting ? <LoaderCircle className="spin" size={15} /> : <GitBranch size={15} />}克隆并注册
+                  {submitting ? <LoaderCircle className="spin" size={15} /> : <GitBranch size={15} />}{t("workspace.cloneAndRegister")}
                 </button>
               </div>
             </form>
@@ -299,12 +302,12 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
       {loadError && <div className="form-error">{loadError}</div>}
 
       {loading ? (
-        <div className="ws-empty"><LoaderCircle className="spin" size={20} /><span>正在加载工作区…</span></div>
+        <div className="ws-empty"><LoaderCircle className="spin" size={20} /><span>{t("workspace.loading")}</span></div>
       ) : workspaces.length === 0 ? (
         <div className="ws-empty">
           <FolderGit2 size={26} />
-          <strong>还没有注册工作区</strong>
-          <span>在 Worker 主机上新建一个工作区目录，或注册已有仓库 / 从 Git URL 克隆。</span>
+          <strong>{t("workspace.empty")}</strong>
+          <span>{t("workspace.emptyHint")}</span>
         </div>
       ) : (
         <div className="ws-grid">
@@ -318,51 +321,51 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
                   <strong>{workspace.name}</strong>
                   <span>{workspace.nodeId} · {workspace.rootPath}</span>
                 </div>
-                {readOnly && <span className="ws-permission" title="共享工作区：只读授权">只读</span>}
-                <span className={`ws-status ws-status-${workspace.status}`}>{statusLabel[workspace.status]}</span>
+                {readOnly && <span className="ws-permission" title={t("workspace.readOnlyTitle")}>{t("workspace.readOnly")}</span>}
+                <span className={`ws-status ws-status-${workspace.status}`}>{t(statusKeys[workspace.status])}</span>
               </header>
 
               <div className="ws-meta">
-                <div><span>分支</span><strong>{workspace.git?.branch || workspace.defaultBranch || "—"}</strong></div>
+                <div><span>{t("workspace.branch")}</span><strong>{workspace.git?.branch || workspace.defaultBranch || "—"}</strong></div>
                 <div><span>HEAD</span><strong>{workspace.git?.head ? workspace.git.head.slice(0, 7) : "—"}</strong></div>
-                <div><span>工作树</span><strong className={workspace.git?.dirty ? "warn" : ""}>{workspace.git ? (workspace.git.dirty ? "有未提交修改" : "干净") : "—"}</strong></div>
-                <div><span>关联任务</span><strong>{runCountFor(workspace) || "—"}</strong></div>
-                <div><span>最近检查</span><strong>{formatTime(workspace.lastCheckedAt)}</strong></div>
+                <div><span>{t("workspace.worktree")}</span><strong className={workspace.git?.dirty ? "warn" : ""}>{workspace.git ? (workspace.git.dirty ? t("workspace.dirty") : t("workspace.clean")) : "—"}</strong></div>
+                <div><span>{t("workspace.linkedRuns")}</span><strong>{runCountFor(workspace) || "—"}</strong></div>
+                <div><span>{t("workspace.lastChecked")}</span><strong>{formatTime(workspace.lastCheckedAt, locale)}</strong></div>
               </div>
 
               {workspace.repositoryUrl && <div className="ws-repo"><GitBranch size={11} />{workspace.repositoryUrl}</div>}
               <div className="ws-checks">
                 {workspace.defaultChecks.length > 0
                   ? workspace.defaultChecks.map((command) => <code key={command}>{command}</code>)
-                  : <em>未配置默认检查命令</em>}
+                  : <em>{t("workspace.noDefaultChecks")}</em>}
               </div>
-              {workspace.git?.dirty && <div className="ws-dirty-note"><AlertTriangle size={11} />存在未提交修改；创建真实任务前建议先提交或清理，避免混入待审核的 Diff。</div>}
-              {workspace.status === "invalid" && <div className="ws-dirty-note">路径校验失败：目录可能已移动或不再是 Git 仓库。可尝试“刷新 Git 状态”，或解除注册后重新注册。</div>}
+              {workspace.git?.dirty && <div className="ws-dirty-note"><AlertTriangle size={11} />{t("workspace.dirtyNote")}</div>}
+              {workspace.status === "invalid" && <div className="ws-dirty-note">{t("workspace.invalidNote")}</div>}
 
               {!readOnly && editingId === workspace.id && (
                 <div className="ws-editor">
-                  <label>默认检查命令（每行一个）
+                  <label>{t("workspace.defaultChecks")}
                     <textarea rows={3} value={editChecks} onChange={(event) => setEditChecks(event.target.value)} placeholder="npm test" />
                   </label>
-                  <label>默认分支
+                  <label>{t("workspace.defaultBranch")}
                     <input value={editBranch} onChange={(event) => setEditBranch(event.target.value)} placeholder="main" />
                   </label>
                   {formError && <div className="form-error">{formError}</div>}
                   <div className="ws-editor-actions">
-                    <button type="button" className="button secondary" onClick={() => setEditingId("")}>取消</button>
+                    <button type="button" className="button secondary" onClick={() => setEditingId("")}>{t("common.cancel")}</button>
                     <button type="button" className="button primary" disabled={savingEdit} onClick={() => void saveEdit(workspace)}>
-                      {savingEdit ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}保存
+                      {savingEdit ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}{t("common.save")}
                     </button>
                   </div>
                 </div>
               )}
 
               <footer className="ws-actions">
-                <button type="button" disabled={readOnly || pendingId === workspace.id} title={readOnly ? "只读授权：无法刷新元数据" : undefined} onClick={() => void refresh(workspace)}>
-                  {pendingId === workspace.id ? <LoaderCircle className="spin" size={13} /> : <RotateCcw size={13} />}刷新 Git 状态
+                <button type="button" disabled={readOnly || pendingId === workspace.id} title={readOnly ? t("workspace.roRefresh") : undefined} onClick={() => void refresh(workspace)}>
+                  {pendingId === workspace.id ? <LoaderCircle className="spin" size={13} /> : <RotateCcw size={13} />}{t("workspace.refresh")}
                 </button>
-                <button type="button" disabled={readOnly} title={readOnly ? "只读授权：无法修改默认检查" : undefined} onClick={() => startEdit(workspace)}><SlidersHorizontal size={13} />默认检查</button>
-                <button type="button" className="danger" disabled={readOnly || pendingId === workspace.id} title={readOnly ? "只读授权：无法解除注册" : undefined} onClick={() => void unregister(workspace)}><Trash2 size={13} />解除注册</button>
+                <button type="button" disabled={readOnly} title={readOnly ? t("workspace.roEditChecks") : undefined} onClick={() => startEdit(workspace)}><SlidersHorizontal size={13} />{t("workspace.editChecks")}</button>
+                <button type="button" className="danger" disabled={readOnly || pendingId === workspace.id} title={readOnly ? t("workspace.roUnregister") : undefined} onClick={() => void unregister(workspace)}><Trash2 size={13} />{t("workspace.unregister")}</button>
               </footer>
             </article>
             );

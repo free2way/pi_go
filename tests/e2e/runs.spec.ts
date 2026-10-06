@@ -40,6 +40,13 @@ test.describe("run creation and run detail", () => {
     await expect(metrics).toContainText("估算成本");
     await expect(metrics).toContainText("状态");
 
+    // The controlled React Flow nodes must stay initialized after SSE replaces
+    // the run/event snapshots. A regression here leaves a dotted blank canvas.
+    const topology = page.locator("#workflow-topology");
+    await expect(topology.locator(".react-flow__node")).toHaveCount(6);
+    await expect(topology.locator(".react-flow__node").first()).toBeVisible();
+    await expect.poll(() => topology.locator(".react-flow__edge").count()).toBeGreaterThanOrEqual(5);
+
     // Activity timeline fills in from the demo event stream.
     await expect(page.locator(".timeline-item").first()).toBeVisible({ timeout: 20_000 });
 

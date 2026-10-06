@@ -3,6 +3,9 @@ import type { Finding, RoundSummary } from "../shared/types";
 import type { RoundStatus } from "../shared/round-status";
 import {
   resolveReworkRounds,
+  roundStatusKey,
+  roundStatusLabel,
+  roundStatusTooltipText,
   resolveRoundStatuses,
   reworkBranchDetailsFromSummaries,
   reworkRoundsFromSummaries,
@@ -37,6 +40,22 @@ const finding = (overrides: Partial<Finding> = {}): Finding => ({
   requiredChange: "fix",
   resolved: false,
   ...overrides,
+});
+
+describe("round status catalog mapping", () => {
+  it("maps every workflow status to a locale-neutral key", () => {
+    expect(roundStatusKey("approved")).toBe("roundStatus.approved");
+    expect(roundStatusKey("changes_requested")).toBe("roundStatus.changes_requested");
+    expect(roundStatusKey("planned")).toBe("roundStatus.planned");
+    expect(roundStatusLabel("approved")).toBe("审核通过");
+    expect(roundStatusLabel("approved", "en")).toBe("Review passed");
+  });
+
+  it("localizes the check/finding tooltip", () => {
+    const status = eventStatus({ checks: { passed: 3, failed: 1 }, findings: { total: 2, resolved: 1 } });
+    expect(roundStatusTooltipText(status)).toBe("检查 通过 3/失败 1 · 发现 2 项（已解决 1）");
+    expect(roundStatusTooltipText(status, "en")).toContain("passed 3/failed 1");
+  });
 });
 
 describe("roundStatusFromSummary", () => {
@@ -159,6 +178,13 @@ describe("reworkBranchDetailsFromSummaries", () => {
 
     expect(details[0].reason).toBe("事件里的退回原因");
     expect(details[0].at).toBe("2026-10-02T00:00:00.000Z");
+  });
+
+  it("localizes the missing-reason fallback", () => {
+    const zh = reworkBranchDetailsFromSummaries([summary({ round: 3, verdict: "changes_requested" })]);
+    const en = reworkBranchDetailsFromSummaries([summary({ round: 3, verdict: "changes_requested" })], [], [], "en");
+    expect(zh[0].reason).toBe("（未记录退回原因）");
+    expect(en[0].reason).toBe("(no return reason recorded)");
   });
 
   it("keeps a return round the summary does not cover", () => {

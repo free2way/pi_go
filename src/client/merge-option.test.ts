@@ -21,6 +21,11 @@ describe("merge option gating (A2/UX)", () => {
     expect(state.hint).toContain("仅管理员");
   });
 
+  it("explains the restriction in the selected language", () => {
+    expect(mergeOptionState({ isAdmin: false }, "en").hint).toContain("Only admins");
+    expect(mergeOptionState(undefined, "en").hint).toContain("Only admins");
+  });
+
   it("treats a user object without isAdmin as non-admin", () => {
     expect(mergeOptionState({}).disabled).toBe(true);
   });
