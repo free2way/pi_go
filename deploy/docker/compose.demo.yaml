@@ -1,0 +1,249 @@
+# PiGO demo / acceptance stack — NOT production.
+#
+# Goal: replace the hand-run `docker run` smoke containers (pigo-web-e2e,
+# pigo-smoke-web, pigo-worker-fake) with one reproducible compose project, and
+# make it impossible to point at production data by accident.
+#
+# What it shares with the host (documented, intentional):
+#   * the EXISTING PostgreSQL container from the production compose project
+#     (`pi-agent`, network `pi-agent-network`) — no `postgres` service is
+#     declared here, the demo containers just join that external network;
+#   * the host Docker socket, so the worker can create per-call sandbox
+#     containers exactly like production does;
+#   * ONE credential vault file that must already exist on the host (it is
+#     never created from repo content and never committed).
+#
+# Safety invariant (enforced twice):
+#   1. `PI_DATABASE_URL` below is hard-wired to `/pigo_demo`;
+#   2. `scripts/demo-env.sh up` resolves the effective configuration with
+#      `docker compose config` and REFUSES to start when any resolved
+#      `*DATABASE_URL*` does not end in `/pigo_demo` (it prints exactly what it
+#      resolved first). Tests for the invariant live in scripts/demo-env.test.mjs.
+#
+# Usage (see docs/25-demo-environment.md):
+#   cp deploy/docker/demo.env.example deploy/docker/demo.env   # then edit
+#   scripts/demo-env.sh up
+#   scripts/demo-env.sh doctor
+#   scripts/demo-env.sh seed
+#   scripts/demo-env.sh down
+
+name: pigo-demo
+
+services:
+  # Fail-closed credential guard. Runs BEFORE demo-web and exits non-zero when
+  # the mounted vault is missing, unreadable or not a v2 vault. Because demo-web
+  # `depends_on` it with `service_completed_successfully`, a bare
+  # `docker compose up` fails closed too — the guard is not tied to the wrapper
+  # script. It never prints vault contents, only the path and byte length.
+  demo-preflight:
+    image: ${PIGO_DEMO_PREFLIGHT_IMAGE:-node:22.23.3-bookworm-slim}
+    container_name: pigo-demo-preflight
+    restart: "no"
+    environment:
+      PI_VAULT_FILE: /app/data/credentials.v1.json
+    volumes:
+      - ${PIGO_DEMO_DATA_DIR:?Set PIGO_DEMO_DATA_DIR in deploy/docker/demo.env}:/app/data:ro
+    entrypoint:
+      - node
+      - -e
+      - |
+        const fs = require("node:fs");
+        const file = process.env.PI_VAULT_FILE;
+        let raw;
+        try {
+          raw = fs.readFileSync(file, "utf8");
+        } catch (error) {
+          console.error("demo preflight: cannot read credential file " + file + ": " + (error.code || error.message));
+          console.error("demo preflight: place an existing PiGO credential vault at PIGO_DEMO_DATA_DIR/credentials.v1.json");
+          console.error("demo preflight: (mode 600, writable by uid 1000 so the vault can chmod/rewrite it). Never commit it.");
+          process.exit(1);
+        }
+        let parsed;
+        try {
+          parsed = JSON.parse(raw);
+        } catch {
+          console.error("demo preflight: " + file + " is not valid JSON");
+          process.exit(1);
+        }
+        if (!parsed || parsed.version !== 2) {
+          console.error("demo preflight: " + file + " is not a v2 credential vault (version=" + (parsed ? parsed.version : "?") + ")");
+          process.exit(1);
+        }
+        console.log("demo preflight: credential vault OK (" + file + ", " + raw.length + " bytes)");
+    networks:
+      - pi-network
+
+  demo-web:
+    build:
+      context: ${PIGO_DEMO_BUILD_CONTEXT:-../..}
+      dockerfile: deploy/docker/Dockerfile.web
+    image: ${PIGO_DEMO_WEB_IMAGE:-local/pigo-web:demo}
+    container_name: pigo-demo-web
+    restart: unless-stopped
+    init: true
+    depends_on:
+      demo-preflight:
+        condition: service_completed_successfully
+    environment:
+      # Development auth + dev server semantics: NODE_ENV must NOT be
+      # production, otherwise Authenticator rejects PI_AUTH_MODE=development.
+      NODE_ENV: development
+      HOST: 0.0.0.0
+      PORT: 3100
+      PI_AUTH_MODE: development
+      PI_DATA_FILE: /app/data/runs.json
+      # The mounted host credential file — deliberately NOT /tmp. The stack uses
+      # one shared vault; /tmp would silently create an empty throwaway vault.
+      PI_VAULT_FILE: /app/data/credentials.v1.json
+      PI_VAULT_SECRET: ${PI_VAULT_SECRET:?Set PI_VAULT_SECRET in deploy/docker/demo.env}
+      # HARD-WIRED demo database. scripts/demo-env.sh up refuses to start if the
+      # resolved URL does not end in /pigo_demo.
+      PI_DATABASE_URL: postgresql://pigo:${PIGO_POSTGRES_PASSWORD:?Set PIGO_POSTGRES_PASSWORD in deploy/docker/demo.env}@postgres:5432/pigo_demo
+      PI_WORKER_URL: http://demo-worker:3200
+      # Same value in demo-web and demo-worker; doctor asserts parity without
+      # printing the token.
+      PI_INTERNAL_TOKEN: ${PI_INTERNAL_TOKEN:?Set PI_INTERNAL_TOKEN in deploy/docker/demo.env}
+      PI_DEMO_MODE: "true"
+      PI_REAL_RUNS_ENABLED: "true"
+      PI_WEB_VERSION: ${PIGO_DEMO_VERSION:?Set PIGO_DEMO_VERSION in deploy/docker/demo.env}
+      PI_WORKER_VERSION: ${PIGO_DEMO_VERSION:?Set PIGO_DEMO_VERSION in deploy/docker/demo.env}
+      PI_WORKSPACES_ENABLED: "true"
+      PI_DEVELOPER_MODEL: ${PI_DEVELOPER_MODEL:-deepseek-flash}
+      PI_REVIEWER_PROVIDER: ${PI_REVIEWER_PROVIDER:-openai-proxy}
+      PI_REVIEWER_MODEL: ${PI_REVIEWER_MODEL:-gpt-5.6-sol}
+      PI_MODEL_PROBE_MODE: ${PI_MODEL_PROBE_MODE:-probe}
+    ports:
+      # Primary demo endpoint (same address the hand-run pigo-web-e2e used).
+      - target: 3100
+        published: "${PIGO_DEMO_WEB_PORT:-3101}"
+        host_ip: ${PIGO_DEMO_WEB_BIND_ADDRESS:-192.168.2.235}
+      # Loopback-only endpoint used by scripts/demo-env.sh (health/seed) and by
+      # the Playwright suite via PI_E2E_BASE_URL. Comment this pair out to close
+      # the loopback listener.
+      - target: 3100
+        published: "${PIGO_DEMO_WEB_LOOPBACK_PORT:-3102}"
+        host_ip: ${PIGO_DEMO_WEB_LOOPBACK_ADDRESS:-127.0.0.1}
+    volumes:
+      # Credential directory + runs.json live here. Must be writable by uid
+      # 1000 (the image's `node` user): CredentialVault chmods the file to 0600.
+      - ${PIGO_DEMO_DATA_DIR:?Set PIGO_DEMO_DATA_DIR in deploy/docker/demo.env}:/app/data
+    networks:
+      - pi-network
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    pids_limit: 256
+    mem_limit: 768m
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3100/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  demo-worker:
+    build:
+      context: ${PIGO_DEMO_BUILD_CONTEXT:-../..}
+      dockerfile: deploy/docker/Dockerfile.worker
+    image: ${PIGO_DEMO_WORKER_IMAGE:-local/pigo-worker:demo}
+    container_name: pigo-demo-worker
+    restart: unless-stopped
+    init: true
+    working_dir: /workspace
+    depends_on:
+      demo-web:
+        condition: service_started
+    environment:
+      NODE_ENV: development
+      HOST: 0.0.0.0
+      PORT: 3200
+      PI_WORKSPACE_ROOT: /workspace
+      # Host path of the mounted workspace root: the worker strips this prefix
+      # when it tells Docker where to bind the run worktrees into sandboxes.
+      PI_HOST_WORKSPACE_ROOT: ${PIGO_DEMO_WORKSPACE_ROOT:?Set PIGO_DEMO_WORKSPACE_ROOT in deploy/docker/demo.env}
+      # Must point at the DEMO web (distinct service name, so the shared
+      # pi-agent-network cannot round-robin callbacks into production web).
+      PI_WEB_CALLBACK_URL: http://demo-web:3100
+      PI_INTERNAL_TOKEN: ${PI_INTERNAL_TOKEN:?Set PI_INTERNAL_TOKEN in deploy/docker/demo.env}
+      PI_WORKER_VERSION: ${PIGO_DEMO_VERSION:?Set PIGO_DEMO_VERSION in deploy/docker/demo.env}
+      PI_WORKER_ID: ${PIGO_DEMO_WORKER_ID:-pigo-demo-worker}
+      PI_DEVELOPER_PROVIDER: ${PI_DEVELOPER_PROVIDER:-deepseek}
+      PI_DEVELOPER_MODEL: ${PI_DEVELOPER_MODEL:-deepseek-flash}
+      PI_REVIEWER_PROVIDER: ${PI_REVIEWER_PROVIDER:-openai-proxy}
+      PI_REVIEWER_MODEL: ${PI_REVIEWER_MODEL:-gpt-5.6-sol}
+      PI_MAX_ACTIVE_JOBS: ${PI_MAX_ACTIVE_JOBS:-1}
+      PI_MAX_REVIEW_ROUNDS: ${PI_MAX_REVIEW_ROUNDS:-3}
+      PI_MAX_SUBAGENTS: ${PI_MAX_SUBAGENTS:-3}
+      PI_RUN_TIMEOUT_SECONDS: ${PI_RUN_TIMEOUT_SECONDS:-1800}
+      # SEC-004: every agent call and check command runs in a dedicated sandbox
+      # container. `auto` still fails closed when the Docker socket is unusable.
+      PI_SANDBOX_MODE: ${PI_SANDBOX_MODE:-auto}
+      # Fail-closed (default OFF). With the line below commented out, a worker
+      # that cannot create sandbox containers REFUSES the run
+      # (SandboxUnavailableError) instead of executing it in-process. Only set
+      # PI_SANDBOX_ALLOW_DEGRADED=1 — the code accepts the literal "1" and
+      # nothing else — for a fully-trusted environment that explicitly accepts
+      # losing isolation; the run is then flagged as degraded.
+      # PI_SANDBOX_ALLOW_DEGRADED: "1"
+      PI_SANDBOX_IMAGE: ${PI_SANDBOX_IMAGE:-local/pigo-sandbox:0.1.0}
+      PI_SANDBOX_NETWORK: ${PIGO_DEMO_SANDBOX_NETWORK:-pi-agent-network}
+      # HOST path of the provider/model definition file, used when the worker
+      # binds it into sandbox containers (the same file is mounted read-only at
+      # /home/node/.pi/agent/models.json below).
+      PI_SANDBOX_MODELS_FILE: ${PIGO_DEMO_MODELS_FILE:?Set PIGO_DEMO_MODELS_FILE in deploy/docker/demo.env}
+      PI_DOCKER_SOCKET: /var/run/docker.sock
+      PI_DOCKER_API_VERSION: ${PI_DOCKER_API_VERSION:-v1.43}
+      PI_GIT_EMPTY_CONFIG: ${PI_GIT_EMPTY_CONFIG:-/dev/null}
+      PI_MIN_FREE_DISK_MB: ${PI_MIN_FREE_DISK_MB:-2048}
+      PI_PROVIDER_ATTEMPTS: ${PI_PROVIDER_ATTEMPTS:-3}
+      PI_PROVIDER_BACKOFF_MS: ${PI_PROVIDER_BACKOFF_MS:-2000}
+      PI_PLANNER_THINKING: ${PI_PLANNER_THINKING:-low}
+      PI_REVIEWER_THINKING: ${PI_REVIEWER_THINKING:-medium}
+      PI_SESSION_REUSE: ${PI_SESSION_REUSE:-on}
+    volumes:
+      - ${PIGO_DEMO_WORKSPACE_ROOT:?Set PIGO_DEMO_WORKSPACE_ROOT in deploy/docker/demo.env}:/workspace
+      # Privileged socket mount — same tradeoff as production (see docs/03).
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PIGO_DEMO_MODELS_FILE:?Set PIGO_DEMO_MODELS_FILE in deploy/docker/demo.env}:/home/node/.pi/agent/models.json:ro
+      - pigo-demo-worker-state:/home/node/.pi
+    # The socket is root:docker (0660); the non-root worker joins that gid so it
+    # can create sandbox containers without running as root. Find the host value
+    # with: stat -c %g /var/run/docker.sock
+    group_add:
+      - "${PIGO_DEMO_DOCKER_GID:-983}"
+    networks:
+      - pi-network
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    pids_limit: 512
+    mem_limit: 4g
+    cpus: 2.0
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3200/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+# Joins the EXISTING production network so the demo containers can reach the
+# production `postgres` container by its service name. Nothing here creates a
+# database, a postgres service or a network.
+networks:
+  pi-network:
+    name: pi-agent-network
+    external: true
+
+volumes:
+  # Demo-only worker Pi state (auth-free; the worker never gets the interactive
+  # Pi config). Independent of the production `pigo-worker-state` volume.
+  pigo-demo-worker-state:
+    name: pigo-demo-worker-state
