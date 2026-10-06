@@ -516,7 +516,9 @@ async function cancelIfActive(request: APIRequestContext, runId: string): Promis
 
 /**
  * Task text for E2E-01b: fix the expiry boundary, do not touch the test, append a
- * per-run note line and commit on the run branch.
+ * per-run note line — and explicitly do NOT commit: committing the round's work
+ * is the product's job (`src/worker/round-commit.ts`, invoked before the round's
+ * diff/checks/review), and the merge assertion below is what guards it.
  *
  * `marker` is unique per run and is BOTH written into the task (so the developer
  * must append exactly that line to `docs/notes.md`) and grep-verified by a submitted
@@ -529,8 +531,8 @@ function e2e01bTask(marker: string): string {
     "修复本仓库 auth.js 中的会话到期判定缺陷：isSessionValid(session, now) 必须在「到期瞬间」（now === session.expiresAt）返回 false，未到期返回 true；保持函数签名与模块导出不变。",
     "运行 node test.js 必须通过；不得修改 test.js（它是验收测试）。",
     `本次运行的强制交付物（无论 auth.js 是否已正确都必须执行）：在 docs/notes.md 末尾追加一行，内容为 \`- ${marker} 复核 isSessionValid 到期判定\`；docs/ 目录或该文件不存在时创建它。`,
-    "把本次改动提交到当前任务分支（工作树根目录执行：git add -A && git -c user.name=PiGO -c user.email=agent@pigo.local commit -m \"fix: session expiry boundary\"）；未提交到任务分支即视为未交付。",
-    "不要修改其它文件，不要新增依赖，不要 push。",
+    "不要自行提交或推送：不要把改动 commit 到任何分支、也不要 push。产品会在本轮检查/审核之前把工作树改动提交到任务分支，人工合并获取的正是那个提交。",
+    "不要修改其它文件，不要新增依赖。",
   ].join("\n");
 }
 
@@ -545,8 +547,8 @@ const E2E01B_REVIEWER_PROVIDER = "openai-proxy";
  * The run's acceptance conditions (docs/05 §13 E2E-01 "验收条件"), all deterministic.
  * They are parameterized by the run's BASE commit (the fixture's default-branch head
  * right before creation, asserted equal to `run.baseSha`) rather than by `HEAD`,
- * because the task asks the agent to commit its work — a `HEAD`-relative check would
- * then silently compare the wrong revision:
+ * because the worker now commits the round's work onto the run branch before the
+ * checks run — a `HEAD`-relative check would compare the wrong revision:
  *  - `node test.js` — the fixture's own 7-assertion suite; assertion #2 encodes the
  *    expiry-instant rule the task is about, so a passing run proves the module was
  *    really fixed (its output ends with `auth tests passed`, asserted below).
@@ -562,14 +564,17 @@ const E2E01B_REVIEWER_PROVIDER = "openai-proxy";
  *    unique marker guarantees a non-empty diff on every run; the commit condition is
  *    what makes the human merge a real fast-forward (see below).
  *
- * Why the task asks for a commit: verified live against the demo deployment — the
- * worker never commits a single-agent worktree, and `POST /runs/:id/merge` only
- * fast-forwards the run BRANCH into the default branch. Without a commit on that
- * branch the merge is a silent no-op (`run.merge.commit === run.baseSha`, HEAD
- * unchanged), i.e. the reviewed work would never reach the workspace. The scenario
- * therefore requires a real commit (a real developer action, not a simulation),
- * which is what makes "the human merge advanced the default branch" an assertable,
- * non-vacuous acceptance criterion.
+ * Why the check requires a commit — and why the task forbids the agent from making
+ * one: verified live against the demo deployment, `POST /runs/:id/merge` only
+ * fast-forwards the run BRANCH into the default branch, while a single-agent round
+ * left its work *uncommitted* in the worktree. The merge was therefore a silent
+ * no-op (`run.merge.commit === run.baseSha`, HEAD unchanged) and the reviewed work
+ * never reached the workspace. The worker now commits each round's work itself
+ * (`src/worker/round-commit.ts`, before the round's diff/checks/review;
+ * `round.committed` event), so the task explicitly forbids the agent from committing
+ * and this check asserts the product's own commit (`HEAD != <base>`), which is what
+ * makes "the human merge advanced the default branch" an assertable, non-vacuous
+ * acceptance criterion and keeps the defect from silently returning.
  */
 function e2e01bChecks(baseCommit: string, marker: string): string[] {
   return [
@@ -1036,10 +1041,11 @@ test.describe("E2E-01 单 Agent 完整闭环", () => {
       expect(mergedEvents[0].seq, "run.merged 必须晚于 review.approved").toBeGreaterThan(reviewApproved.seq);
 
       // The workspace really advanced to the merged commit, and is clean again.
-      // Non-vacuous: the run produced a diff and the task committed it on the run
-      // branch, so the fast-forward must move the default branch to a NEW commit
-      // (a merge that fast-forwards to the base would leave HEAD unchanged and is
-      // exactly the no-op this assertion catches).
+      // Non-vacuous: the run produced a diff and the WORKER committed it on the run
+      // branch (the task forbids the agent from committing), so the fast-forward must
+      // move the default branch to a NEW commit (a merge that fast-forwards to the
+      // base would leave HEAD unchanged and is exactly the no-op this assertion
+      // catches, i.e. the round-commit regression).
       const afterMerge = await refreshWorkspace(request, fixtureId!);
       expect(
         afterMerge.git?.head,
