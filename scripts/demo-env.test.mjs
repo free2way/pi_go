@@ -20,6 +20,9 @@ import {
   EXAMPLE_ENV_FILE,
   OUTSIDE_TREE_ENV_FILE,
   REPO_ROOT,
+  WORKER_GID,
+  WORKER_UID,
+  WORKSPACE_PERMISSIONS_CHECK,
   checkDbSafety,
   checkDemoCompose,
   checkSecretParity,
@@ -36,6 +39,9 @@ import {
   planSeedActions,
   resolveDbTarget,
   resolveDemoEnvFile,
+  workspaceLayout,
+  workspacePermissionVerdict,
+  workspacePermissionsCheck,
 } from "./demo-env-lib.mjs";
 
 const composeText = readFileSync(DEFAULT_COMPOSE_FILE, "utf8");
@@ -606,4 +612,130 @@ test("envFileLine: names the origin and no values", () => {
 
   const example = resolveDemoEnvFile({ env: {}, io: fakeIo([EXAMPLE_ENV_FILE]) });
   assert.match(envFileLine(example), /EXAMPLE FILE/);
+});
+
+// ---------------------------------------------------------------------------
+// Workspace permissions: BOTH the worker (uid 1000) and the host operator must
+// be able to write <root>, <root>/projects and <root>/runs. This is the
+// incident where the container created those dirs as uid 1000 (0755) and the
+// operator could no longer modify the tree.
+// ---------------------------------------------------------------------------
+
+const OPERATOR_UID = 501;
+const OPERATOR_GID = 20;
+
+/** A stat-like record; `mode` carries the file-type bits like `fs.statSync` does. */
+function dirStats(uid, gid, mode) {
+  return { uid, gid, mode: 0o40000 | mode };
+}
+
+/** Inject a fixed stat table + identity, like `ensureWorkspaceDirectories`'s `io`. */
+function statIo(table, uid, gid) {
+  return {
+    stat: (dir) => {
+      if (Object.prototype.hasOwnProperty.call(table, dir)) return table[dir];
+      const error = new Error(`ENOENT: ${dir}`);
+      error.code = "ENOENT";
+      throw error;
+    },
+    getuid: () => uid,
+    getgid: () => gid,
+  };
+}
+
+function layoutTable(layout, stats) {
+  return { [layout.root]: stats, [layout.projects]: stats, [layout.runs]: stats };
+}
+
+test("workspacePermissionVerdict: derives writability and the owner/mode descriptor", () => {
+  const shared = dirStats(WORKER_UID, WORKER_GID, 0o755);
+  const worker = workspacePermissionVerdict(shared, { uid: WORKER_UID, gid: WORKER_GID });
+  const operator = workspacePermissionVerdict(shared, { uid: OPERATOR_UID, gid: OPERATOR_GID });
+  assert.equal(worker.writable, true);
+  assert.equal(worker.grantedBy, "owner");
+  assert.equal(worker.owner, `uid ${WORKER_UID} gid ${WORKER_GID} mode 0755`);
+  assert.equal(operator.writable, false);
+  assert.match(operator.verdict, /uid 501 gid 20 cannot write \(uid 1000 gid 1000 mode 0755\)/);
+
+  // uid 0 writes regardless of the mode (root operator is satisfied).
+  assert.equal(workspacePermissionVerdict(dirStats(0, 0, 0o700), { uid: 0, gid: 0 }).writable, true);
+  // A matching uid never falls through to the group/other bits.
+  assert.equal(workspacePermissionVerdict(dirStats(1000, 1000, 0o070), { uid: 1000, gid: 1000 }).writable, false);
+  // A non-matching uid with a matching gid uses the group bit.
+  assert.equal(workspacePermissionVerdict(dirStats(501, 20, 0o070), { uid: 1000, gid: 20 }).writable, true);
+});
+
+test("workspace permissions: host-owned 0777 lets BOTH identities write (healthy state)", () => {
+  const layout = workspaceLayout("/srv/pigo-workspace");
+  const stats = dirStats(OPERATOR_UID, OPERATOR_GID, 0o777);
+  const check = workspacePermissionsCheck(layout, statIo(layoutTable(layout, stats), OPERATOR_UID, OPERATOR_GID));
+  assert.equal(check.ok, true);
+  assert.deepEqual(check.problems, []);
+  assert.match(check.detail, /3 dir\(s\) writable by worker \(uid 1000 gid 1000\) \+ operator \(uid 501 gid 20\)/);
+  assert.match(check.detail, /mode 0777/);
+});
+
+test("workspace permissions: uid-1000-owned 0755 FAILs — worker writes, operator cannot (the incident)", () => {
+  const layout = workspaceLayout("/srv/pigo-workspace");
+  const stats = dirStats(WORKER_UID, WORKER_GID, 0o755);
+  const check = workspacePermissionsCheck(layout, statIo(layoutTable(layout, stats), OPERATOR_UID, OPERATOR_GID));
+  assert.equal(check.ok, false);
+  assert.equal(check.problems.length, 3, "one problem per directory");
+  for (const dir of [layout.root, layout.projects, layout.runs]) {
+    assert.ok(check.problems.some((problem) => problem.startsWith(`${dir}: operator`) && /cannot write/.test(problem) && /mode 0755/.test(problem)), check.problems.join("\n"));
+  }
+  assert.ok(!check.problems.some((problem) => /worker/.test(problem)), "the worker CAN write 0755");
+  assert.match(check.detail, /operator \(uid 501 gid 20\) cannot write/);
+  assert.match(check.hint, /chown -R 501:20/);
+  assert.match(check.hint, /NOT sufficient/);
+});
+
+test("workspace permissions: root-owned 0700 FAILs for both identities", () => {
+  const layout = workspaceLayout("/srv/pigo-workspace");
+  const stats = dirStats(0, 0, 0o700);
+  const check = workspacePermissionsCheck(layout, statIo(layoutTable(layout, stats), OPERATOR_UID, OPERATOR_GID));
+  assert.equal(check.ok, false);
+  assert.ok(check.problems.some((problem) => /worker \(uid 1000 gid 1000\) cannot write/.test(problem)));
+  assert.ok(check.problems.some((problem) => /operator \(uid 501 gid 20\) cannot write/.test(problem)));
+});
+
+test("workspace permissions: uid-1000-owned 0777 passes for both identities", () => {
+  const layout = workspaceLayout("/srv/pigo-workspace");
+  const stats = dirStats(WORKER_UID, WORKER_GID, 0o777);
+  const check = workspacePermissionsCheck(layout, statIo(layoutTable(layout, stats), OPERATOR_UID, OPERATOR_GID));
+  assert.equal(check.ok, true);
+  assert.match(check.detail, /mode 0777/);
+});
+
+test("workspace permissions: an operator that IS uid/gid 1000 reports ONE identity, not a duplicate error", () => {
+  const layout = workspaceLayout("/srv/pigo-workspace");
+  const stats = dirStats(WORKER_UID, WORKER_GID, 0o755);
+  const check = workspacePermissionsCheck(layout, statIo(layoutTable(layout, stats), WORKER_UID, WORKER_GID));
+  assert.equal(check.ok, true);
+  assert.deepEqual(check.problems, []);
+  assert.match(check.detail, /worker=operator \(uid 1000 gid 1000\)/);
+  assert.equal((check.detail.match(/\(uid 1000 gid 1000\)/g) ?? []).length, 1, "the shared identity must be reported once");
+});
+
+test("workspace permissions: missing directories are reported as uninspectable, never a vacuous PASS", () => {
+  const layout = workspaceLayout("/srv/pigo-workspace");
+  const stats = dirStats(OPERATOR_UID, OPERATOR_GID, 0o777);
+  const onlyRoot = { [layout.root]: stats };
+  const check = workspacePermissionsCheck(layout, statIo(onlyRoot, OPERATOR_UID, OPERATOR_GID));
+  assert.equal(check.ok, false);
+  assert.match(check.detail, /cannot inspect/);
+  assert.ok(check.detail.includes(layout.runs), `detail must name the missing dir: ${check.detail}`);
+  assert.match(check.detail, /ENOENT/);
+});
+
+test("workspace permissions: an unset workspace root is never reported as passing", () => {
+  const check = workspacePermissionsCheck(workspaceLayout(""), statIo({}, OPERATOR_UID, OPERATOR_GID));
+  assert.equal(check.ok, false);
+  assert.match(check.detail, /PIGO_DEMO_WORKSPACE_ROOT is unset/);
+});
+
+test("workspace permissions: the doctor check name is stable", () => {
+  assert.equal(WORKSPACE_PERMISSIONS_CHECK, "workspace-permissions");
+  assert.equal(WORKER_UID, 1000);
+  assert.equal(WORKER_GID, 1000);
 });

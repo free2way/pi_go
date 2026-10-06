@@ -73,6 +73,32 @@ worker 固定使用 `PI_WORKSPACE_ROOT=/workspace`，并据此推导：
   `projects/`、`runs/` 必须对 uid 1000 可写；数据目录同理（`CredentialVault` 会把凭据文件
   chmod 到 0600）。
 
+#### 目录所有者（双身份可写）与 `workspace-permissions` 检查
+
+工作区目录有**两个**都必须可写的身份，缺一不可：
+
+1. **worker（uid 1000 / gid 1000）**：镜像内的 `node` 用户，要创建仓库与运行 worktree；
+2. **发起操作宿主的操作员**（`process.getuid()` / `process.getgid()`）：要能在宿主上管理、
+   清理这棵目录树。
+
+`doctor` 的 `workspace-permissions` 检查会对 `<root>`、`<root>/projects`、`<root>/runs`
+逐一 `stat`，用两个身份分别判断可写性（POSIX：uid 匹配看 owner 位，否则 gid 匹配看 group
+位，否则看 other 位；uid 0 视为可写；操作员恰好就是 uid/gid 1000 时只报一个身份，不重复报
+错）。**目录缺失不算通过**——该检查会报 “cannot inspect …”，存在性由 `workspace-layout`
+检查负责。
+
+典型事故：容器以 uid 1000 创建了工作区目录（`uid 1000 gid 1000 mode 0755`），worker 能写，
+但宿主操作员随后无法修改，只能手工修好。`workspace-permissions` 会 FAIL 并给出具体修复命令：
+
+```sh
+# 两个身份都可写的推荐状态（演示服务器最终采用）
+chown -R <operator>:<operator> <PIGO_DEMO_WORKSPACE_ROOT>
+chmod -R 777 <PIGO_DEMO_WORKSPACE_ROOT>
+```
+
+> 注意：只执行 `chown -R 1000:1000 <root>` **不够**——除非 mode 或 group 同时覆盖操作员，
+> 否则操作员仍不可写。
+
 ## web 与 worker 的职责（web 不执行 Git）
 
 所有工作区操作都由 **web 转发给 worker**：`src/server/workspaces.ts` 调用
@@ -92,7 +118,7 @@ web 进程没有任何工作区文件系统读取或 `git` 子进程——`src/s
 ```sh
 cp deploy/docker/demo.env.example ../demo.env   # 然后编辑；chmod 600
 scripts/demo-env.sh up       # 校验 → 建工作区目录 → 启动 → 等健康检查
-scripts/demo-env.sh doctor   # PASS/FAIL 检查（DB 名、vault、socket、token、版本、工作区目录）
+scripts/demo-env.sh doctor   # PASS/FAIL 检查（DB 名、vault、socket、token、版本、工作区目录与权限）
 scripts/demo-env.sh seed     # 幂等写入演示项目/冲刺/故事
 scripts/demo-env.sh status
 scripts/demo-env.sh down     # 停止但**不**删除卷与宿主工作区目录

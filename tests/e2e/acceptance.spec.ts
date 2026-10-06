@@ -12,12 +12,41 @@ import { E2E_LIVE_ACCEPTANCE, configStatus, expect, openRunByTitle, stopRun, tes
  * is marked `fixme` by default with the reason recorded, and only enabled in a
  * live acceptance environment via `PI_E2E_LIVE=1`.
  *
- * E2E-05 (provider preflight) and E2E-07 (budget stop) are *real* tests: they no
- * longer use `fixme`. Each one is driven entirely by environment variables and
- * either runs its assertions or skips with a precise, actionable reason. That
- * means the acceptance gate still FAILs while such a scenario is skipped — the
- * gate's `PI_E2E_ALLOW_REQUIRED_SKIPS=1` + `..._REASON` override (or a fully
- * configured environment) is the honest way to handle that, never a silent pass.
+ * E2E-02 (check failure → automatic repair), E2E-05 (provider preflight) and
+ * E2E-07 (budget stop) are *real* tests: they no longer use `fixme`. Each one is
+ * driven entirely by environment variables and either runs its assertions or
+ * skips with a precise, actionable reason. That means the acceptance gate still
+ * FAILs while such a scenario is skipped — the gate's
+ * `PI_E2E_ALLOW_REQUIRED_SKIPS=1` + `..._REASON` override (or a fully configured
+ * environment) is the honest way to handle that, never a silent pass.
+ *
+ * ---------------------------------------------------------------------------
+ * E2E-02 — 检查失败自动返修: environment contract
+ * ---------------------------------------------------------------------------
+ *   PI_E2E_WORKSPACE_ID       (optional) workspace to target; otherwise the
+ *                             first active, non-dirty registered workspace.
+ *   PI_E2E_REPAIR_TIMEOUT_MS  (optional) how long to wait for the second round
+ *                             to pass its checks and reach the reviewer,
+ *                             default 300000 (5 min).
+ *   The developer and reviewer selections are pinned explicitly from
+ *   `/api/models` (the first entry selectable for each role), so the round
+ *   never depends on the deployment's default models. The test skips with a
+ *   precise reason when the catalogue has no usable model for either role.
+ *   Also requires `realRunsAvailable: true` and an active, non-dirty workspace.
+ *
+ *   Determinism: the run submits ONE check that fails on the first execution of
+ *   the run worktree and passes on every later execution, because its marker is
+ *   written inside the worktree's Git directory rather than the working tree:
+ *     d=$(git rev-parse --git-dir) || exit 1; m="$d/pigo-e2e-02-marker";
+ *     if [ -f "$m" ]; then exit 0; fi; : > "$m"; exit 1
+ *   The first execution creates the marker and exits 1 (`check.failed`); after
+ *   the automatic repair round the same worktree still carries it, so the second
+ *   execution exits 0 (`check.passed`). Keeping the marker out of the working
+ *   tree means it never shows up in the run diff, so the reviewer cannot flag it
+ *   as an out-of-scope change (which would send the marker round back for
+ *   deletion and re-break the check). The check needs `git` in the run sandbox,
+ *   which the Pi runtime image provides. The spec cancels the run once round 2
+ *   has reached the reviewer, because the review verdict is not part of E2E-02.
  *
  * ---------------------------------------------------------------------------
  * E2E-05 — Provider 故障不浪费开发成本: environment contract
@@ -104,12 +133,27 @@ type AcceptanceRun = {
   id: string;
   title: string;
   state: string;
+  round?: number;
+  maxRounds?: number;
   summary?: string;
   diff?: string;
   modelCalls?: number;
+  /** Last deterministic-check verdict the worker froze on the run. */
+  checkPassed?: boolean;
+  checks?: Array<{ id?: string; command: string; status: string; exitCode?: number }>;
+  /** Per-role CLI session summary (Sprint 2); `resumed` marks a reused session. */
+  sessions?: Array<{ sessionId: string; role: string; rounds: number[]; calls?: number; resumed: boolean }>;
   budget?: { maxTokens: number; maxCostUsd: number; maxModelCalls: number; maxDurationSeconds: number };
 };
-type AcceptanceEvent = { seq: number; type: string; message: string; at: string };
+type AcceptanceEvent = {
+  seq: number;
+  round: number;
+  source: string;
+  type: string;
+  message: string;
+  at: string;
+  meta?: Record<string, unknown>;
+};
 type AcceptanceArtifact = { artifactId: string; kind: string; bytes: number };
 
 /** Run states in which the worker may still start a new model call. */
@@ -142,17 +186,18 @@ async function resolveAcceptanceWorkspace(request: APIRequestContext): Promise<s
 }
 
 /**
- * Developer-role model this scenario pins explicitly, so E2E-05 does not depend
- * on the deployment's `PI_MODEL_DEFAULT_DEVELOPER` (or its built-in default).
- * Taken from the same `/api/models` projection the create-run dialog uses, and
- * only from an entry `POST /api/runs` would accept for `developer` (the additive
- * `selectableRoles` verdict, else `roles` + `available`), so the pinned role
+ * First model the run preflight would accept for `role`, read from the same
+ * `/api/models` projection the create-run dialog uses. Pinning it means the
+ * scenario never inherits the deployment's `PI_MODEL_DEFAULT_*` (or built-in)
+ * defaults. Only an entry the preflight accepts is returned (the additive
+ * `selectableRoles` verdict, else `roles` + `available`), so a pinned role
  * cannot itself trip the preflight. Returns undefined only when the catalogue
- * has no usable developer model at all — a deployment precondition the test
- * reports (and skips) instead of guessing a pair.
+ * has no usable model for that role — a deployment precondition the caller
+ * reports (and skips) instead of guessing.
  */
-async function resolveDeveloperSelection(
+async function resolveRoleSelection(
   request: APIRequestContext,
+  role: "developer" | "reviewer",
 ): Promise<{ provider: string; model: string } | undefined> {
   const response = await request.get("/api/models");
   if (!response.ok()) return undefined;
@@ -167,10 +212,17 @@ async function resolveDeveloperSelection(
   };
   const entry = (body.models ?? []).find((item) =>
     Array.isArray(item.selectableRoles)
-      ? item.selectableRoles.includes("developer")
-      : Boolean(item.roles?.includes("developer")) && item.available === true,
+      ? item.selectableRoles.includes(role)
+      : Boolean(item.roles?.includes(role)) && item.available === true,
   );
   return entry ? { provider: entry.provider, model: entry.model } : undefined;
+}
+
+/** E2E-05's developer pin; see `resolveRoleSelection` for the contract. */
+async function resolveDeveloperSelection(
+  request: APIRequestContext,
+): Promise<{ provider: string; model: string } | undefined> {
+  return resolveRoleSelection(request, "developer");
 }
 
 async function listRuns(request: APIRequestContext): Promise<AcceptanceRun[]> {
@@ -273,18 +325,204 @@ test.describe("E2E-01 单 Agent 完整闭环", () => {
 
 // ---------------------------------------------------------------------------
 // E2E-02 — 检查失败自动返修
+//
+// Real, env-driven test (docs/05 §13). The run is given exactly one check that
+// fails by construction on its first execution and passes on every later one,
+// so the scenario does not depend on the model to repair the check:
+//
+//   round 1: developer runs → check.failed → checks.returned (auto-return to
+//            Developer, state developing); the reviewer must NOT start.
+//   round 2: round.started → the repair Developer call runs against the SAME CLI
+//            session (COST-004, `resumed`) → the checks run again → check.passed
+//            → only then review.started.
+//
+// See the file header for the PI_E2E_REPAIR_* environment contract.
 // ---------------------------------------------------------------------------
+
+/**
+ * Placeholder task: the scenario is about the check→repair loop, not about the
+ * model writing code. Asking the agent to make no change keeps both rounds
+ * cheap (and well inside the deployment's default run budget) and guarantees
+ * the self-healing check is the only reason a round fails.
+ */
+const E2E02_TASK =
+  "验收占位任务（E2E-02）：本次运行无需任何代码改动。不要读取或修改仓库文件，也不要运行命令，直接确认无需改动即可结束。";
+
+/**
+ * The one deterministic check E2E-02 submits. Its marker lives in the run
+ * worktree's Git directory (`git rev-parse --git-dir`), NOT in the working
+ * tree, so:
+ *  - the first execution creates the marker and exits 1 (`check.failed`);
+ *  - every later execution of the same worktree finds it and exits 0
+ *    (`check.passed`) — deterministically, without the repair model having to
+ *    produce anything;
+ *  - the marker never appears in the run diff, so the reviewer cannot flag it as
+ *    an out-of-scope artefact and send it back for deletion (probe: doing so
+ *    re-breaks the check and the run ends at maxRounds).
+ * Assumes `git` is present in the run sandbox (the Pi runtime image provides it).
+ */
+const E2E02_CHECK =
+  'd=$(git rev-parse --git-dir) || exit 1; m="$d/pigo-e2e-02-marker"; if [ -f "$m" ]; then exit 0; fi; : > "$m"; exit 1';
+
 test.describe("E2E-02 检查失败自动返修", () => {
-  test("E2E-02 第一轮检查失败 → Reviewer 不启动 → 复用会话修复 → 第二轮全量检查通过（fixme：需生产验收环境）", async ({ request }) => {
-    requireLiveAcceptance(
-      "可控失败检查的 fixture 仓库（第一版实现必然使一条检查失败）+ 真实 Pi Worker 与两张真实 Provider 凭据。",
-    );
+  test("E2E-02 第一轮检查失败 → 退回 Developer（复用会话）→ 第二轮全量检查通过后才进入审核（需真实运行环境）", async ({ request }) => {
+    const configuredWait = Number(envValue("PI_E2E_REPAIR_TIMEOUT_MS") ?? 300_000);
+    const waitMs = Number.isFinite(configuredWait) && configuredWait > 0 ? configuredWait : 300_000;
+    const preconditions =
+      `需要一个真实运行环境：realRunsAvailable=true（PI_REAL_RUNS_ENABLED=true + PI_INTERNAL_TOKEN + 已配置的 provider 凭据）、一个 active 且未 dirty 的工作区（或设置 PI_E2E_WORKSPACE_ID）、以及 /api/models 中分别可用于 developer 与 reviewer 的模型。Pi 运行沙箱必须提供 git（Pi 运行时镜像默认提供）。可选 PI_E2E_REPAIR_TIMEOUT_MS（默认 300000）控制等待第二轮通过检查的时长；当前值 ${waitMs}。`;
+    test.info().annotations.push({ type: "preconditions", description: preconditions });
+
     const config = await configStatus(request);
-    test.skip(!config.realRunsAvailable, "PI_REAL_RUNS_ENABLED=false 或凭据未配置。");
-    notImplementedYet(
-      "E2E-02",
-      "断言：失败检查后未出现 review.started；第二轮 round=2 且 Developer 复用会话；第二轮重新执行所有必需检查；检查通过后才进入审核。",
+    test.skip(
+      !config.realRunsAvailable,
+      "E2E-02 需要真实运行环境：/api/config/status 报告 realRunsAvailable=false（需 PI_REAL_RUNS_ENABLED=true、PI_INTERNAL_TOKEN 以及至少一个已配置的 provider 凭据）。",
     );
+
+    const workspaceId = await resolveAcceptanceWorkspace(request);
+    test.skip(
+      !workspaceId,
+      "E2E-02 需要工作区：没有 active 且未 dirty 的已注册工作区（或设置 PI_E2E_WORKSPACE_ID 指定）。",
+    );
+
+    // Pin both roles explicitly so nothing here depends on the deployment
+    // defaults; only the run's own check is deliberately failing.
+    const developer = await resolveRoleSelection(request, "developer");
+    const reviewer = await resolveRoleSelection(request, "reviewer");
+    test.skip(
+      !developer || !reviewer,
+      "E2E-02 需要 /api/models 中分别可用于 developer 与 reviewer 的模型（selectableRoles）：缺少任一角色就无法显式钉住两轮所用的模型。",
+    );
+
+    // Two model-driven rounds plus checks; keep the test window aligned with the
+    // poll window.
+    test.setTimeout(waitMs + 90_000);
+
+    const title = `E2E-02 检查返修 ${Date.now()}`;
+    const created = await request.post("/api/runs", {
+      data: {
+        title,
+        task: E2E02_TASK,
+        mode: "real",
+        workspaceId,
+        checks: [E2E02_CHECK],
+        developerModel: developer,
+        reviewerModel: reviewer,
+      },
+    });
+    expect(created.status(), `POST /api/runs 失败（${created.status()}）：${await created.text()}`).toBe(201);
+    const runId = ((await created.json()) as AcceptanceRun).id;
+
+    try {
+      // Wait until the second round has reached the reviewer (the last milestone
+      // E2E-02 asserts) or the run left the active states on its own. The run
+      // document is snapshotted in the same instant so the later state
+      // assertions describe the moment the reviewer started, not a later round.
+      let atReview: AcceptanceRun | undefined;
+      await expect.poll(
+        async () => {
+          const events = await getRunEvents(request, runId);
+          if (events.some((event) => event.type === "review.started" && event.round === 2)) {
+            atReview = await getRun(request, runId);
+            return true;
+          }
+          const current = await getRun(request, runId);
+          return !ACTIVE_RUN_STATES.includes(current.state);
+        },
+        {
+          message: `Run ${runId} 未在 ${waitMs}ms 内完成「检查失败 → 自动返修 → 第二轮检查通过」：第二轮未进入审核，修复轮可能未通过检查（模型改动可能删除了检查标记）或运行被预算/时限中止。`,
+          timeout: waitMs,
+          intervals: [2_000, 5_000],
+        },
+      ).toBe(true);
+
+      const events = await getRunEvents(request, runId);
+      const current = await getRun(request, runId);
+      const summarize = () =>
+        events
+          .filter((event) => /^(round\.started|check\.(started|passed|failed)|checks\.(started|returned)|review\.started)$/.test(event.type))
+          .map((event) => `#${event.seq} r${event.round} ${event.type}`)
+          .join(", ");
+
+      const at = (type: string, round: number) => events.find((event) => event.type === type && event.round === round);
+      const require = (event: AcceptanceEvent | undefined, what: string): AcceptanceEvent => {
+        expect(event, `${what}（实际事件：${summarize() || "无"}）`).toBeTruthy();
+        return event!;
+      };
+
+      // (a) The run carried exactly the constructed check, and round 1 actually
+      // FAILED it. Asserting the command text keeps the verdict attributable to
+      // this check (and rules out a passing-by-accident empty suite).
+      expect(current.checks?.length, "E2E-02 必须只提交一个确定性检查").toBe(1);
+      expect(current.checks?.[0]?.command, "Run 上记录的检查命令必须就是构造的那个").toBe(E2E02_CHECK);
+      const failed = require(at("check.failed", 1), "第 1 轮必须记录 check.failed");
+      expect(failed.message, `check.failed 必须归于构造的检查命令：${failed.message}`).toBe(`${E2E02_CHECK} 失败`);
+      expect(
+        events.filter((event) => event.type === "check.passed" && event.round === 1),
+        "第 1 轮不得出现 check.passed（该轮检查必须失败）",
+      ).toEqual([]);
+
+      // (b) The failure returned the run to the Developer automatically
+      // (`checks.returned` is the worker's failed-checks state transition)...
+      const returned = require(at("checks.returned", 1), "第 1 轮检查失败后必须记录 checks.returned");
+      expect(returned.source, `checks.returned 必须来自 checks 通道：${returned.source}`).toBe("checks");
+      expect(returned.message, `checks.returned 文案必须说明退回 Developer：${returned.message}`).toContain("退回 Developer");
+
+      // ...and the Reviewer must NOT have started for the failed round.
+      expect(
+        events.filter((event) => event.type === "review.started" && event.round === 1),
+        "第 1 轮检查失败不得进入审核（Reviewer 不启动）",
+      ).toEqual([]);
+
+      // (c) The next iteration is the automatic repair round: round 2 starts
+      // after the return, and it reuses the Developer CLI session instead of
+      // creating a fresh one (COST-004).
+      const round2 = require(at("round.started", 2), "检查失败后必须自动开始第 2 轮（round.started）");
+      expect(round2.seq, `第 2 轮必须晚于退回事件（returned #${returned.seq}，round2 #${round2.seq}）`).toBeGreaterThan(returned.seq);
+
+      const developerSessions = events.filter(
+        (event) => event.type === "session.metrics" && event.meta?.role === "developer",
+      );
+      const round1Session = developerSessions.find((event) => event.round === 1);
+      const round2Session = developerSessions.find((event) => event.round === 2);
+      require(round1Session, "第 1 轮必须记录 Developer 会话 session.metrics");
+      require(round2Session, "第 2 轮（修复轮）必须记录 Developer 会话 session.metrics");
+      expect(
+        round2Session!.meta?.resumed,
+        `第 2 轮修复必须复用 Developer 会话（resumed=true；若为 false 请确认部署未设置 PI_SESSION_REUSE=off）：${round2Session!.message}`,
+      ).toBe(true);
+      expect(
+        round2Session!.meta?.sessionId,
+        `修复轮必须复用第 1 轮的同一会话（round1=${String(round1Session!.meta?.sessionId)}，round2=${String(round2Session!.meta?.sessionId)}）`,
+      ).toBe(round1Session!.meta?.sessionId);
+
+      // (d) The repair round re-runs the full check suite from scratch and it
+      // PASSES — a restored checkpoint would mean the checks were not re-run.
+      const round2Checked = require(at("check.started", 2), "第 2 轮必须重新执行检查（check.started）");
+      expect(round2Checked.seq, "第 2 轮检查必须晚于该轮开始").toBeGreaterThan(round2.seq);
+      expect(
+        events.filter((event) => event.type === "checks.checkpoint_restored" && event.round === 2),
+        "第 2 轮不得复用第 1 轮的检查检查点（必须全量重新执行）",
+      ).toEqual([]);
+      const passed = require(at("check.passed", 2), "第 2 轮必须记录 check.passed");
+      expect(passed.message, `check.passed 必须归于构造的检查命令：${passed.message}`).toBe(`${E2E02_CHECK} 通过`);
+      expect(
+        events.filter((event) => event.type === "check.failed" && event.round === 2),
+        "第 2 轮不得出现 check.failed（修复后检查必须通过）",
+      ).toEqual([]);
+
+      // (e) Only after the second round's checks pass may the Reviewer start.
+      const reviewStarted = require(at("review.started", 2), "第 2 轮检查通过后必须进入审核（review.started）");
+      expect(reviewStarted.seq, "审核必须晚于第 2 轮检查通过").toBeGreaterThan(passed.seq);
+      // Run-document corroboration, sampled the moment the reviewer started (a
+      // later round may already be in flight by the time we re-fetch).
+      expect(atReview?.round ?? 0, `Run 必须已推进到第 2 轮（实际 ${String(atReview?.round)}）`).toBeGreaterThanOrEqual(2);
+      expect(
+        atReview?.checkPassed,
+        `Run 必须冻结「当前快照检查通过」（checkPassed=true），实际 ${String(atReview?.checkPassed)}`,
+      ).toBe(true);
+    } finally {
+      await cancelIfActive(request, runId);
+    }
   });
 });
 

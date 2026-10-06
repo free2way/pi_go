@@ -18,7 +18,7 @@
  */
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
@@ -71,6 +71,18 @@ export const WORKSPACE_CONTAINER_ROOT = "/workspace";
 export const WORKSPACE_PROJECTS_DIRNAME = "projects";
 /** Workspace-root subdirectory holding one worktree per run (docs/25). */
 export const WORKSPACE_RUNS_DIRNAME = "runs";
+
+/**
+ * The worker container runs as the image's `node` user. It must be able to
+ * create repositories (`<root>/projects/<repo>`) and run worktrees
+ * (`<root>/runs/<owner>/<run>`), so the workspace tree must be writable by this
+ * exact uid/gid regardless of which host user happens to own it.
+ */
+export const WORKER_UID = 1000;
+export const WORKER_GID = 1000;
+
+/** Doctor check name asserting BOTH the worker and the invoking operator can write the workspace tree. */
+export const WORKSPACE_PERMISSIONS_CHECK = "workspace-permissions";
 
 /** Env vars `up` requires before it will touch Docker. Names only — values are never logged. */
 export const REQUIRED_DEMO_ENV = [
@@ -403,6 +415,132 @@ export function ensureWorkspaceDirectories(layout, io = {}) {
     }
   }
   return { ok: problems.length === 0, problems };
+}
+
+/**
+ * Pure POSIX writability verdict for one directory and one explicit identity.
+ * No filesystem access: `stats` is a stat-like `{uid, gid, mode}` (mode may carry
+ * the file-type bits, they are masked off) and `identity` is `{uid, gid}`.
+ *
+ * POSIX picks the FIRST applicable class — owner if the uids match, else group if
+ * the gids match, else the other bits — so a matching uid never falls through to
+ * the group/other bits. uid 0 writes regardless (CAP_DAC_OVERRIDE), which is how
+ * a root operator is treated as satisfied.
+ *
+ * Returns `{uid, gid, mode, octal, owner, identity, writable, grantedBy, verdict}`;
+ * `owner` is the short human-readable `uid <n> gid <n> mode 0<octal>` descriptor
+ * and `verdict` names the identity and whether/why it can write.
+ */
+export function workspacePermissionVerdict(stats, identity) {
+  const uid = Number(stats?.uid ?? 0);
+  const gid = Number(stats?.gid ?? 0);
+  const mode = Number(stats?.mode ?? 0) & 0o7777;
+  const identityUid = Number(identity?.uid ?? 0);
+  const identityGid = Number(identity?.gid ?? 0);
+  const octal = mode.toString(8).padStart(3, "0");
+  const owner = `uid ${uid} gid ${gid} mode 0${octal}`;
+  const who = `uid ${identityUid} gid ${identityGid}`;
+
+  let grantedBy = null;
+  if (identityUid === 0) {
+    grantedBy = "root";
+  } else if (identityUid === uid) {
+    grantedBy = (mode & 0o200) !== 0 ? "owner" : null;
+  } else if (identityGid === gid) {
+    grantedBy = (mode & 0o020) !== 0 ? "group" : null;
+  } else {
+    grantedBy = (mode & 0o002) !== 0 ? "other" : null;
+  }
+
+  return {
+    uid,
+    gid,
+    mode,
+    octal,
+    owner,
+    identity: { uid: identityUid, gid: identityGid },
+    writable: grantedBy !== null,
+    grantedBy,
+    verdict: grantedBy === null ? `${who} cannot write (${owner})` : `${who} can write (${owner}, via ${grantedBy})`,
+  };
+}
+
+/**
+ * Doctor-level assertion that EVERY existing workspace directory is writable by
+ * BOTH the worker identity (uid/gid 1000) and the invoking host operator
+ * (`process.getuid()`/`getgid()`), so the operator can later manage/clean the
+ * tree. One FAIL lists every per-dir/per-identity problem; missing directories
+ * are reported as uninspectable rather than passed vacuously (the separate
+ * `workspace-layout` check owns "does it exist").
+ *
+ * `io.stat`/`io.getuid`/`io.getgid` are injectable so the decision is unit-tested
+ * without a filesystem or root.
+ */
+export function workspacePermissionsCheck(layout, io = {}) {
+  const stat = io.stat ?? statSync;
+  const getuid = io.getuid ?? (() => process.getuid());
+  const getgid = io.getgid ?? (() => process.getgid());
+  const operator = { uid: Number(getuid()), gid: Number(getgid()) };
+  const root = String(layout?.root ?? "");
+  const rootLabel = root || "<PIGO_DEMO_WORKSPACE_ROOT>";
+
+  const hint =
+    `grant write access to BOTH the worker (uid ${WORKER_UID} gid ${WORKER_GID}) and the operator (uid ${operator.uid} gid ${operator.gid}) on ${rootLabel}: ` +
+    `e.g. \`chown -R ${operator.uid}:${operator.gid} ${rootLabel} && chmod -R 777 ${rootLabel}\` (the state the demo server ended up in). ` +
+    `\`chown -R ${WORKER_UID}:${WORKER_GID} ${rootLabel}\` alone is NOT sufficient unless the operator is also covered by owner/group/mode.`;
+
+  if (!root) {
+    return {
+      ok: false,
+      problems: ["PIGO_DEMO_WORKSPACE_ROOT is unset — the workspace root cannot be inspected"],
+      detail: "cannot inspect the workspace tree: PIGO_DEMO_WORKSPACE_ROOT is unset",
+      hint,
+    };
+  }
+
+  const sameIdentity = operator.uid === WORKER_UID && operator.gid === WORKER_GID;
+  const identities = sameIdentity
+    ? [{ label: `worker=operator (uid ${WORKER_UID} gid ${WORKER_GID})`, uid: WORKER_UID, gid: WORKER_GID }]
+    : [
+        { label: `worker (uid ${WORKER_UID} gid ${WORKER_GID})`, uid: WORKER_UID, gid: WORKER_GID },
+        { label: `operator (uid ${operator.uid} gid ${operator.gid})`, uid: operator.uid, gid: operator.gid },
+      ];
+
+  const directories = [root, path.join(root, WORKSPACE_PROJECTS_DIRNAME), path.join(root, WORKSPACE_RUNS_DIRNAME)];
+  const problems = [];
+  const uninspectable = [];
+  const owners = [];
+  const writableBy = identityLabelList(identities);
+
+  for (const dir of directories) {
+    let stats;
+    try {
+      stats = stat(dir);
+    } catch (error) {
+      uninspectable.push(`${dir} (${error?.code ?? error?.message ?? "stat failed"})`);
+      continue;
+    }
+    for (const identity of identities) {
+      const verdict = workspacePermissionVerdict(stats, identity);
+      if (!verdict.writable) problems.push(`${dir}: ${identity.label} cannot write — owner ${verdict.owner}`);
+      if (!owners.includes(verdict.owner)) owners.push(verdict.owner);
+    }
+  }
+
+  const allProblems = [...problems, ...uninspectable.map((entry) => `cannot inspect ${entry}`)];
+  if (allProblems.length > 0) {
+    return { ok: false, problems: allProblems, detail: allProblems.join("; "), hint };
+  }
+  return {
+    ok: true,
+    problems: [],
+    detail: `${directories.length} dir(s) writable by ${writableBy}: ${directories.join(", ")} [${owners.join(", ")}]`,
+    hint,
+  };
+}
+
+function identityLabelList(identities) {
+  return identities.map((identity) => identity.label).join(" + ");
 }
 
 /**
@@ -1040,6 +1178,12 @@ function cmdDoctor(_argv) {
     layoutMissing.length === 0 ? `${layout.projects} + ${layout.runs}` : `missing ${layoutMissing.join(", ")}`,
     "scripts/demo-env.sh up creates <PIGO_DEMO_WORKSPACE_ROOT>/projects and /runs; ensure the worker (uid 1000) can write them",
   );
+
+  // Ownership/permissions are their own failure mode: the container can create
+  // <root>, projects/ and runs/ as uid 1000, after which the HOST operator
+  // cannot modify the tree. Both identities must be able to write.
+  const permissions = workspacePermissionsCheck(layout);
+  record(WORKSPACE_PERMISSIONS_CHECK, permissions.ok, permissions.detail, permissions.hint);
 
   const resolved = resolvedConfig(env, envFile);
   record("compose-config", resolved.ok, resolved.ok ? "resolved" : resolved.error, "check every ${VAR:?} in the demo env file; then `docker compose config`");
