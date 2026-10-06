@@ -12,7 +12,9 @@ import { configStatus, expect, stopRun, test, trackPageErrors } from "./fixtures
  * - the runs-list failure handler has no dedicated error banner (the shell just
  *   renders the empty/overview state), and
  * - the app has no addressable run URL or dedicated "not found" view; a failed
- *   run-detail load degrades to the overview state.
+ *   run-detail load falls back to the complete snapshot already returned by
+ *   `/api/runs`, so the selected run remains readable while subresources stay
+ *   empty.
  * The assertions below pin that observable behaviour instead of inventing a
  * selector that does not exist.
  */
@@ -131,11 +133,12 @@ test.describe("read-path error states", () => {
     await expect(page.getByRole("heading", { name: "工作区" })).toBeVisible();
   });
 
-  test("a 404 on every run detail resource degrades to the overview state", async ({ page, request }) => {
+  test("a 404 on every run detail resource falls back to the run-list snapshot", async ({ page, request }) => {
     const config = await configStatus(request);
     test.skip(!config.demoMode, "Demo mode is disabled; this test needs a run to select.");
 
-    const created = await request.post("/api/runs", { data: demoRunPayload(`E2E 404 ${Date.now()}`) });
+    const title = `E2E 404 ${Date.now()}`;
+    const created = await request.post("/api/runs", { data: demoRunPayload(title) });
     expect(created.ok()).toBeTruthy();
     const runId = ((await created.json()) as { id: string }).id;
 
@@ -143,16 +146,17 @@ test.describe("read-path error states", () => {
       await failAllRunDetails(page, 404);
       await page.goto("/");
 
-      // No run payload can be loaded, so no detail renders; the console shows the
-      // overview instead of crashing or rendering a broken half-page.
-      await expect(page.locator(".welcome-state")).toBeVisible({ timeout: 20_000 });
-      await expect(page.locator(".run-heading")).toHaveCount(0);
+      // The dedicated detail/subresource requests fail, but `/api/runs` already
+      // returned a complete Run snapshot. The console keeps that selected-run
+      // shell visible instead of crashing or jumping to an unrelated overview.
+      await expect(page.locator(".run-heading")).toBeVisible({ timeout: 20_000 });
+      await expect(page.getByRole("heading", { name: title })).toBeVisible();
       await expect(page.locator(".brand")).toContainText("PiGO");
 
-      // The sidebar still lists the run from /api/runs, but selecting it must not
-      // wedge the UI: the overview stays and navigation keeps working.
+      // Selecting the same list snapshot must not wedge the UI; navigation keeps
+      // working even though every detail subresource still fails.
       await page.locator(".run-item-main").first().click();
-      await expect(page.locator(".run-heading")).toHaveCount(0);
+      await expect(page.locator(".run-heading")).toBeVisible();
       await page.getByRole("button", { name: "模型与凭据" }).click();
       await expect(page.getByRole("heading", { name: "模型与凭据" })).toBeVisible();
     } finally {
@@ -164,7 +168,8 @@ test.describe("read-path error states", () => {
     const config = await configStatus(request);
     test.skip(!config.demoMode, "Demo mode is disabled; this test needs a run to select.");
 
-    const created = await request.post("/api/runs", { data: demoRunPayload(`E2E errors ${Date.now()}`) });
+    const title = `E2E errors ${Date.now()}`;
+    const created = await request.post("/api/runs", { data: demoRunPayload(title) });
     expect(created.ok()).toBeTruthy();
     const runId = ((await created.json()) as { id: string }).id;
 
@@ -172,7 +177,7 @@ test.describe("read-path error states", () => {
       const pageErrors = trackPageErrors(page);
       await failAllRunDetails(page, 500);
       await page.goto("/");
-      await expect(page.locator(".welcome-state")).toBeVisible({ timeout: 20_000 });
+      await expect(page.getByRole("heading", { name: title })).toBeVisible({ timeout: 20_000 });
       // Give the swallowed fetch failures time to settle.
       await page.waitForTimeout(1_500);
       expect(pageErrors, `uncaught page errors: ${pageErrors.join(" | ")}`).toEqual([]);
