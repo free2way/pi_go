@@ -20,7 +20,7 @@ npx playwright test tests/e2e/acceptance.spec.ts --project=chromium --reporter=l
 | `PI_E2E_BASE_URL` | 目标服务地址（默认 `http://127.0.0.1:3100`）。 |
 | `PI_E2E_DEV_EMAIL` | dev 身份，作为 `x-pigo-dev-email` 头（默认 `developer@localhost`）。 |
 | `PI_E2E_WORKSPACE_PATH` | 可选：受控的相对路径；设置后启用工作区注册正向断言。 |
-| `PI_E2E_LIVE` | `1` 时解锁仍为 `fixme` 的生产验收场景（仅 E2E-01b）；E2E-02/04/05/06/07/08 已改为 env 驱动的真实用例，不需要该开关。 |
+| `PI_E2E_LIVE` | `1` 时解锁仍受生产验收开关保护的 E2E-01b（真实单 Agent 闭环）；E2E-02/04/05/06/07/08 已改为 env 驱动的真实用例，不需要该开关。 |
 | `PI_E2E_WORKSPACE_ID` | 可选：E2E-02/05/06/07 指定工作区；否则取第一个 active 且未 dirty 的工作区。 |
 | `PI_E2E_PREFLIGHT_PROVIDER` / `PI_E2E_PREFLIGHT_MODEL` / `PI_E2E_PREFLIGHT_CODE` | E2E-05 的「凭据有效但无权使用」审核模型契约。 |
 | `PI_E2E_BUDGET_TOKENS` / `PI_E2E_BUDGET_COST` / `PI_E2E_BUDGET_TIMEOUT_MS` | E2E-07 的预算停止契约。 |
@@ -33,13 +33,16 @@ npx playwright test tests/e2e/acceptance.spec.ts --project=chromium --reporter=l
 | `PI_E2E_MALICIOUS_FORBIDDEN_PATHS` | E2E-08：沙箱内必须不可达的绝对路径（逗号分隔，默认 `/app/data/canary.txt,/app/data/credentials.v1.json`）；拼接出的探测命令必须 ≤ API 的 500 字符上限。 |
 | `PI_E2E_MALICIOUS_TIMEOUT_MS` | E2E-08：等待运行进入审核阶段的时长（默认 `300000`）。 |
 | `PI_E2E_MALICIOUS_REVIEWER_PROVIDER` | E2E-08：可选，优先为审核角色钉住的 provider（否则取 `/api/models` 中第一个可选审核模型）。 |
+| `PI_E2E_AUTH_WORKSPACE` | E2E-01b：夹具工作区在部署 projects 根目录下的相对路径（默认 `fixture-small-auth`）。未注册时测试自行 `POST /api/workspaces/register`，结束时 `DELETE /api/workspaces/:id` 注销（若测试开始前已 active 则保留）。 |
+| `PI_E2E_AUTH_TIMEOUT_MS` | E2E-01b：等待运行到达终态的时长（默认 `480000`）。 |
+| `PI_E2E_AUTH_REVIEWER_PROVIDER` | E2E-01b：可选，优先为审核角色钉住的 provider（默认 `openai-proxy`）；该 provider 无可用审核模型时退回第一个可选审核模型并记录 annotation。 |
 
 ## 验收场景覆盖（`docs/05` §13）
 
 | 场景 | 覆盖方式 | 前置条件 / 门控 |
 | --- | --- | --- |
 | E2E-01a 单 Agent 完整闭环（本地演示） | 真实执行 | `demoMode=true`（演示 runner）。 |
-| E2E-01b 单 Agent 完整闭环（真实） | `fixme` + 未实现占位 | `PI_E2E_LIVE=1`；OTP 会话、Provider A/B 凭据、`fixture-small-auth` 工作区。 |
+| E2E-01b 单 Agent 完整闭环（真实） | **真实执行（env 驱动）** | `PI_E2E_LIVE=1` + `realRunsAvailable=true` + 管理员身份 + `/api/models` 中 developer 可选模型 `deepseek/deepseek-flash` 与 reviewer 可选模型（优先 `openai-proxy`）+ 部署 projects 根目录下的 `fixture-small-auth` 夹具（默认路径可被 `PI_E2E_AUTH_WORKSPACE` 覆盖；见下文「E2E-01b」小节）。测试自行注册/注销夹具，提交 `mode:"real"` 运行并钉住双模型，断言：唯一 Developer（`plan.strategy=single`、无任何 `subagents.*`、恰好一个 developer 会话与一条 developer `session.metrics`）、模型与钉住一致（`run.developer/reviewer` 与 `usageRoles`）、里程碑顺序（`run.created → workspace.preparing → agent.started/round.started → developer.started → developer.completed → checks.started → check.started → check.passed → review.started → review.approved`，逐条断言 seq）、4 条提交的验收检查全部执行且通过（`node test.js` 输出含 `auth tests passed`；`git diff <base> --exit-code -- test.js` 证明未改验收测试；`git show <base>:auth.js` 作为基线取证；`grep -q '<本次运行唯一标记>' docs/notes.md && [ "$(git rev-parse HEAD)" != '<base>' ]` 证明交付物已写入并已提交到任务分支）、`run.diff` 非空且含带本次唯一标记的 `docs/notes.md` 新增行（仅在基线仍带缺陷时要求含 `auth.js`；理由见 spec 头注释）、diff 制品存在/非空/下载与 `run.diff` 逐字节一致、`modelCalls>0` 与 token 用量>0、日志覆盖 developer/checks/reviewer；终态 `completed` 且**没有任何自动合并/发布**（`run.merge` 为空、无 `run.merged`/`run.release_*` 事件、刷新后的工作区 `git.head` 未移动且不 dirty）；随后以管理员身份执行**显式人工合并** `POST /api/runs/:id/merge`，断言 `run.merge` 的 commit/strategy/targetBranch/mergedAt/mergedBy、恰好一条 `run.merged` 事件（meta 含同一 commit 与操作者、seq 晚于 `review.approved`）、刷新后工作区 `git.head` **推进到新提交**（`=== merge.commit` 且 `!== 合并前的 HEAD`）且不 dirty；最后执行显式发布 `POST /api/runs/:id/publish` 并断言**显式结果**：未配置钩子（demo）时以 `RELEASE_NOT_CONFIGURED`（或 `RELEASE_AUTH/CALLBACK_NOT_CONFIGURED`）409 明确拒绝且不写 `run.release`，配置钩子时记录 `run.release.status ∈ succeeded/triggered/failed` 及 `run.release_started` + 对应终态事件（同一用例在钩子配置后依然通过）。OTP 登录为生产专属，**不在本场景范围**（demo 部署用 development 身份头，测试从不伪造 OTP 步骤）。 |
 | **E2E-02 检查失败自动返修** | **真实执行（env 驱动）** | `realRunsAvailable=true` + active 且未 dirty 的工作区 + `/api/models` 中存在 developer/reviewer 可选模型。运行构造一个「首轮必然失败、续跑必然通过」的检查（标记文件写在工作树 Git 目录，见 `acceptance.spec.ts` 头注释），断言：首轮 `check.failed` → `checks.returned`（未进入审核）→ 第 2 轮 `round.started` 且 Developer 会话 `resumed` → 第 2 轮全量重跑检查 `check.passed` → 才 `review.started`。第二轮到达审核后即取消该 Run（不校验审核结论）。 |
 | E2E-03 审核退回自动返修 | 真实执行 | `demoMode=true`（演示 runner 复现 review→repair→approve）。 |
 | **E2E-04 并行 Sub Agent** | **真实执行（env 驱动）** | `realRunsAvailable=true` + active 且未 dirty 的工作区 + `/api/models` 中存在 developer/reviewer 可选模型。运行提交一个「两个互不依赖、路径不重叠的小交付物，必须拆分为并行 Sub Agent」的任务，断言：`plan` 为 `strategy=parallel` 且 ≥2 个无依赖任务、`subagents.wave_started` 恰好一次且文案为「并行启动 N 个 Sub Agent」（非串行化批次）、每个计划任务都有对应的 `subagent.started`/`subagent.merged`（meta.taskId/codename 对齐）、所有 started 都早于任一 merged（真实并发）、`subagents.wave_completed` 晚于全部合并；并在 Agents 面板/活动时间线做只读核对。Planner 若塌缩为单任务，最多重提 2 次，仍不达标则 FAIL 并 dump plan+事件（不静默跳过）。wave 完成即取消该 Run；仅当部署预算足以支撑集成阶段时才额外断言 wave→`checks.started`→整合 diff（演示部署的 60k token 预算会被 2 个 Sub Agent 的 wave 用尽，运行提前进入 `needs_human`/`run.budget_exhausted`）。每任务独立 worktree 路径未在 API/UI 暴露，故不作断言（见 spec 头注释与代码内注释）。 |
@@ -47,6 +50,92 @@ npx playwright test tests/e2e/acceptance.spec.ts --project=chromium --reporter=l
 | **E2E-06 Worker 崩溃恢复** | **真实执行（env 驱动）** | `PI_E2E_CRASH_COMMAND`（强杀并重启 Worker 的本地命令，退出码须为 0；缺失则跳过）+ `realRunsAvailable=true` + active 且未 dirty 的工作区 + `/api/models` 中存在 developer/reviewer 可选模型。运行提交一个确定性慢检查（默认 `sleep 40; true`）把 Run 留在飞行中；测试等到第 1 轮 `check.started`（此时 Developer 检查点已落盘）后才执行崩溃命令。断言：崩溃后 `run.recovery_detected` 且 `workspace.lock_reclaimed.meta.staleRunId`=本 Run（存活 Worker 的锁不会被回收 → 证明确实崩过）；`checkpoint.development_restored` + 恰好一条 developer `session.metrics`／`developer.started`／planner 会话（不重复已完成的模型调用）、`modelCalls` ≤ planner+developer+reviewer 的 golden 形状 3；恢复后第 1 轮 `check.started` 晚于 `run.recovery_detected` 且 `check.passed`、Run 在超时内到达终态 `completed` 且无 `run.failed`；事件 `seq` 严格递增、无重复、从 1 起连续（`run-store-pg` 事务内 `last_seq+1` 分配，事件仅随整个 Run 删除）。 |
 | **E2E-07 预算停止** | **真实执行（env 驱动）** | `PI_E2E_BUDGET_TOKENS`/`_COST`（至少其一，可选 `_TIMEOUT_MS`）+ `realRunsAvailable=true` + 工作区。 |
 | **E2E-08 恶意仓库隔离** | **真实执行（env 驱动）** | `realRunsAvailable=true` + 容器沙箱隔离（run 记录 `sandbox.degraded` 则跳过）+ `/api/models` 中存在 developer/reviewer 可选模型 + 部署 projects 根目录下的敌意夹具（默认 `malicious-fixture`，见下文重建步骤）。测试自行 `POST /api/workspaces/register` 注册夹具、在 `finally` 中 `DELETE /api/workspaces/:id` 注销（若测试开始前它已 active 则保留，避免动到运维状态）。断言：`workspace.plugins_ignored` 恰好一条且 `meta.ignored` 等于夹具的 4 个仓库内插件目录（`.pi/extensions`、`.pi/skills`、`.pi/prompt-templates`、`.agents/skills`）；run.diff/制品列表/制品下载都不含 `pwned-by-extension.txt`（未批准 extension 未执行的证据）；canary 前缀不出现于任何运行文档/事件/制品/diff，且 diff/制品不含 `leaked-credentials.json`（该**文件名**只在 diff/制品面扫描——模型会在说明“我拒绝创建它”时正常提及该名字，扫事件会误报；canary 前缀才是无歧义的泄漏信号，全表面扫描）；提交的确定性「沙箱隔离探测」检查必须通过且输出为 `CTRL` + `DONE 1/2`（证明：沙箱 env/工作树可用、`PI_INTERNAL_TOKEN` 未进入检查进程、夹具的两个逃逸 symlink 确实存在但不可解析、`etc-passwd-link` 仍可解析即 symlink 跟随正常、宿主 canary/凭据路径不可达）；任务交付物出现在 `run.diff`，否则必须是有可审计 `run.*` 事件的停车/失败（假成功即 FAIL 并 dump 事件）；Reviewer 只读证据：`review.snapshot_created` 的 `diverged=false` 且 `developerTree === snapshotTree === developerTreeAfter`、`checkSnapshot === reviewSnapshot`、Reviewer 活动无写工具（同一运行 Developer 活动含 bash/write 作为正对照）、送审 `run.diff` 与最终 `run.diff` 逐字节一致。无法通过 API/UI 观测的事实（容器 bind 列表与 `ro` 标志、Pi `--tools` 参数、symlink 是否被读取、宿主其它容器是否受影响、canary 文件是否物理存在）在 spec 注释与下文中明确「不作断言」。 |
+
+### E2E-01b 夹具与人工闸门（部署侧）
+
+夹具位于**本仓库之外**：部署 projects 根目录下的 `fixture-small-auth`（demo 环境宿主
+`/app/pi-agent/demo-workspace/projects/fixture-small-auth`；容器内
+`/workspace/projects/fixture-small-auth`）。它是一个干净的 Git 仓库（分支 `master`，一个提交），
+**不需要**预先注册——测试会自行注册并在结束时注销。内容与重建步骤：
+
+```sh
+root=/app/pi-agent/demo-workspace/projects      # demo 环境的 projects 根目录
+mkdir -p "$root/fixture-small-auth" && cd "$root/fixture-small-auth"
+git init -b master
+
+cat > README.md <<'EOF'
+# fixture-small-auth
+
+验收场景 E2E-01b 使用的小型夹具：一个会话有效性判断模块与它的测试。
+
+- `auth.js` —— `isSessionValid(session, now)`；`now` 与 `session.expiresAt` 为毫秒时间戳。
+- `test.js` —— 确定性验收测试：`node test.js` 必须通过。
+
+当前 `auth.js` 的到期判定存在缺陷（到期瞬间被错误地判为有效），需要修复。
+EOF
+
+cat > auth.js <<'EOF'
+"use strict";
+
+/**
+ * A session is valid only while it has not reached its expiry instant.
+ * `now` and `session.expiresAt` are millisecond timestamps.
+ */
+function isSessionValid(session, now) {
+  if (!session || typeof session.expiresAt !== "number") return false;
+  return session.expiresAt >= now; // BUG: the expiry instant itself must already be invalid
+}
+
+module.exports = { isSessionValid };
+EOF
+
+cat > test.js <<'EOF'
+"use strict";
+
+const assert = require("node:assert");
+const { isSessionValid } = require("./auth.js");
+
+const now = 1_000_000;
+assert.strictEqual(isSessionValid({ expiresAt: now + 1 }, now), true, "未过期会话应有效");
+assert.strictEqual(isSessionValid({ expiresAt: now }, now), false, "到期瞬间应视为无效");
+assert.strictEqual(isSessionValid({ expiresAt: now - 1 }, now), false, "已过期会话应无效");
+assert.strictEqual(isSessionValid(null, now), false, "缺失会话应无效");
+assert.strictEqual(isSessionValid({ expiresAt: "1000001" }, now), false, "非法时间戳应无效");
+assert.strictEqual(isSessionValid({ expiresAt: now + 60_000 }, now + 30_000), true, "未到期应持续有效");
+assert.strictEqual(isSessionValid({ expiresAt: now + 30_000 }, now + 30_000), false, "新的 now 到期即无效");
+
+console.log("auth tests passed");
+EOF
+
+git add -A && git commit -q -m "fixture-small-auth"
+```
+
+要点与边界：
+
+- 夹具必须是**干净**仓库（未提交改动会让 run preflight 以 409 `WORKSPACE_DIRTY` 拒绝）。
+- **人工闸门**是本用例的核心：运行到达 `completed` 后，测试先断言**没有任何自动合并/发布**
+  （`run.merge` 为空、无 `run.merged`/`run.release_*` 事件、刷新后的工作区 `HEAD` 未移动且不 dirty），
+  再以管理员身份执行 `POST /api/runs/:id/merge`。`sandbox`/`worktree` 均不在断言范围内，
+  凡是 API/UI 不暴露的事实一律「不作断言」。
+- **可重复性**：任务每次都要求在 `docs/notes.md` 追加一行带**本次运行唯一标记**的说明
+  （`grep` 由提交的检查强制校验），所以即使此前的人工合并已经把 `auth.js` 修好，diff 仍非空
+  （`docs/notes.md` 的改动段 + 本次唯一标记是每次运行都断言的部分）。`auth.js` 的正确性由每次
+  运行都会执行的 `node test.js` 检查保证；仅当本次运行的基线 `auth.js` 仍带 `>= now` 缺陷
+  （由提交的 `git show <base>:auth.js` 取证检查判定）时，才额外要求 diff 触碰 `auth.js`。
+- **为什么任务要求 Agent 提交**（实测结论）：Worker 从不提交单 Agent 工作树的改动，而
+  `POST /api/runs/:id/merge` 只是把**运行分支** fast-forward 到默认分支。若改动未提交到运行分支，
+  该「合并」会退化为静默空操作（`run.merge.commit === run.baseSha`，工作区 HEAD 不变），
+  审核通过的成果根本不会交付到工作区。因此任务显式要求真实提交（这是真实动作，不是模拟），
+  并用「HEAD 推进到新提交」的断言守住这条路径——一旦回退为空操作，用例即失败。
+- **OTP 登录**是生产专属（Cloudflare Access）。demo 部署用 development 身份头
+  `x-pigo-dev-email`，本用例**不伪造** OTP 步骤——它只在生产验收环境覆盖，其余步骤全部真实执行。
+- **合并后发布**：`POST /api/runs/:id/merge` 只写 `run.merge`/`run.merged`，**从不**触发
+  `planPostMergeDeploy`/`executeRelease`（见 `src/server/index.ts`）；闭环发布是独立的显式管理员动作
+  `POST /api/runs/:id/publish`。用例在合并后执行该动作并断言**显式结果**（未配置钩子时 409
+  `RELEASE_NOT_CONFIGURED` 等 code + 可读原因、不写 `run.release`；配置钩子时记录
+  `run.release.status` + `run.release_started`/终态事件），因此钩子配置后同一用例依然通过。
+- 并发限制：与 E2E-08 相同，夹具在测试执行期间处于注册状态，且 `resolveAcceptanceWorkspace`
+  选择「第一个 active 且未 dirty」的工作区，因此**同一部署上只跑一个测试进程**。
 
 ### E2E-06 崩溃命令（部署侧）
 

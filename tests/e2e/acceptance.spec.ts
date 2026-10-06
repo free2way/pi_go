@@ -8,19 +8,40 @@ import { E2E_LIVE_ACCEPTANCE, configStatus, expect, openRunByTitle, stopRun, tes
  *
  * Each scenario has one `test.describe`. Where the current dev-auth / local
  * harness can safely drive the flow (demo runner, seeded run), the test is
- * implemented and runs. The only remaining `fixme` is E2E-01b, which needs the
- * production-only Cloudflare OTP flow; it is enabled only in a live acceptance
- * environment via `PI_E2E_LIVE=1`.
+ * implemented and runs.
  *
- * E2E-02 (check failure → automatic repair), E2E-04 (parallel sub-agents),
- * E2E-05 (provider preflight), E2E-06 (Worker crash recovery), E2E-07 (budget
- * stop) and E2E-08 (hostile repository isolation) are *real* tests: they no
- * longer use `fixme`. Each one is
- * driven entirely by environment variables and either runs its assertions or
+ * E2E-01b (single-agent closed loop, real), E2E-02 (check failure → automatic
+ * repair), E2E-04 (parallel sub-agents), E2E-05 (provider preflight), E2E-06
+ * (Worker crash recovery), E2E-07 (budget stop) and E2E-08 (hostile repository
+ * isolation) are *real* tests: none of them uses `fixme`/`skip` as a placeholder.
+ * E2E-01b keeps the `PI_E2E_LIVE=1` gate (shared by the §13 scenarios that need a
+ * declared live acceptance environment) and is otherwise entirely env-driven like
+ * the others. Each one either runs its assertions or
  * skips with a precise, actionable reason. That means the acceptance gate still
  * FAILs while such a scenario is skipped — the gate's
  * `PI_E2E_ALLOW_REQUIRED_SKIPS=1` + `..._REASON` override (or a fully configured
  * environment) is the honest way to handle that, never a silent pass.
+ *
+ * ---------------------------------------------------------------------------
+ * E2E-01b — 单 Agent 真实完整闭环: environment contract
+ * ---------------------------------------------------------------------------
+ *   PI_E2E_LIVE=1             (required) unlock this scenario (shared §13 gate).
+ *   PI_E2E_AUTH_WORKSPACE     (optional) relative path of the staged fixture under
+ *                             the deployment's projects root, default
+ *                             `fixture-small-auth`.
+ *   PI_E2E_AUTH_TIMEOUT_MS    (optional) how long to wait for the run to reach its
+ *                             terminal state, default 480000 (8 min).
+ *   PI_E2E_AUTH_REVIEWER_PROVIDER (optional) provider preferred for the reviewer
+ *                             pin, default `openai-proxy`.
+ *   The developer role is pinned to `deepseek/deepseek-flash` and the reviewer to
+ *   the first reviewer-selectable OpenAI-proxy model, so the two roles are
+ *   explicitly pinned and (whenever the catalogue allows) come from different
+ *   providers. OTP login is production-only (Cloudflare Access): the demo
+ *   deployment authenticates with the development identity header
+ *   (`x-pigo-dev-email`), so no OTP step is simulated — it is documented as out of
+ *   scope and covered only by the production acceptance environment, while every
+ *   other step of the scenario runs for real. The fixture is registered on demand
+ *   and unregistered in `finally` unless it was already active (E2E-08 pattern).
  *
  * ---------------------------------------------------------------------------
  * E2E-02 — 检查失败自动返修: environment contract
@@ -203,11 +224,6 @@ function requireLiveAcceptance(reason: string): void {
   test.fixme(!E2E_LIVE_ACCEPTANCE, `${LIVE_REASON_PREFIX} 前置条件：${reason}`);
 }
 
-/** Marker used by not-yet-implemented live scenarios so enabling LIVE cannot pass falsely. */
-function notImplementedYet(scenario: string, steps: string): void {
-  test.skip(true, `${scenario} 尚未实现：${steps}`);
-}
-
 async function createDemoRun(request: APIRequestContext, title: string) {
   const response = await request.post("/api/runs", {
     data: { title, task: DEMO_TASK, repository: "demo/auth-service", mode: "demo" },
@@ -231,6 +247,8 @@ type AcceptanceRun = {
   state: string;
   /** Workspace the run was submitted against (E2E-08 pins it to the hostile fixture). */
   workspaceId?: string;
+  /** Base commit the run's worktree was created from (E2E-01b baseline). */
+  baseSha?: string;
   round?: number;
   maxRounds?: number;
   summary?: string;
@@ -245,11 +263,53 @@ type AcceptanceRun = {
   /** Content snapshot hash the latest review verdict applies to (AUD-04). */
   reviewSnapshot?: string;
   checks?: Array<{ id?: string; command: string; status: string; exitCode?: number; output?: string }>;
+  /** Pinned per-role model selection recorded on the run (E2E-01b). */
+  developer?: { provider: string; model: string };
+  reviewer?: { provider: string; model: string };
   /** Per-role CLI session summary (Sprint 2); `resumed` marks a reused session. */
   sessions?: Array<{ sessionId: string; role: string; rounds: number[]; calls?: number; resumed: boolean }>;
   budget?: { maxTokens: number; maxCostUsd: number; maxModelCalls: number; maxDurationSeconds: number };
   /** Planner output surfaced on the run document (E2E-04). */
   plan?: AcceptancePlan;
+  /** Frozen token/cost totals (E2E-01b usage evidence). */
+  usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number; estimatedCost?: number };
+  /** Per-role model actually used (`planner`/`developer`/`reviewer`), E2E-01b. */
+  usageRoles?: Array<{ role: string; provider: string; model: string; calls?: number }>;
+  /** Durable admin-merge record, absent until a human merges (E2E-01b). */
+  merge?: AcceptanceMergeRecord | null;
+  /** Durable explicit release record, absent until an admin publishes (E2E-01b). */
+  release?: AcceptanceReleaseRecord | null;
+};
+/** `RunMergeRecord` (src/shared/types.ts) — written only by the admin merge path. */
+type AcceptanceMergeRecord = {
+  commit: string;
+  strategy: "fast-forward" | "merge-commit";
+  targetBranch: string;
+  mergedAt: string;
+  mergedBy: string;
+};
+/** `RunReleaseRecord` (src/shared/types.ts) — written only by the explicit publish path. */
+type AcceptanceReleaseRecord = {
+  deliveryId: string;
+  status: "publishing" | "triggered" | "succeeded" | "failed";
+  environment: string;
+  commit: string;
+  targetBranch: string;
+  requestedBy: string;
+  startedAt: string;
+  finishedAt?: string;
+  attempt: number;
+  kind: "webhook" | "command";
+  detail?: string;
+};
+/** Subset of `Workspace` this spec reads (git metadata + merge target). */
+type AcceptanceWorkspace = {
+  id: string;
+  name: string;
+  rootPath: string;
+  status: string;
+  defaultBranch: string | null;
+  git: { branch: string | null; head: string | null; dirty: boolean } | null;
 };
 type AcceptancePlan = {
   complexity: string;
@@ -383,6 +443,189 @@ async function cancelIfActive(request: APIRequestContext, runId: string): Promis
 }
 
 // ---------------------------------------------------------------------------
+// E2E-01b — 单 Agent 真实完整闭环: environment contract
+// ---------------------------------------------------------------------------
+//   PI_E2E_LIVE=1                 (required) unlock this scenario; like the other
+//                                 §13 scenarios it is `fixme` until an operator
+//                                 declares a live acceptance environment.
+//   PI_E2E_AUTH_WORKSPACE         (optional) relative path of the staged fixture
+//                                 under the deployment's projects root, default
+//                                 `fixture-small-auth`.
+//   PI_E2E_AUTH_TIMEOUT_MS        (optional) how long to wait for the run to reach
+//                                 its terminal state, default 480000 (8 min).
+//   PI_E2E_AUTH_REVIEWER_PROVIDER (optional) provider preferred for the reviewer
+//                                 pin, default `openai-proxy`; when that provider
+//                                 has no reviewer-selectable model the first
+//                                 selectable reviewer model is used instead (the
+//                                 spec records the fallback as an annotation).
+//
+// OTP 登录 is deliberately NOT simulated (docs/25: the demo deployment authenticates
+// with the development identity header `x-pigo-dev-email`, production uses Cloudflare
+// Access OTP). Faking an OTP step would prove nothing, so it is explicitly out of
+// scope here and covered only by the production acceptance environment; every other
+// step of the scenario runs for real. The scenario therefore asserts the identity it
+// actually got (`/api/me.isAdmin`, needed for the admin-only merge) and never pretends
+// an OTP exchange happened.
+//
+// The run is submitted with `mode:"real"` against the fixture, both roles pinned from
+// `/api/models` (developer `deepseek/deepseek-flash`; reviewer = first OpenAI-proxy
+// reviewer model, so the two roles come from different providers whenever the
+// catalogue allows it). The fixture is registered on demand and unregistered in
+// `finally` unless it was already active (same pattern as E2E-08, for the same
+// reason: `resolveAcceptanceWorkspace` picks the newest active workspace).
+//
+// The human gate is the explicit, admin-only merge (`POST /api/runs/:id/merge`).
+// The spec first proves that NOTHING auto-merged: `run.merge` absent, no
+// `run.merged` event, the workspace default branch's head unchanged and not dirty.
+// It then performs the merge as the authenticated admin and asserts the auditable
+// record (commit/strategy/targetBranch/mergedAt/mergedBy + `run.merged` event +
+// the workspace head ADVANCED to that commit, i.e. not the pre-run head).
+//
+// Why the task asks the agent to commit its work (verified live): the worker never
+// commits a single-agent worktree, and `POST /runs/:id/merge` merely fast-forwards
+// the run BRANCH into the default branch. With uncommitted changes the branch still
+// points at the base commit, so the "merge" is a silent no-op
+// (`run.merge.commit === run.baseSha`, workspace HEAD unchanged) and the reviewed
+// work never reaches the workspace. The task therefore requires a real commit on the
+// run branch so the human merge is a genuine fast-forward; the advancement assertion
+// above is what catches a regression back to the no-op behaviour.
+//
+// Post-merge deploy/release outcome: verified against src/server/index.ts — the
+// merge path (`mergeCompletedRun` → `coordinateApprovedMerge`) writes ONLY
+// `run.merge` + `run.merged`; it never invokes `planPostMergeDeploy`/`executeRelease`.
+// The closed-loop deploy is the SEPARATE explicit admin action
+// (`POST /api/runs/:id/publish`, which is where `planPostMergeDeploy` is consulted).
+// So the spec performs that explicit action after the merge and asserts an explicit
+// outcome either way, never a silent absence:
+//  - hook unset (demo: PI_POST_MERGE_DEPLOY_HOOK is unset) → HTTP 409 with code
+//    RELEASE_NOT_CONFIGURED (or RELEASE_AUTH/CALLBACK_NOT_CONFIGURED) and the
+//    server's own reason, with no release record written;
+//  - hook configured → HTTP 200 with `run.release.status` ∈
+//    succeeded|triggered|failed, commit === merge.commit, plus `run.release_started`
+//    and the matching terminal `run.release_succeeded|triggered|failed` event.
+// This keeps the SAME test green once the release hook is configured.
+//
+// Repeatability: the task always appends a line containing a per-run unique marker to
+// `docs/notes.md` (grep-verified by a submitted check), so the run has a non-empty diff
+// even after a previous run's human merge already fixed `auth.js`. The auth.js fix
+// itself is asserted through the run's mandatory `node test.js` check (which encodes
+// the expiry-instant rule) and, when the run's base still carried the defect, through
+// the diff; the submitted `git show <base>:auth.js` probe check records which of the
+// two cases this run was, so the diff assertion is never vacuous and never presumptuous.
+// ---------------------------------------------------------------------------
+
+/**
+ * Task text for E2E-01b: fix the expiry boundary, do not touch the test, append a
+ * per-run note line and commit on the run branch.
+ *
+ * `marker` is unique per run and is BOTH written into the task (so the developer
+ * must append exactly that line to `docs/notes.md`) and grep-verified by a submitted
+ * check. That is what makes the diff non-empty on every run — including runs whose
+ * base already carries the auth.js fix from an earlier merge — so the scenario stays
+ * repeatable without asserting a diff the run cannot produce.
+ */
+function e2e01bTask(marker: string): string {
+  return [
+    "修复本仓库 auth.js 中的会话到期判定缺陷：isSessionValid(session, now) 必须在「到期瞬间」（now === session.expiresAt）返回 false，未到期返回 true；保持函数签名与模块导出不变。",
+    "运行 node test.js 必须通过；不得修改 test.js（它是验收测试）。",
+    `本次运行的强制交付物（无论 auth.js 是否已正确都必须执行）：在 docs/notes.md 末尾追加一行，内容为 \`- ${marker} 复核 isSessionValid 到期判定\`；docs/ 目录或该文件不存在时创建它。`,
+    "把本次改动提交到当前任务分支（工作树根目录执行：git add -A && git -c user.name=PiGO -c user.email=agent@pigo.local commit -m \"fix: session expiry boundary\"）；未提交到任务分支即视为未交付。",
+    "不要修改其它文件，不要新增依赖，不要 push。",
+  ].join("\n");
+}
+
+const E2E01B_DEFAULT_FIXTURE = "fixture-small-auth";
+/** Developer pin: the deployment's verified DeepSeek Flash (docs/25 demo stack). */
+const E2E01B_DEVELOPER_PROVIDER = "deepseek";
+const E2E01B_DEVELOPER_MODEL = "deepseek-flash";
+/** Reviewer pin: first reviewer-selectable model from this provider (different provider). */
+const E2E01B_REVIEWER_PROVIDER = "openai-proxy";
+
+/**
+ * The run's acceptance conditions (docs/05 §13 E2E-01 "验收条件"), all deterministic.
+ * They are parameterized by the run's BASE commit (the fixture's default-branch head
+ * right before creation, asserted equal to `run.baseSha`) rather than by `HEAD`,
+ * because the task asks the agent to commit its work — a `HEAD`-relative check would
+ * then silently compare the wrong revision:
+ *  - `node test.js` — the fixture's own 7-assertion suite; assertion #2 encodes the
+ *    expiry-instant rule the task is about, so a passing run proves the module was
+ *    really fixed (its output ends with `auth tests passed`, asserted below).
+ *  - `git diff <base> --exit-code -- test.js` — the task forbids editing test.js;
+ *    this fails (exit 1) the moment the acceptance test itself was touched, whether
+ *    the agent committed or not.
+ *  - `git show <base>:auth.js` — baseline evidence probe: prints the run's BASE
+ *    revision of the file, so the spec can tell whether this run had to fix auth.js
+ *    (diff must then touch it) or the base was already fixed by an earlier merge.
+ *    `git show` always exits 0, so it can never fail the run by itself.
+ *  - `grep -q '<marker>' docs/notes.md && [ "$(git rev-parse HEAD)" != '<base>' ]` —
+ *    the run's mandatory deliverable exists AND is committed on the run branch. The
+ *    unique marker guarantees a non-empty diff on every run; the commit condition is
+ *    what makes the human merge a real fast-forward (see below).
+ *
+ * Why the task asks for a commit: verified live against the demo deployment — the
+ * worker never commits a single-agent worktree, and `POST /runs/:id/merge` only
+ * fast-forwards the run BRANCH into the default branch. Without a commit on that
+ * branch the merge is a silent no-op (`run.merge.commit === run.baseSha`, HEAD
+ * unchanged), i.e. the reviewed work would never reach the workspace. The scenario
+ * therefore requires a real commit (a real developer action, not a simulation),
+ * which is what makes "the human merge advanced the default branch" an assertable,
+ * non-vacuous acceptance criterion.
+ */
+function e2e01bChecks(baseCommit: string, marker: string): string[] {
+  return [
+    "node test.js",
+    `git diff ${baseCommit} --exit-code -- test.js`,
+    `git show ${baseCommit}:auth.js`,
+    `grep -q '${marker}' docs/notes.md && [ "$(git rev-parse HEAD)" != "${baseCommit}" ]`,
+  ];
+}
+
+
+
+/**
+ * Exact (provider, model) pin for E2E-01b: like `resolveRoleSelection`, but the
+ * catalogue entry must match the requested provider+model AND be selectable for
+ * `role`. Returns undefined when that pair is not offered, so the scenario skips
+ * with a precise reason instead of silently inheriting the deployment default.
+ */
+async function resolvePinnedRoleSelection(
+  request: APIRequestContext,
+  role: "developer" | "reviewer",
+  provider: string,
+  model: string,
+): Promise<{ provider: string; model: string } | undefined> {
+  const response = await request.get("/api/models");
+  if (!response.ok()) return undefined;
+  const body = (await response.json()) as {
+    models?: Array<{ provider: string; model: string; roles?: string[]; available?: boolean; selectableRoles?: string[] }>;
+  };
+  const entry = (body.models ?? []).find(
+    (item) =>
+      item.provider === provider &&
+      item.model === model &&
+      (Array.isArray(item.selectableRoles)
+        ? item.selectableRoles.includes(role)
+        : Boolean(item.roles?.includes(role)) && item.available === true),
+  );
+  return entry ? { provider: entry.provider, model: entry.model } : undefined;
+}
+
+/**
+ * `POST /api/workspaces/:id/refresh` re-verifies the repository on the worker and
+ * persists branch/head/dirty. `list`/`get` only return the stored row, so the head
+ * must be re-verified before it can be compared across the merge boundary — a stale
+ * row would make the "HEAD unchanged / HEAD advanced" assertions vacuous.
+ */
+async function refreshWorkspace(request: APIRequestContext, workspaceId: string): Promise<AcceptanceWorkspace> {
+  const response = await request.post(`/api/workspaces/${workspaceId}/refresh`);
+  expect(
+    response.ok(),
+    `POST /api/workspaces/${workspaceId}/refresh 失败（HTTP ${response.status()}）：${(await response.text()).slice(0, 300)}`,
+  ).toBeTruthy();
+  return (await response.json()) as AcceptanceWorkspace;
+}
+
+// ---------------------------------------------------------------------------
 // E2E-01 — 单 Agent 完整闭环 (docs/05 §13, "E2E-01：单 Agent 完整闭环")
 // ---------------------------------------------------------------------------
 test.describe("E2E-01 单 Agent 完整闭环", () => {
@@ -439,16 +682,446 @@ test.describe("E2E-01 单 Agent 完整闭环", () => {
     await expect(page.locator(".status-pill.status-completed")).toContainText("已通过");
   });
 
-  test("E2E-01b 真实闭环：OTP 登录 + Provider A 开发 + Provider B 审核 + fixture-small-auth + 人工 Approve（fixme：需生产验收环境）", async ({ request }) => {
-    requireLiveAcceptance(
-      "Cloudflare OTP 会话、已配置的 Provider A/B 凭据、已注册的 fixture-small-auth 工作区（真实 runs 启用）。",
-    );
+  test("E2E-01b 真实闭环：development 身份 + 钉住的两家 Provider + fixture-small-auth + 人工 Approve/合并 + 显式发布结果（需 PI_E2E_LIVE=1）", async ({ request }) => {
+    const fixtureRelative = envValue("PI_E2E_AUTH_WORKSPACE") ?? E2E01B_DEFAULT_FIXTURE;
+    const configuredWait = Number(envValue("PI_E2E_AUTH_TIMEOUT_MS") ?? 480_000);
+    const waitMs = Number.isFinite(configuredWait) && configuredWait > 0 ? configuredWait : 480_000;
+    const preferredReviewerProvider = envValue("PI_E2E_AUTH_REVIEWER_PROVIDER") ?? E2E01B_REVIEWER_PROVIDER;
+
+    const preconditions =
+      `需要一个真实运行环境：PI_E2E_LIVE=1、realRunsAvailable=true（PI_REAL_RUNS_ENABLED=true + PI_INTERNAL_TOKEN + 已配置的 provider 凭据）、管理员身份（人工合并 POST /api/runs/:id/merge 仅管理员可执行）、/api/models 中可选用于 developer 的 ${E2E01B_DEVELOPER_PROVIDER}/${E2E01B_DEVELOPER_MODEL} 与一个可选用于 reviewer 的模型（优先 ${preferredReviewerProvider}，否则退回第一个可选审核模型），以及部署 projects 根目录下的夹具仓库 ${fixtureRelative}（默认 ${E2E01B_DEFAULT_FIXTURE}；测试自行注册、结束时注销）。可选 PI_E2E_AUTH_TIMEOUT_MS（默认 480000）控制等待运行到达终态的时长；当前值 ${waitMs}。OTP 登录为生产专属（demo 部署使用 development 身份头 x-pigo-dev-email），不在本场景范围内。`;
+    requireLiveAcceptance(preconditions);
+
     const config = await configStatus(request);
-    test.skip(!config.realRunsAvailable, "PI_REAL_RUNS_ENABLED=false 或凭据未配置。");
-    notImplementedYet(
-      "E2E-01b",
-      "步骤：1 OTP 登录 2 选择工作区 3 选择两个不同模型 4 提交修复任务+3 条验收条件 5 Planner=small 6 Developer 改码 7 检查通过 8 Reviewer approved 9 人工 Approve；断言唯一 Developer、模型与选择一致、状态顺序、无自动 push/merge、usage/日志/Diff/制品完整。",
+    test.skip(
+      !config.realRunsAvailable,
+      "E2E-01b 需要真实运行环境：/api/config/status 报告 realRunsAvailable=false（需 PI_REAL_RUNS_ENABLED=true、PI_INTERNAL_TOKEN 以及至少一个已配置的 provider 凭据）。",
     );
+
+    // Explicit, exact pins (never the deployment defaults).
+    const developer = await resolvePinnedRoleSelection(request, "developer", E2E01B_DEVELOPER_PROVIDER, E2E01B_DEVELOPER_MODEL);
+    test.skip(
+      !developer,
+      `E2E-01b 需要 developer 钉住的模型 ${E2E01B_DEVELOPER_PROVIDER}/${E2E01B_DEVELOPER_MODEL}：/api/models 中不存在该组合（或其 selectableRoles 不含 developer）。请在部署的模型目录中提供它，或按 docs/25 的 demo 目录启动。`,
+    );
+    const reviewer = await resolveRoleSelection(request, "reviewer", preferredReviewerProvider);
+    test.skip(
+      !reviewer,
+      "E2E-01b 需要 /api/models 中至少一个可选用于 reviewer 的模型（selectableRoles）：没有它就无法显式钉住审核角色。",
+    );
+    test.skip(
+      developer!.provider === reviewer!.provider && developer!.model === reviewer!.model,
+      `E2E-01b 需要开发与审核使用不同的模型（当前两者都是 ${developer!.provider}/${developer!.model}）：本场景要验证「Provider A 开发 + Provider B 审核」的双模型闭环。`,
+    );
+    if (reviewer!.provider !== preferredReviewerProvider) {
+      // The preferred provider had no reviewer-selectable model: fall back to the
+      // first selectable reviewer model, but keep the pair explicitly distinct and
+      // record the fallback so the report cannot be mistaken for the intended pair.
+      test.info().annotations.push({
+        type: "note",
+        description: `E2E-01b reviewer 回退：${preferredReviewerProvider} 没有可选审核模型，改用 ${reviewer!.provider}/${reviewer!.model}（与 developer ${developer!.provider}/${developer!.model} 仍为不同模型）。`,
+      });
+    } else {
+      expect(
+        reviewer!.provider,
+        `E2E-01b 要求开发与审核来自不同 Provider（developer=${developer!.provider}，reviewer=${reviewer!.provider}）`,
+      ).not.toBe(developer!.provider);
+    }
+
+    // The human gate is admin-only; assert the identity we actually have instead of
+    // assuming the demo email. OTP is production-only and intentionally not faked.
+    const meResponse = await request.get("/api/me");
+    expect(meResponse.ok(), `GET /api/me failed with HTTP ${meResponse.status()}`).toBeTruthy();
+    const me = (await meResponse.json()) as { id: string; email: string; isAdmin?: boolean };
+    test.skip(
+      !me.isAdmin,
+      `E2E-01b 需要管理员身份执行人工合并：当前身份 ${me.email} 不是管理员（POST /api/runs/:id/merge 将返回 403 ADMIN_REQUIRED；POST /api/runs/:id/publish 同理）。请用管理员账号运行本场景（demo 部署为 bobo.2000@gmail.com）。`,
+    );
+
+    // Register the fixture on demand (E2E-08 pattern): the fixture is NOT registered
+    // by the operator, and a leftover active fixture would hijack scenarios that
+    // resolve their workspace by "first active, non-dirty" (E2E-02/05/07).
+    const listResponse = await request.get("/api/workspaces");
+    expect(listResponse.ok(), `GET /api/workspaces failed with HTTP ${listResponse.status()}`).toBeTruthy();
+    const registered =
+      ((await listResponse.json()) as { workspaces?: Array<{ id: string; name: string; rootPath: string; status: string }> })
+        .workspaces ?? [];
+    const preexisting = registered.find(
+      (workspace) => workspace.status === "active" && (workspace.rootPath === fixtureRelative || workspace.name === fixtureRelative),
+    );
+    let fixtureId = preexisting?.id;
+    let registeredHere = false;
+    if (!fixtureId) {
+      const registration = await request.post("/api/workspaces/register", { data: { relativePath: fixtureRelative } });
+      if (!registration.ok()) {
+        test.skip(
+          true,
+          `E2E-01b 夹具工作区未注册：POST /api/workspaces/register {relativePath:"${fixtureRelative}"} 返回 HTTP ${registration.status()}：${(await registration.text()).slice(0, 400)}。该夹具位于部署 projects 根目录之下（demo 宿主 /app/pi-agent/demo-workspace/projects/${fixtureRelative}、容器 /workspace/projects/${fixtureRelative}），重建步骤见 tests/e2e/README.md「E2E-01b」小节。`,
+        );
+      }
+      fixtureId = ((await registration.json()) as { id: string }).id;
+      registeredHere = true;
+    }
+    // Re-verified baseline: the stored row may be stale, and this head is the
+    // reference for both "nothing auto-merged" and "the human merge advanced HEAD".
+    const baseline = await refreshWorkspace(request, fixtureId!);
+    expect(baseline.git?.dirty, `夹具工作区 ${fixtureRelative} 必须是干净仓库（否则 run preflight 直接 409 WORKSPACE_DIRTY）`).toBe(false);
+    expect(baseline.git?.head, "夹具工作区必须报告 git.head（人工合并前后的基准提交）").toBeTruthy();
+    const baselineHead = baseline.git!.head as string;
+    const stamp = Date.now();
+    const marker = `PIGO-E2E-01B-${stamp}`;
+    const checks = e2e01bChecks(baselineHead, marker);
+
+    test.setTimeout(waitMs + 300_000);
+
+    const title = `E2E-01b 真实闭环 ${stamp}`;
+    let runId: string | undefined;
+    try {
+      const created = await request.post("/api/runs", {
+        data: {
+          title,
+          task: e2e01bTask(marker),
+          mode: "real",
+          workspaceId: fixtureId,
+          checks: [...checks],
+          developerModel: developer,
+          reviewerModel: reviewer,
+        },
+      });
+      expect(created.status(), `POST /api/runs 失败（${created.status()}）：${await created.text()}`).toBe(201);
+      runId = ((await created.json()) as AcceptanceRun).id;
+      test.info().annotations.push({
+        type: "run",
+        description: `${runId}（developer=${developer!.provider}/${developer!.model}，reviewer=${reviewer!.provider}/${reviewer!.model}）`,
+      });
+
+      // Wait for the run's terminal state; the poll mirrors E2E-07.
+      let completed = false;
+      await expect
+        .poll(
+          async () => {
+            const current = await getRun(request, runId!);
+            if (current.state === "completed") {
+              completed = true;
+              return true;
+            }
+            return !ACTIVE_RUN_STATES.includes(current.state);
+          },
+          {
+            message: `Run ${runId} 未在 ${waitMs}ms 内到达终态（completed 或 needs_human/failed）。`,
+            timeout: waitMs,
+            intervals: [2_000, 5_000],
+          },
+        )
+        .toBe(true);
+
+      const run = await getRun(request, runId);
+      const events = await getRunEvents(request, runId);
+      const dump = () => formatEvents(events);
+      const require_ = (event: AcceptanceEvent | undefined, what: string): AcceptanceEvent => {
+        expect(event, `${what}。事件日志：\n${dump()}`).toBeTruthy();
+        return event!;
+      };
+      const seqOf = (type: string, what: string) =>
+        require_(events.find((event) => event.type === type), `缺少里程碑事件 ${type}（${what}）`).seq;
+
+      // (a) Terminal state of the single-agent closed loop. A changes_requested
+      // verdict parks the run in needs_human and fails here with the full log.
+      expect(completed, `Run ${runId} 未完成闭环（实际 state=${run.state}，summary=${run.summary ?? ""}）。事件日志：\n${dump()}`).toBe(true);
+      expect(run.state, `Run ${runId} 终态必须是 completed（独立审核通过）。事件日志：\n${dump()}`).toBe("completed");
+      expect(run.round, "单 Agent 闭环必须一次通过，不进入返修轮次").toBe(1);
+      expect(run.workspaceId, `Run 必须跑在夹具工作区上（期望 ${fixtureId}，实际 ${String(run.workspaceId)}）`).toBe(fixtureId);
+      expect(run.baseSha, "Run 的基线提交必须等于创建前刷新得到的夹具 HEAD（检查命令以它为基准）").toBe(baselineHead);
+
+      // (b) Pinned models really are the ones recorded (and used). `usageRoles`
+      // carries the per-role model that actually served the calls (planner and
+      // developer share the developer pin; the reviewer uses the reviewer pin).
+      expect(run.developer, "Run 记录的 developer 必须等于钉住的选择").toEqual(developer);
+      expect(run.reviewer, "Run 记录的 reviewer 必须等于钉住的选择").toEqual(reviewer);
+      const usageRoles = run.usageRoles ?? [];
+      expect(usageRoles.length, `Run 必须记录 usageRoles（实际：${JSON.stringify(usageRoles)}）`).toBeGreaterThan(0);
+      for (const entry of usageRoles) {
+        const expected = entry.role === "reviewer" ? reviewer! : developer!;
+        expect(
+          { provider: entry.provider, model: entry.model },
+          `usageRoles 中 ${entry.role} 实际使用的模型必须等于钉住的选择`,
+        ).toEqual(expected);
+      }
+
+      // (c) Exactly one developer agent: single plan, no Sub Agent events, one
+      // developer session and one developer session.metrics (no repair round).
+      expect(run.plan?.strategy, `Planner 必须判定为单 Agent（实际 ${String(run.plan?.strategy)}）`).toBe("single");
+      expect(
+        events.filter((event) => /^subagents?\./.test(event.type)).map((event) => `${event.type}: ${event.message}`),
+        "单 Agent 闭环不得出现任何 Sub Agent 事件",
+      ).toEqual([]);
+      const developerSessions = (run.sessions ?? []).filter((session) => session.role === "developer");
+      expect(
+        developerSessions.length,
+        `必须恰好一个 developer 会话（实际：${JSON.stringify((run.sessions ?? []).map((session) => session.role))}）`,
+      ).toBe(1);
+      expect(developerSessions[0].rounds, "唯一的 developer 会话必须只覆盖第 1 轮").toEqual([1]);
+      expect(
+        events.filter((event) => event.type === "session.metrics" && event.meta?.role === "developer"),
+        "必须恰好一条 developer session.metrics（多一条即意味着发生了额外的开发轮次）",
+      ).toHaveLength(1);
+
+      // (d) Observed milestone order (docs/05 E2E-01 状态顺序). Each key milestone's
+      // seq is asserted; the two "start" milestones that may interleave
+      // (agent.started / round.started) are asserted as a group between the
+      // workspace preparation and the developer call.
+      const runCreatedSeq = seqOf("run.created", "运行创建");
+      const preparingSeq = seqOf("workspace.preparing", "克隆独立运行目录");
+      const agentStartedSeq = seqOf("agent.started", "主 Agent 启动");
+      const roundStartedSeq = seqOf("round.started", "第 1 轮开始");
+      const developerStartedSeq = seqOf("developer.started", "单 Agent 开始实现");
+      const developerCompletedSeq = seqOf("developer.completed", "单 Agent 实现完成");
+      const checksStartedSeq = seqOf("checks.started", "开始确定性检查");
+      const reviewStartedSeq = seqOf("review.started", "独立审核开始");
+      const reviewApproved = require_(events.find((event) => event.type === "review.approved"), "审核必须通过（review.approved）");
+      expect(runCreatedSeq, `run.created(#${runCreatedSeq}) 必须早于 workspace.preparing(#${preparingSeq})`).toBeLessThan(preparingSeq);
+      expect(
+        preparingSeq,
+        `workspace.preparing(#${preparingSeq}) 必须早于 agent.started(#${agentStartedSeq})/round.started(#${roundStartedSeq})`,
+      ).toBeLessThan(Math.min(agentStartedSeq, roundStartedSeq));
+      expect(
+        Math.max(agentStartedSeq, roundStartedSeq),
+        `agent.started(#${agentStartedSeq})/round.started(#${roundStartedSeq}) 必须早于 developer.started(#${developerStartedSeq})`,
+      ).toBeLessThan(developerStartedSeq);
+      expect(developerStartedSeq, "developer.started 必须早于 developer.completed").toBeLessThan(developerCompletedSeq);
+      expect(developerCompletedSeq, "developer.completed 必须早于 checks.started").toBeLessThan(checksStartedSeq);
+
+      // (e) The submitted checks are exactly what ran, and every one passed. The
+      // `node test.js` output pins the verdict to the fixture's own boundary
+      // assertions, so "the fixed module really passed" cannot be satisfied by an
+      // empty or foreign command.
+      expect(run.checks?.map((check) => check.command), "Run 记录的检查命令必须与本用例提交的验收条件一致").toEqual([...checks]);
+      for (const check of run.checks ?? []) {
+        expect(
+          check.status,
+          `检查必须通过：${check.command}（status=${check.status}, exitCode=${String(check.exitCode)}, output=${JSON.stringify(check.output)}）`,
+        ).toBe("passed");
+        expect(check.exitCode, `检查 ${check.command} 的 exitCode 必须为 0`).toBe(0);
+      }
+      const unitCheckSeq = require_(
+        events.find((event) => event.type === "check.started" && event.round === 1 && event.message.includes(checks[0])),
+        "必须执行 node test.js（check.started）",
+      ).seq;
+      const unitPassed = require_(
+        events.find((event) => event.type === "check.passed" && event.round === 1 && event.message.includes(checks[0])),
+        "node test.js 必须通过（check.passed）",
+      );
+      expect(unitPassed.message, `check.passed 必须归于 node test.js：${unitPassed.message}`).toBe(`${checks[0]} 通过`);
+      expect(
+        run.checks?.[0]?.output,
+        `node test.js 的输出必须包含 "auth tests passed"（证明夹具自身的到期瞬间断言真的通过）。实际 output=${JSON.stringify(run.checks?.[0]?.output)}`,
+      ).toContain("auth tests passed");
+      expect(
+        events.filter((event) => event.type === "check.failed").map((event) => event.message),
+        "闭环运行不得出现任何 check.failed",
+      ).toEqual([]);
+      expect(checksStartedSeq, "checks.started 必须早于第一条 check.started").toBeLessThan(unitCheckSeq);
+      expect(unitCheckSeq, "node test.js 的 check.started 必须早于它的 check.passed").toBeLessThan(unitPassed.seq);
+      expect(unitPassed.seq, "node test.js 通过后必须才进入审核（review.started）").toBeLessThan(reviewStartedSeq);
+      expect(reviewStartedSeq, "review.started 必须早于 review.approved").toBeLessThan(reviewApproved.seq);
+
+      // (f) Diff evidence: non-empty, carries the appended note (which is what keeps
+      // this scenario repeatable), never touches test.js, and — when the run's base
+      // still carried the expiry bug (recorded by the `git show <base>:auth.js` probe
+      // check) — carries the auth.js fix too.
+      const diff = run.diff ?? "";
+      expect(diff, "Run 必须产出非空 diff（docs/notes.md 说明行是每次运行都要求的交付物）").not.toBe("");
+      const notesSection = diff.split(/^diff --git /m).find((section) => section.startsWith("a/docs/notes.md b/docs/notes.md"));
+      expect(notesSection, `run.diff 必须包含 docs/notes.md 的改动段。run.diff：\n${diff}`).toBeTruthy();
+      expect(
+        notesSection!.split("\n").some((line) => line.startsWith("+") && !line.startsWith("+++")),
+        `docs/notes.md 的 diff 必须包含至少一行新增说明。实际：\n${notesSection}`,
+      ).toBe(true);
+      expect(
+        notesSection,
+        `docs/notes.md 的新增行必须包含本次运行唯一的标记 ${marker}（否则说明追加的不是本次运行的交付物）。实际：\n${notesSection}`,
+      ).toContain(marker);
+      expect(diff, "任务明确不得修改 test.js：run.diff 不得触碰 test.js").not.toContain("a/test.js b/test.js");
+      const baseAuthJs = run.checks?.[2]?.output ?? "";
+      expect(
+        baseAuthJs,
+        `基线取证检查（git show <base>:auth.js）必须回显 isSessionValid：${JSON.stringify(baseAuthJs)}`,
+      ).toContain("isSessionValid");
+      if (/expiresAt\s*>=\s*now/.test(baseAuthJs)) {
+        expect(
+          diff,
+          `基线 auth.js 仍带 \`>= now\` 到期判定缺陷（${JSON.stringify(baseAuthJs)}），run.diff 必须包含对 auth.js 的修复：\n${diff}`,
+        ).toContain("diff --git a/auth.js b/auth.js");
+      } else {
+        test.info().annotations.push({
+          type: "note",
+          description:
+            "本次运行的基线 auth.js 已不含 `>= now` 缺陷（此前的人工合并已修复），因此 run.diff 只含 docs/notes.md；auth.js 的正确性由每次运行都会执行的 node test.js 检查保证。",
+        });
+      }
+
+      // (g) Diff artifact: present, non-empty, downloadable byte-for-byte identical.
+      const artifactResponse = await request.get(`/api/runs/${runId}/artifacts`);
+      expect(artifactResponse.ok(), `GET /api/runs/${runId}/artifacts failed with HTTP ${artifactResponse.status()}`).toBeTruthy();
+      const artifacts = ((await artifactResponse.json()) as { artifacts: AcceptanceArtifact[] }).artifacts;
+      const diffArtifact = artifacts.find((artifact) => artifact.artifactId === "diff");
+      expect(diffArtifact, `Run 有 diff 却未保留 diff 制品（现有制品：${artifacts.map((a) => a.artifactId).join(", ") || "无"}）`).toBeTruthy();
+      expect(diffArtifact!.bytes, `diff 制品字节数必须非零，实际 ${diffArtifact!.bytes}`).toBeGreaterThan(0);
+      const download = await request.get(`/api/runs/${runId}/artifacts/diff/download`);
+      expect(download.ok(), "diff 制品必须可下载").toBeTruthy();
+      expect(await download.text(), "下载的 diff 制品必须与 run.diff 逐字节一致").toBe(diff);
+
+      // (h) Usage / log evidence: a run that never called a model cannot pass, and
+      // the expected roles must each leave a trace.
+      expect(run.modelCalls ?? 0, "Run 必须记录模型调用次数（usage 证据）").toBeGreaterThan(0);
+      expect(run.usage?.totalTokens ?? 0, `Run 必须记录 token 用量（实际 usage=${JSON.stringify(run.usage)}）`).toBeGreaterThan(0);
+      const sources = new Set(events.map((event) => event.source));
+      for (const expected of ["developer", "checks", "reviewer"]) {
+        expect([...sources], `活动时间线必须包含 ${expected} 角色的日志`).toContain(expected);
+      }
+      const requiredMilestones = ["developer.started", "developer.completed", "check.passed", "review.started", "review.approved"];
+      const missing = requiredMilestones.filter((type) => !events.some((event) => event.type === type));
+      expect(missing, `Run ${runId} 缺少里程碑/日志：${missing.join(", ")}`).toEqual([]);
+      expect(run.lastSeq, "Run 记录的 lastSeq 必须等于最后一条事件的 seq").toBe(events[events.length - 1]?.seq);
+
+      // (i) NO automatic merge/push: the run ends completed and stops there. The
+      // human gate is the explicit admin merge performed below (docs/05 E2E-01:
+      // "不自动 push/merge").
+      expect(run.merge ?? null, "终态 completed 不得自动合并到工作区默认分支").toBeNull();
+      expect(
+        events.filter((event) => /^run\.(merged|merge_failed)$/.test(event.type)).map((event) => event.message),
+        "不得出现自动合并事件（run.merged/run.merge_failed）",
+      ).toEqual([]);
+      expect(run.release ?? null, "合并/完成本身不得隐式发布（发布是独立的显式管理员动作）").toBeNull();
+      expect(
+        events.filter((event) => /^run\.release_/.test(event.type)).map((event) => event.message),
+        "不得出现隐式发布事件（run.release_*）",
+      ).toEqual([]);
+      const beforeMerge = await refreshWorkspace(request, fixtureId!);
+      expect(beforeMerge.git?.dirty, "Run 不得改动工作区工作树（运行在独立克隆中进行）").toBe(false);
+      expect(
+        beforeMerge.git?.head,
+        `人工合并前默认分支 HEAD 不得移动（期望 ${baselineHead}，实际 ${String(beforeMerge.git?.head)}）`,
+      ).toBe(baselineHead);
+
+      // ---------------------------------------------------------------------
+      // Human gate: the explicit, admin-only merge. This is the ONLY thing that
+      // moves the workspace default branch.
+      // ---------------------------------------------------------------------
+      const mergeResponse = await request.post(`/api/runs/${runId}/merge`, {
+        data: { confirm: true, note: "E2E-01b 人工 Approve：合并独立审核通过的修复" },
+      });
+      expect(
+        mergeResponse.status(),
+        `POST /api/runs/${runId}/merge 失败（HTTP ${mergeResponse.status()}）：${(await mergeResponse.text()).slice(0, 500)}`,
+      ).toBe(200);
+      const merged = (await mergeResponse.json()) as AcceptanceRun;
+      expect(merged.merge, `合并响应必须携带 run.merge 记录：${JSON.stringify(merged)}`).toBeTruthy();
+      const merge = merged.merge!;
+      expect(merge.commit, `合并必须记录 40 位提交哈希（实际 ${JSON.stringify(merge)}）`).toMatch(/^[0-9a-f]{40}$/);
+      expect(["fast-forward", "merge-commit"], `未知的合并策略 ${merge.strategy}`).toContain(merge.strategy);
+      expect(merge.targetBranch, `合并目标必须是工作区默认分支（${String(baseline.defaultBranch)}）`).toBe(baseline.defaultBranch);
+      expect(merge.mergedBy, `合并必须记录操作者（可审计），期望管理员 ${me.id}`).toBe(me.id);
+      expect(Number.isFinite(Date.parse(merge.mergedAt)), `合并时间戳必须是可解析的 ISO 时间（实际 ${merge.mergedAt}）`).toBe(true);
+      test.info().annotations.push({ type: "merge", description: JSON.stringify(merge) });
+
+      // Auditable on the event stream, after the review verdict, exactly once.
+      const mergedEvents = (await getRunEvents(request, runId)).filter((event) => event.type === "run.merged");
+      expect(mergedEvents, "人工合并必须恰好记录一条 run.merged 事件").toHaveLength(1);
+      expect(
+        String(mergedEvents[0].meta?.commit ?? ""),
+        `run.merged 必须携带同一个 commit：${JSON.stringify(mergedEvents[0].meta ?? {})}`,
+      ).toBe(merge.commit);
+      expect(String(mergedEvents[0].meta?.mergedBy ?? ""), "run.merged 必须携带操作者").toBe(merge.mergedBy);
+      expect(mergedEvents[0].seq, "run.merged 必须晚于 review.approved").toBeGreaterThan(reviewApproved.seq);
+
+      // The workspace really advanced to the merged commit, and is clean again.
+      // Non-vacuous: the run produced a diff and the task committed it on the run
+      // branch, so the fast-forward must move the default branch to a NEW commit
+      // (a merge that fast-forwards to the base would leave HEAD unchanged and is
+      // exactly the no-op this assertion catches).
+      const afterMerge = await refreshWorkspace(request, fixtureId!);
+      expect(
+        afterMerge.git?.head,
+        `人工合并后默认分支 HEAD 必须推进到合并 commit（期望 ${merge.commit}，实际 ${String(afterMerge.git?.head)}）`,
+      ).toBe(merge.commit);
+      expect(
+        merge.commit,
+        `人工合并必须把默认分支推进到新提交（基线 ${baselineHead}）：HEAD 未移动意味着合并是 fast-forward 到基线的空操作，审核通过的成果并未交付到工作区。`,
+      ).not.toBe(baselineHead);
+      expect(afterMerge.git?.dirty, "人工合并后工作区必须是干净的").toBe(false);
+
+      // ---------------------------------------------------------------------
+      // Post-merge deploy/release outcome, asserted explicitly (never silently
+      // absent). Verified in src/server/index.ts: the merge path writes only
+      // `run.merge`/`run.merged`; the closed-loop deploy lives in the separate
+      // explicit publish action, which consults planPostMergeDeploy and either
+      // refuses with an explicit code (hook unset/misconfigured) or records
+      // `run.release` with status succeeded|triggered|failed.
+      // ---------------------------------------------------------------------
+      const publishResponse = await request.post(`/api/runs/${runId}/publish`, {
+        data: { environment: "demo", confirm: true },
+      });
+      if (publishResponse.status() === 200) {
+        const published = (await publishResponse.json()) as AcceptanceRun;
+        expect(published.release, `发布成功必须携带 run.release 记录：${JSON.stringify(published)}`).toBeTruthy();
+        expect(
+          ["succeeded", "triggered", "failed"],
+          `已配置发布钩子时 run.release.status 必须是 succeeded/triggered/failed，实际 ${String(published.release?.status)}`,
+        ).toContain(published.release!.status);
+        expect(published.release!.commit, "发布记录必须指向被合并的 commit").toBe(merge.commit);
+        expect(published.release!.environment, "发布记录必须指向请求的环境").toBe("demo");
+        const releaseEvents = await getRunEvents(request, runId);
+        expect(
+          releaseEvents.filter((event) => event.type === "run.release_started"),
+          "发布必须记录 run.release_started（发布尝试可审计，不是静默跳过）",
+        ).toHaveLength(1);
+        const terminalType =
+          published.release!.status === "triggered"
+            ? "run.release_triggered"
+            : published.release!.status === "succeeded"
+              ? "run.release_succeeded"
+              : "run.release_failed";
+        expect(
+          releaseEvents.filter((event) => event.type === terminalType).map((event) => event.message),
+          `发布必须记录终态事件 ${terminalType}（status=${published.release!.status}）`,
+        ).toHaveLength(1);
+        test.info().annotations.push({ type: "release", description: JSON.stringify(published.release) });
+      } else {
+        // Hook unset (demo) or misconfigured: the server must say so explicitly.
+        const body = await publishResponse.text();
+        expect(
+          publishResponse.status(),
+          `未配置发布钩子时显式拒绝的 HTTP 状态应为 409（实际 ${publishResponse.status()}）：${body.slice(0, 400)}`,
+        ).toBe(409);
+        const parsed = JSON.parse(body) as { code?: string; error?: string };
+        expect(
+          ["RELEASE_NOT_CONFIGURED", "RELEASE_CONFIG_INVALID", "RELEASE_AUTH_NOT_CONFIGURED", "RELEASE_CALLBACK_NOT_CONFIGURED"],
+          `未配置/配置不完整的发布必须以明确的 code 拒绝（实际 code=${String(parsed.code)}，error=${String(parsed.error)}）`,
+        ).toContain(parsed.code);
+        expect(String(parsed.error ?? ""), "显式拒绝必须携带可读原因（绝不静默）").not.toBe("");
+        const afterPublish = await getRun(request, runId);
+        expect(afterPublish.release ?? null, "被显式拒绝的发布不得写入 run.release").toBeNull();
+        expect(
+          (await getRunEvents(request, runId)).filter((event) => /^run\.release_/.test(event.type)),
+          "被显式拒绝的发布不得产生 run.release_* 事件",
+        ).toEqual([]);
+        test.info().annotations.push({ type: "release", description: `explicitly not configured: ${body.slice(0, 300)}` });
+      }
+    } finally {
+      // Best-effort cleanup: cancel a run still in flight, then release the fixture
+      // only if THIS test registered it (an operator-registered fixture stays).
+      if (runId) await cancelIfActive(request, runId);
+      if (registeredHere && fixtureId) {
+        const removal = await request.delete(`/api/workspaces/${fixtureId}`).catch(() => undefined);
+        if (removal && !removal.ok() && removal.status() !== 404) {
+          test.info().annotations.push({
+            type: "cleanup_failed",
+            description: `DELETE /api/workspaces/${fixtureId} 返回 HTTP ${removal.status()}：夹具工作区可能仍处于 active 状态，并影响其它场景的默认工作区解析。`,
+          });
+        }
+      }
+    }
   });
 });
 
