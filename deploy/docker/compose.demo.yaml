@@ -128,7 +128,15 @@ services:
         published: "${PIGO_DEMO_WEB_LOOPBACK_PORT:-3102}"
         host_ip: ${PIGO_DEMO_WEB_LOOPBACK_ADDRESS:-127.0.0.1}
     volumes:
-      - ${PIGO_DEMO_WORKSPACE_ROOT}:/workspace/projects
+      # SINGLE workspace-root mount, identical to demo-worker:
+      #   host ${PIGO_DEMO_WORKSPACE_ROOT}  <=>  container /workspace
+      # Web performs no workspace I/O (register/validate/refresh/clone are
+      # forwarded to the worker over PI_WORKER_URL), but it declares the SAME
+      # mapping so a stored workspaces.canonical_path can never mean a different
+      # host directory in web than in the worker. Do NOT add a nested bind such
+      # as /workspace/projects: it shadows the real <root>/projects subdirectory
+      # and desynchronizes web, worker and the sandbox binds.
+      - ${PIGO_DEMO_WORKSPACE_ROOT:?Set PIGO_DEMO_WORKSPACE_ROOT in deploy/docker/demo.env}:/workspace
       # Credential directory + runs.json live here. Must be writable by uid
       # 1000 (the image's `node` user): CredentialVault chmods the file to 0600.
       - ${PIGO_DEMO_DATA_DIR:?Set PIGO_DEMO_DATA_DIR in deploy/docker/demo.env}:/app/data
@@ -213,7 +221,13 @@ services:
       PI_REVIEWER_THINKING: ${PI_REVIEWER_THINKING:-medium}
       PI_SESSION_REUSE: ${PI_SESSION_REUSE:-on}
     volumes:
-      - ${PIGO_DEMO_WORKSPACE_ROOT}:/workspace/projects
+      # SINGLE workspace-root mount (see demo-web). Host <root> <=> /workspace, so
+      # repositories are real subdirectories at <root>/projects/<repo> and run
+      # worktrees at <root>/runs/<run> — matching the DB workspaces.canonical_path
+      # (/workspace/projects/<repo>) and the host paths the worker derives from
+      # PI_HOST_WORKSPACE_ROOT when it binds worktrees into sandbox containers.
+      # NEVER add a nested /workspace/projects bind: it would shadow <root>/projects
+      # and make the in-container path disagree with those sandbox host binds.
       - ${PIGO_DEMO_WORKSPACE_ROOT:?Set PIGO_DEMO_WORKSPACE_ROOT in deploy/docker/demo.env}:/workspace
       # Privileged socket mount — keep access limited to the isolated worker.
       - /var/run/docker.sock:/var/run/docker.sock

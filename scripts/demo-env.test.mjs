@@ -247,7 +247,10 @@ function demoConfig(overrides = {}) {
           PI_INTERNAL_TOKEN: "token-abc",
           PI_WEB_VERSION: "demo-0.27.1",
         },
-        volumes: [{ type: "bind", source: "/app/pi-agent/demo-data", target: "/app/data" }],
+        volumes: [
+          { type: "bind", source: "/app/pi-agent/demo-data", target: "/app/data" },
+          { type: "bind", source: "/app/pi-agent/demo-workspace", target: "/workspace" },
+        ],
         ports: [{ mode: "host", target: 3100, published: "3101", host_ip: "0.0.0.0" }],
       },
       "demo-worker": {
@@ -256,6 +259,8 @@ function demoConfig(overrides = {}) {
           PI_INTERNAL_TOKEN: "token-abc",
           PI_WORKER_VERSION: "demo-0.27.1",
           PI_SANDBOX_MODE: "auto",
+          PI_WORKSPACE_ROOT: "/workspace",
+          PI_HOST_WORKSPACE_ROOT: "/app/pi-agent/demo-workspace",
         },
         volumes: [
           { type: "bind", source: "/app/pi-agent/demo-workspace", target: "/workspace" },

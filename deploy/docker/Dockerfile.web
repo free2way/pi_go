@@ -13,9 +13,15 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 COPY --from=build /app/dist ./dist
 RUN install -d -o node -g node /app/data
-# 工作区/仓库校验需要 git（与 Dockerfile.worker 一致；缺失会把工作区标记 invalid）
-RUN apt-get update && apt-get install -y --no-install-recommends git \
-  && rm -rf /var/lib/apt/lists/*
+# No git here (deliberate). Every workspace operation — create/validate/refresh
+# and clone — is forwarded from the web process to the worker over PI_WORKER_URL
+# (src/server/workspaces.ts calls POST /workspaces/{verify,clone,create}); every
+# `git` subprocess runs in the worker (src/worker/index.ts). The only subprocess
+# the web process can start is the operator-configured post-merge release command
+# (src/server/release-execution.ts, /bin/sh -c), which is not workspace I/O.
+# The earlier "workspace invalid" symptom came from the demo compose workspace
+# path/ownership (a nested bind), not from a missing web-side git. Keep git in
+# Dockerfile.worker only.
 
 USER node
 EXPOSE 3100

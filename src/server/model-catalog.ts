@@ -7,6 +7,7 @@ import type {
   ProviderAvailability,
   ProviderModelCapability,
 } from "../shared/types.js";
+import { MODEL_ROLES, isModelSelectableForRole } from "../shared/model-select.js";
 
 /**
  * Built-in allowlist. The entries mirror the providers and models configured for
@@ -240,16 +241,21 @@ export function availableModels(
       capabilitiesVerified,
       capabilities: capability ?? null,
     };
-    if (!entry.roles.length) {
-      return { ...base, available: false, unavailableReason: "role_restricted" as const, verified: false };
-    }
-    const state = providerModelState(index, entry.provider, entry.model);
-    if (state === "ready" || state === "asserted") {
-      return { ...base, available: true, unavailableReason: null, verified: state === "ready" };
-    }
-    const unavailableReason =
-      state === "missing" ? "credential_missing" : state === "unverified" ? "credential_unverified" : "model_unverified";
-    return { ...base, available: false, unavailableReason, verified: false };
+    const usability: Pick<ModelInfo, "available" | "unavailableReason" | "verified"> = (() => {
+      if (!entry.roles.length) return { available: false, unavailableReason: "role_restricted" as const, verified: false };
+      const state = providerModelState(index, entry.provider, entry.model);
+      if (state === "ready" || state === "asserted") {
+        return { available: true, unavailableReason: null, verified: state === "ready" };
+      }
+      const unavailableReason =
+        state === "missing" ? "credential_missing" : state === "unverified" ? "credential_unverified" : "model_unverified";
+      return { available: false, unavailableReason, verified: false };
+    })();
+    const info: ModelInfo = { ...base, ...usability };
+    // AUD-09: expose the preflight's per-role verdict additively so the create-run
+    // dialog can only offer pairs `POST /api/runs` will accept. Uses the same
+    // shared predicate the client mirrors, so the two cannot drift.
+    return { ...info, selectableRoles: MODEL_ROLES.filter((role) => isModelSelectableForRole(info, role)) };
   });
 }
 

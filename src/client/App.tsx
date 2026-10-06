@@ -94,6 +94,8 @@ import { reworkBranchDetailsFromSummaries, resolveReworkRounds, resolveRoundStat
 import { reworkBranchLayout, reworkBranchPath, type ReworkSide } from "./rework-layout";
 import { ModelsPage } from "./ModelsPage";
 import { mergeOptionState } from "./merge-option";
+import { buildRoleModelOptions, modelOptionText, preferredModelId, roleUncovered } from "./model-options";
+import { isModelSelectableForRole } from "../shared/model-select";
 import { AccountsPage } from "./AccountsPage";
 import { SystemStatusPage } from "./SystemStatusPage";
 import { WorkspacesPage } from "./WorkspacesPage";
@@ -495,13 +497,10 @@ function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, onGoWor
         if (preferred.defaultChecks.length > 0) setChecks(preferred.defaultChecks.join("\n"));
       }
       const pick = (selection: { provider: string; model: string }, role: "developer" | "reviewer") => {
-        const exact = modelResult.models.find((entry) => entry.provider === selection.provider && entry.model === selection.model);
-        if (exact) return exact.id;
-        // AUD-09: prefer a verified model but still allow choosing any model for
-        // the role — the run preflight reports the precise blocking reason.
-        return modelResult.models.find((entry) => entry.roles.includes(role) && entry.available)?.id
-          ?? modelResult.models.find((entry) => entry.roles.includes(role))?.id
-          ?? "";
+        // AUD-09: only default to a pair the run preflight will accept; an
+        // unusable catalogue entry stays visible (disabled) in the select but is
+        // never preselected. Falls back to the exact default when it is usable.
+        return preferredModelId(modelResult.models, role, selection);
       };
       setDeveloperModelId(pick(modelResult.defaultDeveloper, "developer"));
       setReviewerModelId(pick(modelResult.defaultReviewer, "reviewer"));
@@ -509,6 +508,15 @@ function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, onGoWor
   }, [open, config?.realRunsAvailable, locale]);
 
   if (!open) return null;
+  // AUD-09: options come from the shared predicate, so the dialog can only offer
+  // pairs the run preflight accepts; unusable entries stay visible but disabled
+  // with the reason (never silently hidden).
+  const developerOptions = buildRoleModelOptions(models?.models, "developer", locale);
+  const reviewerOptions = buildRoleModelOptions(models?.models, "reviewer", locale);
+  const developerUsable = developerOptions.some((option) => option.id === developerModelId && option.selectable);
+  const reviewerUsable = reviewerOptions.some((option) => option.id === reviewerModelId && option.selectable);
+  const developerUncovered = roleUncovered(models?.models, "developer");
+  const reviewerUncovered = roleUncovered(models?.models, "reviewer");
   const selectedWorkspace = workspaces.find((item) => item.id === workspaceId);
   const selectedDirty = Boolean(selectedWorkspace?.git?.dirty);
   const selectWorkspace = (nextId: string) => {
@@ -581,7 +589,10 @@ function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, onGoWor
                     const template = templates.find((item) => item.id === event.target.value);
                     if (!template || !models) return;
                     const match = (selection: { provider: string; model: string }, role: "developer" | "reviewer") =>
-                      models.models.find((entry) => entry.roles.includes(role) && entry.provider === selection.provider && entry.model === selection.model)?.id;
+                      // AUD-09: a template may pin a pair this deployment cannot
+                      // preflight; never apply it silently — leave the current
+                      // (selectable) choice so the disabled option explains why.
+                      models.models.find((entry) => entry.roles.includes(role) && entry.provider === selection.provider && entry.model === selection.model && isModelSelectableForRole(entry, role))?.id;
                     const developer = match(template.developerModel, "developer");
                     const reviewer = match(template.reviewerModel, "reviewer");
                     if (developer) setDeveloperModelId(developer);
@@ -597,15 +608,17 @@ function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, onGoWor
                 </label>
               )}
               <label>{t("createRun.developerModel")}<select value={developerModelId} onChange={(event) => setDeveloperModelId(event.target.value)}>
-                {(models?.models ?? []).filter((entry) => entry.roles.includes("developer")).map((entry) => (
-                  <option value={entry.id} key={entry.id} disabled={!entry.available}>{entry.label} · {entry.model}{entry.available ? "" : t("createRun.missingCredentialSuffix")}</option>
+                {developerOptions.map((option) => (
+                  <option value={option.id} key={option.id} disabled={!option.selectable}>{modelOptionText(option)}</option>
                 ))}
               </select></label>
+              {developerUncovered && <div className="form-error">{t("createRun.modelRoleUncovered")}</div>}
               <label>{t("createRun.reviewerModel")}<select value={reviewerModelId} onChange={(event) => setReviewerModelId(event.target.value)}>
-                {(models?.models ?? []).filter((entry) => entry.roles.includes("reviewer")).map((entry) => (
-                  <option value={entry.id} key={entry.id} disabled={!entry.available}>{entry.label} · {entry.model}{entry.available ? "" : t("createRun.missingCredentialSuffix")}</option>
+                {reviewerOptions.map((option) => (
+                  <option value={option.id} key={option.id} disabled={!option.selectable}>{modelOptionText(option)}</option>
                 ))}
               </select></label>
+              {reviewerUncovered && <div className="form-error">{t("createRun.modelRoleUncovered")}</div>}
               {selectedDirty && (
                 <div className="dirty-warning">
                   <AlertTriangle size={15} />
@@ -643,7 +656,7 @@ function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, onGoWor
         {error && <div className="form-error">{error}</div>}
         <div className="modal-actions">
           <button type="button" className="button secondary" onClick={onClose}>{t("common.cancel")}</button>
-          <button type="submit" className="button primary" disabled={submitting || (mode === "real" && (!workspaceId || selectedDirty || !developerModelId || !reviewerModelId))}>
+          <button type="submit" className="button primary" disabled={submitting || (mode === "real" && (!workspaceId || selectedDirty || !developerUsable || !reviewerUsable))}>
             {submitting ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}{t(mode === "real" ? "createRun.submitReal" : "createRun.submitDemo")}
           </button>
         </div>

@@ -226,8 +226,46 @@ describe("model catalog", () => {
     expect(result).toMatchObject({ ok: false, role: "developer", code: "MODEL_CONFIG_INVALID" });
   });
 
-  it("exposes the configured defaults", () => {
-    const defaults = defaultSelections({
+  it("advertises selectableRoles that agree with validateModelSelection for every role (AUD-09)", () => {
+    const entries = loadModelCatalog({
+      PI_REVIEWER_PROVIDER: "deepseek",
+      PI_REVIEWER_MODEL: "gpt-5.6-sol",
+    } as NodeJS.ProcessEnv);
+    const availability: ProviderAvailability[] = [
+      { provider: "deepseek", configured: true, verifiedAt: "2026-01-01T00:00:00.000Z", verifiedModels: ["deepseek-flash", "deepseek-chat"] },
+      { provider: "openai-proxy", configured: true, verifiedAt: "2026-01-01T00:00:00.000Z", verifiedModels: ["gpt-5.6-sol", "gpt-5.6-luna"] },
+    ];
+    const models = availableModels(entries, availability);
+    for (const info of models) {
+      const expected = (["developer", "reviewer"] as const).filter(
+        (role) => validateModelSelection(entries, role, { provider: info.provider, model: info.model }, availability).ok,
+      );
+      expect(info.selectableRoles, `${info.provider}/${info.model}`).toEqual(expected);
+    }
+    // The reviewer default the operator configured points at a model this
+    // provider does not serve: it must not be selectable for the reviewer role.
+    const rejected = models.find((entry) => entry.provider === "deepseek" && entry.model === "gpt-5.6-sol");
+    expect(rejected?.selectableRoles).toEqual([]);
+    expect(rejected?.available).toBe(false);
+    expect(rejected?.unavailableReason).toBe("model_unverified");
+    // An allow-listed pair of the same model on the provider that does serve it
+    // stays selectable for the reviewer role.
+    expect(models.find((entry) => entry.provider === "openai-proxy" && entry.model === "gpt-5.6-sol")?.selectableRoles).toEqual(["reviewer"]);
+    expect(models.find((entry) => entry.provider === "deepseek" && entry.model === "deepseek-chat")?.selectableRoles).toEqual(["developer", "reviewer"]);
+  });
+
+  it("exposes selectableRoles for an operator-asserted credential (AUD-08/09)", () => {
+    const entries = loadModelCatalog({} as NodeJS.ProcessEnv);
+    const availability: ProviderAvailability[] = [
+      { provider: "deepseek", configured: true, verifiedAt: null, verifiedModels: null, verification: "operator_asserted", asserted: true },
+    ];
+    const models = availableModels(entries, availability);
+    expect(models.find((entry) => entry.model === "deepseek-flash")?.selectableRoles).toEqual(["developer"]);
+    // A provider with no credential at all is never selectable.
+    expect(models.find((entry) => entry.provider === "openai-proxy")?.selectableRoles).toEqual([]);
+  });
+
+  it("exposes the configured defaults", () => {    const defaults = defaultSelections({
       PI_DEVELOPER_PROVIDER: "deepseek",
       PI_DEVELOPER_MODEL: "deepseek-chat",
       PI_REVIEWER_PROVIDER: "openai-proxy",

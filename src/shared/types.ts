@@ -575,6 +575,15 @@ export interface ModelCatalogEntry {
 export interface ModelInfo extends ModelCatalogEntry {
   available: boolean;
   unavailableReason: "credential_missing" | "credential_unverified" | "model_unverified" | "role_restricted" | null;
+  /**
+   * AUD-09 (additive): the roles this entry is actually selectable for, i.e. the
+   * roles the run preflight would accept this (provider, model) pair for. Derived
+   * server-side by `availableModels` with the shared `isModelSelectableForRole`
+   * predicate, so `/api/models` and the create-run dialog cannot disagree with
+   * `POST /api/runs` preflight. Absent in older payloads; clients then fall back
+   * to the same predicate over `roles` + `available`/`unavailableReason`.
+   */
+  selectableRoles?: ModelRole[];
   /** AUD-08 / AT-MODEL-001: model is backed by a live-verified credential. */
   verified?: boolean;
   /** AUD-08 / AT-MODEL-004: when the backing provider key was last verified. */

@@ -18,7 +18,7 @@
  */
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
@@ -59,6 +59,18 @@ export const DEMO_WEB_SERVICE = "demo-web";
 export const DEMO_WORKER_SERVICE = "demo-worker";
 export const DEMO_VAULT_IN_CONTAINER = "/app/data/credentials.v1.json";
 export const DEMO_DATA_MOUNT = "/app/data";
+
+/**
+ * In-container workspace root. The worker sets PI_WORKSPACE_ROOT=/workspace and
+ * every DB `workspaces.canonical_path` is recorded relative to it
+ * (`/workspace/projects/<repo>`), so this constant ties the compose mount layout
+ * to the persisted paths.
+ */
+export const WORKSPACE_CONTAINER_ROOT = "/workspace";
+/** Workspace-root subdirectory holding the cloned repositories (docs/25). */
+export const WORKSPACE_PROJECTS_DIRNAME = "projects";
+/** Workspace-root subdirectory holding one worktree per run (docs/25). */
+export const WORKSPACE_RUNS_DIRNAME = "runs";
 
 /** Env vars `up` requires before it will touch Docker. Names only — values are never logged. */
 export const REQUIRED_DEMO_ENV = [
@@ -299,6 +311,101 @@ function volumeTargets(service) {
 }
 
 /**
+ * Host source of a compose volume. Handles the long syntax `docker compose
+ * config` emits (`{source, target}`) and, defensively, raw short syntax. The
+ * demo stack is POSIX-only, so a short entry is split at the first `:/` — this
+ * keeps `${VAR:?error message}:/container/path` intact, where a naive
+ * `split(":")` would be fooled by the `:?` in the interpolation.
+ */
+export function mountSource(volume) {
+  if (volume && typeof volume === "object") return String(volume.source ?? "");
+  const raw = String(volume ?? "").trim();
+  const index = raw.indexOf(":/");
+  return index === -1 ? "" : raw.slice(0, index);
+}
+
+/** Container target of a compose volume (object or short syntax). */
+export function mountTarget(volume) {
+  if (volume && typeof volume === "object") return String(volume.target ?? "");
+  const raw = String(volume ?? "").trim();
+  const index = raw.indexOf(":/");
+  if (index === -1) return "";
+  return raw.slice(index + 1).split(":")[0].split(",")[0];
+}
+
+/**
+ * The mounts that carry the workspace root: the single `/workspace` bind and,
+ * if present, any nested `/workspace/...` bind (which must NOT exist — see
+ * `checkDemoCompose`). Pure, works on resolved config or raw short syntax.
+ */
+export function workspaceRootMounts(service) {
+  return (service?.volumes ?? [])
+    .map((volume) => ({ source: mountSource(volume), target: mountTarget(volume) }))
+    .filter((mount) => mount.target === WORKSPACE_CONTAINER_ROOT || mount.target.startsWith(`${WORKSPACE_CONTAINER_ROOT}/`));
+}
+
+/**
+ * Maps a DB `workspaces.canonical_path` (an absolute in-container path under
+ * /workspace) to the host directory a given service actually sees, using that
+ * service's declared mounts (longest matching target wins). Returns `undefined`
+ * when no mount covers the path. Pure: this is how a test proves web and worker
+ * resolve the same canonical_path to the same host directory.
+ */
+export function resolveWorkspaceHostPath(canonicalPath, service) {
+  const candidate = String(canonicalPath ?? "").trim();
+  if (candidate !== WORKSPACE_CONTAINER_ROOT && !candidate.startsWith(`${WORKSPACE_CONTAINER_ROOT}/`)) return undefined;
+  const mounts = workspaceRootMounts(service).sort((left, right) => right.target.length - left.target.length);
+  for (const mount of mounts) {
+    const target = mount.target.replace(/\/+$/, "");
+    if (candidate !== target && !candidate.startsWith(`${target}/`)) continue;
+    if (!mount.source) return undefined;
+    const relative = candidate.slice(target.length).replace(/^\/+/, "");
+    return path.posix.join(mount.source.replace(/\/+$/, ""), relative);
+  }
+  return undefined;
+}
+
+/**
+ * Documented host layout for a workspace root: `<root>/projects` (repositories)
+ * and `<root>/runs` (per-run worktrees), matching the in-container
+ * `/workspace/projects` and `/workspace/runs` produced by a single
+ * `<root>:/workspace` mount.
+ */
+export function workspaceLayout(root) {
+  const base = String(root ?? "");
+  return {
+    root: base,
+    projects: path.join(base, WORKSPACE_PROJECTS_DIRNAME),
+    runs: path.join(base, WORKSPACE_RUNS_DIRNAME),
+  };
+}
+
+/**
+ * `up` guarantees the host workspace layout exists. The worker's create path
+ * mkdirs the projects root itself (`prepareWorkspaceDirectory`), but
+ * clone/register/verify run `git` with the projects root as its cwd and fail
+ * when it is absent, so the demo driver creates `<root>/projects` and
+ * `<root>/runs` before the stack starts. `io.mkdir` is injectable so the
+ * failure path is unit-tested without a filesystem.
+ */
+export function ensureWorkspaceDirectories(layout, io = {}) {
+  const mkdir = io.mkdir ?? mkdirSync;
+  const problems = [];
+  for (const dir of [layout?.projects, layout?.runs]) {
+    if (!dir) {
+      problems.push("workspace root is empty");
+      continue;
+    }
+    try {
+      mkdir(dir, { recursive: true });
+    } catch (error) {
+      problems.push(`cannot create ${dir}: ${error.code || error.message}`);
+    }
+  }
+  return { ok: problems.length === 0, problems };
+}
+
+/**
  * Structural checks over the RESOLVED compose config (as `docker compose config
  * --format json` produces). Pure: takes the parsed config, returns problems.
  */
@@ -368,10 +475,51 @@ export function checkDemoCompose(config, options = {}) {
     if (String(worker.env.PI_SANDBOX_MODE ?? "") !== "auto") {
       problems.push(`${workerName}.PI_SANDBOX_MODE is "${worker.env.PI_SANDBOX_MODE ?? ""}" — expected auto (fail-closed when Docker is unusable)`);
     }
-    const mountTargets = volumeTargets(worker);
-    if (!mountTargets.some((target) => target.split(":")[0] === "/workspace")) {
-      problems.push(`${workerName} does not mount the workspaces root at /workspace`);
+    if (String(worker.env.PI_WORKSPACE_ROOT ?? "") !== WORKSPACE_CONTAINER_ROOT) {
+      problems.push(`${workerName}.PI_WORKSPACE_ROOT is "${worker.env.PI_WORKSPACE_ROOT ?? ""}" — expected ${WORKSPACE_CONTAINER_ROOT} to match the workspace-root mount`);
     }
+    const workerRootMount = workspaceRootMounts(worker).find((mount) => mount.target === WORKSPACE_CONTAINER_ROOT);
+    const workerHostRoot = String(worker.env.PI_HOST_WORKSPACE_ROOT ?? "");
+    if (workerRootMount && workerHostRoot && workerRootMount.source && workerHostRoot !== workerRootMount.source) {
+      problems.push(
+        `${workerName}.PI_HOST_WORKSPACE_ROOT is "${workerHostRoot}" but the ${WORKSPACE_CONTAINER_ROOT} mount comes from "${workerRootMount.source}" — sandbox containers would be bound to the wrong host path`,
+      );
+    }
+  }
+
+  // P1: the workspace root must be mounted EXACTLY ONCE, at /workspace, in BOTH
+  // services. The worker resolves repos at /workspace/projects/<repo> (the value
+  // persisted as workspaces.canonical_path) and derives sandbox host binds from
+  // PI_HOST_WORKSPACE_ROOT. A nested bind (e.g. /workspace/projects) shadows the
+  // real <root>/projects subdirectory, so web, worker and the sandboxes disagree
+  // about where a workspace lives and existing repos look invalid.
+  for (const [serviceName, service] of [[webName, web], [workerName, worker]]) {
+    if (!service) continue;
+    const mounts = workspaceRootMounts(service);
+    const roots = mounts.filter((mount) => mount.target === WORKSPACE_CONTAINER_ROOT);
+    const nested = mounts.filter((mount) => mount.target !== WORKSPACE_CONTAINER_ROOT);
+    if (roots.length !== 1) {
+      problems.push(`${serviceName} must mount the workspace root exactly once at ${WORKSPACE_CONTAINER_ROOT} (found ${roots.length})`);
+    }
+    if (nested.length > 0) {
+      problems.push(
+        `${serviceName} mounts ${nested.map((mount) => mount.target).join(", ")} inside ${WORKSPACE_CONTAINER_ROOT} — a nested bind shadows the documented ${WORKSPACE_PROJECTS_DIRNAME}/ and ${WORKSPACE_RUNS_DIRNAME}/ layout`,
+      );
+    }
+    if (roots.length === 1) {
+      facts.workspaceContainerRoot = WORKSPACE_CONTAINER_ROOT;
+      facts.workspaceMountSource = facts.workspaceMountSource ?? roots[0].source;
+    }
+  }
+
+  // The two services must also mount the SAME host directory, otherwise a stored
+  // canonical_path resolves to different host paths in web and worker.
+  const webRootMount = web && workspaceRootMounts(web).find((mount) => mount.target === WORKSPACE_CONTAINER_ROOT);
+  const workerRootMountForParity = worker && workspaceRootMounts(worker).find((mount) => mount.target === WORKSPACE_CONTAINER_ROOT);
+  if (webRootMount?.source && workerRootMountForParity?.source && webRootMount.source !== workerRootMountForParity.source) {
+    problems.push(
+      `${webName} and ${workerName} mount different host directories at ${WORKSPACE_CONTAINER_ROOT} ("${webRootMount.source}" vs "${workerRootMountForParity.source}") — every workspaces.canonical_path would resolve differently`,
+    );
   }
 
   if (web && worker) {
@@ -754,6 +902,19 @@ async function cmdUp(argv) {
   }
   console.log(`PASS compose structure: ${structural.facts.version}; token ${structural.facts.token}`);
 
+  // P1: with the single <root>:/workspace mount, /workspace/projects is now a
+  // REAL host subdirectory. The worker's create path mkdirs it, but
+  // clone/register/verify run `git` with it as cwd and fail when it is absent,
+  // so make sure the documented layout exists before the stack starts.
+  const layout = workspaceLayout(env.PIGO_DEMO_WORKSPACE_ROOT);
+  const ensured = ensureWorkspaceDirectories(layout);
+  if (!ensured.ok) {
+    console.error("refusing to start: cannot prepare the workspace layout:");
+    for (const problem of ensured.problems) console.error(`  - ${problem}`);
+    return 1;
+  }
+  console.log(`PASS workspace layout: ${layout.projects} (repositories), ${layout.runs} (run worktrees)`);
+
   const build = env.PIGO_DEMO_SKIP_BUILD === "1" ? [] : ["--build"];
   const upArgs = ["up", "-d", ...build, ...argv];
   console.log(`$ docker compose -f ${paths().composeFile} ${upArgs.join(" ")}`);
@@ -866,6 +1027,19 @@ function cmdDoctor(_argv) {
   const vaultFile = env.PIGO_DEMO_DATA_DIR ? path.join(env.PIGO_DEMO_DATA_DIR, "credentials.v1.json") : "(PIGO_DEMO_DATA_DIR unset)";
   const vault = credentialPreflight(vaultFile);
   record("credential-file", vault.ok, vault.message, "place an existing credentials.v1.json in PIGO_DEMO_DATA_DIR (0600, uid 1000); never commit it");
+
+  // P1: the documented layout is <root>/projects/<repo> and <root>/runs/<run>,
+  // reachable in-container at /workspace/projects and /workspace/runs. `up`
+  // creates both; doctor reports the host paths so a wrong PIGO_DEMO_WORKSPACE_ROOT
+  // is visible before a run fails.
+  const layout = workspaceLayout(env.PIGO_DEMO_WORKSPACE_ROOT);
+  const layoutMissing = [layout.projects, layout.runs].filter((dir) => !dir || !existsSync(dir));
+  record(
+    "workspace-layout",
+    layoutMissing.length === 0,
+    layoutMissing.length === 0 ? `${layout.projects} + ${layout.runs}` : `missing ${layoutMissing.join(", ")}`,
+    "scripts/demo-env.sh up creates <PIGO_DEMO_WORKSPACE_ROOT>/projects and /runs; ensure the worker (uid 1000) can write them",
+  );
 
   const resolved = resolvedConfig(env, envFile);
   record("compose-config", resolved.ok, resolved.ok ? "resolved" : resolved.error, "check every ${VAR:?} in the demo env file; then `docker compose config`");
