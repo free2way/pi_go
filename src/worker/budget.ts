@@ -9,6 +9,9 @@ export interface BudgetLimits {
 
 export type BudgetState = "ok" | "warning" | "exhausted";
 
+/** COST-002/003: the fraction of a limit at which the 80% warning fires. */
+export const BUDGET_WARNING_RATIO = 0.8;
+
 export interface BudgetStatus {
   state: BudgetState;
   /** Which limit is closest to being reached (for messages). */
@@ -18,6 +21,20 @@ export interface BudgetStatus {
   /** Human readable reason when the budget is exhausted. */
   reason?: string;
 }
+
+/** One configured dimension's usage reading. */
+export interface BudgetReading {
+  dimension: keyof BudgetLimits;
+  used: number;
+  limit: number;
+  ratio: number;
+}
+
+/** The budget dimensions with a hard limit to compare against. */
+export type BudgetUsage = Pick<
+  RunUsage,
+  "inputTokens" | "outputTokens" | "cacheReadTokens" | "cacheWriteTokens" | "totalTokens" | "estimatedCost"
+>;
 
 /**
  * COST-002/003: reads the run-level hard budgets. Product semantics (docs/03
@@ -35,20 +52,19 @@ export function readBudgetLimits(env: NodeJS.ProcessEnv = process.env): BudgetLi
   };
 }
 
-function ratio(used: number, limit: number) {
-  return limit > 0 ? used / limit : 0;
-}
-
-/**
- * COST-002 / COST-003 / AT-PERF-008: run level hard budgets. The tracker decides
- * when to warn (>=80%) and when to stop starting new model calls (>=100%).
- */
-export function evaluateBudget(input: {
-  usage: Pick<RunUsage, "inputTokens" | "outputTokens" | "cacheReadTokens" | "cacheWriteTokens" | "totalTokens" | "estimatedCost">;
+export interface BudgetEvaluationInput {
+  usage: BudgetUsage;
   modelCalls: number;
   elapsedMs: number;
   limits: BudgetLimits;
-}): BudgetStatus {
+}
+
+/**
+ * COST-002/003: every configured (limit > 0) dimension's usage reading, in a
+ * stable order. Warnings are per dimension, so the tracker needs each reading
+ * rather than only the single worst status `evaluateBudget` returns.
+ */
+export function budgetReadings(input: BudgetEvaluationInput): BudgetReading[] {
   const totalTokens = input.usage.totalTokens
     ?? input.usage.inputTokens + input.usage.outputTokens + (input.usage.cacheReadTokens ?? 0) + (input.usage.cacheWriteTokens ?? 0);
   const measurements: Array<[keyof BudgetLimits, number, number]> = [
@@ -57,12 +73,22 @@ export function evaluateBudget(input: {
     ["maxModelCalls", input.modelCalls, input.limits.maxModelCalls],
     ["maxDurationSeconds", input.elapsedMs / 1000, input.limits.maxDurationSeconds],
   ];
-
-  let worst: BudgetStatus = { state: "ok" };
+  const readings: BudgetReading[] = [];
   for (const [dimension, used, limit] of measurements) {
     if (limit <= 0) continue;
-    const value = ratio(used, limit);
-    if (value >= 1) {
+    readings.push({ dimension, used, limit, ratio: used / limit });
+  }
+  return readings;
+}
+
+/**
+ * COST-002 / COST-003 / AT-PERF-008: run level hard budgets. The tracker decides
+ * when to warn (>=80%) and when to stop starting new model calls (>=100%).
+ */
+export function evaluateBudget(input: BudgetEvaluationInput): BudgetStatus {
+  let worst: BudgetStatus = { state: "ok" };
+  for (const { dimension, used, limit, ratio } of budgetReadings(input)) {
+    if (ratio >= 1) {
       return {
         state: "exhausted",
         dimension,
@@ -71,7 +97,7 @@ export function evaluateBudget(input: {
         reason: budgetReason(dimension, used, limit),
       };
     }
-    if (value >= 0.8 && worst.state === "ok") {
+    if (ratio >= BUDGET_WARNING_RATIO && worst.state === "ok") {
       worst = { state: "warning", dimension, used, limit };
     }
   }

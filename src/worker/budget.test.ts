@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Run } from "../shared/types.js";
-import { budgetWarningMessage, evaluateBudget, mergeRoleUsage, readBudgetLimits } from "./budget.js";
+import { BUDGET_WARNING_RATIO, budgetReadings, budgetWarningMessage, evaluateBudget, mergeRoleUsage, readBudgetLimits } from "./budget.js";
 import { baseRealRun } from "../server/real-run.js";
 
 const usage = (totalTokens: number, cost: number) => ({
@@ -45,6 +45,17 @@ describe("evaluateBudget", () => {
   it("ignores disabled limits", () => {
     const off = { maxTokens: 0, maxCostUsd: 0, maxModelCalls: 0, maxDurationSeconds: 0 };
     expect(evaluateBudget({ usage: usage(9_999_999, 999), modelCalls: 99, elapsedMs: 10_000_000, limits: off }).state).toBe("ok");
+  });
+
+  it("exposes every configured dimension's reading so each can warn once", () => {
+    const readings = budgetReadings({ usage: usage(900, 0.9), modelCalls: 1, elapsedMs: 1_000, limits });
+    expect(readings.map((reading) => reading.dimension)).toEqual(["maxTokens", "maxCostUsd", "maxModelCalls", "maxDurationSeconds"]);
+    // 900/1000 tokens and 0.9/1 cost are both past the 80% threshold at once.
+    expect(readings.filter((reading) => reading.ratio >= BUDGET_WARNING_RATIO).map((reading) => reading.dimension))
+      .toEqual(["maxTokens", "maxCostUsd"]);
+    // Disabled limits (<= 0) are never reported.
+    expect(budgetReadings({ usage: usage(900, 0.9), modelCalls: 1, elapsedMs: 1_000, limits: { ...limits, maxCostUsd: 0 } }).map((reading) => reading.dimension))
+      .toEqual(["maxTokens", "maxModelCalls", "maxDurationSeconds"]);
   });
 });
 
