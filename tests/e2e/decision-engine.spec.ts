@@ -345,7 +345,7 @@ test.describe("JEV 决策平面 shadow 契约", () => {
     if (engine!.engine === "jev" && engine!.configured !== true) {
       test.skip(
         true,
-        `${skipPrefix}已选择真实 TypeSafe 引擎但缺少凭据（configured=false${engine!.reason ? `, reason=${engine!.reason}` : ""}）。设置 TYPESAFE_API_KEY=<key>（并保持 PI_JEV_MODE=shadow）。`,
+        `${skipPrefix}已选择真实 TypeSafe 引擎但缺少凭据（configured=false${engine!.reason ? `, reason=${engine!.reason}` : ""}）。请在「模型与凭据」页录入 TypeSafe/Jev 密钥（或设置 TYPESAFE_API_KEY=<key>），并保持 PI_JEV_MODE=shadow。`,
       );
     }
     test.skip(

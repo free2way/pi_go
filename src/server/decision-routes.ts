@@ -305,8 +305,19 @@ export function decisionEngineStatus(
   }
   const keySource: "vault" | "env" | null = options.vaultKey ? "vault" : loaded.config.hasApiKey ? "env" : null;
   if (keySource === null) {
-    // AT-JEV-003: no vault key and no env key — actionable reason, no value.
-    return { engine: "disabled", mode: "off", configured: false, policyVersion: null, reason: "missing_credentials" };
+    // AT-JEV-003: no vault key and no env key. The deployment config IS enabled
+    // (`jev`/mode), only the credential for THIS user is missing — reporting the
+    // engine as `disabled` would tell the operator to flip PI_DECISION_ENGINE
+    // when it is already set. Keep the configured engine/mode and let
+    // `configured`/`reason` carry the actionable part, with no key value.
+    return {
+      engine: "jev",
+      mode: loaded.config.mode,
+      configured: false,
+      keySource: null,
+      policyVersion: loaded.config.policyVersion,
+      reason: "missing_credentials",
+    };
   }
   return {
     engine: "jev",

@@ -12,8 +12,8 @@ import type { DecisionEngineConfig, DecisionRequest } from "./types.js";
  * stays the fallback when it is absent, and `disabled`/`mock` never consult it.
  */
 
-const VAULT_KEY = "sk-VAULT-ONLY-DO-NOT-LEAK-0123456789";
-const ENV_KEY = "sk-ENV-FALLBACK-DO-NOT-LEAK-abcdef";
+const VAULT_KEY = "sk-DUMMY-VAULT-ONLY-DO-NOT-LEAK-0123456789";
+const ENV_KEY = "sk-DUMMY-ENV-FALLBACK-DO-NOT-LEAK-abcdef";
 
 const config = (overrides: Partial<DecisionEngineConfig> = {}): DecisionEngineConfig => ({
   engine: "jev",

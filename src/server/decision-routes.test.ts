@@ -990,11 +990,16 @@ describe("decisionEngineStatus (/api/config/status)", () => {
       { PI_DECISION_ENGINE: "jev", PI_JEV_MODE: "shadow" },
       { allowMissingApiKey: true },
     );
+    // The deployment IS enabled: only this user's credential is missing. Reporting
+    // `disabled` here would send the operator looking for a config toggle that is
+    // already set, so the configured engine/mode is kept and `configured`/`reason`
+    // carry the actionable part.
     expect(decisionEngineStatus(none, { vaultKey: false })).toEqual({
-      engine: "disabled",
-      mode: "off",
+      engine: "jev",
+      mode: "shadow",
       configured: false,
-      policyVersion: null,
+      keySource: null,
+      policyVersion: "review-triage-v1",
       reason: "missing_credentials",
     });
   });
