@@ -298,7 +298,7 @@ async function cancelIfActive(request: APIRequestContext, runId: string): Promis
   }
 }
 
-/** decision.* 事件 meta 的允许集合（docs/26 §13 / AT-JEV-063）。 */
+/** decision.* 事件 meta 的允许集合（docs/26 §13 / AT-JEV-063；批次扇出后增加 batchIndex/batchCount）。 */
 const DECISION_EVENT_META_KEYS = new Set([
   "evaluationId",
   "kind",
@@ -311,6 +311,8 @@ const DECISION_EVENT_META_KEYS = new Set([
   "inputTokens",
   "outputTokens",
   "estimatedCostUsd",
+  "batchIndex",
+  "batchCount",
 ]);
 
 /** 看着像凭据 / 外发 payload 的键或值（任何命中即 FAIL）。 */
@@ -474,6 +476,17 @@ test.describe("JEV 决策平面 shadow 契约", () => {
           if (!DECISION_EVENT_META_KEYS.has(key)) return `meta 出现未允许的键 ${key}`;
           const text = typeof value === "string" ? value : JSON.stringify(value ?? null);
           if (FORBIDDEN_TOKEN.test(text)) return `meta.${key} 的值看起来像凭据：${text.slice(0, 120)}`;
+        }
+        // 批次语义（findings 超过 PI_JEV_REVIEW_MAX_FINDINGS 时按批扇出）：允许存在，
+        // 但必须是自洽的 1-based 计数——放行不等于不管。
+        const index = meta.batchIndex;
+        const count = meta.batchCount;
+        if (index !== undefined || count !== undefined) {
+          const i = Number(index);
+          const n = Number(count);
+          if (!Number.isInteger(i) || !Number.isInteger(n) || n < 1 || i < 1 || i > n) {
+            return `meta 批次字段不自洽（batchIndex=${String(index)} batchCount=${String(count)}）`;
+          }
         }
         return undefined;
       };
@@ -716,12 +729,14 @@ test.describe("JEV 决策平面 shadow 契约", () => {
         }
         expect(FORBIDDEN_TOKEN.test(event.message), `decision 事件文案不得包含凭据：${event.message}`).toBe(false);
       }
-      // requested 只带 id（+ kind/mode/model），不得带 status/answer 内容。
+      // requested 只带 id（+ kind/mode/model，以及批次扇出时的 batchIndex/batchCount），
+      // 不得带 status/answer 内容。
+      const allowedRequestedKeys = ["evaluationId", "kind", "mode", "requestedModel", "batchIndex", "batchCount"];
       for (const event of requested) {
         expect(
           Object.keys(event.meta ?? {}).sort(),
-          `decision.requested 的 meta 只允许 evaluationId/kind/mode/requestedModel：${describeEvent(event)}`,
-        ).toEqual([...DECISION_EVENT_META_KEYS].filter((key) => ["evaluationId", "kind", "mode", "requestedModel"].includes(key)).sort());
+          `decision.requested 的 meta 只允许 ${allowedRequestedKeys.join("/")}：${describeEvent(event)}`,
+        ).toEqual([...DECISION_EVENT_META_KEYS].filter((key) => allowedRequestedKeys.includes(key)).sort());
       }
       for (const event of outcomes) {
         if (event.type === "decision.fallback") {
