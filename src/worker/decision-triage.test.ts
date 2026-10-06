@@ -116,7 +116,7 @@ describe("createReviewTriageTrigger", () => {
 });
 
 describe("recordVerdictThenReviewTriage (review-stage ordering)", () => {
-  it("records the review verdict before the triage call fires", async () => {
+  it("[AT-JEV-020] records the review verdict before the triage call fires", async () => {
     const sequence: string[] = [];
     const verdict = await recordVerdictThenReviewTriage({
       runId: "run_abc",
@@ -133,7 +133,7 @@ describe("recordVerdictThenReviewTriage (review-stage ordering)", () => {
     expect(sequence).toEqual(["verdict", "triage:run_abc"]);
   });
 
-  it("never fires the triage when recording the verdict failed", async () => {
+  it("[AT-JEV-028] never fires the triage when recording the verdict failed", async () => {
     const sequence: string[] = [];
     await expect(
       recordVerdictThenReviewTriage({

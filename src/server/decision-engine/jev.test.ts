@@ -95,7 +95,7 @@ afterEach(() => {
 });
 
 describe("provider request mapping", () => {
-  it("maps probability→noul with criteria when meanings are supplied", () => {
+  it("[AT-JEV-010] maps probability→noul with criteria when meanings are supplied", () => {
     expect(mapQuestionToProvider(questions.q_prob)).toEqual({ type: "noul", criteria: { true: "yes", false: "no" } });
   });
 
@@ -103,14 +103,14 @@ describe("provider request mapping", () => {
     expect(mapQuestionToProvider({ type: "probability", prompt: "p" })).toEqual({ type: "noul" });
   });
 
-  it("maps choice→choice with a criteria map", () => {
+  it("[AT-JEV-011] maps choice→choice with a criteria map", () => {
     expect(mapQuestionToProvider(questions.q_choice)).toEqual({
       type: "choice",
       criteria: { none: "none", material: "material" },
     });
   });
 
-  it("maps score→score with an ordered criteria array", () => {
+  it("[AT-JEV-012] maps score→score with an ordered criteria array", () => {
     expect(mapQuestionToProvider(questions.q_score)).toEqual({
       type: "score",
       criteria: [
@@ -133,7 +133,7 @@ describe("provider request mapping", () => {
     expect(built.ok).toBe(false);
   });
 
-  it("builds {state, model, questions} with no key inside", () => {
+  it("[AT-JEV-050] builds {state, model, questions} with no key inside", () => {
     const built = buildProviderRequestBody(request(), config());
     expect(built.ok).toBe(true);
     if (!built.ok) return;
@@ -167,7 +167,7 @@ describe("jev engine — transport", () => {
     expect((fetchImpl.mock.calls as unknown as Array<[string, RequestInit]>)[0][0]).toBe("https://mock.local/v1/systemone");
   });
 
-  it("returns a completed evaluation with resolved model and tokens", async () => {
+  it("[AT-JEV-014] returns a completed evaluation with resolved model and tokens", async () => {
     const engine = createJevEngine(config(), { fetchImpl: async () => json(validBody()) });
     const evaluation = await engine.evaluate(request());
     expect(evaluation.status).toBe("completed");
@@ -180,7 +180,7 @@ describe("jev engine — transport", () => {
     expect(evaluation.stateHash).toBe("hash");
   });
 
-  it("falls back with missing_credentials without any request when the key is absent", async () => {
+  it("[AT-JEV-003] falls back with missing_credentials without any request when the key is absent", async () => {
     delete process.env.TYPESAFE_API_KEY;
     const fetchImpl = vi.fn(async () => json(validBody()));
     const engine = createJevEngine(config({ hasApiKey: false }), { fetchImpl: fetchImpl as unknown as typeof fetch });
@@ -189,7 +189,7 @@ describe("jev engine — transport", () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it("rejects an over-limit payload before dispatch", async () => {
+  it("[AT-JEV-016] rejects an over-limit payload before dispatch", async () => {
     const fetchImpl = vi.fn(async () => json(validBody()));
     const engine = createJevEngine(config({ maxStateTokens: 1, maxStateBytes: 1 }), { fetchImpl: fetchImpl as unknown as typeof fetch });
     const evaluation = await engine.evaluate(request());
@@ -200,7 +200,7 @@ describe("jev engine — transport", () => {
 });
 
 describe("jev engine — retry table", () => {
-  it("does not retry 401 and opens the breaker until the config changes", async () => {
+  it("[AT-JEV-043] does not retry 401 and opens the breaker until the config changes", async () => {
     const fetchImpl = vi.fn(async () => json({ error: "nope" }, 401));
     const engine = createJevEngine(config(), { fetchImpl: fetchImpl as unknown as typeof fetch });
     const evaluation = await engine.evaluate(request());
@@ -220,7 +220,7 @@ describe("jev engine — retry table", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
-  it("does not retry 422 and reports the policy version and question schema hash", async () => {
+  it("[AT-JEV-044] does not retry 422 and reports the policy version and question schema hash", async () => {
     const fetchImpl = vi.fn(async () => json({ error: "contract" }, 422));
     const engine = createJevEngine(config(), { fetchImpl: fetchImpl as unknown as typeof fetch });
     const evaluation = await engine.evaluate(request());
@@ -230,7 +230,7 @@ describe("jev engine — retry table", () => {
     expect(evaluation.detail).toMatch(/schema=[0-9a-f]{64}/);
   });
 
-  it("logs the validation loc/msg for a live 422 only with PI_JEV_DIAG=1, never an echoed input", async () => {
+  it("[AT-JEV-055] logs the validation loc/msg for a live 422 only with PI_JEV_DIAG=1, never an echoed input", async () => {
     // A live 422 is otherwise indistinguishable by field; FastAPI returns
     // `{"detail":[{"loc","msg","type","input"}]}` and may echo the offending
     // value, so the diagnostic reads loc/msg/type and nothing else.
@@ -288,7 +288,7 @@ describe("jev engine — retry table", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
-  it("retries a 429 once honoring Retry-After", async () => {
+  it("[AT-JEV-041] retries a 429 once honoring Retry-After", async () => {
     let calls = 0;
     const fetchImpl = vi.fn(async () => {
       calls += 1;
@@ -301,7 +301,7 @@ describe("jev engine — retry table", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
-  it("does not wait when Retry-After exceeds the remaining budget", async () => {
+  it("[AT-JEV-041] does not wait when Retry-After exceeds the remaining budget", async () => {
     const fetchImpl = vi.fn(async () => json({ error: "slow down" }, 429, { "Retry-After": "30" }));
     const engine = createJevEngine(config({ timeoutMs: 2000 }), { fetchImpl: fetchImpl as unknown as typeof fetch });
     const started = Date.now();
@@ -311,7 +311,7 @@ describe("jev engine — retry table", () => {
     expect(Date.now() - started).toBeLessThan(1000);
   });
 
-  it("retries a 529 once with jitter and then succeeds", async () => {
+  it("[AT-JEV-042] retries a 529 once with jitter and then succeeds", async () => {
     let calls = 0;
     const fetchImpl = vi.fn(async () => {
       calls += 1;
@@ -324,7 +324,7 @@ describe("jev engine — retry table", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
-  it("retries a 5xx once and reports provider_unavailable when it persists", async () => {
+  it("[AT-JEV-042] retries a 5xx once and reports provider_unavailable when it persists", async () => {
     const fetchImpl = vi.fn(async () => json({ error: "boom" }, 503));
     const engine = createJevEngine(config(), { fetchImpl: fetchImpl as unknown as typeof fetch });
     const evaluation = await engine.evaluate(request());
@@ -332,7 +332,7 @@ describe("jev engine — retry table", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
-  it("retries a network error once and normalizes it to provider_unavailable", async () => {
+  it("[AT-JEV-045] retries a network error once and normalizes it to provider_unavailable", async () => {
     let calls = 0;
     const fetchImpl = vi.fn(async () => {
       calls += 1;
@@ -345,7 +345,7 @@ describe("jev engine — retry table", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
-  it("opens the breaker after five consecutive provider-attributable failures", async () => {
+  it("[AT-JEV-048] opens the breaker after five consecutive provider-attributable failures", async () => {
     const fetchImpl = vi.fn(async () => json({ error: "boom" }, 500));
     const engine = createJevEngine(config(), { fetchImpl: fetchImpl as unknown as typeof fetch });
     for (let i = 0; i < 3; i += 1) {
@@ -359,7 +359,7 @@ describe("jev engine — retry table", () => {
 });
 
 describe("jev engine — time budget and cancellation", () => {
-  it("cancels the underlying request at the total timeout and reports timeout", async () => {
+  it("[AT-JEV-040] cancels the underlying request at the total timeout and reports timeout", async () => {
     const engine = createJevEngine(config({ timeoutMs: 60 }), { fetchImpl: hangingFetch() });
     const started = Date.now();
     const evaluation = await engine.evaluate(request());
@@ -367,7 +367,7 @@ describe("jev engine — time budget and cancellation", () => {
     expect(Date.now() - started).toBeLessThan(1000);
   });
 
-  it("propagates a caller abort and reports aborted", async () => {
+  it("[AT-JEV-046] propagates a caller abort and reports aborted", async () => {
     const engine = createJevEngine(config({ timeoutMs: 5000 }), { fetchImpl: hangingFetch() });
     const controller = new AbortController();
     const promise = engine.evaluate(request(), controller.signal);
@@ -376,7 +376,7 @@ describe("jev engine — time budget and cancellation", () => {
     expect(evaluation.fallbackReason).toBe("aborted");
   });
 
-  it("reports aborted without dispatching when the signal is already aborted", async () => {
+  it("[AT-JEV-046] reports aborted without dispatching when the signal is already aborted", async () => {
     const fetchImpl = vi.fn(async () => json(validBody()));
     const engine = createJevEngine(config(), { fetchImpl: fetchImpl as unknown as typeof fetch });
     const controller = new AbortController();
@@ -393,7 +393,7 @@ describe("CircuitBreaker", () => {
     return { now: () => current, advance: (ms: number) => (current += ms) };
   };
 
-  it("opens after the threshold and admits one half-open probe after the cooldown", () => {
+  it("[AT-JEV-048] opens after the threshold and admits one half-open probe after the cooldown", () => {
     const clock = makeClock();
     const breaker = new CircuitBreaker({ now: clock.now });
     for (let i = 0; i < BREAKER_THRESHOLD; i += 1) breaker.onProviderFailure();
@@ -420,7 +420,7 @@ describe("CircuitBreaker", () => {
     expect(breaker.allow()).toBe(false);
   });
 
-  it("locks open on auth failure until reset (config change)", () => {
+  it("[AT-JEV-043] locks open on auth failure until reset (config change)", () => {
     const clock = makeClock();
     const breaker = new CircuitBreaker({ now: clock.now });
     breaker.onAuthFailure();
@@ -440,7 +440,7 @@ describe("CircuitBreaker", () => {
     expect(breaker.state()).toBe("closed");
   });
 
-  it("releases an inconclusive half-open probe and waits another cooldown", () => {
+  it("[AT-JEV-048] releases an inconclusive half-open probe and waits another cooldown", () => {
     const clock = makeClock();
     const breaker = new CircuitBreaker({ now: clock.now });
     for (let i = 0; i < BREAKER_THRESHOLD; i += 1) breaker.onProviderFailure();

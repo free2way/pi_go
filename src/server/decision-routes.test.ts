@@ -288,7 +288,7 @@ async function auditRowCount(db: DecisionAuditStore) {
 }
 
 describe("POST /api/internal/decisions/evaluate (docs/26 §8.1)", () => {
-  it("requires the internal worker token — a browser session is rejected without any provider call", async () => {
+  it("[AT-JEV-054] requires the internal worker token — a browser session is rejected without any provider call", async () => {
     const h = await harness();
 
     const noAuth = await h.evaluate({ headers: {} });
@@ -318,7 +318,7 @@ describe("POST /api/internal/decisions/evaluate (docs/26 §8.1)", () => {
     expect(h.engineCalls).toHaveLength(0);
   });
 
-  it("returns a business-safe disabled result for off/disabled without an outbound call or an audit row", async () => {
+  it("[AT-JEV-002] returns a business-safe disabled result for off/disabled without an outbound call or an audit row", async () => {
     const off = await harness({ load: { ok: true, config: testConfig({ mode: "off" }) } });
     const offResponse = await off.evaluate();
     expect(offResponse.statusCode).toBe(200);
@@ -370,7 +370,7 @@ describe("POST /api/internal/decisions/evaluate (docs/26 §8.1)", () => {
     expect(await auditRowCount(h.audit)).toBe(0);
   });
 
-  it("persists exactly one audit row and appends decision.requested then decision.completed", async () => {
+  it("[AT-JEV-020][AT-JEV-060] persists exactly one audit row and appends decision.requested then decision.completed", async () => {
     const h = await harness();
     const response = await h.evaluate();
     expect(response.statusCode).toBe(200);
@@ -416,7 +416,7 @@ describe("POST /api/internal/decisions/evaluate (docs/26 §8.1)", () => {
     expect(serializedMeta).not.toContain("taskSummary");
   });
 
-  it("appends decision.fallback with the standard reason when the engine falls back", async () => {
+  it("[AT-JEV-063] appends decision.fallback with the standard reason when the engine falls back", async () => {
     const h = await harness({
       evaluation: (request) =>
         completedEvaluation(request, { status: "fallback", fallbackReason: "timeout", detail: "provider timed out", answers: [], resolvedModel: undefined }),
@@ -460,7 +460,7 @@ describe("POST /api/internal/decisions/evaluate (docs/26 §8.1)", () => {
     expect((await h.audit.listByRun(h.run.id))[0]).toMatchObject({ mode: "assist", appliedOutcome: "assist_suggestion" });
   });
 
-  it("is idempotent: a duplicate evaluationId returns the stored row without a second call, row or event pair", async () => {
+  it("[AT-JEV-047] is idempotent: a duplicate evaluationId returns the stored row without a second call, row or event pair", async () => {
     const h = await harness();
     const first = await h.evaluate();
     const second = await h.evaluate();
@@ -472,7 +472,7 @@ describe("POST /api/internal/decisions/evaluate (docs/26 §8.1)", () => {
     expect((await decisionEvents(h.store, h.run.id)).map((event) => event.type)).toEqual(["decision.requested", "decision.completed"]);
   });
 
-  it("does not double-insert when the store sees a duplicate key directly", async () => {
+  it("[AT-JEV-047] does not double-insert when the store sees a duplicate key directly", async () => {
     const h = await harness();
     await h.evaluate();
     const stored = (await h.audit.listByRun(h.run.id))[0];
@@ -482,7 +482,7 @@ describe("POST /api/internal/decisions/evaluate (docs/26 §8.1)", () => {
     expect(await auditRowCount(h.audit)).toBe(1);
   });
 
-  it("stores an unknown cost as NULL (never 0) and keeps a small real cost unrounded", async () => {
+  it("[AT-JEV-062] stores an unknown cost as NULL (never 0) and keeps a small real cost unrounded", async () => {
     const h = await harness();
     await h.evaluate();
     const unknownRow = (await h.db.query("SELECT estimated_cost_usd FROM decision_evaluations")).rows[0];
@@ -498,7 +498,7 @@ describe("POST /api/internal/decisions/evaluate (docs/26 §8.1)", () => {
     expect((await priced.decisions(priced.run.id)).json().decisions[0].estimatedCostUsd).toBe(0.0042);
   });
 
-  it("never persists the outbound payload or a credential", async () => {
+  it("[AT-JEV-055] never persists the outbound payload or a credential", async () => {
     const h = await harness();
     const response = await h.evaluate();
     const serialized = JSON.stringify(response.json());
@@ -608,7 +608,7 @@ describe("review-triage batch fan-out (docs/26 §9.2)", () => {
     expect(new Set(events.map((event) => event.meta?.evaluationId)).size).toBe(3);
   });
 
-  it("keeps the other batches when one batch's provider call fails", async () => {
+  it("[AT-JEV-026] keeps the other batches when one batch's provider call fails", async () => {
     let calls = 0;
     const h = await harness({
       buildBatches: buildReviewTriageBatches,
@@ -674,7 +674,7 @@ describe("review-triage batch fan-out (docs/26 §9.2)", () => {
     ]);
   });
 
-  it("is idempotent per batch on replay: no second provider call, row or event pair", async () => {
+  it("[AT-JEV-047] is idempotent per batch on replay: no second provider call, row or event pair", async () => {
     const h = await harness({
       buildBatches: buildReviewTriageBatches,
       load: { ok: true, config: testConfig({ reviewMaxFindings: 1 }) },
@@ -792,7 +792,7 @@ describe("decision-plane key resolution — vault first, env fallback (docs/26 �
     expect(vaultReads.map((read) => read.provider)).toEqual(["typesafe", "jev"]);
   });
 
-  it("reports missing_credentials with no provider call, batch build or audit row when nothing resolves", async () => {
+  it("[AT-JEV-003] reports missing_credentials with no provider call, batch build or audit row when nothing resolves", async () => {
     resetDecisionCircuitBreakers();
     const fetchImpl = providerFetch();
     const h = await harness({
@@ -816,7 +816,7 @@ describe("decision-plane key resolution — vault first, env fallback (docs/26 �
     expect(await decisionEvents(h.store, h.run.id)).toHaveLength(0);
   });
 
-  it("never persists the resolved key in the response, the audit row or the events", async () => {
+  it("[AT-JEV-050] never persists the resolved key in the response, the audit row or the events", async () => {
     resetDecisionCircuitBreakers();
     const fetchImpl = providerFetch();
     const h = await harness({
@@ -838,7 +838,7 @@ describe("decision-plane key resolution — vault first, env fallback (docs/26 �
 });
 
 describe("non-jev engines never read the credential vault (docs/26 §11)", () => {
-  it("does not query the vault for a disabled engine or the off kill switch", async () => {
+  it("[AT-JEV-005] does not query the vault for a disabled engine or the off kill switch", async () => {
     const reads: Array<{ userId: string; provider: string }> = [];
     const disabled = await harness({
       load: { ok: true, config: testConfig({ engine: "disabled", mode: "shadow" }) },
@@ -882,7 +882,7 @@ describe("GET /api/runs/:runId/decisions (docs/26 §8.2)", () => {
     expect((await h.decisions("run_missing")).statusCode).toBe(404);
   });
 
-  it("returns only the redacted audit projection, newest first", async () => {
+  it("[AT-JEV-060] returns only the redacted audit projection, newest first", async () => {
     const h = await harness();
     await h.evaluate();
     const response = await h.decisions(h.run.id);
@@ -922,7 +922,7 @@ describe("GET /api/runs/:runId/decisions (docs/26 §8.2)", () => {
 });
 
 describe("decision audit aggregate (docs/26 §13)", () => {
-  it("counts by status and kind for the config/metrics surface", async () => {
+  it("[AT-JEV-064] counts by status and kind for the config/metrics surface", async () => {
     let fallbackRunId = "";
     const h = await harness({
       evaluation: (request) =>
@@ -960,7 +960,7 @@ describe("decisionEngineStatus (/api/config/status)", () => {
     expect(serialized).not.toContain("pass");
   });
 
-  it("reports jev without a key as not configured, with the standard reason (preflight, AT-JEV-003)", () => {
+  it("[AT-JEV-003] reports jev without a key as not configured, with the standard reason (preflight)", () => {
     const status = decisionEngineStatus(loadDecisionEngineConfig({ PI_DECISION_ENGINE: "jev", PI_JEV_MODE: "shadow" }));
     expect(status).toEqual({
       engine: "disabled",

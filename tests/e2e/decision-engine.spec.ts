@@ -324,7 +324,7 @@ function describeEvent(event: RunEvent): string {
 }
 
 test.describe("JEV 决策平面 shadow 契约", () => {
-  test("真实运行的 shadow 零影响：决策只见证、不改写状态，审计/事件只暴露脱敏内容", async ({ request }) => {
+  test("[AT-JEV-021] 真实运行的 shadow 零影响：决策只见证、不改写状态，审计/事件只暴露脱敏内容", async ({ request }) => {
     // 目标：证明 shadow 模式下，决策平面观察到真实的 review finding，但结果
     // 只被记录（appliedOutcome=none），主流程与没有决策平面时完全一致。
     const waitMs = Number(envValue("PI_E2E_DECISION_TIMEOUT_MS") ?? 420_000);

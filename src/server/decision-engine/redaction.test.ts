@@ -24,7 +24,7 @@ describe("redactText — secrets", () => {
     ["openai key", "sk-DUMMYabcdefghijklmnopqrstuvwxyz0123", "openai_key"],
     ["slack token", "xoxb-1234567890-abcdefghijkl", "slack_token"],
     ["google key", "AIzaSyDUMMY-not-a-real-key0000000000000", "google_api_key"],
-  ])("redacts a %s", (_name, secret, rule) => {
+  ])("[AT-JEV-051] redacts a %s", (_name, secret, rule) => {
     const text = `credential found: ${secret} end`;
     const redacted = redactText(text);
     expect(redacted).not.toContain(secret);
@@ -32,7 +32,7 @@ describe("redactText — secrets", () => {
     expect(matchedRedactionRules(text)).toContain(rule);
   });
 
-  it("redacts JWT and Authorization headers", () => {
+  it("[AT-JEV-051] redacts JWT and Authorization headers", () => {
     const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dummy";
     const text = `token=${jwt}\nAuthorization: Bearer DUMMY-token-abc123def456`;
     const redacted = redactText(text);
@@ -54,7 +54,7 @@ describe("redactText — secrets", () => {
     expect(redacted).toContain(REDACTED);
   });
 
-  it("redacts URLs with embedded credentials", () => {
+  it("[AT-JEV-051] redacts URLs with embedded credentials", () => {
     const redacted = redactText("postgres://admin:hunter2@db.internal:5432/pigo");
     expect(redacted).not.toContain("hunter2");
     expect(redacted).toContain(`postgres://${REDACTED}@db.internal:5432/pigo`.replace("[redacted]@", "[redacted]@"));
@@ -112,19 +112,19 @@ describe("redactDeep", () => {
 });
 
 describe("canonicalJson + hashes", () => {
-  it("is insensitive to object key order", () => {
+  it("[AT-JEV-015] is insensitive to object key order", () => {
     expect(canonicalJson({ b: 1, a: { d: 2, c: [3, 4] } })).toBe(canonicalJson({ a: { c: [3, 4], d: 2 }, b: 1 }));
   });
 
-  it("produces the same stateHash for semantically identical states", () => {
+  it("[AT-JEV-015] produces the same stateHash for semantically identical states", () => {
     expect(stateHash({ a: 1, b: [2, 3] })).toBe(stateHash({ b: [2, 3], a: 1 }));
   });
 
-  it("changes the stateHash when content changes", () => {
+  it("[AT-JEV-015] changes the stateHash when content changes", () => {
     expect(stateHash({ a: 1 })).not.toBe(stateHash({ a: 2 }));
   });
 
-  it("hashes the redacted form, so two states differing only by a secret collide", () => {
+  it("[AT-JEV-051] hashes the redacted form, so two states differing only by a secret collide", () => {
     const withSecret = stateHash({ note: "key sk-DUMMYabcdefghijklmnopqrstuvwxyz0123" });
     const redacted = stateHash({ note: "key [redacted]" });
     expect(withSecret).toBe(redacted);
@@ -134,7 +134,7 @@ describe("canonicalJson + hashes", () => {
     expect(canonicalJson({ a: Number.NaN, b: Number.POSITIVE_INFINITY })).toBe('{"a":null,"b":null}');
   });
 
-  it("questionSchemaHash changes when options or levels change", () => {
+  it("[AT-JEV-015] questionSchemaHash changes when options or levels change", () => {
     const base: Record<string, DecisionQuestion> = {
       q1: { type: "choice", prompt: "pick", options: ["a", "b"] },
       q2: { type: "score", prompt: "rate", levels: [{ value: "low", description: "l" }, { value: "high", description: "h" }] },
@@ -167,7 +167,7 @@ describe("estimateTokens / measurePayload", () => {
     expect(measurement.bytes).toBeGreaterThan(0);
   });
 
-  it("rejects over-limit payloads with payload_rejected (no truncation)", () => {
+  it("[AT-JEV-016] rejects over-limit payloads with payload_rejected (no truncation)", () => {
     const state = { blob: "y".repeat(4000) };
     const questions: Record<string, DecisionQuestion> = { q: { type: "probability", prompt: "p" } };
     const tooFewTokens = checkPayloadLimits(state, questions, { maxTokens: 10, maxBytes: 1_000_000 });

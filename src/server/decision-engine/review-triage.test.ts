@@ -128,7 +128,7 @@ describe("review-triage state projection", () => {
     expect(state.findings[0].title.length).toBeLessThanOrEqual(200);
   });
 
-  it("redacts secrets and PII in every free-text field", () => {
+  it("[AT-JEV-051] redacts secrets and PII in every free-text field", () => {
     const secret = "sk-DUMMYabcdefghijklmnopqrstuvwxyz0123";
     const run = makeRun({
       task: `use ${secret} for the deploy`,
@@ -150,7 +150,7 @@ describe("review-triage state projection", () => {
     expect(JSON.stringify(buildReviewTriageState(run))).not.toContain("/Users/operator");
   });
 
-  it("flags an incomplete diff and never includes diff content", () => {
+  it("[AT-JEV-027] flags an incomplete diff and never includes diff content", () => {
     const run = makeRun({ diff: "# [PiGO] inline diff truncated bytes=999999\ndiff --git a/a.ts b/a.ts\n+leaked source line" });
     const state = buildReviewTriageState(run);
     expect(state.change.diffComplete).toBe(false);
@@ -241,7 +241,7 @@ describe("review-triage batching", () => {
       finding({ id: `F${index}`, title: `finding ${index}`, file: `src/f${index}.ts`, consecutiveRounds: index % 3 }),
     );
 
-  it("splits beyond maxFindings into ordered, disjoint, complete batches", () => {
+  it("[AT-JEV-026] splits beyond maxFindings into ordered, disjoint, complete batches", () => {
     const run = makeRun({ findings: manyFindings(100) });
     const batches = buildReviewTriageBatches(input(run, { maxFindings: 50 }));
     expect(batches).toHaveLength(2);
@@ -275,7 +275,7 @@ describe("review-triage batching", () => {
     expect(batches.flatMap((batch) => batch.findingKeys)).toHaveLength(6);
   });
 
-  it("reports an over-limit batch instead of truncating the question set", () => {
+  it("[AT-JEV-016] reports an over-limit batch instead of truncating the question set", () => {
     const run = makeRun({ findings: manyFindings(3) });
     const batches = buildReviewTriageBatches(input(run), { maxTokens: 1, maxBytes: 1_000_000 });
     expect(batches.length).toBeGreaterThan(0);
@@ -317,7 +317,7 @@ describe("runReviewTriageBatches — isolation", () => {
     fallbackReason: "timeout",
   });
 
-  it("lets a failing batch fail without affecting the others", async () => {
+  it("[AT-JEV-026] lets a failing batch fail without affecting the others", async () => {
     const run = makeRun({ findings: Array.from({ length: 3 }, (_, index) => finding({ id: `F${index}`, title: `finding ${index}` })) });
     const batches = buildReviewTriageBatches(input(run, { maxFindings: 1 }));
     expect(batches).toHaveLength(3);

@@ -53,7 +53,7 @@ describe("mapProviderResponse — happy path", () => {
     expect(result.answers.map((a) => a.questionId)).toEqual(["q_prob", "q_choice", "q_score"]);
   });
 
-  it("maps noul to probability + certainty and never stores confidence", () => {
+  it("[AT-JEV-010] maps noul to probability + certainty and never stores confidence", () => {
     const result = mapProviderResponse(response(validAnswer()), request);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -63,7 +63,7 @@ describe("mapProviderResponse — happy path", () => {
     expect(answer.confidence).toBeUndefined();
   });
 
-  it("derives a false boolean below 0.5 while keeping the raw probability", () => {
+  it("[AT-JEV-010] derives a false boolean below 0.5 while keeping the raw probability", () => {
     const result = mapProviderResponse(
       response({ ...validAnswer(), q_prob: { probability: 0.2, confidence: 0.99 } }),
       request,
@@ -76,7 +76,7 @@ describe("mapProviderResponse — happy path", () => {
     expect(answer.confidence).toBeUndefined();
   });
 
-  it("maps choice with distribution and confidence", () => {
+  it("[AT-JEV-011] maps choice with distribution and confidence", () => {
     const result = mapProviderResponse(response(validAnswer()), request);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -85,7 +85,7 @@ describe("mapProviderResponse — happy path", () => {
     expect(answer.probabilities).toEqual({ none: 0.05, possible: 0.15, material: 0.8 });
   });
 
-  it("maps score to the nearest ordered level", () => {
+  it("[AT-JEV-012] maps score to the nearest ordered level", () => {
     const result = mapProviderResponse(response(validAnswer()), request);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -93,7 +93,7 @@ describe("mapProviderResponse — happy path", () => {
     expect(answer).toMatchObject({ type: "score", value: "medium", weightedScore: 2.4, confidence: 0.7 });
   });
 
-  it("rounds an in-range weighted score to the nearest level", () => {
+  it("[AT-JEV-012] rounds an in-range weighted score to the nearest level", () => {
     const result = mapProviderResponse(
       response({ ...validAnswer(), q_score: { score: 2.6, probabilities: { none: 0, low: 0, medium: 0.5, high: 0.5 }, confidence: 0.5 } }),
       request,
@@ -129,7 +129,7 @@ describe("mapProviderResponse — happy path", () => {
     expect(result.ok).toBe(true);
   });
 
-  it("records missing usage as unknown rather than zero-cost", () => {
+  it("[AT-JEV-062] records missing usage as unknown rather than zero-cost", () => {
     const result = mapProviderResponse({ model: "jev-1.13.0", answers: validAnswer() }, request);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -178,7 +178,7 @@ describe("mapProviderResponse — contract_invalid cases (never partial)", () =>
     ["null response", null],
   ];
 
-  it.each(cases)("rejects %s", (_name, payload) => {
+  it.each(cases)("[AT-JEV-013] rejects %s", (_name, payload) => {
     const result = mapProviderResponse(payload, request);
     expect(result.ok).toBe(false);
     if (result.ok) return;
@@ -186,7 +186,7 @@ describe("mapProviderResponse — contract_invalid cases (never partial)", () =>
     expect(result.detail).not.toContain("answers\":");
   });
 
-  it("does not partially apply a valid answer when another is invalid", () => {
+  it("[AT-JEV-013] does not partially apply a valid answer when another is invalid", () => {
     const result = mapProviderResponse(
       response({ q_prob: { probability: 0.9 }, q_choice: { choice: "bogus", probabilities: {}, confidence: 1 }, q_score: { score: 1, probabilities: { none: 1, low: 0, medium: 0, high: 0 }, confidence: 1 } }),
       request,

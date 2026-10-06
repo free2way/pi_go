@@ -72,7 +72,7 @@ describe("createDecisionEngine — composition and mode gating", () => {
     expect(result.ok).toBe(true);
   });
 
-  it("disabled engine never reaches a provider", async () => {
+  it("[AT-JEV-001] disabled engine never reaches a provider", async () => {
     const fetchImpl = vi.fn();
     const engine = createDecisionEngine(config({ engine: "disabled", mode: "shadow" }), {
       fetchImpl: fetchImpl as unknown as typeof fetch,
@@ -83,7 +83,7 @@ describe("createDecisionEngine — composition and mode gating", () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it("mock engine completes in shadow and records appliedOutcome=none", async () => {
+  it("[AT-JEV-021] mock engine completes in shadow and records appliedOutcome=none", async () => {
     const engine = createDecisionEngine(config({ engine: "mock", mode: "shadow" }));
     const evaluation = await engine.evaluate(request());
     expect(evaluation.status).toBe("completed");
@@ -98,7 +98,7 @@ describe("createDecisionEngine — composition and mode gating", () => {
     expect(evaluation.appliedOutcome).toBe("assist_suggestion");
   });
 
-  it("mode off skips even the mock engine", async () => {
+  it("[AT-JEV-002] mode off skips even the mock engine", async () => {
     const engine = createDecisionEngine(config({ engine: "mock", mode: "off" }));
     const evaluation = await engine.evaluate(request({ mode: "assist" }));
     expect(evaluation.status).toBe("disabled");

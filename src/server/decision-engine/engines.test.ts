@@ -89,7 +89,7 @@ describe("mock engine", () => {
     expect(Object.values(score.probabilities!).reduce((a, b) => a + b, 0)).toBeCloseTo(1, 6);
   });
 
-  it("records a resolved model distinct from the requested alias", async () => {
+  it("[AT-JEV-014] records a resolved model distinct from the requested alias", async () => {
     const engine = createMockEngine(config());
     const evaluation = await engine.evaluate(request);
     expect(evaluation.requestedModel).toBe("jev-latest");

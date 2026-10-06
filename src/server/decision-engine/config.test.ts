@@ -4,7 +4,7 @@ import { DECISION_ENGINE_DEFAULTS, loadDecisionEngineConfig } from "./config.js"
 const env = (overrides: Record<string, string | undefined> = {}): NodeJS.ProcessEnv => ({ ...overrides }) as NodeJS.ProcessEnv;
 
 describe("loadDecisionEngineConfig — defaults", () => {
-  it("defaults to disabled/off with no credentials and never leaks a key", () => {
+  it("[AT-JEV-001] defaults to disabled/off with no credentials and never leaks a key", () => {
     const result = loadDecisionEngineConfig(env());
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -65,7 +65,7 @@ describe("loadDecisionEngineConfig — strict validation", () => {
     ["PI_JEV_SHADOW_SAMPLE_RATE", "mostly"],
     ["PI_JEV_BASE_URL", "ftp://example.com"],
     ["PI_JEV_BASE_URL", "not a url"],
-  ])("rejects %s=%s as invalid_configuration", (key, value) => {
+  ])("[AT-JEV-004] rejects %s=%s as invalid_configuration", (key, value) => {
     const result = loadDecisionEngineConfig(env({ [key]: value }));
     expect(result.ok).toBe(false);
     if (result.ok) return;
@@ -73,12 +73,12 @@ describe("loadDecisionEngineConfig — strict validation", () => {
     expect(result.detail.length).toBeGreaterThan(0);
   });
 
-  it("never degrades an invalid value to a宽松 default", () => {
+  it("[AT-JEV-004] never degrades an invalid value to a宽松 default", () => {
     const result = loadDecisionEngineConfig(env({ PI_JEV_MODE: "loud" }));
     expect(result.ok).toBe(false);
   });
 
-  it("rejects PI_JEV_ALLOW_SOURCE=true with invalid_configuration even with a valid key", () => {
+  it("[AT-JEV-004][AT-JEV-052] rejects PI_JEV_ALLOW_SOURCE=true with invalid_configuration even with a valid key", () => {
     const result = loadDecisionEngineConfig(
       env({ PI_DECISION_ENGINE: "jev", TYPESAFE_API_KEY: "sk-x", PI_JEV_ALLOW_SOURCE: "true" }),
     );
@@ -88,14 +88,14 @@ describe("loadDecisionEngineConfig — strict validation", () => {
     expect(result.detail).toContain("PI_JEV_ALLOW_SOURCE");
   });
 
-  it("rejects a non-boolean PI_JEV_ALLOW_SOURCE", () => {
+  it("[AT-JEV-004] rejects a non-boolean PI_JEV_ALLOW_SOURCE", () => {
     const result = loadDecisionEngineConfig(env({ PI_JEV_ALLOW_SOURCE: "maybe" }));
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.reason).toBe("invalid_configuration");
   });
 
-  it("never includes the secret value in an error detail", () => {
+  it("[AT-JEV-004] never includes the secret value in an error detail", () => {
     const result = loadDecisionEngineConfig(
       env({ PI_DECISION_ENGINE: "jev", TYPESAFE_API_KEY: "sk-do-not-log-me", PI_JEV_MODE: "broken" }),
     );
@@ -106,7 +106,7 @@ describe("loadDecisionEngineConfig — strict validation", () => {
 });
 
 describe("loadDecisionEngineConfig — credentials", () => {
-  it("requires a key for engine=jev (missing_credentials)", () => {
+  it("[AT-JEV-003] requires a key for engine=jev (missing_credentials)", () => {
     const result = loadDecisionEngineConfig(env({ PI_DECISION_ENGINE: "jev", PI_JEV_MODE: "shadow" }));
     expect(result.ok).toBe(false);
     if (result.ok) return;

@@ -431,30 +431,32 @@ PI_JEV_ALLOW_SOURCE=false
 
 ## 8. 自动化测试矩阵
 
-| 层级 | 建议测试文件 | 重点 |
+| 层级 | 实际测试文件 | 重点 |
 | --- | --- | --- |
-| Unit | `src/server/decision-engine/config.test.ts` | 默认值、严格配置 |
-| Unit | `src/server/decision-engine/redaction.test.ts` | 密钥、PII、payload 上限 |
-| Unit | `src/server/decision-engine/response-schema.test.ts` | 三类输出和畸形响应 |
-| Unit | `src/server/decision-engine/policy.test.ts` | 模式、阈值、不可变规则 |
-| Unit | `src/server/decision-engine/jev.test.ts` | headers、错误映射、取消 |
-| Integration | `src/server/decision-engine/integration.test.ts` | mock HTTP、重试、熔断、幂等 |
-| Worker | `src/worker/decision-integration.test.ts` | review 调用点、shadow 零影响 |
-| API | `src/server/decision-routes.test.ts` | 鉴权、查询、脱敏 |
-| E2E | `tests/e2e/decision-engine.spec.ts` | off/shadow/assist 完整流程 |
-| Live | `tests/live/jev-contract.test.ts` | 官方 API 合同和模型版本 |
+| Unit | `src/server/decision-engine/config.test.ts` | 默认值、严格配置、凭据缺失 |
+| Unit | `src/server/decision-engine/redaction.test.ts` | 密钥/PII 脱敏、payload 上限、状态与 schema hash |
+| Unit | `src/server/decision-engine/response-schema.test.ts` | 三类输出映射、畸形响应、live 字段形状 |
+| Unit | `src/server/decision-engine/policy.test.ts` | 模式门控、不可变规则、低置信度 |
+| Unit | `src/server/decision-engine/jev.test.ts` | 请求映射、headers、错误映射、重试表、熔断、取消 |
+| Unit | `src/server/decision-engine/engines.test.ts` | disabled/mock 引擎契约 |
+| Unit | `src/server/decision-engine/index.test.ts` | 引擎组装、模式门控、shadow 采样 |
+| Unit | `src/server/decision-engine/key-source.test.ts` | vault/env key 解析优先级 |
+| Unit | `src/server/decision-engine/review-triage.test.ts` | 状态投影、问题集、分批与批次隔离 |
+| Integration | `src/server/decision-engine/integration.test.ts` | 本地 HTTP server：重试、熔断、超时、取消、鉴权 |
+| Worker | `src/worker/decision-triage.test.ts` | worker 侧调用点、verdict→triage 顺序 |
+| Worker | `src/worker/decision-integration.test.ts` | worker 端到端接入（注入 transport，无网络） |
+| API | `src/server/decision-routes.test.ts` | 内部鉴权、持久化、事件配对、幂等、脱敏查询 |
+| E2E | `tests/e2e/decision-engine.spec.ts` | off/shadow 真实运行零影响（需已部署环境） |
+| Live | `tests/live/jev-contract.test.ts` | 官方 API 合同、resolved model、时延分布（`PI_JEV_LIVE=1` 才运行） |
 
-以上是实施时应新增的目标文件，不表示当前仓库已存在这些测试。
+以上均为当前仓库实际存在的文件。
 
-建议新增目标脚本：
+实际存在的 npm 脚本（见 `package.json`）：
 
-```json
-{
-  "test:decision": "运行全部离线决策测试",
-  "test:decision:e2e": "运行 mock E2E",
-  "test:jev:live": "仅在 PI_JEV_LIVE=1 时运行在线合同测试"
-}
-```
+- `npm run test:decision` — 运行决策引擎单测、`src/server/decision-routes.test.ts` 与 worker 接入测试。
+- `npm run test:decision:e2e` — 运行 `tests/e2e/decision-engine.spec.ts`（需要已部署环境）。
+- `npm run test:jev:live` — 在线合同测试，仅在 `PI_JEV_LIVE=1` 时真正发起调用（`vitest.live.config.ts`）。
+- `npm run report:at-coverage` — 生成 §7/§12 用例的引用级追溯矩阵（见 §8.1）。
 
 常规 CI 门禁应包含：
 
@@ -465,9 +467,32 @@ npm test
 npm run build
 npm run test:decision
 npm run test:decision:e2e
+npm run report:at-coverage
 ```
 
-`npm run test:jev:live` 不进入每个 PR 的强制门禁，建议在手动 workflow 或受控 nightly 中运行。在线测试失败应通知负责人并阻止模式升级，但不应因供应商瞬时故障阻止无关代码合并。
+`npm run test:jev:live` 不进入每个 PR 的强制门禁，建议在手动 workflow 或受控 nightly 中运行。在线测试失败应通知负责人并阻止模式升级，但不应因供应商瞬时故障阻止无关代码合并。`npm run report:at-coverage` 默认退出码为 0（报告性质），`--strict` 才在存在 uncited 用例时以 1 退出。
+
+### 8.1 AT 追溯矩阵（引用级检查）
+
+`npm run report:at-coverage` 解析本文档 §7.1–§7.9 与 §12 的 `AT-JEV-xxx` 标题，并在
+`src/**/*.test.ts(x)`、`tests/e2e/**`、`tests/live/**`、`scripts/*.test.mjs` 中检索编号引用，
+打印三态结果：`cited`（列出引用文件）、`uncited`（文档有用例、无任何测试引用），以及
+"被测试引用但文档中不存在"的防御性提示（正常应为 0）。
+
+局限（诚实声明）：这是**引用级**检查，不是覆盖率证明。编号出现在测试标题或注释里只表示
+"有人声称该测试映射到这条用例"，**不等于**该用例描述的行为已被断言证明。`uncited` 是可靠信号
+（无人声称覆盖）；`cited` 仍需人工核对断言内容。截至本次更新：61 条用例中 41 条 cited、20 条 uncited。
+
+已知缺口（无自动化证据，不得在阶段升级时当作已验收）：
+
+- **AT-JEV-025（中英文一致性）**：无任何测试引用。
+- **AT-JEV-070 / 072 / 073（Mock 开销、并发限流、大批 Findings 容量）**：无自动化证据。
+- **AT-JEV-071（Live 时延）**：`tests/live/jev-contract.test.ts` 仅记录 p50/p95/max 日志，且需
+  `PI_JEV_LIVE=1`；它**不断言** p95 ≤ 2s / p99 ≤ 3s 阈值，不构成门禁级证据。
+- **AT-JEV-080 / 081（真实 API 最小调用、别名漂移）**：同样仅由在线 opt-in 套件引用。
+- **AT-JEV-030～035（Planner 路由）、053、056、061、065、082、083、090～093**：当前无自动化引用，
+  多为阶段 3/4 或运维演练用例。
+
 
 ## 9. Shadow 统计验收
 

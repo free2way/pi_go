@@ -65,7 +65,7 @@ afterEach(() => {
 });
 
 describe("createDecisionEngine — TypeSafe/Jev key source", () => {
-  it("uses the injected resolver (vault) ahead of the environment, with exactly one provider call", async () => {
+  it("[AT-JEV-050] uses the injected resolver (vault) ahead of the environment, with exactly one provider call", async () => {
     const fetchImpl = vi.fn(async () =>
       new Response(JSON.stringify(validBody()), { status: 200, headers: { "Content-Type": "application/json" } }),
     );

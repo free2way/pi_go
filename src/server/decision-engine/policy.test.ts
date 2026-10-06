@@ -30,7 +30,7 @@ const choice = (id: string, value: string, confidence: number, probabilities: Re
 });
 
 describe("mode gating", () => {
-  it("off skips the external call", () => {
+  it("[AT-JEV-002] off skips the external call", () => {
     const plan = planDecision({ requestedMode: "off", kind: "review_triage" });
     expect(plan).toEqual({ action: "skip", mode: "off", reason: "disabled", detail: expect.any(String) });
   });
@@ -74,7 +74,7 @@ describe("uncertainty", () => {
     expect(isUncertain(probability("q", 0.9))).toBe(false);
   });
 
-  it("marks low confidence and flat distributions as uncertain", () => {
+  it("[AT-JEV-024] marks low confidence and flat distributions as uncertain", () => {
     const flat = choice("q", "a", 0.9, { a: 0.34, b: 0.33, c: 0.33 });
     const unsure = choice("q", "a", 0.3, { a: 0.8, b: 0.1, c: 0.1 });
     const clear = choice("q", "a", 0.9, { a: 0.8, b: 0.1, c: 0.1 });
@@ -108,7 +108,7 @@ describe("resolveAppliedOutcome — immutable rules", () => {
     subjects: [{ key: "f_1", severity: "high" as const, answerIds: ["q"] }],
   };
 
-  it("shadow always applies none", () => {
+  it("[AT-JEV-021] shadow always applies none", () => {
     for (const answers of [[probability("q", 0.99)], [probability("q", 0.5)], []]) {
       const result = resolveAppliedOutcome({ ...base, mode: "shadow", answers });
       expect(result.appliedOutcome).toBe(APPLIED_NONE);
@@ -131,13 +131,13 @@ describe("resolveAppliedOutcome — immutable rules", () => {
     expect(result.violations).toEqual([]);
   });
 
-  it("never turns a failing deterministic state into a pass", () => {
+  it("[AT-JEV-023] never turns a failing deterministic state into a pass", () => {
     const result = resolveAppliedOutcome({ ...base, mode: "assist", deterministicFailed: true });
     expect(result.appliedOutcome).toBe(APPLIED_NONE);
     expect(result.violations).toContain(OUTCOME_VIOLATIONS.deterministicFailed);
   });
 
-  it("never downgrades a critical/high finding", () => {
+  it("[AT-JEV-022] never downgrades a critical/high finding", () => {
     const result = resolveAppliedOutcome({
       ...base,
       mode: "assist",
@@ -158,7 +158,7 @@ describe("resolveAppliedOutcome — immutable rules", () => {
     expect(result.appliedOutcome).toBe(APPLIED_ASSIST);
   });
 
-  it("marks uncertain answers and applies nothing", () => {
+  it("[AT-JEV-024] marks uncertain answers and applies nothing", () => {
     const result = resolveAppliedOutcome({ ...base, mode: "assist", answers: [probability("q", 0.5)] });
     expect(result.uncertain).toEqual(["q"]);
     expect(result.appliedOutcome).toBe(APPLIED_NONE);
