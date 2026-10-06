@@ -132,8 +132,16 @@ web 进程没有任何工作区文件系统读取或 `git` 子进程——`src/s
 - 结果写入 `decision_evaluations`（迁移 15），`GET /api/runs/:id/decisions` 只回**脱敏投影**；
   `decision.requested` + 一条结果事件落在 run 事件流里，meta 里只有 id/模式/状态/模型/时延
   （批次扇出时另有自洽的 `batchIndex`/`batchCount`）。
-- 真实引擎（`PI_DECISION_ENGINE=jev`）另需 `TYPESAFE_API_KEY`；`TYPESAFE_API_KEY` 只作占位
-  转发，任何环境都不写值。上线真实调用前需完成供应商准入与合规评审（docs/26 §14.3）。
+- 真实引擎（`PI_DECISION_ENGINE=jev`）另需一把 TypeSafe Key。**录入位置**：控制台「模型与凭据」
+  页的 `TypeSafe · Jev 决策平面` 卡片（该 provider 不在模型目录里，卡片只用于管理这把凭据，
+  可保存/轮换/删除）。保存即调用既有 `PUT /api/credentials`，服务端用
+  `GET ${PI_JEV_BASE_URL||https://api.typesafe.ai}/v1/models` 真实校验：200 → 标记「已验证」，
+  401 → 「未校验」（密钥仍是密文保存，界面与 API 永不回显明文）。`TYPESAFE_API_KEY` 是**平台
+  级回退**：取 key 的顺序为 该用户 vault（`typesafe` → `jev` 别名）→ 环境变量；部署未启用引擎时
+  不读 vault、零外呼。
+- **存 key ≠ 启用**：卡片会显示部署侧引擎/模式，未启用时明确提示还需部署侧
+  `PI_DECISION_ENGINE=jev`（保存凭据不会打开决策平面）。
+- 上线真实调用前需完成供应商准入与合规评审（docs/26 §14.3）。
 - 验收：`tests/e2e/decision-engine.spec.ts`（部署未启用时精确跳过）；离线用例覆盖配置/脱敏/
   载荷上限/响应映射/重试熔断/策略不可变规则。
 
