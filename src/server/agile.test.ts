@@ -271,10 +271,10 @@ describe("AgileService run linkage and reconciliation", () => {
     await service.markStoryInProgress(story.id);
 
     // A terminal cancelled run must not hold a run-level block: reconcile
-    // releases the story back to its pre-block status.
+    // returns the story to `ready` so it can be retried.
     await replaceRun(db, makeRun("run_1", "cancelled", { updatedAt: "2026-01-02T00:00:00.000Z", summary: "已由用户取消" }));
-    expect(await service.reconcileRun("run_1")).toEqual(["in_progress"]);
-    expect((await service.getStory(["user_a"], story.id)).status).toBe("in_progress");
+    expect(await service.reconcileRun("run_1")).toEqual(["ready"]);
+    expect((await service.getStory(["user_a"], story.id)).status).toBe("ready");
     // Unlinked runs reconcile to nothing.
     expect(await service.reconcileRun("run_missing")).toEqual([]);
   });
@@ -370,7 +370,7 @@ describe("AgileService automatic run-block release", () => {
     // The released ids drive the run audit event recorded by the caller.
     expect(await service.releaseStoryBlocksForTerminalRun("run_cancel", "cancelled")).toEqual([story.id]);
     const detail = await service.getStory(["user_a"], story.id);
-    expect(detail.status).toBe("in_progress");
+    expect(detail.status).toBe("ready");
     expect(detail.blockedReason).toBeNull();
     expect(detail.blockedBy).toBeNull();
   });
@@ -385,7 +385,7 @@ describe("AgileService automatic run-block release", () => {
     await replaceRun(db, makeRun("run_failed", "failed", { summary: "运行失败", updatedAt: "2026-01-02T00:00:00.000Z" }));
 
     expect(await service.releaseStoryBlocksForTerminalRun("run_failed", "failed")).toEqual([story.id]);
-    expect((await service.getStory(["user_a"], story.id)).status).toBe("in_progress");
+    expect((await service.getStory(["user_a"], story.id)).status).toBe("ready");
   });
 
   it("releases a story blocked by a completed run to awaiting_acceptance", async () => {
@@ -421,7 +421,7 @@ describe("AgileService automatic run-block release", () => {
     await forceRunBlock(db, story.id);
 
     const unblocked = await service.unblockStory(["user_a"], story.id);
-    expect(unblocked).toMatchObject({ status: "in_progress", blockedReason: null, blockedBy: null });
+    expect(unblocked).toMatchObject({ status: "ready", blockedReason: null, blockedBy: null });
   });
 
   it("releases an already-stuck story and the kanban query stops reporting it blocked", async () => {
@@ -446,7 +446,7 @@ describe("AgileService automatic run-block release", () => {
 
     // No new run transition fires; reading the story must release the stale block.
     const detail = await service.getStory(["user_a"], story.id);
-    expect(detail.status).toBe("in_progress");
+    expect(detail.status).toBe("ready");
     expect(detail.blockedReason).toBeNull();
   });
 
@@ -460,6 +460,82 @@ describe("AgileService automatic run-block release", () => {
     expect(await service.releaseStoryBlocksForTerminalRun("run_1", "cancelled")).toEqual([]);
     const detail = await service.getStory(["user_a"], story.id);
     expect(detail).toMatchObject({ status: "blocked", blockedReason: "暂停开发", blockedBy: "user_a" });
+  });
+});
+
+describe("AgileService story reopen (failed latest run)", () => {
+  it("reopens a failed story to ready, keeps run history and allows a new run afterwards", async () => {
+    const { db, service, project } = await seed();
+    const story = await service.createStory("user_a", { projectId: project.id, title: "故事", status: "ready" });
+    await insertRun(db, makeRun("run_failed", "failed", { updatedAt: "2026-01-02T00:00:00.000Z", summary: "运行失败" }));
+    await service.linkRun(story.id, "run_failed");
+    await service.markStoryInProgress(story.id);
+
+    // The story row is stuck at in_progress (the pre-fix deadlock); the reopen
+    // moves it back to ready and reports the observed previous status.
+    const stuck = (await db.query("SELECT status FROM agile_stories WHERE id = $1", [story.id])).rows[0] as { status: string };
+    expect(stuck.status).toBe("in_progress");
+
+    const reopened = await service.reopenStory(["user_a"], story.id);
+    expect(reopened.story.status).toBe("ready");
+    expect(reopened.runId).toBe("run_failed");
+    expect(reopened.previousStatus).toBe("in_progress");
+    // The previous run row survives the reopen (and the audit is keyed by its id).
+    expect(reopened.story.runs.map((entry) => entry.runId)).toEqual(["run_failed"]);
+    // The read path also heals the stuck status on its own (before any reopen).
+    expect((await service.getStory(["user_a"], story.id)).status).toBe("ready");
+
+    // A new run can now be created against the reopened story; both rows remain.
+    await insertRun(db, makeRun("run_retry", "developing", { updatedAt: "2026-01-03T00:00:00.000Z" }));
+    await service.linkRun(story.id, "run_retry");
+    const after = await service.getStory(["user_a"], story.id);
+    expect(after.status).toBe("in_progress");
+    expect(after.runs.map((entry) => entry.runId).sort()).toEqual(["run_failed", "run_retry"]);
+  });
+
+  it("refuses to reopen while the latest run needs a human, naming the run id", async () => {
+    const { db, service, project } = await seed();
+    const story = await service.createStory("user_a", { projectId: project.id, title: "故事" });
+    await insertRun(db, makeRun("run_parked", "needs_human", { summary: "预算超限" }));
+    await service.linkRun(story.id, "run_parked");
+    await service.reconcileRun("run_parked");
+
+    await expect(service.reopenStory(["user_a"], story.id)).rejects.toMatchObject({ code: "BLOCKED_BY_RUN", status: 409 });
+    await expect(service.reopenStory(["user_a"], story.id)).rejects.toThrow(/run_parked/);
+    expect((await service.getStory(["user_a"], story.id)).status).toBe("blocked");
+  });
+
+  it("refuses to reopen while the latest run is still live, naming the run id", async () => {
+    const { db, service, project } = await seed();
+    const story = await service.createStory("user_a", { projectId: project.id, title: "故事" });
+    await insertRun(db, makeRun("run_live", "developing"));
+    await service.linkRun(story.id, "run_live");
+
+    await expect(service.reopenStory(["user_a"], story.id)).rejects.toMatchObject({ code: "BLOCKED_BY_RUN", status: 409 });
+    await expect(service.reopenStory(["user_a"], story.id)).rejects.toThrow(/run_live/);
+  });
+
+  it("does not silently reopen a manually blocked story", async () => {
+    const { db, service, project } = await seed();
+    const story = await service.createStory("user_a", { projectId: project.id, title: "故事", status: "ready" });
+    await insertRun(db, makeRun("run_failed", "failed", { summary: "运行失败" }));
+    await service.linkRun(story.id, "run_failed");
+    await service.blockStory(["user_a"], story.id, "等待上游接口", "user_a");
+
+    await expect(service.reopenStory(["user_a"], story.id)).rejects.toMatchObject({ code: "BLOCKED_BY_MANUAL", status: 409 });
+    const detail = await service.getStory(["user_a"], story.id);
+    expect(detail).toMatchObject({ status: "blocked", blockedReason: "等待上游接口" });
+  });
+
+  it("refuses to reopen an already delivered (completed) run", async () => {
+    const { db, service, project } = await seed();
+    const story = await service.createStory("user_a", { projectId: project.id, title: "故事" });
+    await insertRun(db, makeRun("run_done", "completed"));
+    await service.linkRun(story.id, "run_done");
+
+    await expect(service.reopenStory(["user_a"], story.id)).rejects.toMatchObject({ code: "STORY_NOT_REOPENABLE", status: 409 });
+    await expect(service.reopenStory(["user_a"], story.id)).rejects.toThrow(/run_done/);
+    expect((await service.getStory(["user_a"], story.id)).status).toBe("awaiting_acceptance");
   });
 });
 

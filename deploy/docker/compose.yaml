@@ -216,7 +216,7 @@ services:
       PI_REVIEW_RETRY_MAX_ELAPSED_SECONDS: ${PI_REVIEW_RETRY_MAX_ELAPSED_SECONDS:-120}
       # Review convergence and deterministic diff-input budgets.
       PI_REVIEW_CONVERGENCE_GUARD: ${PI_REVIEW_CONVERGENCE_GUARD:-on}
-      PI_REVIEW_STALL_ROUNDS: ${PI_REVIEW_STALL_ROUNDS:-3}
+      PI_REVIEW_STALL_ROUNDS: ${PI_REVIEW_STALL_ROUNDS:-2}
       PI_REVIEW_FILE_DIFF_BYTES: ${PI_REVIEW_FILE_DIFF_BYTES:-40000}
       PI_REVIEW_TOTAL_DIFF_BYTES: ${PI_REVIEW_TOTAL_DIFF_BYTES:-200000}
       # Sprint 2 A/B: `off` makes developer/integrator/sub-agent sessions fresh

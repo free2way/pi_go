@@ -1,4 +1,4 @@
-import { BarChart3, ClipboardList, Copy, Download, LayoutTemplate, ListChecks, LoaderCircle, Pencil, Plus, Rocket, Trash2, X } from "lucide-react";
+import { BarChart3, ClipboardList, Copy, Download, LayoutTemplate, ListChecks, LoaderCircle, Pencil, Plus, Rocket, RotateCcw, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { applyModelTemplate, RELEASE_STATUSES, STORY_PRIORITIES, STORY_STATUSES, STORY_STATUS_LABELS, type AgileProject, type AgileRelease, type AgileSprint, type AgileStory, type ModelTemplate, type ReleaseDeployRecord, type ReleaseStatus, type StoryDetail, type StoryPriority, type StoryStatus } from "../shared/agile";
 import type { AgileMetricsResponse, ReleaseRetrospective, ReleaseSummary } from "../shared/agile-metrics";
@@ -578,6 +578,22 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
       setDetail((current) => (current && current.id === updated.id ? updated : current));
     } catch (cause) {
       setError(agileFormErrorMessage(cause, "解除阻塞失败"));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  // Explicit reopen of a story whose latest run is terminal failed/cancelled.
+  // Never silently lifts a manual block or a parked run (the server 409s).
+  const reopenStory = async (story: AgileStory) => {
+    setBusy(`reopen:${story.id}`);
+    setError("");
+    try {
+      const updated = await api.reopenStory(story.id);
+      setStories((current) => current.map((item) => (item.id === updated.id ? updated : item)));
+      setDetail((current) => (current && current.id === updated.id ? updated : current));
+    } catch (cause) {
+      setError(agileFormErrorMessage(cause, "重新打开失败"));
     } finally {
       setBusy("");
     }
@@ -1248,15 +1264,22 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
             {detail.status !== "blocked"
               ? <button type="button" className="button secondary" disabled={busy === `block:${detail.id}`} onClick={() => void blockStory(detail)}>标记阻塞</button>
               : <button type="button" className="button secondary" disabled={busy === `unblock:${detail.id}`} onClick={() => void unblockStory(detail)}>解除阻塞</button>}
+            {detail.status !== "blocked" && (detail.runs[0]?.state === "failed" || detail.runs[0]?.state === "cancelled") && (
+              <button type="button" className="button secondary" disabled={busy === `reopen:${detail.id}`} onClick={() => void reopenStory(detail)}>
+                {busy === `reopen:${detail.id}` ? <LoaderCircle className="spin" size={15} /> : <RotateCcw size={15} />}重新打开
+              </button>
+            )}
             <button type="button" className="button primary" disabled={detail.status !== "ready" || busy === `submit:${detail.id}`} onClick={() => void submit(detail)}>
               {busy === `submit:${detail.id}` ? <LoaderCircle className="spin" size={15} /> : <Rocket size={15} />}提交为运行
             </button>
             <span className="agile-hint">
               {detail.status !== "ready"
                 ? "只有「就绪」状态的故事可以提交为运行。"
-                : config?.realRunsAvailable
-                  ? "将以真实运行执行，检查命令来自所选工作区。"
-                  : "真实执行未启用（缺少模型 Key），将以演示模式提交。"}
+                : detail.runs[0]?.state === "failed" || detail.runs[0]?.state === "cancelled"
+                  ? "最近一次运行已失败/取消，故事已回到「就绪」，可直接重新提交，或点「重新打开」记录一次显式重开。"
+                  : config?.realRunsAvailable
+                    ? "将以真实运行执行，检查命令来自所选工作区。"
+                    : "真实执行未启用（缺少模型 Key），将以演示模式提交。"}
             </span>
           </div>
         </section>

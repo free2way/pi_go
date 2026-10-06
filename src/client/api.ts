@@ -214,6 +214,11 @@ export const api = {
   /** Clears a manual block; 409 BLOCKED_BY_RUN while a linked run is parked. */
   unblockStory: (id: string) =>
     request<StoryDetail>(`/api/stories/${encodeURIComponent(id)}/unblock`, { method: "POST", body: JSON.stringify({}) }),
+  /** Reopens a story whose latest run is terminal failed/cancelled back to `ready`.
+   * 409 BLOCKED_BY_RUN (live/needs_human, run id in the message), 409
+   * BLOCKED_BY_MANUAL or 409 STORY_NOT_REOPENABLE. Audited as `story.reopened`. */
+  reopenStory: (id: string) =>
+    request<StoryDetail>(`/api/stories/${encodeURIComponent(id)}/reopen`, { method: "POST", body: JSON.stringify({}) }),
   sprints: (projectId?: string) =>
     request<{ sprints: AgileSprint[] }>(`/api/sprints${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ""}`),
   createSprint: (body: { projectId: string; name: string; goal?: string; startDate?: string | null; endDate?: string | null }) =>

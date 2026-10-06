@@ -124,12 +124,14 @@ describe("convergenceVerdict / convergenceStop (early stop before another repair
     expect(convergenceVerdict(convergenceHistory(findings, 3)).stalled).toBe(false);
   });
 
-  it("makes no judgement with sparse data (fewer than three rounds)", () => {
+  it("makes no rule-1 judgement with sparse data (fewer than three rounds)", () => {
     const one = reviewRounds([["critical"]]);
     expect(convergenceVerdict(convergenceHistory(one, 1)).stalled).toBe(false);
     const two = reviewRounds([["critical"], ["critical"]]);
     const sparse = convergenceVerdict(convergenceHistory(two, 2));
-    expect(sparse.stalled).toBe(false);
+    // Rule 1 (NEW severe count) needs two comparisons, so it does not fire yet;
+    // rule 2 may still stop the loop (see the unresolved-blocking suite).
+    expect(sparse.stalledRounds).toBe(1);
     expect(sparse.perRound).toHaveLength(2);
   });
 
@@ -148,19 +150,19 @@ describe("convergenceVerdict / convergenceStop (early stop before another repair
 });
 
 describe("reviewStallRounds (PI_REVIEW_STALL_ROUNDS)", () => {
-  it("defaults to 3 and only accepts integers >= 2", () => {
-    expect(defaultReviewStallRounds).toBe(3);
-    expect(reviewStallRounds(undefined)).toBe(3);
-    expect(reviewStallRounds("")).toBe(3);
-    expect(reviewStallRounds("  ")).toBe(3);
+  it("defaults to 2 and only accepts integers >= 2", () => {
+    expect(defaultReviewStallRounds).toBe(2);
+    expect(reviewStallRounds(undefined)).toBe(2);
+    expect(reviewStallRounds("")).toBe(2);
+    expect(reviewStallRounds("  ")).toBe(2);
     expect(reviewStallRounds("3")).toBe(3);
     expect(reviewStallRounds("2")).toBe(2);
     expect(reviewStallRounds("10")).toBe(10);
-    expect(reviewStallRounds("1")).toBe(3);
-    expect(reviewStallRounds("0")).toBe(3);
-    expect(reviewStallRounds("-2")).toBe(3);
-    expect(reviewStallRounds("2.5")).toBe(3);
-    expect(reviewStallRounds("nope")).toBe(3);
+    expect(reviewStallRounds("1")).toBe(2);
+    expect(reviewStallRounds("0")).toBe(2);
+    expect(reviewStallRounds("-2")).toBe(2);
+    expect(reviewStallRounds("2.5")).toBe(2);
+    expect(reviewStallRounds("nope")).toBe(2);
   });
 });
 
@@ -169,6 +171,15 @@ describe("unresolved-blocking convergence rule (same batch persisting)", () => {
   function persistingRounds(rounds: number): Finding[] {
     let findings: Finding[] = [];
     for (let round = 1; round <= rounds; round += 1) {
+      findings = mergeFindings(findings, [repeated(`reviewer-id-r${round}`)], { round });
+    }
+    return findings;
+  }
+
+  /** The same defect, but first reported in `startRound` (earlier rounds raised none). */
+  function persistingRoundsFrom(startRound: number, endRound: number): Finding[] {
+    let findings: Finding[] = [];
+    for (let round = startRound; round <= endRound; round += 1) {
       findings = mergeFindings(findings, [repeated(`reviewer-id-r${round}`)], { round });
     }
     return findings;
@@ -190,8 +201,36 @@ describe("unresolved-blocking convergence rule (same batch persisting)", () => {
     expect(perRound.map((entry) => entry.unresolvedBlocking)).toEqual([1, 1, 1]);
   });
 
-  it("does not escalate at round 2 with the default threshold of 3", () => {
-    expect(convergenceStop({ findings: persistingRounds(2), currentRound: 2 }).stop).toBe(false);
+  it("escalates at round 2 under the default threshold of 2", () => {
+    const stop = convergenceStop({ findings: persistingRounds(2), currentRound: 2 });
+    expect(stop.stop).toBe(true);
+    if (!stop.stop) throw new Error("expected a stop");
+    expect(stop.meta.stallRule).toBe("unresolved-blocking");
+    expect(stop.meta.unresolvedStalledRounds).toBe(2);
+    expect(stop.message).toContain("同一批阻断问题连续 2 轮未减少");
+  });
+
+  it("fires within the default max rounds when the blocker first appears in round 2 (run_747fa0f5baa141d9)", () => {
+    // Round 1 raised no review findings, so convergenceHistory keeps only rounds
+    // 2 and 3. Under the old default of 3 the trailing run (2 rounds) was below
+    // the threshold and the max-rounds guard won first; with the default 2 the
+    // stall rule fires at the round cap, before `run.needs_human` max-rounds.
+    const findings = persistingRoundsFrom(2, 3);
+    expect(convergenceHistory(findings, 3).map((entry) => entry.round)).toEqual([2, 3]);
+    const stop = convergenceStop({ findings, currentRound: 3, requiredUnresolvedRounds: reviewStallRounds(undefined) });
+    expect(stop.stop).toBe(true);
+    if (!stop.stop) throw new Error("expected a stop");
+    expect(stop.meta.stallRule).toBe("unresolved-blocking");
+    expect(stop.meta.unresolvedStalledRounds).toBe(2);
+    expect(stop.meta.currentUnresolvedBlocking).toBe(1);
+    expect(stop.message).toContain("同一批阻断问题连续 2 轮未减少");
+  });
+
+  it("honours a higher PI_REVIEW_STALL_ROUNDS override", () => {
+    // The env override still wins: with 3 required rounds the round-2 blocker does
+    // not fire at the round cap, so the max-rounds guard takes over.
+    const findings = persistingRoundsFrom(2, 3);
+    expect(convergenceStop({ findings, currentRound: 3, requiredUnresolvedRounds: reviewStallRounds("3") }).stop).toBe(false);
   });
 
   it("honours a lower PI_REVIEW_STALL_ROUNDS override", () => {

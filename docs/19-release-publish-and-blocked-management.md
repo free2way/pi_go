@@ -59,6 +59,16 @@
 - `POST /api/stories/:id/unblock`：解除手动阻塞；若关联运行仍处于
   `needs_human`，返回 `409 BLOCKED_BY_RUN`（消息含 run id）；**终态运行**（completed/failed/cancelled）**不再持有阻塞**，解除会成功并恢复阻塞前状态，
   必须先处理该运行。已 `done` 的故事不允许手动阻塞（`409 STORY_DONE`）。
+- `POST /api/stories/:id/reopen`（v0.26.2）：显式重开。**仅有失败/取消末次运行的故事
+  需要它**——若最新关联运行为 `failed` / `cancelled`，故事回到 `ready` 以便再次提交；
+  成功时在最新运行上追加审计事件 `story.reopened`（meta 含 `storyId` / `actorId` /
+  `previousStatus`）。
+  - `409 BLOCKED_BY_RUN`（消息含 run id）：最新运行仍在执行（queued/preparing/
+    developing/checking/reviewing），或处于 `needs_human`（运行派生 `blocked`）。
+  - `409 BLOCKED_BY_MANUAL`：故事带**手动**阻塞（`blocked_reason`）；人工阻塞不会被
+    静默重开，必须先 `unblock`。
+  - `409 STORY_NOT_REOPENABLE`：最新运行已 `completed`（应走验收/退回，而不是重开）。
+  - 重开不删除任何 `story_runs` 行，历史运行与事件完整保留。
 
 ### 2.3 纯函数优先级 `deriveStoryStatus(run, manual)`
 
@@ -68,4 +78,10 @@
 2. 已验收（done）→ `done`，手动阻塞不能把已交付故事改回阻塞。
 3. 有手动阻塞 → `blocked` + 手动原因，覆盖派生的
    `in_progress` / `in_review` / `awaiting_acceptance`。
-4. 其余按运行状态派生；无运行且无手动阻塞 → `undefined`（保留人工规划状态）。
+4. 其余按运行状态派生；**`failed` / `cancelled` 末次运行 → `ready`**（v0.26.2）：
+   终态运行什么都没交付且永远不会自行推进，故事必须可重试；此前回落到
+   `in_progress`，提交守卫只接受 `ready`，于是「失败一次」的故事再也无法提交
+   （`409 STORY_NOT_READY` 死锁）。该派生即读取时的自愈，旧的卡住行在下次
+   `GET /api/stories/:id` 即恢复 `ready`，无需显式 `reopen`；`reopen` 提供显式审计
+   与上述三个 409 守卫。`needs_human` / 手动阻塞的语义不变，仍必须走人工路径。
+5. 无运行且无手动阻塞 → `undefined`（保留人工规划状态）。

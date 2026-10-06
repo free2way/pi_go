@@ -1,3 +1,4 @@
+import { releasesStoryBlocks } from "./run-state.js";
 import type { ModelSelection, Run } from "./types.js";
 
 /**
@@ -273,7 +274,9 @@ export interface StoryStatusDerivation {
  * run moves the story to awaiting acceptance. An accepted run is `done` (a manual
  * block never un-dones a delivered story); otherwise a manual block wins over the
  * derived active statuses (`in_progress`/`in_review`/`awaiting_acceptance`) and
- * shows the manual reason; then a finished run awaits acceptance, an active
+ * shows the manual reason; then a finished run awaits acceptance, a failed or
+ * cancelled run returns the story to `ready` (retryable — it delivered nothing,
+ * and `in_progress` used to deadlock the story: see docs/19), an active
  * `reviewing` run is `in_review`, and every other active state is `in_progress`.
  */
 export function deriveStoryStatus(
@@ -293,6 +296,10 @@ export function deriveStoryStatus(
   if (manualReason) return { status: "blocked", reason: manualReason };
   if (run.state === "completed") return { status: "awaiting_acceptance" };
   if (run.state === "reviewing") return { status: "in_review" };
+  // A failed/cancelled run delivered nothing and can never advance, so the story
+  // is retryable again (`ready`) instead of being stuck at `in_progress`, which
+  // made the submit guard refuse it forever.
+  if (releasesStoryBlocks(run.state)) return { status: "ready" };
   // queued / preparing / developing / checking
   return { status: "in_progress" };
 }

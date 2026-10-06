@@ -44,8 +44,12 @@ server 共用；`src/worker/review-findings.ts` 仅做薄 re-export）：
 
 - 每轮统计**本轮上报的未解决阻断（critical/high）**数量与稳定键（`lastSeenRound`
   加当前连续窗口重建），构成 `unresolvedBlocking` / `blockingKeys`。
-- 若尾部连续 `PI_REVIEW_STALL_ROUNDS` 轮（默认 3，最小 2，严格解析）该数量**未下降**，
+- 若尾部连续 `PI_REVIEW_STALL_ROUNDS` 轮（默认 **2**，最小 2，严格解析）该数量**未下降**，
   则判定未收敛，在开启下一轮返修前转 `needs_human`，事件 `review.not_converging`。
+  默认取 2 而非 3：默认 `maxRounds=3`，若要求连续 3 个「计入审核轮」才算停滞，
+  当阻断问题在第 2 轮才首次出现时（现场 `run_747fa0f5baa141d9`：轮次上限处
+  `streak=2`），规则永远赶不上 `达到最大审核轮次` 的兜底，成为死代码。默认 2 时，
+  第 2 轮出现、第 3 轮仍未减少即可在轮次上限之前由本规则触发（`stallRule=unresolved-blocking`）。
 - 事件 meta 附带 `stallRule`、`unresolvedStalledRounds`、`persistingBlockingKeys`、
   `currentUnresolvedBlocking` 与逐轮 `perRound`；中文摘要形如
   `审核未收敛：同一批阻断问题连续 3 轮未减少（当前 1 个未解决阻断问题：file|title）`。
@@ -78,6 +82,6 @@ reviewer prompt 同时声明：输入可能被预算裁剪、锁文件/构建产
 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `PI_REVIEW_CONVERGENCE_GUARD` | `on` | `off` 关闭全部收敛守卫 |
-| `PI_REVIEW_STALL_ROUNDS` | `3` | 同一批阻断问题连续未减少轮数；整数 ≥ 2，否则回落 3 |
+| `PI_REVIEW_STALL_ROUNDS` | `2` | 同一批阻断问题连续未减少轮数；整数 ≥ 2，否则回落 2 |
 | `PI_REVIEW_FILE_DIFF_BYTES` | `40000` | 单文件 diff 上限；严格正整数 |
 | `PI_REVIEW_TOTAL_DIFF_BYTES` | `200000` | reviewer diff 总上限；严格正整数 |

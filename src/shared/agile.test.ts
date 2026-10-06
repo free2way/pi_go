@@ -102,11 +102,20 @@ describe("deriveStoryStatus", () => {
     });
   });
 
-  it("does not hold a block for terminal runs (failed/cancelled)", () => {
-    // A terminal run is final, so it can never advance on its own: keeping the
-    // story blocked would deadlock the board (manual unblock used to 409).
-    expect(deriveStoryStatus(run("failed"))).toEqual({ status: "in_progress" });
-    expect(deriveStoryStatus(run("cancelled", { summary: "已由用户取消" }))).toEqual({ status: "in_progress" });
+  it("returns a terminal failed/cancelled run to ready (retryable), never a block", () => {
+    // A terminal run is final, so it can never advance on its own: parking the
+    // story at `in_progress` deadlocked it (the submit guard only accepts
+    // `ready`); parking it as `blocked` was the pre-v0.26.1 deadlock (manual
+    // unblock used to 409). It goes back to `ready` so it can be retried.
+    expect(deriveStoryStatus(run("failed"))).toEqual({ status: "ready" });
+    expect(deriveStoryStatus(run("cancelled", { summary: "已由用户取消" }))).toEqual({ status: "ready" });
+  });
+
+  it("still lets a manual block win over a terminal failed run (no silent reopen)", () => {
+    expect(deriveStoryStatus(run("failed"), { blockedReason: "等待上游接口" })).toEqual({
+      status: "blocked",
+      reason: "等待上游接口",
+    });
   });
 
   it("prefers blocked over an old acceptance snapshot (reopened run)", () => {

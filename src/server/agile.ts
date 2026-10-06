@@ -586,6 +586,58 @@ export class AgileService {
   }
 
   /**
+   * Explicit operator reopen (Kanban): a story whose latest linked run is a
+   * terminal `failed`/`cancelled` run goes back to `ready` so it can be
+   * submitted again, and the caller records an audit event with the returned
+   * `runId` (see `POST /api/stories/:id/reopen`, docs/19).
+   *
+   * Refusals, each 409 with an explicit code:
+   * - a manual block (`blocked_reason`) is a human decision and is never
+   *   reopened silently → `BLOCKED_BY_MANUAL`;
+   * - a run still holding the story (live, or `needs_human` → derived blocked)
+   *   → `BLOCKED_BY_RUN` naming the run id;
+   * - a `completed` run already delivered → `STORY_NOT_REOPENABLE`.
+   *
+   * `deriveStoryStatus` already returns `ready` for a terminal failed/cancelled
+   * run, so this is idempotent and never clobbers run history; the explicit
+   * action exists for auditability and for the guard messages above.
+   */
+  async reopenStory(
+    ownerKeys: string[],
+    id: string,
+    isAdmin = false,
+  ): Promise<{ story: StoryDetail; runId: string | null; previousStatus: StoryStatus }> {
+    const existing = await this.requireStory(ownerKeys, id, isAdmin);
+    const previousStatus = existing.status as StoryStatus;
+    const latest = latestLinkedRun(await this.listStoryRunsDetailed(id));
+    if (existing.blocked_reason) {
+      throw new AgileError(
+        "BLOCKED_BY_MANUAL",
+        `该故事处于人工阻塞（${existing.blocked_reason}），请先解除阻塞再重新打开`,
+        409,
+      );
+    }
+    if (latest) {
+      const blocker = deriveStoryStatus(latest.run);
+      if (blocker?.status === "blocked") {
+        throw new AgileError(
+          "BLOCKED_BY_RUN",
+          `该故事仍被运行 ${latest.run.id} 阻塞（${blocker.reason ?? "需要人工处理"}）；请先处理该运行`,
+          409,
+        );
+      }
+      if (!releasesStoryBlocks(latest.run.state)) {
+        throw new AgileError("BLOCKED_BY_RUN", `该故事的最新运行 ${latest.run.id} 仍在执行中，请先等待或取消该运行`, 409);
+      }
+      if (latest.run.state === "completed") {
+        throw new AgileError("STORY_NOT_REOPENABLE", `该故事的最新运行 ${latest.run.id} 已完成，请先验收或退回，而不是重新打开`, 409);
+      }
+    }
+    await this.db.query("UPDATE agile_stories SET status = 'ready', updated_at = $1 WHERE id = $2", [this.now(), id]);
+    return { story: await this.getStory(ownerKeys, id, isAdmin), runId: latest?.run.id ?? null, previousStatus };
+  }
+
+  /**
    * Automatic release of the run-level story blocks held by a run that just
    * reached a terminal state (completed/failed/cancelled). Only stories for which
    * this run is the *latest* linked run and that carry no manual reason

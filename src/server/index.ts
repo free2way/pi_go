@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { internalUpdateRejection, releasesStoryBlocks, storyBlockReleaseNote } from "../shared/run-state.js";
-import { buildStoryRunInput, type RunBudget, type StoryDetail } from "../shared/agile.js";
+import { buildStoryRunInput, STORY_STATUS_LABELS, type RunBudget, type StoryDetail } from "../shared/agile.js";
 import type { ConfigStatus, CurrentUser, ModelCatalogResponse, ReviewScope, Run, RunEvent, RunReleaseRecord, Workspace } from "../shared/types.js";
 import { AccountError, AccountService, accountAdminGate } from "./accounts.js";
 import { AlertManager, createAlertSink } from "./alerts.js";
@@ -1194,6 +1194,34 @@ app.post<{ Params: { id: string } }>("/api/stories/:id/unblock", async (request,
   const user = auth.user(request);
   try {
     return await agile.unblockStory(ownerKeysFor(request), request.params.id, await identities.isAdmin(user.id));
+  } catch (error) {
+    return agileErrorReply(reply, error);
+  }
+});
+
+// Reopen a story whose latest run is a terminal failed/cancelled run: it goes
+// back to `ready` so it can be submitted again. This is the explicit human path
+// for a stuck (or manually blocked) story and never silently lifts a manual
+// block: 409 with the run id while the latest run is live or needs_human, 409
+// BLOCKED_BY_MANUAL on a manual block, 409 STORY_NOT_REOPENABLE once delivered.
+// The reopen is audited on the latest run (`story.reopened`). See docs/19.
+app.post<{ Params: { id: string } }>("/api/stories/:id/reopen", async (request, reply) => {
+  const user = auth.user(request);
+  try {
+    const result = await agile.reopenStory(ownerKeysFor(request), request.params.id, await identities.isAdmin(user.id));
+    if (result.runId) {
+      const run = store.getRun(result.runId);
+      await store.appendEvent({
+        runId: result.runId,
+        round: run?.round ?? 0,
+        source: "system",
+        type: "story.reopened",
+        message: `故事「${result.story.title}」已重新打开为就绪（原状态 ${STORY_STATUS_LABELS[result.previousStatus]}）`,
+        at: new Date().toISOString(),
+        meta: { storyId: result.story.id, actorId: user.id, previousStatus: result.previousStatus },
+      });
+    }
+    return result.story;
   } catch (error) {
     return agileErrorReply(reply, error);
   }

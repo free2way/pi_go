@@ -55,12 +55,17 @@ export const convergenceSeverities: ReadonlyArray<Finding["severity"]> = ["criti
 export const requiredStalledRounds = 2;
 
 /** Default consecutive non-decreasing review rounds for the unresolved-blocking rule. */
-export const defaultReviewStallRounds = 3;
+export const defaultReviewStallRounds = 2;
 
 /**
  * Strict parser for `PI_REVIEW_STALL_ROUNDS`: only a plain decimal integer >= 2
  * is accepted; anything else (unset, empty, junk, < 2) falls back to the default
- * of 3. `PI_REVIEW_CONVERGENCE_GUARD=off` still disables the whole guard.
+ * of 2. `PI_REVIEW_CONVERGENCE_GUARD=off` still disables the whole guard.
+ *
+ * The default is 2 (not 3): the default `maxRounds` is 3, so a rule that needed
+ * three *counted* review rounds could never fire before the max-rounds
+ * escalation when the persisting blocker first appeared in round 2 (the live
+ * `run_747fa0f5baa141d9` shape: `streak=2` at the round cap).
  */
 export function reviewStallRounds(value: string | undefined = process.env.PI_REVIEW_STALL_ROUNDS): number {
   const raw = String(value ?? "").trim();
