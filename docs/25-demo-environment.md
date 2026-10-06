@@ -113,6 +113,30 @@ web 进程没有任何工作区文件系统读取或 `git` 子进程——`src/s
 > 若你使用 `kind=command` 的合并后发布钩子并让其中的命令调用 `git`，那属于该命令自身的
 > 依赖：请在自定义镜像里自行安装，web 基础镜像不再提供。
 
+## 决策平面（Jev）在演示环境的配置
+
+决策平面（`src/server/decision-engine/**`，docs/26）默认 **`disabled`/`off`：零外发、
+零行为变化**，生产不需要任何配置。演示环境把它打开成**确定性的 mock + shadow**，用于演示与
+验收「决策只见证、不改判」的契约：
+
+| 变量 | 演示值 | 含义 |
+| --- | --- | --- |
+| `PI_DECISION_ENGINE` | `mock` | 用确定性 mock 引擎（无网络）；`jev` 才调真实 TypeSafe API |
+| `PI_JEV_MODE` | `shadow` | 只记录、不改变任务状态（`appliedOutcome=none`） |
+
+要点：
+
+- `PI_JEV_MODE` 必须**同时**给 web 与 worker：worker 用它做**显式 opt-in**（未设置/`off`
+  时完全不调用网关，零 HTTP、零事件）；网关侧仍以自己的配置为准（worker 说 shadow、web 说
+  off 时返回 business-safe `disabled`，不发起任何外呼）。
+- 结果写入 `decision_evaluations`（迁移 15），`GET /api/runs/:id/decisions` 只回**脱敏投影**；
+  `decision.requested` + 一条结果事件落在 run 事件流里，meta 里只有 id/模式/状态/模型/时延
+  （批次扇出时另有自洽的 `batchIndex`/`batchCount`）。
+- 真实引擎（`PI_DECISION_ENGINE=jev`）另需 `TYPESAFE_API_KEY`；`TYPESAFE_API_KEY` 只作占位
+  转发，任何环境都不写值。上线真实调用前需完成供应商准入与合规评审（docs/26 §14.3）。
+- 验收：`tests/e2e/decision-engine.spec.ts`（部署未启用时精确跳过）；离线用例覆盖配置/脱敏/
+  载荷上限/响应映射/重试熔断/策略不可变规则。
+
 ## 常用命令
 
 ```sh
