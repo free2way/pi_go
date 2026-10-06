@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import type { APIRequestContext, Page } from "@playwright/test";
 import { E2E_LIVE_ACCEPTANCE, configStatus, expect, openRunByTitle, stopRun, test } from "./fixtures";
 
@@ -7,14 +8,13 @@ import { E2E_LIVE_ACCEPTANCE, configStatus, expect, openRunByTitle, stopRun, tes
  *
  * Each scenario has one `test.describe`. Where the current dev-auth / local
  * harness can safely drive the flow (demo runner, seeded run), the test is
- * implemented and runs. Where the scenario needs production-only preconditions
- * (Cloudflare OTP, the fixture repositories, a crashed/restarted Worker) the test
- * is marked `fixme` by default with the reason recorded, and only enabled in a
- * live acceptance environment via `PI_E2E_LIVE=1`.
+ * implemented and runs. The only remaining `fixme` is E2E-01b, which needs the
+ * production-only Cloudflare OTP flow; it is enabled only in a live acceptance
+ * environment via `PI_E2E_LIVE=1`.
  *
  * E2E-02 (check failure → automatic repair), E2E-04 (parallel sub-agents),
- * E2E-05 (provider preflight), E2E-07 (budget stop) and E2E-08 (hostile
- * repository isolation) are *real* tests: they no
+ * E2E-05 (provider preflight), E2E-06 (Worker crash recovery), E2E-07 (budget
+ * stop) and E2E-08 (hostile repository isolation) are *real* tests: they no
  * longer use `fixme`. Each one is
  * driven entirely by environment variables and either runs its assertions or
  * skips with a precise, actionable reason. That means the acceptance gate still
@@ -101,6 +101,42 @@ import { E2E_LIVE_ACCEPTANCE, configStatus, expect, openRunByTitle, stopRun, tes
  *     the `reviewer` role  →  MODEL_NOT_ALLOWED, or
  *   - a provider whose live verification returned a `verifiedModels` list that
  *     does not contain the model  →  MODEL_NOT_AVAILABLE (model_unverified).
+ *
+ * ---------------------------------------------------------------------------
+ * E2E-06 — Worker 崩溃恢复: environment contract
+ * ---------------------------------------------------------------------------
+ *   PI_E2E_CRASH_COMMAND      (required) shell command the spec executes at the
+ *                             deterministic kill point (immediately after the
+ *                             round-1 `check.started`). It must SIGKILL the
+ *                             deployment's Pi Worker and start it again, and must
+ *                             exit 0; the spec never talks to docker/ssh itself.
+ *                             A non-zero exit fails the test with the command's
+ *                             (secret-redacted) output.
+ *   PI_E2E_CRASH_TIMEOUT_MS   (optional) how long to wait for recovery and the
+ *                             terminal state, default 600000 (10 min). Recovery
+ *                             latency is dominated by the restarted worker
+ *                             waiting for the dead holder's workspace lock to go
+ *                             stale: PI_WORKSPACE_LOCK_STALE_SECONDS, default
+ *                             300s (the job heartbeat
+ *                             PI_JOB_STALE_SECONDS, default 120s, is shorter).
+ *   PI_E2E_WORKSPACE_ID       (optional) workspace to target; otherwise the
+ *                             first active, non-dirty registered workspace.
+ *   Roles are pinned explicitly from /api/models (first selectable entry per
+ *   role), so the run never depends on the deployment defaults. Also requires
+ *   `realRunsAvailable: true`.
+ *   Determinism: the run submits ONE deliberately slow, deterministic check
+ *   (`sleep 40; true`) so the kill lands while the run is genuinely in flight;
+ *   the developer checkpoint is already durable at that point
+ *   (`tracker.complete(stages.development(round))` precedes `checks.started` in
+ *   src/worker/index.ts). A no-op run alone finishes in ~12s, too fast to kill.
+ *
+ * Demo-environment recipe (see tests/e2e/README.md for the full contract): with
+ * `PI_E2E_BASE_URL=http://192.168.2.235:3101`, `PI_E2E_DEV_EMAIL=bobo.2000@gmail.com`
+ * and `NO_PROXY=localhost,127.0.0.1,192.168.2.235` (the deployment is on the LAN),
+ * set `PI_E2E_CRASH_COMMAND='bash /tmp/pigo-kill-worker.sh'`. That helper SIGKILLs
+ * only `pigo-demo-worker` and explicitly starts it again (on this Docker daemon
+ * `docker kill` alone does not trigger the `restart: unless-stopped` policy), and
+ * reads `PIGO_SSH_PW` from the operator's environment — never committed.
  *
  * ---------------------------------------------------------------------------
  * E2E-07 — 预算停止: environment contract
@@ -200,6 +236,8 @@ type AcceptanceRun = {
   summary?: string;
   diff?: string;
   modelCalls?: number;
+  /** Last allocated per-run event sequence (E2E-06 seq integrity). */
+  lastSeq?: number;
   /** Last deterministic-check verdict the worker froze on the run. */
   checkPassed?: boolean;
   /** Content snapshot hash that passed the required checks (AUD-04). */
@@ -1152,18 +1190,353 @@ test.describe("E2E-05 Provider 故障不浪费开发成本", () => {
 
 // ---------------------------------------------------------------------------
 // E2E-06 — Worker 崩溃恢复
+//
+// Real, env-driven test (docs/05 §13). A no-op real run finishes in ~12s, so the
+// run is kept in flight by ONE deliberately slow, deterministic check
+// (`sleep 40; true`): the spec waits for the round-1 `check.started` — which the
+// worker emits only after the developer stage and its checkpoint are durable
+// (`tracker.complete(stages.development(round))` precedes `checks.started` in
+// src/worker/index.ts) — and only then executes the operator-provided crash
+// command. That command SIGKILLs the worker and starts it again; the spec never
+// calls docker/ssh itself. See the file header for the PI_E2E_CRASH_* contract
+// and tests/e2e/README.md for the demo-environment recipe.
+//
+// Ground truth: the manual drill run `run_86af5afd92994b9f` (fetched read-only).
+// Its recovered sequence — after the kill landed inside the round-1 slow check —
+// was: workspace.locked (deferred, lock held by the dead run) →
+// workspace.lock_reclaimed (meta.staleRunId = this run) → run.recovered →
+// run.recovery_detected → agent.started → round.started →
+// checkpoint.development_restored → diff.artifact_persisted → checks.started →
+// check.started → check.passed → review.snapshot_created → review.approved
+// (state=completed), with seq 1..38 contiguous, one developer.started, one
+// developer session, one planner session and modelCalls=3
+// (planner+developer+reviewer).
+//
+// Assertions (each inline comment names the guarantee it relies on):
+//  1. the recovery follows a real crash: run.recovery_detected after the kill
+//     point, and workspace.lock_reclaimed with meta.staleRunId = runId (a live
+//     worker keeps touching its lock, so a live lock can never be reclaimed);
+//  2. no duplicated model work: one planner session, one developer session, one
+//     developer.started, checkpoint.development_restored present, modelCalls
+//     bounded by the planner+developer+reviewer golden shape;
+//  3. the interrupted stage re-runs and completes: a round-1 check.started after
+//     run.recovery_detected, then check.passed round 1, terminal `completed`
+//     within the timeout and no run.failed;
+//  4. seq integrity: strictly increasing, no duplicates and contiguous from 1
+//     (the store allocates seq as a row-locked `last_seq + 1` inside the event
+//     insert transaction, and events are only removed with the whole run).
 // ---------------------------------------------------------------------------
+
+/**
+ * The one deterministic check E2E-06 submits. Deliberately slow so the crash
+ * command lands while the run is genuinely in flight with the developer
+ * checkpoint already durable; deterministic and cheap so the recovered run
+ * passes it and reaches `completed`. The command text is asserted, so an
+ * accidental change to the kill window cannot pass silently.
+ */
+const E2E06_SLOW_CHECK = "sleep 40; true";
+
+/**
+ * Placeholder task: the scenario is about crash recovery, not about the model
+ * writing code. Asking the agent to make no change keeps the run cheap and
+ * guarantees the only long-running step is the deterministic check.
+ */
+const E2E06_TASK =
+  "验收占位任务（E2E-06）：本次运行无需任何代码改动。不要读取或修改仓库文件，也不要运行命令，直接确认无需改动即可结束。";
+
+/**
+ * Environment values that must never be echoed back in a failure diagnostic:
+ * the operator's crash helper reads them, and the diagnostic must not become a
+ * leak channel.
+ */
+const E2E06_SECRET_ENV = ["PIGO_SSH_PW", "PI_INTERNAL_TOKEN"];
+
+/** Redacts configured secret values from captured crash-command output. */
+function redactSecrets(text: string): string {
+  return E2E06_SECRET_ENV.reduce((safe, name) => {
+    const value = process.env[name];
+    return value ? safe.replaceAll(value, "[redacted]") : safe;
+  }, text);
+}
+
+type CrashOutcome = { status: number | null; signal: NodeJS.Signals | null; output: string };
+
+/**
+ * Runs the operator-provided crash command as a local child process through a
+ * shell (e.g. `bash /tmp/pigo-kill-worker.sh`). Whatever remote teardown the
+ * deployment needs lives in that command; the spec only requires it to succeed.
+ * Output is captured (and redacted) so a failure can be diagnosed.
+ */
+function runCrashCommand(command: string, timeoutMs: number): CrashOutcome {
+  const result = spawnSync(command, { shell: true, encoding: "utf8", timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 });
+  const output = redactSecrets([result.stdout, result.stderr].filter(Boolean).join("\n").trim()) || "(无输出)";
+  return { status: result.status, signal: result.signal, output };
+}
+
+/**
+ * Fetches the complete per-run event stream. The default page is 500 events, so
+ * the integrity assertion below pages explicitly instead of silently reading a
+ * truncated window.
+ */
+async function getAllRunEvents(request: APIRequestContext, runId: string): Promise<AcceptanceEvent[]> {
+  const all: AcceptanceEvent[] = [];
+  for (;;) {
+    const after = all.at(-1)?.seq ?? 0;
+    const response = await request.get(`/api/runs/${runId}/events?after=${after}&limit=1000`);
+    expect(response.ok(), `GET /api/runs/${runId}/events failed with HTTP ${response.status()}`).toBeTruthy();
+    const page = (await response.json()) as AcceptanceEvent[];
+    all.push(...page);
+    if (page.length < 1_000) break;
+  }
+  return all;
+}
+
 test.describe("E2E-06 Worker 崩溃恢复", () => {
-  test("E2E-06 开发完成写入 checkpoint 后强杀 Worker：Run 不卡死、调用不重复、seq 连续、按阶段续跑（fixme：需生产验收环境）", async ({ request }) => {
-    requireLiveAcceptance(
-      "真实 runs + 可强制重启的 Pi Worker 与真实 PostgreSQL（浏览器侧只能观察结果）。",
-    );
+  test("E2E-06 开发 checkpoint 落盘后强杀 Worker：锁被回收、按检查点续跑、不重复模型调用、seq 连续、Run 最终 completed（需 PI_E2E_CRASH_COMMAND）", async ({ request }) => {
+    const crashCommand = envValue("PI_E2E_CRASH_COMMAND");
+    const configuredWait = Number(envValue("PI_E2E_CRASH_TIMEOUT_MS") ?? 600_000);
+    const waitMs = Number.isFinite(configuredWait) && configuredWait > 0 ? configuredWait : 600_000;
+    const preconditions =
+      `需要一个真实运行环境（realRunsAvailable=true + 一个 active 且未 dirty 的工作区 + /api/models 中 developer/reviewer 可选模型）以及一条「强杀并随即重启部署的 Pi Worker」的本地命令：设置 PI_E2E_CRASH_COMMAND（demo 环境用 'bash /tmp/pigo-kill-worker.sh'，该 helper 自行读取 PIGO_SSH_PW 并只重启 demo worker）。可选 PI_E2E_CRASH_TIMEOUT_MS（默认 600000）控制等待恢复并完成的时长——恢复延迟主要由 PI_WORKSPACE_LOCK_STALE_SECONDS（默认 300s）决定；当前值 ${waitMs}。测试自身不执行 docker/ssh，只运行该命令，且要求其退出码为 0。`;
+    test.info().annotations.push({ type: "preconditions", description: preconditions });
+    test.skip(!crashCommand, `E2E-06 未配置：${preconditions}`);
+
     const config = await configStatus(request);
-    test.skip(!config.realRunsAvailable, "PI_REAL_RUNS_ENABLED=false 或凭据未配置。");
-    notImplementedYet(
-      "E2E-06",
-      "断言：Run 最终完成或明确转人工；Developer 已完成调用不重复；事件 seq 连续；从正确阶段继续。",
+    test.skip(
+      !config.realRunsAvailable,
+      "E2E-06 需要真实运行环境：/api/config/status 报告 realRunsAvailable=false（需 PI_REAL_RUNS_ENABLED=true、PI_INTERNAL_TOKEN 以及至少一个已配置的 provider 凭据）。",
     );
+
+    const workspaceId = await resolveAcceptanceWorkspace(request);
+    test.skip(
+      !workspaceId,
+      "E2E-06 需要工作区：没有 active 且未 dirty 的已注册工作区（或设置 PI_E2E_WORKSPACE_ID 指定）。",
+    );
+
+    // Pin both roles explicitly, so the run never inherits a deployment default.
+    const developer = await resolveRoleSelection(request, "developer");
+    const reviewer = await resolveRoleSelection(request, "reviewer");
+    test.skip(
+      !developer || !reviewer,
+      "E2E-06 需要 /api/models 中分别可用于 developer 与 reviewer 的模型（selectableRoles）：缺少任一角色就无法显式钉住运行所用的模型。",
+    );
+
+    // Recovery is expected around +300s (lock staleness) plus the check and the
+    // review; keep the test window aligned with the poll window plus slack.
+    test.setTimeout(waitMs + 120_000);
+
+    const title = `E2E-06 崩溃恢复 ${Date.now()}`;
+    const created = await request.post("/api/runs", {
+      data: {
+        title,
+        task: E2E06_TASK,
+        mode: "real",
+        workspaceId,
+        checks: [E2E06_SLOW_CHECK],
+        developerModel: developer,
+        reviewerModel: reviewer,
+      },
+    });
+    expect(created.status(), `POST /api/runs 失败（${created.status()}）：${await created.text()}`).toBe(201);
+    const runId = ((await created.json()) as AcceptanceRun).id;
+
+    let crashDiagnostic = "(崩溃命令尚未执行)";
+    try {
+      // (a) Deterministic kill point: round-1 `check.started` means the developer
+      // stage and its checkpoint are already durable, and the slow check keeps
+      // the run in flight long enough for the crash to land inside it. Wait for
+      // it — or an early stop — before touching the worker.
+      let killEvent: AcceptanceEvent | undefined;
+      let preCrashEvents: AcceptanceEvent[] = [];
+      const killDeadline = Date.now() + waitMs;
+      while (Date.now() < killDeadline) {
+        preCrashEvents = await getRunEvents(request, runId);
+        killEvent = preCrashEvents.find((event) => event.type === "check.started" && event.round === 1);
+        if (killEvent) break;
+        const current = await getRun(request, runId);
+        if (!ACTIVE_RUN_STATES.includes(current.state)) break;
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+      }
+      expect(
+        killEvent,
+        `Run ${runId} 未在 ${waitMs}ms 内进入第 1 轮检查（check.started），无法在确定性时点执行崩溃命令。事件日志：\n${formatEvents(preCrashEvents)}`,
+      ).toBeTruthy();
+      const killSeq = killEvent!.seq;
+
+      // The run really carries the constructed slow check (so the kill point is
+      // attributable to it) and is pinned to the resolved workspace (so the
+      // reclaimed lock below has an unambiguous key).
+      const beforeCrash = await getRun(request, runId);
+      expect(
+        beforeCrash.workspaceId,
+        `Run 必须跑在解析出的工作区上（期望 ${workspaceId}，实际 ${String(beforeCrash.workspaceId)}）`,
+      ).toBe(workspaceId);
+      expect(beforeCrash.checks?.[0]?.command, "Run 上记录的检查命令必须就是构造的慢检查").toBe(E2E06_SLOW_CHECK);
+      expect(
+        ACTIVE_RUN_STATES.includes(beforeCrash.state),
+        `执行崩溃命令前 Run 必须仍在运行态，否则不会打断任何在飞阶段（实际 ${beforeCrash.state}）`,
+      ).toBe(true);
+
+      // (b) Issue the crash at the deterministic point. The operator command owns
+      // the remote teardown; the spec requires it to succeed and reports its
+      // (redacted) output when it does not.
+      const crash = runCrashCommand(crashCommand!, 120_000);
+      crashDiagnostic = `exit=${String(crash.status)} signal=${String(crash.signal)}\n${crash.output}`;
+      expect(
+        crash.status,
+        `PI_E2E_CRASH_COMMAND 必须以 0 退出（实际 status=${String(crash.status)} signal=${String(crash.signal)}）——否则 Worker 可能仍存活，恢复断言无意义。输出：\n${crash.output}`,
+      ).toBe(0);
+
+      // (c) Wait for the run to leave the active states on its own. Recovery
+      // latency is dominated by the restarted worker waiting for the dead
+      // holder's workspace lock to go stale (default 300s), so the full timeout
+      // is used. A manual loop (rather than expect.poll) keeps the event log in
+      // the timeout diagnostic.
+      let terminal: AcceptanceRun | undefined;
+      let observedEvents: AcceptanceEvent[] = [];
+      const recoveryDeadline = Date.now() + waitMs;
+      while (Date.now() < recoveryDeadline) {
+        observedEvents = await getRunEvents(request, runId);
+        terminal = await getRun(request, runId);
+        if (!ACTIVE_RUN_STATES.includes(terminal.state)) break;
+        await new Promise((resolve) => setTimeout(resolve, 5_000));
+      }
+      expect(
+        terminal !== undefined && !ACTIVE_RUN_STATES.includes(terminal.state),
+        `Run ${runId} 未在 ${waitMs}ms 内离开运行态：Worker 可能没有被崩溃命令强杀/重启，或恢复被卡住。崩溃命令输出：\n${crashDiagnostic}\n事件日志：\n${formatEvents(observedEvents)}`,
+      ).toBe(true);
+
+      const finalRun = await getRun(request, runId);
+      const events = await getAllRunEvents(request, runId);
+      const all = (type: string) => events.filter((event) => event.type === type);
+      const diagnostic = `崩溃命令输出：\n${crashDiagnostic}\n事件日志：\n${formatEvents(events)}`;
+
+      // (1) The recovery really follows a crash. `run.recovery_detected` is the
+      // post-restart detection. `workspace.lock_reclaimed` can only exist when
+      // the previous holder's lock went stale, i.e. the holder really died — a
+      // live worker keeps touching its lock (`workspaceLockHeartbeatMs`), so a
+      // live lock is never reclaimed. Its `meta.staleRunId` being THIS run pins
+      // the reclaim to our crash.
+      const recovery = events.find((event) => event.type === "run.recovery_detected");
+      expect(
+        recovery,
+        `Run ${runId} 必须记录 run.recovery_detected（Worker 重启后检测到未完成任务并复用已有运行目录）。${diagnostic}`,
+      ).toBeTruthy();
+      expect(
+        recovery!.seq,
+        `run.recovery_detected 必须晚于崩溃时点（kill #${killSeq}，recovery #${recovery!.seq}）。${diagnostic}`,
+      ).toBeGreaterThan(killSeq);
+
+      const reclaimed = all("workspace.lock_reclaimed").filter((event) => event.meta?.staleRunId === runId);
+      expect(
+        reclaimed.length,
+        `Run ${runId} 必须记录 workspace.lock_reclaimed 且 meta.staleRunId 为本运行（否则无法证明 Worker 真被强杀：存活 Worker 的锁不会被回收）。${diagnostic}`,
+      ).toBeGreaterThan(0);
+      expect(
+        reclaimed[0].meta?.workspace,
+        `workspace.lock_reclaimed.meta.workspace 必须是被占用的工作区 ${workspaceId}（实际 ${String(reclaimed[0].meta?.workspace)}）`,
+      ).toBe(workspaceId);
+      expect(
+        reclaimed[0].seq,
+        `锁回收必须晚于崩溃时点（kill #${killSeq}，reclaim #${reclaimed[0].seq}）。${diagnostic}`,
+      ).toBeGreaterThan(killSeq);
+      // Same dispatch: the lock is taken over before executeJob() resumes, which
+      // is where run.recovered / run.recovery_detected are emitted.
+      expect(
+        reclaimed[0].seq,
+        `锁回收必须先于 run.recovery_detected（reclaim #${reclaimed[0].seq}，recovery #${recovery!.seq}）。${diagnostic}`,
+      ).toBeLessThan(recovery!.seq);
+
+      // (2) No duplicated model work. The developer checkpoint was restored
+      // instead of re-running the model: exactly one planner session, exactly one
+      // developer session and one `developer.started`, plus the product's own
+      // "跳过重复的模型调用" event. A recovery that re-ran the restored developer
+      // stage would show two developer sessions / two developer.started events.
+      const sessions = all("session.metrics");
+      const sessionsOf = (role: string) => sessions.filter((event) => event.meta?.role === role);
+      expect(
+        sessionsOf("planner"),
+        `崩溃恢复不得重复 Planner 模型调用（session.metrics role=planner 必须恰好一条）。${diagnostic}`,
+      ).toHaveLength(1);
+      expect(
+        sessionsOf("developer"),
+        `崩溃恢复不得重复 Developer 模型调用（session.metrics role=developer 必须恰好一条）。${diagnostic}`,
+      ).toHaveLength(1);
+      expect(
+        sessionsOf("reviewer"),
+        `本场景必须恰好一次 Reviewer 模型调用（session.metrics role=reviewer 必须恰好一条）。${diagnostic}`,
+      ).toHaveLength(1);
+      expect(
+        all("developer.started"),
+        `崩溃恢复不得重复启动 Developer（developer.started 必须恰好一条）。${diagnostic}`,
+      ).toHaveLength(1);
+      const restored = all("checkpoint.development_restored");
+      expect(
+        restored.length,
+        `必须记录 checkpoint.development_restored —— 产品自身的「第 1 轮开发已由检查点确认完成，跳过重复的模型调用」证据。${diagnostic}`,
+      ).toBeGreaterThan(0);
+      expect(
+        restored[0].seq,
+        `checkpoint.development_restored 必须发生在恢复之后（recovery #${recovery!.seq}，restored #${restored[0].seq}）。${diagnostic}`,
+      ).toBeGreaterThan(recovery!.seq);
+
+      // Golden shape (run_86af5afd92994b9f): planner + developer + reviewer, one
+      // provider call each = 3. A recovery that repeated a restored stage would
+      // push this up (and would already fail the per-role session assertions);
+      // provider-level retries also increment this counter, so a failure names
+      // the per-session counts for investigation instead of guessing.
+      const accountedCalls = sessions.reduce((total, event) => total + Number(event.meta?.modelCalls ?? 0), 0);
+      expect(
+        finalRun.modelCalls,
+        `Run.modelCalls 必须不超过 golden 形状 3（planner+developer+reviewer 各 1 次）：modelCalls=${String(finalRun.modelCalls)}，会话合计=${accountedCalls}，逐会话=${sessions.map((event) => `${String(event.meta?.role)}:${String(event.meta?.modelCalls)}`).join(", ")}。多出的调用意味着崩溃恢复重复了已完成的模型工作。${diagnostic}`,
+      ).toBeLessThanOrEqual(3);
+      expect(
+        finalRun.modelCalls,
+        `Run.modelCalls 必须等于各会话调用数之和（会话合计=${accountedCalls}）。${diagnostic}`,
+      ).toBe(accountedCalls);
+
+      // (3) The interrupted stage re-runs and completes. The pre-crash check
+      // never passed (the kill landed inside it), and a round-1 check.started
+      // after recovery re-ran it to a pass.
+      expect(
+        all("check.passed").filter((event) => event.seq < recovery!.seq),
+        `崩溃必须发生在第 1 轮检查执行中：恢复前不得出现 check.passed（否则杀点落在检查之后，未真正打断在飞阶段）。${diagnostic}`,
+      ).toEqual([]);
+      const reRunChecks = all("check.started").filter((event) => event.round === 1 && event.seq > recovery!.seq);
+      expect(
+        reRunChecks.length,
+        `恢复后必须重新执行被中断的第 1 轮检查（check.started 晚于 run.recovery_detected #${recovery!.seq}）。${diagnostic}`,
+      ).toBeGreaterThan(0);
+      const passed = all("check.passed").find((event) => event.round === 1 && event.seq > reRunChecks[0].seq);
+      expect(
+        passed,
+        `恢复后重跑的第 1 轮检查必须通过（check.passed 晚于 #${reRunChecks[0].seq}）。${diagnostic}`,
+      ).toBeTruthy();
+      expect(passed!.message, `check.passed 必须归于构造的慢检查：${passed!.message}`).toBe(`${E2E06_SLOW_CHECK} 通过`);
+      expect(
+        finalRun.state,
+        `Run 必须在超时内到达终态 completed（实际 ${finalRun.state}）——恢复不得把 Run 卡死或转人工。${diagnostic}`,
+      ).toBe("completed");
+      expect(all("run.failed"), `恢复后不得记录 run.failed。${diagnostic}`).toEqual([]);
+
+      // (4) seq integrity. `RunStorePg.nextSequence` allocates each event's seq
+      // as `last_seq = last_seq + 1` inside the same transaction that inserts the
+      // event (row-locked on `runs`), and a run's events are only ever removed by
+      // `deleteRun` (which removes the whole run). For a live run the stream is
+      // therefore strictly increasing and contiguous from 1; this is asserted,
+      // not assumed, and the full stream was fetched above.
+      const seqs = events.map((event) => event.seq);
+      for (let index = 1; index < seqs.length; index += 1) {
+        expect(seqs[index], `事件 seq 必须严格递增且无重复：seqs=${seqs.join(",")}`).toBeGreaterThan(seqs[index - 1]);
+      }
+      expect(
+        seqs,
+        `事件 seq 必须从 1 起连续无缺口（run-store-pg 事务内 last_seq+1 分配；事件仅随整个 Run 删除）：seqs=${seqs.join(",")}`,
+      ).toEqual(Array.from({ length: seqs.length }, (_, index) => index + 1));
+      expect(finalRun.lastSeq, "Run.lastSeq 必须等于事件流最后一个 seq").toBe(seqs.at(-1));
+    } finally {
+      await cancelIfActive(request, runId);
+    }
   });
 });
 

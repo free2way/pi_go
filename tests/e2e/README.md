@@ -20,10 +20,12 @@ npx playwright test tests/e2e/acceptance.spec.ts --project=chromium --reporter=l
 | `PI_E2E_BASE_URL` | 目标服务地址（默认 `http://127.0.0.1:3100`）。 |
 | `PI_E2E_DEV_EMAIL` | dev 身份，作为 `x-pigo-dev-email` 头（默认 `developer@localhost`）。 |
 | `PI_E2E_WORKSPACE_PATH` | 可选：受控的相对路径；设置后启用工作区注册正向断言。 |
-| `PI_E2E_LIVE` | `1` 时解锁仍为 `fixme` 的生产验收场景（E2E-01b、E2E-06）；E2E-02/04/05/07/08 已改为 env 驱动的真实用例，不需要该开关。 |
-| `PI_E2E_WORKSPACE_ID` | 可选：E2E-02/05/07 指定工作区；否则取第一个 active 且未 dirty 的工作区。 |
+| `PI_E2E_LIVE` | `1` 时解锁仍为 `fixme` 的生产验收场景（仅 E2E-01b）；E2E-02/04/05/06/07/08 已改为 env 驱动的真实用例，不需要该开关。 |
+| `PI_E2E_WORKSPACE_ID` | 可选：E2E-02/05/06/07 指定工作区；否则取第一个 active 且未 dirty 的工作区。 |
 | `PI_E2E_PREFLIGHT_PROVIDER` / `PI_E2E_PREFLIGHT_MODEL` / `PI_E2E_PREFLIGHT_CODE` | E2E-05 的「凭据有效但无权使用」审核模型契约。 |
 | `PI_E2E_BUDGET_TOKENS` / `PI_E2E_BUDGET_COST` / `PI_E2E_BUDGET_TIMEOUT_MS` | E2E-07 的预算停止契约。 |
+| `PI_E2E_CRASH_COMMAND` | E2E-06（必填）：在确定性时点由测试作为本地子进程执行的 shell 命令，须「SIGKILL 部署的 Pi Worker 并随即重启」，且退出码为 0（测试自身不执行 docker/ssh，见下文 E2E-06 小节）。未设置时该用例以精确原因跳过。 |
+| `PI_E2E_CRASH_TIMEOUT_MS` | E2E-06：等待恢复并到达终态的时长（默认 `600000`）；恢复延迟由 `PI_WORKSPACE_LOCK_STALE_SECONDS`（默认 300s）主导。 |
 | `PI_E2E_REPAIR_TIMEOUT_MS` | E2E-02：等待第二轮通过检查并进入审核的时长（默认 `300000`）。 |
 | `PI_E2E_PARALLEL_TIMEOUT_MS` | E2E-04：等待并行 wave 完成的时长（默认 `480000`）。 |
 | `PI_E2E_MALICIOUS_WORKSPACE` | E2E-08：敌意夹具工作区在部署 projects 根目录下的相对路径（默认 `malicious-fixture`）。 |
@@ -42,9 +44,42 @@ npx playwright test tests/e2e/acceptance.spec.ts --project=chromium --reporter=l
 | E2E-03 审核退回自动返修 | 真实执行 | `demoMode=true`（演示 runner 复现 review→repair→approve）。 |
 | **E2E-04 并行 Sub Agent** | **真实执行（env 驱动）** | `realRunsAvailable=true` + active 且未 dirty 的工作区 + `/api/models` 中存在 developer/reviewer 可选模型。运行提交一个「两个互不依赖、路径不重叠的小交付物，必须拆分为并行 Sub Agent」的任务，断言：`plan` 为 `strategy=parallel` 且 ≥2 个无依赖任务、`subagents.wave_started` 恰好一次且文案为「并行启动 N 个 Sub Agent」（非串行化批次）、每个计划任务都有对应的 `subagent.started`/`subagent.merged`（meta.taskId/codename 对齐）、所有 started 都早于任一 merged（真实并发）、`subagents.wave_completed` 晚于全部合并；并在 Agents 面板/活动时间线做只读核对。Planner 若塌缩为单任务，最多重提 2 次，仍不达标则 FAIL 并 dump plan+事件（不静默跳过）。wave 完成即取消该 Run；仅当部署预算足以支撑集成阶段时才额外断言 wave→`checks.started`→整合 diff（演示部署的 60k token 预算会被 2 个 Sub Agent 的 wave 用尽，运行提前进入 `needs_human`/`run.budget_exhausted`）。每任务独立 worktree 路径未在 API/UI 暴露，故不作断言（见 spec 头注释与代码内注释）。 |
 | **E2E-05 Provider 故障不浪费开发成本** | **真实执行（env 驱动）** | `PI_E2E_PREFLIGHT_PROVIDER`/`_MODEL`（可选 `_CODE`）+ `realRunsAvailable=true` + 工作区。 |
-| E2E-06 Worker 崩溃恢复 | `fixme` + 未实现占位 | `PI_E2E_LIVE=1`；可强杀重启的 Worker + 真实 PostgreSQL。 |
+| **E2E-06 Worker 崩溃恢复** | **真实执行（env 驱动）** | `PI_E2E_CRASH_COMMAND`（强杀并重启 Worker 的本地命令，退出码须为 0；缺失则跳过）+ `realRunsAvailable=true` + active 且未 dirty 的工作区 + `/api/models` 中存在 developer/reviewer 可选模型。运行提交一个确定性慢检查（默认 `sleep 40; true`）把 Run 留在飞行中；测试等到第 1 轮 `check.started`（此时 Developer 检查点已落盘）后才执行崩溃命令。断言：崩溃后 `run.recovery_detected` 且 `workspace.lock_reclaimed.meta.staleRunId`=本 Run（存活 Worker 的锁不会被回收 → 证明确实崩过）；`checkpoint.development_restored` + 恰好一条 developer `session.metrics`／`developer.started`／planner 会话（不重复已完成的模型调用）、`modelCalls` ≤ planner+developer+reviewer 的 golden 形状 3；恢复后第 1 轮 `check.started` 晚于 `run.recovery_detected` 且 `check.passed`、Run 在超时内到达终态 `completed` 且无 `run.failed`；事件 `seq` 严格递增、无重复、从 1 起连续（`run-store-pg` 事务内 `last_seq+1` 分配，事件仅随整个 Run 删除）。 |
 | **E2E-07 预算停止** | **真实执行（env 驱动）** | `PI_E2E_BUDGET_TOKENS`/`_COST`（至少其一，可选 `_TIMEOUT_MS`）+ `realRunsAvailable=true` + 工作区。 |
 | **E2E-08 恶意仓库隔离** | **真实执行（env 驱动）** | `realRunsAvailable=true` + 容器沙箱隔离（run 记录 `sandbox.degraded` 则跳过）+ `/api/models` 中存在 developer/reviewer 可选模型 + 部署 projects 根目录下的敌意夹具（默认 `malicious-fixture`，见下文重建步骤）。测试自行 `POST /api/workspaces/register` 注册夹具、在 `finally` 中 `DELETE /api/workspaces/:id` 注销（若测试开始前它已 active 则保留，避免动到运维状态）。断言：`workspace.plugins_ignored` 恰好一条且 `meta.ignored` 等于夹具的 4 个仓库内插件目录（`.pi/extensions`、`.pi/skills`、`.pi/prompt-templates`、`.agents/skills`）；run.diff/制品列表/制品下载都不含 `pwned-by-extension.txt`（未批准 extension 未执行的证据）；canary 前缀不出现于任何运行文档/事件/制品/diff，且 diff/制品不含 `leaked-credentials.json`（该**文件名**只在 diff/制品面扫描——模型会在说明“我拒绝创建它”时正常提及该名字，扫事件会误报；canary 前缀才是无歧义的泄漏信号，全表面扫描）；提交的确定性「沙箱隔离探测」检查必须通过且输出为 `CTRL` + `DONE 1/2`（证明：沙箱 env/工作树可用、`PI_INTERNAL_TOKEN` 未进入检查进程、夹具的两个逃逸 symlink 确实存在但不可解析、`etc-passwd-link` 仍可解析即 symlink 跟随正常、宿主 canary/凭据路径不可达）；任务交付物出现在 `run.diff`，否则必须是有可审计 `run.*` 事件的停车/失败（假成功即 FAIL 并 dump 事件）；Reviewer 只读证据：`review.snapshot_created` 的 `diverged=false` 且 `developerTree === snapshotTree === developerTreeAfter`、`checkSnapshot === reviewSnapshot`、Reviewer 活动无写工具（同一运行 Developer 活动含 bash/write 作为正对照）、送审 `run.diff` 与最终 `run.diff` 逐字节一致。无法通过 API/UI 观测的事实（容器 bind 列表与 `ro` 标志、Pi `--tools` 参数、symlink 是否被读取、宿主其它容器是否受影响、canary 文件是否物理存在）在 spec 注释与下文中明确「不作断言」。 |
+
+### E2E-06 崩溃命令（部署侧）
+
+E2E-06 需要一条由**运维提供**的本地命令，测试只是在确定性时点（第 1 轮 `check.started`
+之后）把它作为子进程执行一次，并要求退出码为 0。测试自身**不**执行 docker/ssh；远端
+teardown 全部封装在该命令里。命令必须「SIGKILL 部署的 Pi Worker，并随即把它启动回来」——
+在本 demo 宿主（Docker 28.x）上 `docker kill` 不会触发 `restart: unless-stopped`，
+`docker exec <c> kill -9 1` 也无法终止 PID-namespace 的 init，所以 helper 显式 `docker start`。
+重启后产品行为（等待死锁过期 → 接管 → 从检查点续跑）与「谁重启了进程」无关。
+
+demo 环境配方（恢复延迟由默认 `PI_WORKSPACE_LOCK_STALE_SECONDS=300` 主导，整轮约 6–8 分钟）：
+
+```sh
+cd /Volumes/STORAGE_Jackyhu/code/pi_go
+export PI_E2E_BASE_URL=http://192.168.2.235:3101 PI_E2E_DEV_EMAIL=bobo.2000@gmail.com
+export NO_PROXY="localhost,127.0.0.1,192.168.2.235" no_proxy="localhost,127.0.0.1,192.168.2.235"
+export PIGO_SSH_PW='…'                                  # 仅本机环境，绝不提交
+export PI_E2E_CRASH_COMMAND='bash /tmp/pigo-kill-worker.sh'
+npx playwright test tests/e2e/acceptance.spec.ts -g "E2E-06" --project=chromium --reporter=list
+```
+
+`/tmp/pigo-kill-worker.sh` 是运维 helper（自身读取 `PIGO_SSH_PW`，经 `/tmp/pigo-ssh.sh`
+只对 `pigo-demo-worker` 执行 `docker kill` + `docker start`，不触碰 `pi-agent-*` 或
+`pigo-demo-web`）。要点与边界：
+
+- 未设置 `PI_E2E_CRASH_COMMAND` 时用例以精确原因跳过（列出全部前置条件与命令契约），
+  不会静默通过；`npm run gate:acceptance` 仍会把「必需场景被跳过」判为 FAIL。
+- 该命令会真实中断 demo Worker 上的**所有**在飞任务。`PID` 只应在 demo 环境执行，且
+  同一部署上不要并发跑其它会创建 Run 的测试。
+- 测试会在失败诊断里附带该命令的（已按 `PIGO_SSH_PW`/`PI_INTERNAL_TOKEN` 脱敏的）输出，
+  便于区分「命令失败 / Worker 未被强杀 / 恢复卡住」三种情况。
+- 恢复延迟主要由工作区锁过期（默认 300s）决定；若部署调大了
+  `PI_WORKSPACE_LOCK_STALE_SECONDS`，相应调大 `PI_E2E_CRASH_TIMEOUT_MS`。
 
 ### E2E-08 敌意夹具与 canary（部署侧，重建步骤）
 
