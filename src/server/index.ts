@@ -33,6 +33,7 @@ import { resumeDeadlinePatch } from "./run-deadline-base.js";
 import { parseRunSearch, searchRuns } from "./run-search.js";
 import { ROUNDS_SCHEMA_VERSION, readRunRounds } from "./run-rounds.js";
 import { readDecisionBrief } from "./decision-brief.js";
+import { readDecisionUsageSafe } from "./decision-usage.js";
 import { DecisionAuditStore } from "./decision-engine/audit-store.js";
 import { createDecisionEngine, loadDecisionEngineConfig } from "./decision-engine/index.js";
 import { buildReviewTriageBatches } from "./decision-engine/review-triage.js";
@@ -261,6 +262,9 @@ const runRoleUsageSchema = z.object({
   cacheWriteTokens: z.number().min(0).optional(),
   estimatedCost: z.number().min(0),
   calls: z.number().int().min(0),
+  // AT-JEV-062: calls with no price table (decision plane) are counted here, so
+  // a reader can render "unknown" instead of $0.000. Additive/optional.
+  unpricedCalls: z.number().int().min(0).max(10_000).optional(),
 });
 const runUsageSchema = z.object({
   inputTokens: z.number().min(0),
@@ -1710,7 +1714,15 @@ app.get<{ Params: { id: string } }>("/api/runs/:id", async (request, reply) => {
   if (run.mergePending) {
     run = (await replayPendingMerge(store, run.id)) ?? run;
   }
-  return run;
+  // AT-JEV-061/062: the decision plane's real provider usage lives in
+  // `decision_evaluations`, not in the run document (the worker owns that
+  // revision). Aggregate it at read time under its own `role: "decision"` entry
+  // and NEVER let an audit-table problem break the run-detail response: a
+  // storage failure degrades to the run without decision usage and a warn.
+  return readDecisionUsageSafe(db, run, (error) => {
+    const message = error instanceof Error ? `${error.name}: ${error.message}`.slice(0, 300) : "unknown error";
+    app.log.warn({ error: message }, "decision usage aggregation failed; returning run without decision usage");
+  });
 });
 
 app.get<{ Params: { id: string }; Querystring: { after?: string; limit?: string } }>("/api/runs/:id/events", async (request, reply) => {
@@ -3263,6 +3275,10 @@ registerDecisionRoutes(app, {
   internalAuthorized: (request) => safeTokenMatch(request.headers.authorization),
   ownerKeysFor,
   readVaultKey,
+  // AT-JEV-081: a `jev-latest` alias that starts resolving to a new model version
+  // raises one deduplicated warning through the existing AlertManager (structured
+  // log + optional PI_ALERT_WEBHOOK). Details carry ids and version strings only.
+  raiseAlert: (alert) => alerts.raise(alert),
 });
 
 const currentDir = path.dirname(fileURLToPath(import.meta.url));

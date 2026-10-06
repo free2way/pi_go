@@ -30,6 +30,7 @@ import {
   type DecisionAuditStoreLike,
 } from "./decision-engine/audit-store.js";
 import { canonicalJson, questionSchemaHash, sha256Hex, stateManifest } from "./decision-engine/redaction.js";
+import type { Alert } from "./alerts.js";
 import {
   runReviewTriageBatches,
   type ReviewTriageBatch,
@@ -112,6 +113,14 @@ export interface DecisionRouteDeps {
   readVaultKey?: (userId: string, provider: string) => string | undefined | Promise<string | undefined>;
   /** Injectable clock so the disabled path's `createdAt` is deterministic in tests. */
   now?: () => Date;
+  /**
+   * AT-JEV-081: alert sink for a model-alias drift (the requested alias starts
+   * resolving to a new version). Production passes
+   * `(alert) => alerts.raise(alert)` so the existing `AlertManager` owns
+   * deduplication/cooldown; tests inject a spy. When omitted nothing is raised —
+   * drift detection still runs, it just has no sink to report to.
+   */
+  raiseAlert?: (alert: Alert) => void;
 }
 
 /** Whitelisted, redacted projection of one audit row (docs/26 §8.2). */
@@ -519,6 +528,49 @@ async function appendDecisionEvents(
 }
 
 /**
+ * AT-JEV-081: warns once when a requested model alias (`jev-latest`) starts
+ * resolving to a new version. The newly persisted COMPLETED row is compared with
+ * the newest completed row previously stored for the same alias; a missing
+ * baseline (first observation), an equal version or either side lacking a
+ * `resolved_model` raises nothing.
+ *
+ * The alert carries identifiers and version strings only — never a key and never
+ * any part of the outbound payload. Drift detection is observational: any query
+ * failure degrades to "no alert" and must never affect the evaluation response
+ * or the row that was already persisted.
+ */
+async function raiseModelDriftIfNeeded(
+  record: DecisionEvaluationRecord,
+  deps: DecisionRouteDeps,
+  at: string,
+): Promise<void> {
+  const resolvedModel = record.resolvedModel?.trim();
+  if (!resolvedModel) return;
+  let previous: DecisionEvaluationRecord | undefined;
+  try {
+    previous = await deps.audit.findLatestCompletedByRequestedModel(record.requestedModel, record.evaluationId);
+  } catch {
+    // Deliberately silent: the evaluation is already persisted and must return
+    // normally. Logging here would need a new logger dependency for no benefit.
+    return;
+  }
+  const previousResolvedModel = previous?.resolvedModel?.trim();
+  if (!previousResolvedModel || previousResolvedModel === resolvedModel) return;
+  deps.raiseAlert?.({
+    key: "jev_model_drift",
+    severity: "warning",
+    message: `Jev 模型别名漂移：${record.requestedModel} 由 ${previousResolvedModel} 变为 ${resolvedModel}`,
+    details: {
+      requestedModel: record.requestedModel,
+      previousResolvedModel,
+      resolvedModel,
+      evaluationId: record.evaluationId,
+      at,
+    },
+  });
+}
+
+/**
  * Business-safe fallback for a batch that was never dispatched (`payload_rejected`
  * for an over-limit finding set) or whose engine call threw. It is persisted and
  * evented exactly like a provider fallback, so one bad batch is visible in the
@@ -759,8 +811,12 @@ export async function evaluateDecisionForRun(
       fallbackLatencyMs: skipped ? 0 : Date.now() - dispatchStarted,
     });
     const { record: persisted, created } = await deps.audit.insert(record);
-    // A concurrent duplicate persisted the row first; it also owns the events.
-    if (created) await appendDecisionEvents(persisted, run, deps, { index: entry.index, count: entries.length });
+    // A concurrent duplicate persisted the row first; it also owns the events
+    // and the drift signal, so a replay never re-raises the alert (AT-JEV-081).
+    if (created) {
+      await appendDecisionEvents(persisted, run, deps, { index: entry.index, count: entries.length });
+      if (persisted.status === "completed") await raiseModelDriftIfNeeded(persisted, deps, now);
+    }
     records.push(persisted);
   }
 

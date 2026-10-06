@@ -481,7 +481,7 @@ npm run report:at-coverage
 
 局限（诚实声明）：这是**引用级**检查，不是覆盖率证明。编号出现在测试标题或注释里只表示
 "有人声称该测试映射到这条用例"，**不等于**该用例描述的行为已被断言证明。`uncited` 是可靠信号
-（无人声称覆盖）；`cited` 仍需人工核对断言内容。截至本次更新：61 条用例中 41 条 cited、20 条 uncited。
+（无人声称覆盖）；`cited` 仍需人工核对断言内容。截至本次更新：61 条用例中 42 条 cited、19 条 uncited。
 
 已知缺口（无自动化证据，不得在阶段升级时当作已验收）：
 
@@ -489,9 +489,21 @@ npm run report:at-coverage
 - **AT-JEV-070 / 072 / 073（Mock 开销、并发限流、大批 Findings 容量）**：无自动化证据。
 - **AT-JEV-071（Live 时延）**：`tests/live/jev-contract.test.ts` 仅记录 p50/p95/max 日志，且需
   `PI_JEV_LIVE=1`；它**不断言** p95 ≤ 2s / p99 ≤ 3s 阈值，不构成门禁级证据。
-- **AT-JEV-080 / 081（真实 API 最小调用、别名漂移）**：同样仅由在线 opt-in 套件引用。
-- **AT-JEV-030～035（Planner 路由）、053、056、061、065、082、083、090～093**：当前无自动化引用，
+- **AT-JEV-080（真实 API 最小调用）**：由在线 opt-in 套件引用（需 `PI_JEV_LIVE=1` + 真 key）。
+- **AT-JEV-030～035（Planner 路由）、053、056、065、082、083、090～093**：当前无自动化引用，
   多为阶段 3/4 或运维演练用例。
+
+已被证据补齐（本次更新移出缺口清单）：
+
+- **AT-JEV-061（usage 独立归类）**：`src/server/decision-usage.ts` 读取时聚合（不落库、无迁移）+
+  `GET /api/runs/:id` 接线；证据：`decision-usage.test.ts`、`decision-usage-route.test.ts`。
+- **AT-JEV-062（成本未知不得显示 $0.00）**：`RunRoleUsage.unpricedCalls` + 客户端纯函数
+  `roleCostDisplay/roleCostLabel`（角色行与**面板汇总行**同一判定）+ zh/en 文案；
+  证据：`src/client/budget-roles-view.test.ts`。
+- **AT-JEV-081（别名漂移告警）**：`decision-drift.test.ts`（首次观测/同版本不告警、版本变化恰好一次、
+  幂等重放不告警、未接线静默 no-op、基线查询失败不影响评估）；生产经 `AlertManager`
+  （key `jev_model_drift`，900s 去重）出结构化日志 + 可选 `PI_ALERT_WEBHOOK`。
+  触发路径的真实漂移只有在供应商更换版本时才会发生：单测覆盖触发逻辑，线上只验证"同版本不误报"。
 
 
 ## 9. Shadow 统计验收

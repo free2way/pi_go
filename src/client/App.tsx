@@ -61,6 +61,7 @@ import {
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { DEFAULT_LOCALE, intlLocale, localizeError, type Locale } from "../shared/i18n";
 import { useT, type TFunction } from "./i18n";
+import { roleCostDisplay, roleCostLabel, roleDisplayName, totalUnpricedCalls } from "./budget-roles-view";
 import { chatCounts, chatMessageView, chatMessagesFromEvents, chatTabs, filterChatMessages, isReviewMessage, messageFindings, reworkBranchDetails, reworkBranchRounds, type ChatTab, type ReworkBranchDetail } from "../shared/chat";
 import { describeMergeRestore, mergeRestoreFields } from "../shared/merge";
 import { findingFingerprint } from "../shared/finding-fingerprint";
@@ -968,21 +969,34 @@ function ChecksPanel({ run }: { run: Run }) {
 
 /** GAP-04: per-run budget limits vs. current spend, remaining calls/cost. */
 function BudgetPanel({ run }: { run: Run }) {
-  const { t } = useT();
+  const { t, locale } = useT();
   const budget = run.budget;
   const usedTokens = run.usage.totalTokens ?? run.usage.inputTokens + run.usage.outputTokens;
   const usedCost = run.usage.estimatedCost;
   const usedCalls = run.modelCalls ?? (run.usageRoles ?? []).reduce((total, entry) => total + entry.calls, 0);
   const usedSeconds = Math.round(run.durationMs / 1000);
   const remaining = (limit: number, used: number) => (limit > 0 ? Math.max(0, limit - used) : null);
+  // AT-JEV-062: the summary cost row must not read as a plain `$0.000` when some
+  // calls could not be priced (e.g. the decision plane). It uses the exact same
+  // rule as the per-role rows so the two can never disagree.
+  const summaryCost = roleCostDisplay({ calls: usedCalls, estimatedCost: usedCost, unpricedCalls: totalUnpricedCalls(run.usageRoles) });
   const rows = [
     { label: t("budget.tokens"), limit: budget?.maxTokens ?? 0, used: usedTokens, remaining: remaining(budget?.maxTokens ?? 0, usedTokens), unit: "" },
-    { label: t("budget.cost"), limit: budget?.maxCostUsd ?? 0, used: usedCost, remaining: remaining(budget?.maxCostUsd ?? 0, usedCost), unit: "$" },
+    {
+      label: t("budget.cost"),
+      limit: budget?.maxCostUsd ?? 0,
+      used: usedCost,
+      remaining: remaining(budget?.maxCostUsd ?? 0, usedCost),
+      unit: "$",
+      display: summaryCost.kind === "priced" ? undefined : roleCostLabel({ calls: usedCalls, estimatedCost: usedCost, unpricedCalls: totalUnpricedCalls(run.usageRoles) }),
+    },
     { label: t("budget.modelCalls"), limit: budget?.maxModelCalls ?? 0, used: usedCalls, remaining: remaining(budget?.maxModelCalls ?? 0, usedCalls), unit: "" },
     { label: t("budget.duration"), limit: budget?.maxDurationSeconds ?? 0, used: usedSeconds, remaining: remaining(budget?.maxDurationSeconds ?? 0, usedSeconds), unit: "" },
   ];
   const format = (value: number, unit: string) => `${unit}${unit === "$" ? value.toFixed(3) : compactNumber(value)}`;
   const roles: RunRoleUsage[] = run.usageRoles ?? [];
+  // AT-JEV-062: calls the price table cannot cover (e.g. decision plane / TypeSafe).
+  const unpricedCalls = totalUnpricedCalls(roles);
   // Sprint 2: prefer real per-session data; fall back to the derived id for
   // runs recorded before the `sessions` field existed.
   const sessionFor = (role: string) => {
@@ -1008,7 +1022,7 @@ function BudgetPanel({ run }: { run: Run }) {
         {rows.map((row) => (
           <div className="budget-row" key={row.label}>
             <span>{row.label}</span>
-            <strong>{format(row.used, row.unit)}{row.limit > 0 ? <em> / {format(row.limit, row.unit)}</em> : <em> / {t("budget.noLimit")}</em>}</strong>
+            <strong>{(row as { display?: string }).display ?? format(row.used, row.unit)}{row.limit > 0 ? <em> / {format(row.limit, row.unit)}</em> : <em> / {t("budget.noLimit")}</em>}</strong>
             <small>{row.remaining === null ? t("budget.noLimit") : t("budget.remaining", { value: format(row.remaining, row.unit) })}</small>
           </div>
         ))}
@@ -1018,13 +1032,14 @@ function BudgetPanel({ run }: { run: Run }) {
         {roles.length === 0 && <div className="budget-empty">{t("budget.empty")}</div>}
         {roles.map((entry) => (
           <div className="budget-roles-row" key={`${entry.role}-${entry.provider}-${entry.model}`}>
-            <span><strong>{entry.role}</strong><code>{sessionFor(entry.role)}</code></span>
+            <span><strong>{roleDisplayName(entry.role, locale)}</strong><code>{sessionFor(entry.role)}</code></span>
             <span>{entry.provider}/{entry.model}</span>
             <span>{entry.calls}</span>
             <span>{compactNumber(entry.inputTokens + entry.outputTokens)}</span>
-            <span>${entry.estimatedCost.toFixed(3)}</span>
+            <span>{roleCostLabel(entry, locale)}</span>
           </div>
         ))}
+        {unpricedCalls > 0 && <div className="budget-unknown">{t("budget.unpricedCalls", { count: unpricedCalls })}</div>}
         {(run.usageUnknownCalls ?? 0) > 0 && <div className="budget-unknown">{t("budget.unknownCalls", { count: run.usageUnknownCalls ?? 0 })}</div>}
       </div>
     </div>

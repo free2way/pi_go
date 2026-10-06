@@ -404,6 +404,14 @@ export interface RunRoleUsage {
   cacheWriteTokens?: number;
   estimatedCost: number;
   calls: number;
+  /**
+   * Calls in this role whose cost could NOT be priced (e.g. the decision plane
+   * has no price table for TypeSafe yet). `estimatedCost` only covers priced
+   * calls, so a UI must render "unknown" instead of `$0.000` when this equals
+   * `calls`, and "≥ $x" for a partial value. Additive and optional: rows written
+   * before this field exist are treated as fully priced.
+   */
+  unpricedCalls?: number;
 }
 
 /**

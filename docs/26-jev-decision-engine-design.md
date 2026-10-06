@@ -460,6 +460,18 @@ Authorization: Bearer <TYPESAFE_API_KEY>
 | `estimated_cost_usd` | 能可靠计算时记录，否则为 `null`，不得写成 0 |
 | `created_at` | 时间戳 |
 
+**用量与成本在 run 侧如何呈现（AT-JEV-061/062）**：决策用量**不落 run 文档**，而是在
+`GET /api/runs/:id` 读取时由 `src/server/decision-usage.ts` 从本表 `completed` 行聚合，作为
+`usageRoles` 里 `role: "decision"` 的独立条目（`provider: "typesafe"`，按 `resolved_model` 分组）。
+`estimatedCost` 恒为已计价部分（当前为 0），未计价调用记在 `unpricedCalls`，客户端显示「未知」或
+`≥ $x`，**绝不显示 `$0.00`**；决策调用不并入 developer/reviewer 用量，也不计入
+`usage.estimatedCost` 与 `usageUnknownCalls`。价格表落地后只需在聚合处填 `estimatedCost` 并相应
+减小 `unpricedCalls`。
+
+**别名漂移（AT-JEV-081）**：新写入的 completed 行会与本表上一条同 `requested_model` 的 completed 行
+比较 `resolved_model`；不同则经 `AlertManager` 发一条 `jev_model_drift` 警告（去重 900s，
+可选 `PI_ALERT_WEBHOOK`）。告警 details 只含 requested/previous/current 版本与 evaluationId。
+
 建议增加索引：`run_id`、`kind + created_at`、`status + created_at`、`resolved_model + policy_version`。
 
 事件流增加：

@@ -64,6 +64,17 @@ export interface DecisionAuditStoreLike {
   insert(record: DecisionEvaluationRecord): Promise<{ record: DecisionEvaluationRecord; created: boolean }>;
   listByRun(runId: string, limit?: number): Promise<DecisionEvaluationRecord[]>;
   aggregate(): Promise<DecisionAuditAggregate>;
+  /**
+   * AT-JEV-081: the newest COMPLETED row written for one requested model alias
+   * before this evaluation, so the route can tell whether the alias now resolves
+   * to a different version. The evaluation itself is excluded by id (the row may
+   * already be persisted when this runs); ordering mirrors `listByRun`
+   * (`created_at DESC, id DESC`).
+   */
+  findLatestCompletedByRequestedModel(
+    requestedModel: string,
+    excludeEvaluationId: string,
+  ): Promise<DecisionEvaluationRecord | undefined>;
 }
 
 function str(value: unknown): string {
@@ -208,6 +219,26 @@ export class DecisionAuditStore implements DecisionAuditStoreLike {
       [runId, bounded],
     )).rows;
     return rows.map(decisionRowToRecord);
+  }
+
+  /**
+   * AT-JEV-081: the previous completed observation of one requested model alias.
+   * Only `status = 'completed'` counts (a fallback/disabled row never produced a
+   * real version), the just-written row is excluded by id, and the newest row
+   * wins on `created_at DESC, id DESC` — independent of run, because the alias
+   * is a deployment-wide model pointer, not a per-run one.
+   */
+  async findLatestCompletedByRequestedModel(
+    requestedModel: string,
+    excludeEvaluationId: string,
+  ): Promise<DecisionEvaluationRecord | undefined> {
+    const row = (await this.db.query(
+      `SELECT ${COLUMNS} FROM decision_evaluations
+        WHERE requested_model = $1 AND status = 'completed' AND id <> $2
+        ORDER BY created_at DESC, id DESC LIMIT 1`,
+      [requestedModel, excludeEvaluationId],
+    )).rows[0];
+    return row ? decisionRowToRecord(row) : undefined;
   }
 
   /**
