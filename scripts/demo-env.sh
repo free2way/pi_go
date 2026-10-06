@@ -9,6 +9,11 @@
 # exist on the host. `up` refuses to start unless every resolved database URL
 # ends in /pigo_demo. See docs/25-demo-environment.md.
 #
+# Env file: resolved as $PIGO_DEMO_ENV_FILE, then <parent-of-repo>/demo.env,
+# then <repo>/deploy/docker/demo.env, then the example (refused). Keep the real
+# file OUTSIDE the repo tree: a deploy replaces `source/` and would delete it.
+# `up`/`doctor`/`status` print the resolved path (never any value).
+#
 # The command surface lives here; the decision logic and Docker orchestration
 # live in scripts/demo-env-lib.mjs so the safety invariant, token/version parity
 # and refusal paths can be unit-tested without a Docker daemon

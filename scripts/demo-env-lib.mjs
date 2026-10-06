@@ -18,14 +18,41 @@
  */
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 export const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.resolve(SCRIPT_DIR, "..");
 export const DEFAULT_COMPOSE_FILE = path.join(REPO_ROOT, "deploy", "docker", "compose.demo.yaml");
+/** In-repo fallback (git-ignored): fine for local development, replaced by a deploy. */
 export const DEFAULT_ENV_FILE = path.join(REPO_ROOT, "deploy", "docker", "demo.env");
+/** Placeholder template. Shipping a real value here is a bug — see the example file. */
+export const EXAMPLE_ENV_FILE = path.join(REPO_ROOT, "deploy", "docker", "demo.env.example");
+/**
+ * Preferred location on a deploy host: `<parent-of-repo>/demo.env`. A deploy
+ * moves this repo (`…/source`) aside to `source.prevN-…` and extracts a fresh
+ * `source/`, so an env file inside the tree silently disappears. One directory
+ * up survives. See docs/25-demo-environment.md.
+ */
+export const OUTSIDE_TREE_ENV_FILE = path.join(path.dirname(REPO_ROOT), "demo.env");
+
+/** Explicit override; wins over every convention. */
+export const ENV_FILE_OVERRIDE_VAR = "PIGO_DEMO_ENV_FILE";
+/** Legacy alias, checked after `PIGO_DEMO_ENV_FILE`. */
+export const LEGACY_ENV_FILE_VAR = "DEMO_ENV_FILE";
+
+const ENV_FILE_SOURCE_LABELS = {
+  override: "explicit override",
+  "outside-tree": "outside the deployed tree (recommended on a deploy host)",
+  "in-repo": "in-repo fallback (local development)",
+  example: "EXAMPLE FILE — placeholders only, not usable",
+};
+
+/** True when an absolute path segment looks like a source tree a deploy swaps out. */
+function isReplacedTreeSegment(segment) {
+  return segment === "source" || /^source\.prev/.test(segment);
+}
 
 export const DEMO_DB_NAME = "pigo_demo";
 export const DEMO_WEB_SERVICE = "demo-web";
@@ -385,14 +412,173 @@ export function planSeedActions(existing, spec = DEMO_SEED_SPEC) {
 }
 
 // ---------------------------------------------------------------------------
+// Env-file resolution (the incident: deploy/ replaces source/, so an env file
+// kept inside the tree silently disappears) and the recurrence guard.
+// ---------------------------------------------------------------------------
+
+/** Human label for a resolved env file's origin. */
+export function envFileSourceLabel(info) {
+  const base = ENV_FILE_SOURCE_LABELS[info?.source] ?? "unknown";
+  return info?.overrideVar ? base + " $" + info.overrideVar : base;
+}
+
+/** Ordered resolution candidates (override first, example last). */
+export function envFileCandidates(env = process.env) {
+  const candidates = [];
+  for (const varName of [ENV_FILE_OVERRIDE_VAR, LEGACY_ENV_FILE_VAR]) {
+    const raw = String(env?.[varName] ?? "").trim();
+    if (raw !== "") candidates.push({ source: "override", overrideVar: varName, path: path.resolve(raw) });
+  }
+  candidates.push({ source: "outside-tree", overrideVar: null, path: OUTSIDE_TREE_ENV_FILE });
+  candidates.push({ source: "in-repo", overrideVar: null, path: DEFAULT_ENV_FILE });
+  candidates.push({ source: "example", overrideVar: null, path: EXAMPLE_ENV_FILE });
+  return candidates;
+}
+
+/**
+ * Actionable, fail-closed message when no usable env file exists. It names every
+ * candidate that was tried and the exact command that fixes it — the example
+ * file must never be used silently.
+ */
+export function envFileMissingMessage(info, io = {}) {
+  const exists = io.exists ?? existsSync;
+  const lines = [
+    `demo env file not found: no usable env file resolved (tried, in order):`,
+  ];
+  for (const candidate of info.candidates) {
+    const label = candidate.source === "override" ? "$" + candidate.overrideVar : candidate.source;
+    lines.push(`  ${exists(candidate.path) ? "found  " : "missing"} ${candidate.path} (${label})`);
+  }
+  lines.push(`refusing to fall back to ${info.path} — it is the example file with replace-with-… placeholders.`);
+  lines.push(`fix: cp deploy/docker/demo.env.example ${info.recommendedPath} && chmod 600 ${info.recommendedPath}`);
+  lines.push(`     then fill it in and re-run. Keep it OUTSIDE ${REPO_ROOT}/ (a deploy replaces that directory; see docs/25-demo-environment.md).`);
+  return lines.join("\n");
+}
+
+/**
+ * Resolve the effective demo env file. Precedence:
+ *   1. `PIGO_DEMO_ENV_FILE` (then legacy `DEMO_ENV_FILE`) — explicit override;
+ *   2. `<parent-of-repo>/demo.env` — outside the deployed tree (recommended);
+ *   3. `<repo>/deploy/docker/demo.env` — in-repo fallback for local development;
+ *   4. `demo.env.example` — never used silently: `error` is set and callers refuse.
+ *
+ * `io.exists` is injectable for tests. Returns the path (never any values).
+ */
+export function resolveDemoEnvFile({ env = process.env, io = {} } = {}) {
+  const exists = io.exists ?? existsSync;
+  const candidates = envFileCandidates(env);
+  const override = candidates.find((candidate) => candidate.source === "override");
+  const fallbacks = candidates.filter((candidate) => candidate.source !== "override");
+  const outside = fallbacks.find((candidate) => candidate.source === "outside-tree");
+  const recommendedPath = outside.path;
+
+  const overrideInfo = (candidate, present) => ({
+    path: candidate.path,
+    source: "override",
+    overrideVar: candidate.overrideVar,
+    isExample: false,
+    exists: present,
+    error: present
+      ? null
+      : `demo env file from ${candidate.overrideVar} not found: ${candidate.path}\n  → point ${candidate.overrideVar} at an existing file, or unset it to use the conventional locations.`,
+    recommendedPath,
+    candidates,
+  });
+
+  // 1. An explicit override is honoured as-is (and fails loudly when it is wrong).
+  if (override) return overrideInfo(override, exists(override.path));
+
+  // 2/3/4. First existing conventional candidate wins; the example never silently wins.
+  const found = fallbacks.find((candidate) => exists(candidate.path)) ?? fallbacks[fallbacks.length - 1];
+  const isExample = found.source === "example";
+  const info = {
+    path: found.path,
+    source: found.source,
+    overrideVar: null,
+    isExample,
+    exists: exists(found.path),
+    error: null,
+    recommendedPath,
+    candidates,
+  };
+  info.error = isExample ? envFileMissingMessage(info, io) : null;
+  return info;
+}
+
+/**
+ * Detect an env file that lives inside a directory a deploy replaces. The host
+ * deploy does `mv source source.prevN-…` and extracts a fresh `source/`, so a
+ * file at `…/source/…` (or inside an already-rotated `source.prevN/`) is gone
+ * after the next deploy. Purely path/`readdir` based and injectable for tests.
+ */
+export function detectDeployReplacedEnvFile(filePath, io = {}) {
+  const readdir = io.readdir ?? readdirSync;
+  const parts = path.resolve(String(filePath)).split(path.sep).filter(Boolean);
+  const dirs = parts.slice(0, -1);
+  const segmentIndex = dirs.findIndex((segment) => isReplacedTreeSegment(segment));
+  if (segmentIndex === -1) {
+    return { replaced: false, treeRoot: null, parentDir: null, prevSiblings: [], recommendedPath: null };
+  }
+  const treeRoot = path.sep + dirs.slice(0, segmentIndex + 1).join(path.sep);
+  const parentDir = path.sep + dirs.slice(0, segmentIndex).join(path.sep);
+  let prevSiblings = [];
+  try {
+    prevSiblings = (readdir(parentDir) ?? []).filter((entry) => /^source\.prev/.test(String(entry))).map(String).sort();
+  } catch {
+    prevSiblings = [];
+  }
+  return {
+    replaced: true,
+    treeRoot,
+    parentDir,
+    prevSiblings,
+    recommendedPath: path.join(parentDir, "demo.env"),
+  };
+}
+
+/** One-line, value-free statement of which env file is in use. */
+export function envFileLine(info) {
+  return `env file: ${info.path} (${envFileSourceLabel(info)})`;
+}
+
+/**
+ * Header each subcommand prints. `up`, `status` and `doctor` all go through
+ * this so the resolved path is always visible (and never a secret value).
+ */
+export function envFileHeader(command, info) {
+  if (!["up", "status", "doctor"].includes(command)) throw new Error(`unknown subcommand for env-file header: ${command}`);
+  return `${command}: ${envFileLine(info)}`;
+}
+
+/**
+ * The single recurrence guard `doctor` reports: FAIL when the effective env
+ * file sits inside a deploy-replaced tree, with the exact remediation.
+ */
+export function envFileLocationCheck(info, io = {}) {
+  const detection = detectDeployReplacedEnvFile(info.path, io);
+  if (!detection.replaced) {
+    return {
+      name: "env-file-outside-source",
+      ok: true,
+      detail: `${info.path} is outside any deploy-replaced source/ tree`,
+      hint: "",
+    };
+  }
+  const evidence = detection.prevSiblings.length > 0 ? `; sibling ${detection.prevSiblings.join(", ")} already seen` : "";
+  return {
+    name: "env-file-outside-source",
+    ok: false,
+    detail: `${info.path} lives inside a directory a deploy replaces (${detection.treeRoot}${evidence}) — a deploy moves source/ aside and extracts a fresh one, so this file WILL disappear and 'up' will fail with "couldn't find env file"`,
+    hint: `move it to ${detection.recommendedPath} and re-run scripts/demo-env.sh doctor (or set PIGO_DEMO_ENV_FILE to an absolute path outside source/)`,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Docker / compose orchestration
 // ---------------------------------------------------------------------------
 
 function paths() {
-  return {
-    composeFile: process.env.DEMO_COMPOSE_FILE || DEFAULT_COMPOSE_FILE,
-    envFile: process.env.DEMO_ENV_FILE || DEFAULT_ENV_FILE,
-  };
+  return { composeFile: process.env.DEMO_COMPOSE_FILE || DEFAULT_COMPOSE_FILE };
 }
 
 function loadFileEnv(envFile) {
@@ -405,8 +591,8 @@ function effectiveEnv(fileEnv) {
   return { ...fileEnv, ...process.env };
 }
 
-function compose(args, env) {
-  const { composeFile, envFile } = paths();
+function compose(args, env, envFile) {
+  const { composeFile } = paths();
   const result = spawnSync(
     "docker",
     ["compose", "--env-file", envFile, "-f", composeFile, "--project-name", "pigo-demo", ...args],
@@ -418,8 +604,8 @@ function compose(args, env) {
   return { status: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
 
-function resolvedConfig(env) {
-  const result = compose(["config", "--format", "json"], env);
+function resolvedConfig(env, envFile) {
+  const result = compose(["config", "--format", "json"], env, envFile);
   if (result.status !== 0) return { ok: false, error: result.stderr.trim() || result.stdout.trim() };
   try {
     return { ok: true, config: JSON.parse(result.stdout) };
@@ -445,28 +631,31 @@ function printDbResolution(entries) {
   }
 }
 
-function requireReady(effective) {
+function requireReady(effective, info) {
   const missing = REQUIRED_DEMO_ENV.filter((name) => !String(effective[name] ?? "").trim());
   if (missing.length > 0) {
     console.error(`demo env is incomplete: ${missing.join(", ")}`);
-    console.error("  → cp deploy/docker/demo.env.example deploy/docker/demo.env, fill it in, and re-run.");
+    console.error(`  → fill in ${info.path}, then re-run.`);
+    if (info.path !== info.recommendedPath) {
+      console.error(`  → on a deploy host, keep it at ${info.recommendedPath} (outside the replaced source/ tree).`);
+    }
     return false;
   }
   const placeholders = REQUIRED_DEMO_ENV.filter((name) => String(effective[name]).startsWith(PLACEHOLDER_PREFIX));
   if (placeholders.length > 0) {
     console.error(`demo env still contains example placeholders: ${placeholders.join(", ")}`);
-    console.error("  → replace every replace-with-… value in deploy/docker/demo.env before starting.");
+    console.error(`  → replace every replace-with-… value in ${info.path} before starting.`);
     return false;
   }
   return true;
 }
 
-function healthJson(service, url, env, timeoutMs, intervalMs) {
+function healthJson(service, url, env, timeoutMs, intervalMs, envFile) {
   const script = `fetch(${JSON.stringify(url)}).then(async r=>{const t=await r.text();if(!r.ok){console.error(t);process.exit(1)}process.stdout.write(t)}).catch(e=>{console.error(String(e));process.exit(1)})`;
   const deadline = Date.now() + timeoutMs;
   let last = "";
   while (Date.now() < deadline) {
-    const result = compose(["exec", "-T", service, "node", "-e", script], env);
+    const result = compose(["exec", "-T", service, "node", "-e", script], env, envFile);
     if (result.status === 0) {
       try {
         return { ok: true, json: JSON.parse(result.stdout) };
@@ -512,15 +701,21 @@ async function api(baseUrl, devEmail, method, requestPath, body) {
 // ---------------------------------------------------------------------------
 
 async function cmdUp(argv) {
-  const { envFile } = paths();
+  const info = resolveDemoEnvFile();
+  console.log(envFileHeader("up", info));
+  if (info.error) {
+    console.error(info.error);
+    return 1;
+  }
+  const envFile = info.path;
   const fileEnv = loadFileEnv(envFile);
   if (!fileEnv) {
     console.error(`demo env file not found: ${envFile}`);
-    console.error("  → cp deploy/docker/demo.env.example deploy/docker/demo.env  (then edit; never commit it)");
+    console.error(`  → cp deploy/docker/demo.env.example ${info.recommendedPath} && chmod 600 ${info.recommendedPath}  (then edit; never commit it)`);
     return 1;
   }
   const env = effectiveEnv(fileEnv);
-  if (!requireReady(env)) return 1;
+  if (!requireReady(env, info)) return 1;
 
   const vaultFile = path.join(env.PIGO_DEMO_DATA_DIR, "credentials.v1.json");
   const vault = credentialPreflight(vaultFile);
@@ -530,7 +725,7 @@ async function cmdUp(argv) {
     return 1;
   }
 
-  const resolved = resolvedConfig(env);
+  const resolved = resolvedConfig(env, envFile);
   if (!resolved.ok) {
     console.error("refusing to start: `docker compose config` failed:");
     console.error(resolved.error);
@@ -561,7 +756,7 @@ async function cmdUp(argv) {
   const build = env.PIGO_DEMO_SKIP_BUILD === "1" ? [] : ["--build"];
   const upArgs = ["up", "-d", ...build, ...argv];
   console.log(`$ docker compose -f ${paths().composeFile} ${upArgs.join(" ")}`);
-  const up = compose(upArgs, env);
+  const up = compose(upArgs, env, envFile);
   if (up.stdout.trim()) console.log(up.stdout.trim());
   if (up.status !== 0) {
     console.error(up.stderr.trim());
@@ -570,13 +765,13 @@ async function cmdUp(argv) {
   }
 
   const timeoutMs = Number(env.PIGO_DEMO_HEALTH_TIMEOUT_MS || 120_000);
-  const web = healthJson(DEMO_WEB_SERVICE, "http://127.0.0.1:3100/api/health", env, timeoutMs, 3000);
+  const web = healthJson(DEMO_WEB_SERVICE, "http://127.0.0.1:3100/api/health", env, timeoutMs, 3000, envFile);
   if (!web.ok) {
     console.error(`demo-web did not become healthy: ${web.error}`);
     console.error("  → scripts/demo-env.sh doctor   (and: docker compose logs demo-web)");
     return 1;
   }
-  const worker = healthJson(DEMO_WORKER_SERVICE, "http://127.0.0.1:3200/health", env, timeoutMs, 3000);
+  const worker = healthJson(DEMO_WORKER_SERVICE, "http://127.0.0.1:3200/health", env, timeoutMs, 3000, envFile);
   if (!worker.ok) {
     console.error(`demo-worker did not become healthy: ${worker.error}`);
     console.error("  → scripts/demo-env.sh doctor   (and: docker compose logs demo-worker)");
@@ -591,10 +786,11 @@ async function cmdUp(argv) {
 }
 
 function cmdDown(_argv) {
-  const { envFile } = paths();
+  const info = resolveDemoEnvFile();
+  const envFile = info.path;
   const fileEnv = loadFileEnv(envFile);
   const env = effectiveEnv(fileEnv ?? {});
-  const result = compose(["down"], env);
+  const result = compose(["down"], env, envFile);
   if (result.stdout.trim()) console.log(result.stdout.trim());
   if (result.stderr.trim()) console.error(result.stderr.trim());
   if (result.status === 0) {
@@ -604,18 +800,24 @@ function cmdDown(_argv) {
 }
 
 function cmdStatus(_argv) {
-  const { envFile } = paths();
+  const info = resolveDemoEnvFile();
+  console.log(envFileHeader("status", info));
+  if (info.error) {
+    console.error(info.error);
+    return 1;
+  }
+  const envFile = info.path;
   const fileEnv = loadFileEnv(envFile);
   if (!fileEnv) {
     console.error(`demo env file not found: ${envFile} (needed to interpolate the compose file)`);
     return 1;
   }
   const env = effectiveEnv(fileEnv);
-  const ps = compose(["ps"], env);
+  const ps = compose(["ps"], env, envFile);
   if (ps.stdout.trim()) console.log(ps.stdout.trim());
   if (ps.status !== 0) console.error(ps.stderr.trim());
 
-  const resolved = resolvedConfig(env);
+  const resolved = resolvedConfig(env, envFile);
   if (resolved.ok) {
     const db = checkDbSafety(dbEntriesFromConfig(resolved.config));
     console.log("resolved target: " + db.resolved.map((entry) => `${entry.display} (${entry.reason})`).join(", "));
@@ -625,28 +827,38 @@ function cmdStatus(_argv) {
     [DEMO_WEB_SERVICE, "http://127.0.0.1:3100/api/health"],
     [DEMO_WORKER_SERVICE, "http://127.0.0.1:3200/health"],
   ]) {
-    const health = healthJson(service, url, env, 5000, 2000);
+    const health = healthJson(service, url, env, 5000, 2000, envFile);
     console.log(`  ${service}: ${health.ok ? JSON.stringify(health.json) : `unreachable (${health.error})`}`);
   }
   return 0;
 }
 
 function cmdDoctor(_argv) {
-  const { envFile } = paths();
-  const fileEnv = loadFileEnv(envFile);
+  const info = resolveDemoEnvFile();
+  console.log(envFileHeader("doctor", info));
+  const envFile = info.path;
+  const fileEnv = info.error ? undefined : loadFileEnv(envFile);
   const results = [];
   const record = (name, ok, detail, hint) => {
     results.push({ name, ok, detail, hint });
   };
 
-  if (!fileEnv) {
-    record("env-file", false, `${envFile} not found`, "cp deploy/docker/demo.env.example deploy/docker/demo.env and edit it");
+  if (info.error) {
+    record("env-file", false, info.error.split("\n")[0], info.error.split("\n").slice(1).map((line) => line.trim()).join(" "));
+  } else if (!fileEnv) {
+    record("env-file", false, `${envFile} not found`, `cp deploy/docker/demo.env.example ${info.recommendedPath} and edit it`);
   } else {
-    record("env-file", true, envFile, "");
+    record("env-file", true, `${envFile} (${envFileSourceLabel(info)})`, "");
   }
+
+  // Single recurrence guard: an env file inside a deploy-replaced tree is lost on
+  // the next deploy. Reported as one FAIL with the exact remediation.
+  const locationCheck = envFileLocationCheck(info);
+  record(locationCheck.name, locationCheck.ok, locationCheck.detail, locationCheck.hint);
+
   const env = effectiveEnv(fileEnv ?? {});
   const missing = REQUIRED_DEMO_ENV.filter((name) => !String(env[name] ?? "").trim());
-  record("env-required", missing.length === 0, missing.length === 0 ? `${REQUIRED_DEMO_ENV.length} required values present` : `missing ${missing.join(", ")}`, "fill in deploy/docker/demo.env");
+  record("env-required", missing.length === 0, missing.length === 0 ? `${REQUIRED_DEMO_ENV.length} required values present` : `missing ${missing.join(", ")}`, `fill in ${info.path}`);
   const placeholders = REQUIRED_DEMO_ENV.filter((name) => String(env[name] ?? "").startsWith(PLACEHOLDER_PREFIX));
   record("env-placeholders", placeholders.length === 0, placeholders.length === 0 ? "no example placeholders" : `unreplaced: ${placeholders.join(", ")}`, "replace the replace-with-… values");
 
@@ -654,7 +866,7 @@ function cmdDoctor(_argv) {
   const vault = credentialPreflight(vaultFile);
   record("credential-file", vault.ok, vault.message, "place an existing credentials.v1.json in PIGO_DEMO_DATA_DIR (0600, uid 1000); never commit it");
 
-  const resolved = resolvedConfig(env);
+  const resolved = resolvedConfig(env, envFile);
   record("compose-config", resolved.ok, resolved.ok ? "resolved" : resolved.error, "check every ${VAR:?} in the demo env file; then `docker compose config`");
   if (!resolved.ok) {
     reportDoctor(results);
@@ -685,7 +897,7 @@ function cmdDoctor(_argv) {
     "console.log(`socket ok gid=${st.gid} groups=[${groups.join(',')}]`)}",
     "catch(e){console.error(e.code||e.message);process.exit(1)}",
   ].join("");
-  const socket = compose(["exec", "-T", DEMO_WORKER_SERVICE, "node", "-e", socketScript], env);
+  const socket = compose(["exec", "-T", DEMO_WORKER_SERVICE, "node", "-e", socketScript], env, envFile);
   record(
     "docker-socket",
     socket.status === 0,
@@ -693,9 +905,9 @@ function cmdDoctor(_argv) {
     "set PIGO_DEMO_DOCKER_GID to `stat -c %g /var/run/docker.sock` and ensure the socket is mounted into demo-worker",
   );
 
-  const webHealth = healthJson(DEMO_WEB_SERVICE, "http://127.0.0.1:3100/api/health", env, 5000, 2000);
+  const webHealth = healthJson(DEMO_WEB_SERVICE, "http://127.0.0.1:3100/api/health", env, 5000, 2000, envFile);
   record("web-health", webHealth.ok, webHealth.ok ? JSON.stringify(webHealth.json) : webHealth.error, "scripts/demo-env.sh up; docker compose logs demo-web");
-  const workerHealth = healthJson(DEMO_WORKER_SERVICE, "http://127.0.0.1:3200/health", env, 5000, 2000);
+  const workerHealth = healthJson(DEMO_WORKER_SERVICE, "http://127.0.0.1:3200/health", env, 5000, 2000, envFile);
   record("worker-health", workerHealth.ok, workerHealth.ok ? JSON.stringify(workerHealth.json) : workerHealth.error, "scripts/demo-env.sh up; docker compose logs demo-worker");
 
   if (webHealth.ok && workerHealth.ok) {
@@ -733,8 +945,7 @@ function reportDoctor(results) {
 }
 
 async function cmdSeed(_argv) {
-  const { envFile } = paths();
-  const fileEnv = loadFileEnv(envFile);
+  const fileEnv = loadFileEnv(resolveDemoEnvFile().path);
   const env = effectiveEnv(fileEnv ?? {});
   const baseUrl = loopbackBase(env);
   const devEmail = env.PIGO_DEMO_DEV_EMAIL || "developer@localhost";
@@ -822,8 +1033,16 @@ Usage: scripts/demo-env.sh <command>
   doctor   PASS/FAIL checks (DB name, vault, docker socket, token, versions)
 
 Environment overrides:
-  DEMO_ENV_FILE      default deploy/docker/demo.env
-  DEMO_COMPOSE_FILE  default deploy/docker/compose.demo.yaml
+  PIGO_DEMO_ENV_FILE  explicit env file (wins over everything; keep it OUTSIDE the
+                      deployed source/ tree, e.g. /app/pi-agent/demo.env)
+  DEMO_COMPOSE_FILE   default deploy/docker/compose.demo.yaml
+
+Env-file resolution order:
+  1. $PIGO_DEMO_ENV_FILE (then legacy $DEMO_ENV_FILE)
+  2. <parent-of-repo>/demo.env   (outside the tree a deploy replaces — recommended)
+  3. deploy/docker/demo.env      (in-repo fallback for local development)
+  4. deploy/docker/demo.env.example — refused (placeholders); prints a fix command
+up/status/doctor always print the resolved env-file path, never any value.
 
 This is NOT production. See docs/25-demo-environment.md.`);
 }

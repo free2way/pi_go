@@ -16,17 +16,26 @@ import {
   DEMO_DB_NAME,
   DEMO_STORIES,
   DEFAULT_COMPOSE_FILE,
+  DEFAULT_ENV_FILE,
+  EXAMPLE_ENV_FILE,
+  OUTSIDE_TREE_ENV_FILE,
+  REPO_ROOT,
   checkDbSafety,
   checkDemoCompose,
   checkSecretParity,
   checkVersionParity,
   credentialPreflight,
   dbNameOf,
+  detectDeployReplacedEnvFile,
+  envFileHeader,
+  envFileLine,
+  envFileLocationCheck,
   fingerprintValue,
   maskUrl,
   parseEnvFile,
   planSeedActions,
   resolveDbTarget,
+  resolveDemoEnvFile,
 } from "./demo-env-lib.mjs";
 
 const composeText = readFileSync(DEFAULT_COMPOSE_FILE, "utf8");
@@ -418,4 +427,178 @@ test("parseEnvFile: ignores comments/blank lines and strips quotes", () => {
   assert.equal(env.PIGO_DEMO_WEB_PORT, "3101");
   assert.equal(env.PI_VAULT_SECRET, "quoted value");
   assert.equal(env.X, "single");
+});
+
+// ---------------------------------------------------------------------------
+// Env-file resolution and the deploy-recurrence guard.
+//
+// Incident: `deploy/docker/demo.env` was git-ignored and kept inside the
+// deployed tree (`/app/pi-agent/source/…`). Every deploy does
+// `mv source source.prevN-…` + extracts a fresh `source/`, so the file vanished
+// and the demo stack could not be recreated. Resolution must therefore prefer a
+// path outside the tree, and `doctor` must flag the risky location.
+// ---------------------------------------------------------------------------
+
+/** Deterministic `exists`/`readdir` doubles — no filesystem, no Docker. */
+function fakeIo(present = [], dirs = {}) {
+  const set = new Set(present);
+  return {
+    exists: (target) => set.has(target),
+    readdir: (dir) => {
+      if (Object.prototype.hasOwnProperty.call(dirs, dir)) return dirs[dir];
+      const error = new Error(`ENOENT: ${dir}`);
+      error.code = "ENOENT";
+      throw error;
+    },
+  };
+}
+
+test("env-file resolution: an explicit PIGO_DEMO_ENV_FILE override wins over every convention", () => {
+  const override = "/srv/secrets/pigo-demo.env";
+  const io = fakeIo([override, OUTSIDE_TREE_ENV_FILE, DEFAULT_ENV_FILE, EXAMPLE_ENV_FILE]);
+  const info = resolveDemoEnvFile({ env: { PIGO_DEMO_ENV_FILE: override }, io });
+  assert.equal(info.path, override);
+  assert.equal(info.source, "override");
+  assert.equal(info.overrideVar, "PIGO_DEMO_ENV_FILE");
+  assert.equal(info.isExample, false);
+  assert.equal(info.error, null);
+});
+
+test("env-file resolution: the legacy DEMO_ENV_FILE is honoured after PIGO_DEMO_ENV_FILE", () => {
+  const legacy = resolveDemoEnvFile({ env: { DEMO_ENV_FILE: "/srv/legacy.env" }, io: fakeIo(["/srv/legacy.env"]) });
+  assert.equal(legacy.source, "override");
+  assert.equal(legacy.overrideVar, "DEMO_ENV_FILE");
+
+  const both = resolveDemoEnvFile({
+    env: { PIGO_DEMO_ENV_FILE: "/srv/a.env", DEMO_ENV_FILE: "/srv/b.env" },
+    io: fakeIo(["/srv/a.env", "/srv/b.env"]),
+  });
+  assert.equal(both.path, "/srv/a.env", "PIGO_DEMO_ENV_FILE must win over the legacy alias");
+});
+
+test("env-file resolution: a missing override fails loudly instead of falling through", () => {
+  const info = resolveDemoEnvFile({ env: { PIGO_DEMO_ENV_FILE: "/nope/demo.env" }, io: fakeIo([OUTSIDE_TREE_ENV_FILE]) });
+  assert.equal(info.path, "/nope/demo.env");
+  assert.equal(info.exists, false);
+  assert.ok(info.error, "a missing override must set an error");
+  assert.match(info.error, /PIGO_DEMO_ENV_FILE/);
+  assert.match(info.error, /\/nope\/demo\.env/);
+});
+
+test("env-file resolution: a path outside the deployed tree wins over the in-repo fallback", () => {
+  const info = resolveDemoEnvFile({ env: {}, io: fakeIo([OUTSIDE_TREE_ENV_FILE, DEFAULT_ENV_FILE]) });
+  assert.equal(info.path, OUTSIDE_TREE_ENV_FILE);
+  assert.equal(info.source, "outside-tree");
+  assert.equal(info.error, null);
+  assert.ok(info.path.startsWith(REPO_ROOT + "/") === false, "the preferred path must live outside the repo tree");
+});
+
+test("env-file resolution: the in-repo file is used only when no outside-tree file exists", () => {
+  const info = resolveDemoEnvFile({ env: {}, io: fakeIo([DEFAULT_ENV_FILE]) });
+  assert.equal(info.path, DEFAULT_ENV_FILE);
+  assert.equal(info.source, "in-repo");
+  assert.equal(info.error, null);
+});
+
+test("env-file resolution: only the example exists -> actionable error, never a silent default", () => {
+  const info = resolveDemoEnvFile({ env: {}, io: fakeIo([EXAMPLE_ENV_FILE]) });
+  assert.equal(info.path, EXAMPLE_ENV_FILE);
+  assert.equal(info.source, "example");
+  assert.equal(info.isExample, true);
+  assert.ok(info.error, "the example file must never be accepted silently");
+  assert.match(info.error, /example only|demo\.env\.example/);
+  assert.match(info.error, /refusing to fall back/);
+  assert.ok(info.error.includes(info.recommendedPath), "the fix must name the recommended absolute path");
+  assert.match(info.error, /cp deploy\/docker\/demo\.env\.example/);
+  assert.match(info.error, /docs\/25-demo-environment\.md/);
+});
+
+test("env-file resolution: with nothing present it still names the example and errors", () => {
+  const info = resolveDemoEnvFile({ env: {}, io: fakeIo([]) });
+  assert.equal(info.path, EXAMPLE_ENV_FILE);
+  assert.equal(info.isExample, true);
+  assert.ok(info.error);
+});
+
+test("env-file resolution: the resolution output carries no env values", () => {
+  const secret = "sup3r-s3cret-token";
+  const io = fakeIo([OUTSIDE_TREE_ENV_FILE]);
+  const info = resolveDemoEnvFile({ env: { PI_INTERNAL_TOKEN: secret, PIGO_POSTGRES_PASSWORD: secret }, io });
+  assert.ok(!JSON.stringify(info).includes(secret), "resolution output must never include env values");
+});
+
+test("deploy guard: a path outside any source/ tree is safe even with source.prevN siblings", () => {
+  const dirs = { "/app/pi-agent": ["source", "source.prev3-20261006", "backups"] };
+  const det = detectDeployReplacedEnvFile("/app/pi-agent/demo.env", fakeIo([], dirs));
+  assert.equal(det.replaced, false);
+  assert.equal(det.treeRoot, null);
+});
+
+test("deploy guard: a path inside source/ is flagged and reports the source.prevN evidence", () => {
+  const file = "/app/pi-agent/source/deploy/docker/demo.env";
+  const dirs = { "/app/pi-agent": ["source", "source.prev2-20261005", "backups"] };
+  const det = detectDeployReplacedEnvFile(file, fakeIo([], dirs));
+  assert.equal(det.replaced, true);
+  assert.equal(det.treeRoot, "/app/pi-agent/source");
+  assert.deepEqual(det.prevSiblings, ["source.prev2-20261005"]);
+  assert.equal(det.recommendedPath, "/app/pi-agent/demo.env");
+});
+
+test("deploy guard: inside source/ is still flagged when no source.prevN sibling can be listed", () => {
+  const det = detectDeployReplacedEnvFile("/app/pi-agent/source/deploy/docker/demo.env", fakeIo());
+  assert.equal(det.replaced, true);
+  assert.deepEqual(det.prevSiblings, []);
+});
+
+test("deploy guard: a file inside an already-rotated source.prevN/ is flagged", () => {
+  const det = detectDeployReplacedEnvFile("/app/pi-agent/source.prev4-20261006/deploy/docker/demo.env", fakeIo());
+  assert.equal(det.replaced, true);
+  assert.equal(det.treeRoot, "/app/pi-agent/source.prev4-20261006");
+});
+
+test("deploy guard: an ordinary local checkout path is not flagged", () => {
+  const det = detectDeployReplacedEnvFile("/opt/pigo/checkout/deploy/docker/demo.env", fakeIo());
+  assert.equal(det.replaced, false);
+});
+
+test("envFileLocationCheck: safe path PASSes as the single env-file-outside-source check", () => {
+  const info = resolveDemoEnvFile({ env: { PIGO_DEMO_ENV_FILE: "/app/pi-agent/demo.env" }, io: fakeIo(["/app/pi-agent/demo.env"]) });
+  const check = envFileLocationCheck(info, fakeIo([], { "/app/pi-agent": ["source.prev1-20261006"] }));
+  assert.equal(check.name, "env-file-outside-source");
+  assert.equal(check.ok, true);
+});
+
+test("envFileLocationCheck: FAILs inside source/ and names the exact move target", () => {
+  const file = "/app/pi-agent/source/deploy/docker/demo.env";
+  const info = resolveDemoEnvFile({ env: { PIGO_DEMO_ENV_FILE: file }, io: fakeIo([file]) });
+  const check = envFileLocationCheck(info, fakeIo([], { "/app/pi-agent": ["source", "source.prev7-20261006"] }));
+  assert.equal(check.name, "env-file-outside-source");
+  assert.equal(check.ok, false);
+  assert.match(check.detail, /deploy replaces/);
+  assert.match(check.detail, /source\.prev7-20261006/);
+  assert.match(check.hint, /move it to \/app\/pi-agent\/demo\.env/);
+  assert.match(check.hint, /re-run scripts\/demo-env\.sh doctor/);
+});
+
+test("envFileHeader: up, status and doctor each print the resolved path (and never a value)", () => {
+  const secret = "sup3r-s3cret-token";
+  const info = resolveDemoEnvFile({
+    env: { PIGO_DEMO_ENV_FILE: "/app/pi-agent/demo.env", PI_INTERNAL_TOKEN: secret },
+    io: fakeIo(["/app/pi-agent/demo.env"]),
+  });
+  for (const command of ["up", "status", "doctor"]) {
+    const header = envFileHeader(command, info);
+    assert.ok(header.startsWith(`${command}:`), `${command} header must name the subcommand`);
+    assert.ok(header.includes(info.path), `${command} must print the resolved path`);
+    assert.ok(!header.includes(secret), `${command} must never print env values`);
+  }
+  assert.throws(() => envFileHeader("seed", info), /unknown subcommand/);
+});
+
+test("envFileLine: names the origin and no values", () => {
+  const info = resolveDemoEnvFile({ env: { PIGO_DEMO_ENV_FILE: "/app/pi-agent/demo.env" }, io: fakeIo(["/app/pi-agent/demo.env"]) });
+  assert.equal(envFileLine(info), "env file: /app/pi-agent/demo.env (explicit override $PIGO_DEMO_ENV_FILE)");
+
+  const example = resolveDemoEnvFile({ env: {}, io: fakeIo([EXAMPLE_ENV_FILE]) });
+  assert.match(envFileLine(example), /EXAMPLE FILE/);
 });

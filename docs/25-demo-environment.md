@@ -43,12 +43,53 @@
 - 该不变量的纯逻辑与拒绝路径由 `npm run test:scripts`
   （[`scripts/demo-env.test.mjs`](../scripts/demo-env.test.mjs)）锁定。
 
+## 环境文件放在哪里（以及为什么不能放在 `source/` 里）
+
+**曾经的故障**：`deploy/docker/demo.env` 被 `.gitignore` 忽略，却被留在了**部署树内部**
+（`/app/pi-agent/source/deploy/docker/demo.env`）。宿主机每次部署都会
+`mv source source.prevN-…` 再解压出一份全新的 `source/`，该文件随之消失，演示栈再也
+无法重建（`couldn't find env file`），还浪费了一次 bring-up 尝试。任何被 git 忽略、
+又留在仓库目录里的文件都有同样的风险。
+
+因此 `scripts/demo-env.sh` 按**固定顺序**解析要用的 env 文件（第一个存在者胜出），并在
+`up` / `doctor` / `status` 中打印解析结果——**只打印路径，绝不打印任何值**：
+
+| 顺序 | 位置 | 用途 |
+| --- | --- | --- |
+| 1 | `$PIGO_DEMO_ENV_FILE`（兼容旧名 `$DEMO_ENV_FILE`） | 显式覆盖，优先级最高；指向不存在的文件会直接报错，不会回退 |
+| 2 | `<repo 的父目录>/demo.env`，例如 **`/app/pi-agent/demo.env`** | **部署机推荐位置**：在 `source/` 之外，部署替换 `source/` 时不受影响 |
+| 3 | `<repo>/deploy/docker/demo.env` | 仅本地开发使用 |
+| 4 | `deploy/docker/demo.env.example` | 只是模板：**永远不会被静默采用**，而是打印可执行的修复命令后拒绝启动 |
+
+`doctor` 还会检查生效的 env 文件是否位于「会被部署替换的目录」内（路径包含
+`…/source/…` 段，或同级已存在 `source.prev*`）；命中时以 FAIL 报告并给出准确修复：
+
+```
+FAIL  env-file-outside-source: … lives inside a directory a deploy replaces (/app/pi-agent/source …)
+      → move it to /app/pi-agent/demo.env and re-run scripts/demo-env.sh doctor
+```
+
+推荐做法（绝对路径、`source/` 之外）：
+
+```bash
+cp deploy/docker/demo.env.example /app/pi-agent/demo.env
+chmod 600 /app/pi-agent/demo.env     # 然后填入真实值
+scripts/demo-env.sh doctor           # 打印实际解析到的 env 文件路径
+```
+
+不经过本驱动脚本、手工调用 `docker compose` 时，用 `--env-file` 指向同一个绝对路径：
+
+```bash
+docker compose --env-file /app/pi-agent/demo.env \
+  -f /app/pi-agent/source/deploy/docker/compose.demo.yaml --project-name pigo-demo config
+```
+
 ## 使用
 
 ```bash
-# 1) 准备配置（不提交）
-cp deploy/docker/demo.env.example deploy/docker/demo.env
-chmod 600 deploy/docker/demo.env        # 填入 PIGO_POSTGRES_PASSWORD / PI_VAULT_SECRET / PI_INTERNAL_TOKEN
+# 1) 准备配置（不提交；放在 source/ 之外）
+cp deploy/docker/demo.env.example /app/pi-agent/demo.env
+chmod 600 /app/pi-agent/demo.env        # 填入 PIGO_POSTGRES_PASSWORD / PI_VAULT_SECRET / PI_INTERNAL_TOKEN
 
 # 2) 准备凭据文件（已存在，不要提交）
 mkdir -p /app/pi-agent/demo-data
@@ -73,7 +114,8 @@ PI_E2E_BASE_URL=http://127.0.0.1:3102 npm run e2e:browser
 
 | 检查 | 含义 | 失败提示方向 |
 | --- | --- | --- |
-| `env-file` / `env-required` / `env-placeholders` | 配置文件存在且已填写 | 复制 `demo.env.example` 并替换 `replace-with-…` |
+| `env-file` / `env-required` / `env-placeholders` | 配置文件已按解析顺序找到且已填写（并打印解析到的路径） | 复制 `demo.env.example` 到 `/app/pi-agent/demo.env` 并替换 `replace-with-…` |
+| `env-file-outside-source` | 生效的 env 文件不在会被部署替换的目录内（`…/source/…`、`source.prev*`） | 移到 `/app/pi-agent/demo.env` 后重跑 `doctor` |
 | `credential-file` | 挂载的凭据文件存在、可读且为 v2 格式 | 放置 `credentials.v1.json`（0600、uid 1000） |
 | `compose-config` | `docker compose config` 可解析（所有 `${VAR:?}` 都已提供） | 补齐 demo.env |
 | `database-name` | 每个解析出的 `*DATABASE_URL*` 都是 `/pigo_demo` | 修正 compose/env |
