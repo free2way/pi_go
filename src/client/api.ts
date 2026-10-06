@@ -2,6 +2,7 @@ import type { AgileMetricsResponse, ReleaseRetrospective, ReleaseSummary } from 
 import type { DecisionBrief } from "../shared/decision-brief";
 import type { AgileProject, AgileRelease, AgileSprint, AgileStory, ReleaseDeployRecord, ModelTemplate, StoryDetail, StoryPriority, StoryStatus } from "../shared/agile";
 import type { ConfigStatus, CredentialStatus, CurrentUser, ModelCatalogResponse, ModelSelection, Run, RunArtifact, RunEvent, RunRoundsResponse, RunState, Workspace, AccountDetail, AccountSummary, AccountWorkspaceOption, WorkspacePermission } from "../shared/types";
+import { LOCALE_TAGS, type Locale } from "../shared/i18n";
 
 /** A3: read-only deployment status returned by `GET /api/deployments`. */
 export interface DeploymentRecord {
@@ -93,6 +94,16 @@ export interface SystemStatusResponse {
 }
 
 
+/**
+ * Locale-aware request headers (docs/24-i18n.md §9): the client tells the server
+ * which language the requester reads, so `POST /api/runs` records `run.locale`
+ * and the worker writes its live text in that language. A browser sends its own
+ * `Accept-Language` anyway; this makes the in-app choice explicit and wins.
+ */
+function localeHeaders(locale?: Locale): Record<string, string> | undefined {
+  return locale ? { "Accept-Language": LOCALE_TAGS[locale] } : undefined;
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
     ...init,
@@ -147,7 +158,7 @@ export const api = {
   /** 拓扑轮次模型: server-aggregated per-round summary (source of truth for branches/badges). */
   runRounds: (id: string) => request<RunRoundsResponse>(`/api/runs/${id}/rounds`),
   /** 决策摘要: read-only aggregate answering accept-vs-continue for a parked run. */
-  decisionBrief: (id: string) => request<DecisionBrief>(`/api/runs/${id}/decision-brief`),
+  decisionBrief: (id: string, locale?: Locale) => request<DecisionBrief>(`/api/runs/${id}/decision-brief`, { headers: localeHeaders(locale) }),
   artifacts: (id: string) => request<{ artifacts: RunArtifact[] }>(`/api/runs/${id}/artifacts`),
   artifactDownloadUrl: (id: string, artifactId: string) => `/api/runs/${id}/artifacts/${encodeURIComponent(artifactId)}/download`,
   /** A1: full run patch (regenerated on the worker when no artifact body exists). */
@@ -160,8 +171,8 @@ export const api = {
     request<Run>(`/api/runs/${id}/reopen`, { method: "POST", body: JSON.stringify(body) }),
   batchRuns: (body: { action: "continue" | "accept" | "cleanup"; runIds: string[]; note?: string; acknowledgeOpenFindings?: boolean; deleteRunDirectory?: boolean }) =>
     request<BatchSummary>("/api/runs/batch", { method: "POST", body: JSON.stringify(body) }),
-  createRun: (body: { title: string; task: string; repository?: string; workspaceId?: string; mode: "demo" | "real"; checks?: string[]; developerModel?: ModelSelection; reviewerModel?: ModelSelection }) =>
-    request<Run>("/api/runs", { method: "POST", body: JSON.stringify(body) }),
+  createRun: (body: { title: string; task: string; repository?: string; workspaceId?: string; mode: "demo" | "real"; checks?: string[]; developerModel?: ModelSelection; reviewerModel?: ModelSelection }, options: { locale?: Locale } = {}) =>
+    request<Run>("/api/runs", { method: "POST", body: JSON.stringify(body), headers: localeHeaders(options.locale) }),
   cancelRun: (id: string) => request<Run>(`/api/runs/${id}/cancel`, { method: "POST" }),
   approveRun: (id: string, body: { mode?: "continue" | "accept"; note?: string; acknowledgeOpenFindings?: boolean; mergeIntoWorkspace?: boolean; reviewScope?: "all" | "blocking" } = {}) =>
     request<Run>(`/api/runs/${id}/approve`, { method: "POST", body: JSON.stringify(body) }),

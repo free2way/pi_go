@@ -9,8 +9,10 @@ import {
   duplicateCatalogKeys,
   interpolate,
   isLocale,
+  localeFromAcceptLanguage,
   localizeError,
   resolveLocale,
+  resolveRequestLocale,
   t,
   type Locale,
   type MessageKey,
@@ -106,6 +108,30 @@ describe("resolveLocale", () => {
 
   it("exposes a stable storage key", () => {
     expect(LOCALE_STORAGE_KEY).toBe("pigo.locale");
+  });
+});
+
+describe("request locale resolution", () => {
+  it("reads the Accept-Language header first", () => {
+    expect(resolveRequestLocale("en-US,en;q=0.9,zh;q=0.8", "zh")).toBe("en");
+    expect(resolveRequestLocale("zh-CN,zh;q=0.9", "en")).toBe("zh");
+    expect(localeFromAcceptLanguage("en-GB")).toBe("en");
+    expect(localeFromAcceptLanguage("de-DE,zh;q=0.5")).toBe("zh");
+  });
+
+  it("falls back to ?locale, then to the default locale", () => {
+    expect(resolveRequestLocale(undefined, "en")).toBe("en");
+    expect(resolveRequestLocale("de-DE", "en")).toBe("en");
+    expect(resolveRequestLocale(undefined, undefined)).toBe(DEFAULT_LOCALE);
+    expect(resolveRequestLocale(undefined, "fr")).toBe(DEFAULT_LOCALE);
+  });
+
+  it("ignores unusable headers instead of guessing", () => {
+    expect(localeFromAcceptLanguage(undefined)).toBeUndefined();
+    expect(localeFromAcceptLanguage(42)).toBeUndefined();
+    expect(localeFromAcceptLanguage("*")).toBeUndefined();
+    expect(localeFromAcceptLanguage("")).toBeUndefined();
+    expect(localeFromAcceptLanguage("de-DE, fr;q=0.8")).toBeUndefined();
   });
 });
 

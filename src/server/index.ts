@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { internalUpdateRejection, releasesStoryBlocks, storyBlockReleaseNote } from "../shared/run-state.js";
 import { buildStoryRunInput, STORY_STATUS_LABELS, type RunBudget, type StoryDetail } from "../shared/agile.js";
+import { resolveRequestLocale, type Locale } from "../shared/i18n.js";
 import type { ConfigStatus, CurrentUser, ModelCatalogResponse, ReviewScope, Run, RunEvent, RunReleaseRecord, Workspace } from "../shared/types.js";
 import { AccountError, AccountService, accountAdminGate } from "./accounts.js";
 import { AlertManager, createAlertSink } from "./alerts.js";
@@ -62,7 +63,7 @@ const app = Fastify({
 });
 const port = Number(process.env.PORT || 3100);
 const host = process.env.HOST || "localhost";
-const webVersion = process.env.PI_WEB_VERSION?.trim() || "0.27.3";
+const webVersion = process.env.PI_WEB_VERSION?.trim() || "0.27.4";
 const demoMode = process.env.PI_DEMO_MODE !== "false";
 const realRunsEnabled = process.env.PI_REAL_RUNS_ENABLED === "true";
 const workerUrl = process.env.PI_WORKER_URL || "http://worker:3200";
@@ -501,6 +502,18 @@ app.addHook("preHandler", async (request, reply) => {
 function ownerKeysFor(request: FastifyRequest) {
   const user = auth.user(request);
   return user.legacyOwnerId ? [user.id, user.legacyOwnerId] : [user.id];
+}
+
+/**
+ * Locale of a request that produces code-generated runtime text
+ * (docs/24-i18n.md §9): `Accept-Language` first, then `?locale=`, then `zh`.
+ * The resolution is pure and lives in `src/shared/i18n.ts` so the server routes
+ * and their tests share one rule; a request that expresses neither preference
+ * reads as Chinese, exactly as before this change.
+ */
+function requestLocale(request: FastifyRequest): Locale {
+  const query = (request.query ?? {}) as { locale?: unknown };
+  return resolveRequestLocale(request.headers["accept-language"], query.locale);
 }
 
 /** Narrows vault lookups into a complete credential pair or nothing. */
@@ -1263,6 +1276,8 @@ app.post<{ Params: { id: string } }>("/api/stories/:id/runs", async (request, re
     if (!demoMode) return reply.code(403).send({ error: "Demo mode is disabled" });
     const run = baseDemoRun({ title: input.title, task: input.task, repository: "demo/agile-story" }, user.id);
     run.storyId = story.id;
+    // 运行时文案语言 (docs/24-i18n.md §9): the story run records the requester's locale.
+    run.locale = requestLocale(request);
     await store.createRun(run, { runId: run.id, round: 1, source: "system", type: "run.created", message: "已从用户故事创建演示任务", at: new Date().toISOString() });
     void runDemo(store, run.id);
     await agile.linkRun(story.id, run.id);
@@ -1684,7 +1699,7 @@ app.get<{ Params: { id: string } }>("/api/runs/:id/rounds", async (request, repl
 app.get<{ Params: { id: string } }>("/api/runs/:id/decision-brief", async (request, reply) => {
   const run = store.getRun(request.params.id, ownerKeysFor(request));
   if (!run) return reply.code(404).send({ error: "Run not found" });
-  return readDecisionBrief(db, run);
+  return readDecisionBrief(db, run, requestLocale(request));
 });
 
 // GAP-04 / AT-UI-005: artifact listing and download, authenticated like every
@@ -1953,6 +1968,10 @@ async function startRealRun(
     reviewer: credentialFingerprint(vault.get(vaultKeyFor(request), reviewerEntry.provider)),
   };
   if (extra.storyId) run.storyId = extra.storyId;
+  // 运行时文案语言 (docs/24-i18n.md §9): the run remembers the locale it was
+  // created in, so the worker writes its guard/stop text and prompts in the
+  // requester's language. Additive — omitted reads as Chinese.
+  run.locale = requestLocale(request);
   if (extra.maxParallel !== undefined) run.maxParallel = extra.maxParallel;
   await store.createRun(run, { runId: run.id, round: 1, source: "system", type: "run.created", message: "真实任务已创建，正在交给隔离 Pi Worker", at: new Date().toISOString() });
   try {
@@ -1982,6 +2001,8 @@ app.post("/api/runs", async (request, reply) => {
   }
   if (!demoMode) return reply.code(403).send({ error: "Demo mode is disabled" });
   const run = baseDemoRun(parsed.data, user.id);
+  // 运行时文案语言 (docs/24-i18n.md §9): demo runs record the requester's locale too.
+  run.locale = requestLocale(request);
   await store.createRun(run, { runId: run.id, round: 1, source: "system", type: "run.created", message: "演示任务已创建；所有 Agent 活动均为可视化演示数据", at: new Date().toISOString() });
   void runDemo(store, run.id);
   return reply.code(201).send(run);

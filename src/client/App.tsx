@@ -76,6 +76,9 @@ import {
   decisionBriefExpanded,
   decisionBriefHeadingKey,
   decisionBriefTone,
+  decisionGateDetail,
+  decisionRecommendationNote,
+  decisionStopMessage,
   gateNavTarget,
   groupRemainingByAc,
   decisionGateKeys,
@@ -532,7 +535,7 @@ function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, onGoWor
               reviewerModel: reviewer ? { provider: reviewer.provider, model: reviewer.model } : undefined,
             }
           : { repository, checks: [] }),
-      });
+      }, { locale });
       onCreated(run);
       onClose();
     } catch (cause) {
@@ -1244,7 +1247,7 @@ function DecisionBriefCard({
   onOpenFinding: (key: string) => void;
   onOpenTab: (tab: Tab) => void;
 }) {
-  const { t } = useT();
+  const { t, locale } = useT();
   const findingsByKey = useMemo(
     () => new Map(run.findings.map((finding) => [finding.fingerprint ?? findingFingerprint(finding), finding])),
     [run.findings],
@@ -1252,6 +1255,10 @@ function DecisionBriefCard({
   const groups = groupRemainingByAc(brief.remaining);
   const tone = decisionBriefTone(brief);
   const stop = brief.stopReason;
+  // docs/24-i18n.md §9: the brief carries both languages, so the code-generated
+  // judgement text follows the UI language without a refetch.
+  const stopMessage = decisionStopMessage(stop, locale);
+  const recommendationNote = decisionRecommendationNote(brief, locale);
 
   return (
     <section className={`decision-brief decision-brief-${tone}`} id="decision-brief">
@@ -1262,7 +1269,7 @@ function DecisionBriefCard({
         </div>
         <div className="decision-stop">
           <em>{stop.code}</em>
-          {stop.message ? <span>{stop.message}</span> : null}
+          {stopMessage ? <span>{stopMessage}</span> : null}
         </div>
         {open ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
       </button>
@@ -1275,7 +1282,7 @@ function DecisionBriefCard({
                 <div className={`decision-gate decision-gate-${gate.status}`} key={gate.id}>
                   <span className="decision-gate-light" />
                   <strong>{t(decisionGateKeys[gate.id])}</strong>
-                  <small>{gate.detail}</small>
+                  <small>{decisionGateDetail(gate, locale)}</small>
                   {gate.status !== "green" ? (
                     <button
                       type="button"
@@ -1317,9 +1324,9 @@ function DecisionBriefCard({
             </div>
           ) : null}
           <div className="decision-reco">
-            <p><ShieldCheck size={14} />{brief.recommendation.note}</p>
+            <p><ShieldCheck size={14} />{recommendationNote}</p>
             <div className="decision-actions">
-              <button type="button" className="button primary" onClick={() => onContinue(brief.recommendation.note)}>
+              <button type="button" className="button primary" onClick={() => onContinue(recommendationNote)}>
                 <Play size={15} />{t("decision.continue")}
               </button>
               <button type="button" className="button primary" onClick={onAccept}>
@@ -1589,15 +1596,18 @@ export function App() {
 
   // 决策摘要: fetched once per selection / state change. A failure (or an older
   // server without the route) simply leaves the card hidden — no polling, and
-  // no dependency on the other requests succeeding.
+  // no dependency on the other requests succeeding. The request carries the UI
+  // locale so the server records it and echoes it from the stop event
+  // (docs/24-i18n.md §9); the card itself renders from the already-fetched
+  // payload, so switching language does not need a refetch.
   useEffect(() => {
     if (!selectedId) return;
     let active = true;
-    void api.decisionBrief(selectedId).then((next) => {
+    void api.decisionBrief(selectedId, locale).then((next) => {
       if (active) setDecisionBrief(next);
     }).catch(() => undefined);
     return () => { active = false; };
-  }, [selectedId, activeRun?.state]);
+  }, [selectedId, activeRun?.state, locale]);
 
   const handleReworkSelect = useCallback((round: number) => {
     setReworkRound((current) => (current === round ? null : round));

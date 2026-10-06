@@ -20,6 +20,7 @@ import {
   type DecisionBriefInput,
 } from "../shared/decision-brief.js";
 import { findingFingerprint } from "../shared/finding-fingerprint.js";
+import type { Locale } from "../shared/i18n.js";
 import type { Run } from "../shared/types.js";
 import type { Queryable } from "./db.js";
 
@@ -269,7 +270,13 @@ export async function collectDecisionBriefInput(db: Queryable, run: Run): Promis
   };
 }
 
-/** Owner-scoped aggregation entry point used by the run-detail route. */
-export async function readDecisionBrief(db: Queryable, run: Run): Promise<DecisionBrief> {
-  return buildDecisionBrief(await collectDecisionBriefInput(db, run));
+/**
+ * Owner-scoped aggregation entry point used by the run-detail route.
+ * `locale` (docs/24-i18n.md §9) is the requester's locale; it is recorded on the
+ * brief and echoed from the stop event. The brief always carries both the
+ * Chinese field and its English `*En` counterpart, so an omitted locale only
+ * affects the recorded value, never the text.
+ */
+export async function readDecisionBrief(db: Queryable, run: Run, locale?: Locale | null): Promise<DecisionBrief> {
+  return buildDecisionBrief({ ...(await collectDecisionBriefInput(db, run)), locale: locale ?? null });
 }

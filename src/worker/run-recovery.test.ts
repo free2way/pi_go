@@ -62,6 +62,30 @@ describe("planRecovery (R3-001 / R3-FINAL-ROUND-AMBIGUOUS)", () => {
     expect(overCap).toMatchObject({ stop: true, reason: "max_rounds" });
   });
 
+  it("localizes the stop message and always offers the English variant (docs/24-i18n.md §9)", () => {
+    const zh = planRecovery({ state: "reviewing", recovery: true, round: 3, maxRounds: 3, locale: "zh" });
+    expect(zh).toMatchObject({ stop: true, message: MAX_ROUNDS_MESSAGE, messageEn: "Maximum review rounds reached; human handling required" });
+    const en = planRecovery({ state: "reviewing", recovery: true, round: 3, maxRounds: 3, locale: "en" });
+    expect(en).toMatchObject({ stop: true, message: "Maximum review rounds reached; human handling required" });
+    // An omitted locale is the previous behaviour, byte for byte.
+    expect(planRecovery({ state: "reviewing", recovery: true, round: 3, maxRounds: 3 })).toMatchObject({ message: MAX_ROUNDS_MESSAGE });
+    const deadline = planRecovery({
+      state: "developing",
+      recovery: true,
+      round: 1,
+      maxRounds: 3,
+      limits: { ...NO_LIMITS, maxDurationSeconds: 60 },
+      createdAt: "2026-01-01T00:00:00.000Z",
+      now: Date.parse("2026-01-01T00:05:00.000Z"),
+      locale: "en",
+    });
+    expect(deadline).toMatchObject({ stop: true, reason: "deadline_exceeded" });
+    if (deadline.stop) {
+      expect(deadline.message).toContain("time budget");
+      expect(deadline.messageEn).toContain("time budget");
+    }
+  });
+
   it("proceeds when round/maxRounds are sparse (backward compatible)", () => {
     expect(planRecovery({ state: "reviewing", recovery: true }).stop).toBe(false);
     expect(planRecovery({ state: "reviewing", recovery: true, round: 3 }).stop).toBe(false);

@@ -9,8 +9,11 @@ import {
   decisionBriefHeading,
   decisionBriefHeadingKey,
   decisionBriefTone,
+  decisionGateDetail,
   decisionGateKeys,
+  decisionRecommendationNote,
   decisionRemainingGroupKey,
+  decisionStopMessage,
   gateNavTarget,
   groupRemainingByAc,
 } from "./decision-brief-view";
@@ -133,5 +136,34 @@ describe("decision brief view · one-click actions", () => {
     expect(acceptConfirmMessage("任务", 0)).not.toContain("未解决意见");
     expect(acceptConfirmMessage("Task", 2, "en")).toContain("2 unresolved finding(s)");
     expect(continueConfirmMessage("Task", "note", "en")).toContain("drafted note");
+  });
+});
+
+describe("decision brief view · localized server text (docs/24-i18n.md §9)", () => {
+  it("renders the English counterpart only for an English UI (Chinese stays byte-identical)", () => {
+    for (const gate of green.gates) {
+      expect(decisionGateDetail(gate, "zh")).toBe(gate.detail);
+      expect(decisionGateDetail(gate, "en")).toBe(gate.detailEn);
+    }
+    expect(decisionRecommendationNote(green, "zh")).toBe(green.recommendation.note);
+    expect(decisionRecommendationNote(green, "en")).toBe(green.recommendation.noteEn);
+    expect(decisionRecommendationNote(green, "en")).toContain("hard gates are green");
+  });
+
+  it("falls back to the recorded text when an older payload has no English variant", () => {
+    const legacy = { ...green, gates: green.gates.map(({ detailEn: _en, ...rest }) => rest as typeof green.gates[number]) };
+    expect(decisionGateDetail(legacy.gates[0], "en")).toBe(legacy.gates[0].detail);
+    expect(decisionStopMessage({ code: "unknown", message: "达到最大审核轮次", meta: {} }, "en")).toBe("达到最大审核轮次");
+  });
+
+  it("prefers the event's English message for an English UI", () => {
+    const stop = {
+      code: "max_review_rounds",
+      message: "达到最大审核轮次",
+      messageEn: "Maximum review rounds reached; human handling required",
+      meta: {},
+    };
+    expect(decisionStopMessage(stop, "zh")).toBe("达到最大审核轮次");
+    expect(decisionStopMessage(stop, "en")).toBe("Maximum review rounds reached; human handling required");
   });
 });

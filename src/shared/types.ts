@@ -1,3 +1,5 @@
+import type { Locale } from "./i18n.js";
+
 export type RunState =
   | "queued"
   | "preparing"
@@ -287,6 +289,14 @@ export interface Run {
    * travels inside the run document and is read by the worker's review gate.
    */
   reviewScope?: ReviewScope;
+  /**
+   * 运行时文案语言 (docs/24-i18n.md §9): the locale this run was created in,
+   * resolved from the creating request (`Accept-Language` → `?locale` → `zh`).
+   * Additive and backward compatible — runs written before this field exist are
+   * treated as `zh`. The worker uses it for its guard/stop event text and for the
+   * agent prompts' locale instruction; historical events are never rewritten.
+   */
+  locale?: Locale;
 }
 
 /** A2: recorded outcome of merging a run branch into the workspace default branch. */

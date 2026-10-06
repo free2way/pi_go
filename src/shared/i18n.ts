@@ -6,9 +6,12 @@
  * which owns the browser store) and by unit tests. Nothing here touches
  * `window`, `document` or `navigator`.
  *
- * Boundary: only *client* copy lives here. Server-generated runtime text
- * (run events, review summaries, decision-brief details/notes, agent output)
- * is model/prompt-generated and stays in its original language for now.
+ * Boundary: only *client* copy lives here, plus the request-locale resolution
+ * helpers used by the server (`localeFromAcceptLanguage` / `resolveRequestLocale`)
+ * and the shared `Locale` type. The localized text the server/worker generate at
+ * runtime does NOT live here: `src/shared/decision-brief.ts` owns the Decision
+ * Brief copy and the worker owns the guard/stop event copy, so the client
+ * catalog stays a pure UI concern (docs/24-i18n.md §9).
  */
 
 export type Locale = "zh" | "en";
@@ -55,6 +58,35 @@ export function resolveLocale(stored: unknown, navigatorLanguages: readonly stri
     if (tag.startsWith("zh")) return "zh";
   }
   return DEFAULT_LOCALE;
+}
+
+/**
+ * Parses one `Accept-Language` header (RFC 9110: comma-separated tags, optional
+ * `;q=` weights) into a supported locale. Returns `undefined` when the header
+ * expresses no `zh*`/`en*` preference, so the caller can apply its own fallback.
+ * Weights are ignored on purpose: the first *supported* tag wins, which matches
+ * `resolveLocale`'s browser-language rule and keeps the behaviour predictable.
+ */
+export function localeFromAcceptLanguage(header: unknown): Locale | undefined {
+  if (typeof header !== "string") return undefined;
+  for (const part of header.split(",")) {
+    const tag = part.split(";")[0].trim().toLowerCase();
+    if (!tag || tag === "*") continue;
+    if (tag.startsWith("en")) return "en";
+    if (tag.startsWith("zh")) return "zh";
+  }
+  return undefined;
+}
+
+/**
+ * Locale of a server request that carries code-generated runtime text
+ * (docs/24-i18n.md): the `Accept-Language` header first, then an explicit
+ * `?locale=` query parameter, then `DEFAULT_LOCALE`. Backwards compatible by
+ * construction — a request that expresses neither reads as Chinese, so existing
+ * callers keep the exact same output.
+ */
+export function resolveRequestLocale(acceptLanguage?: unknown, queryLocale?: unknown): Locale {
+  return localeFromAcceptLanguage(acceptLanguage) ?? (isLocale(queryLocale) ? queryLocale : DEFAULT_LOCALE);
 }
 
 export type I18nParams = Record<string, string | number | null | undefined>;

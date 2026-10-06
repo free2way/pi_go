@@ -1,3 +1,5 @@
+import { DEFAULT_LOCALE, type Locale } from "../shared/i18n.js";
+
 export type ProviderErrorKind =
   | "credential"
   | "storage"
@@ -39,6 +41,22 @@ export const providerErrorHints: Record<ProviderErrorKind, string> = {
   unknown: "未知错误：查看任务事件与 worker 日志后重试。",
 };
 
+/**
+ * English rendering of {@link providerErrorHints} (docs/24-i18n.md §9). Additive:
+ * the Chinese table above stays the default, so a run without a locale reads
+ * exactly as before.
+ */
+export const providerErrorHintsEn: Record<ProviderErrorKind, string> = {
+  credential: "Credential problem: check or rotate this provider's key on the Models & Credentials page.",
+  storage: "Storage error: a database or disk write failed and the task did not complete; restore storage and continue from the needs-human entry.",
+  rate_limit: "Rate limited or out of quota: retry later, or switch model/account quota.",
+  timeout: "Call timed out: confirm the network and proxy are stable, then retry (the run can be resumed manually).",
+  unsupported: "This account or proxy does not support the selected model: switch to another model in the allowed catalog.",
+  provider: "Provider-side failure: confirm the proxy/gateway status and retry.",
+  protocol: "The model output did not match the protocol: it was retried once automatically and still needs human handling.",
+  unknown: "Unknown error: inspect the run events and worker logs, then retry.",
+};
+
 /** Pi reads provider keys from provider-specific environment variables. */
 export function apiKeyEnvName(provider: string): string {
   const normalized = provider.toLowerCase();
@@ -50,6 +68,9 @@ export function apiKeyEnvName(provider: string): string {
 }
 
 /** Short, UI-friendly rendering used in run summaries: `kind｜hint`. */
-export function providerErrorSummary(kind: ProviderErrorKind, message: string) {
+export function providerErrorSummary(kind: ProviderErrorKind, message: string, locale: Locale = DEFAULT_LOCALE): string {
+  if (locale === "en") {
+    return `${message} (category: ${kind}) | hint: ${providerErrorHintsEn[kind]}`;
+  }
   return `${message}（分类：${kind}）｜建议：${providerErrorHints[kind]}`;
 }

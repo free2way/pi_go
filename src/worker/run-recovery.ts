@@ -1,6 +1,8 @@
 import type { Run, RunState } from "../shared/types.js";
+import type { Locale } from "../shared/i18n.js";
 import { evaluateBudget, type BudgetLimits } from "./budget.js";
 import { runDeadlineDelayMs } from "./run-deadline.js";
+import { asRunLocale, budgetExhaustedText, deadlineExceededText, localizedPair, MAX_ROUNDS_TEXT } from "./runtime-locale.js";
 
 /**
  * NEW-04 / AT-RUN-008/011 / REL-002: recovery of a job whose Worker died
@@ -64,7 +66,10 @@ export interface RecoveryStop {
   reason: RecoveryStopReason;
   /** Event type the stop is recorded with (existing semantics). */
   eventType: string;
+  /** Human-facing message in the run's locale (docs/24-i18n.md §9). */
   message: string;
+  /** English variant, recorded as `meta.messageEn` by the worker. */
+  messageEn: string;
 }
 
 export interface RecoveryProceed {
@@ -96,6 +101,11 @@ export interface RecoveryPlanningInput {
   deadlineBaseAt?: string;
   /** Injectable clock (epoch ms) for deterministic tests. */
   now?: number;
+  /**
+   * Locale for the human-facing stop message (docs/24-i18n.md §9). Additive:
+   * omitted/invalid reads as `zh`, so existing callers are unchanged.
+   */
+  locale?: Locale;
 }
 
 function finite(value: number | undefined): value is number {
@@ -122,10 +132,11 @@ export function planRecovery(input: RecoveryPlanningInput): RecoveryPlan {
   // Human actions (resume / retry review) own their entry state and get a fresh
   // deadline window; never pre-empt them with an automatic stop.
   if (!input.recovery || input.resume || input.retryReview) return { stop: false };
+  const locale = asRunLocale(input.locale);
 
   // 1. Maximum rounds already reached (or exceeded).
   if (finite(input.round) && finite(input.maxRounds) && input.maxRounds >= 1 && input.round >= input.maxRounds) {
-    return { stop: true, reason: "max_rounds", eventType: "run.needs_human", message: MAX_ROUNDS_MESSAGE };
+    return { stop: true, reason: "max_rounds", eventType: "run.needs_human", ...localizedPair(MAX_ROUNDS_TEXT, locale) };
   }
 
   // 2. Hard budget (tokens / cost / model calls) already exhausted. Duration is
@@ -146,11 +157,12 @@ export function planRecovery(input: RecoveryPlanningInput): RecoveryPlan {
       limits: { ...input.limits, maxDurationSeconds: 0 },
     });
     if (status.state === "exhausted") {
+      const reason = status.reason ?? (locale === "en" ? "the run budget is exhausted" : "运行预算已用尽");
       return {
         stop: true,
         reason: "budget_exhausted",
         eventType: "run.budget_exhausted",
-        message: `运行预算已用尽，已停止新的模型调用：${status.reason ?? "运行预算已用尽"}`,
+        ...localizedPair(budgetExhaustedText(reason), locale),
       };
     }
   }
@@ -172,7 +184,7 @@ export function planRecovery(input: RecoveryPlanningInput): RecoveryPlan {
           stop: true,
           reason: "deadline_exceeded",
           eventType: "run.deadline_exceeded",
-          message: `运行超过时限预算（${input.limits.maxDurationSeconds}s），已终止本次执行并转人工处理`,
+          ...localizedPair(deadlineExceededText(input.limits.maxDurationSeconds), locale),
         };
       }
     }

@@ -147,6 +147,16 @@ describe("convergenceVerdict / convergenceStop (early stop before another repair
 
     expect(convergenceStop({ findings, currentRound: 3, enabled: false })).toEqual({ stop: false });
   });
+
+  it("always returns the English convergence message alongside the Chinese one (docs/24-i18n.md §9)", () => {
+    const findings = reviewRounds([["high"], ["high"], ["high"]]);
+    const stop = convergenceStop({ findings, currentRound: 3 });
+    expect(stop.stop).toBe(true);
+    if (!stop.stop) throw new Error("expected a stop");
+    expect(stop.message).toContain("审核未收敛");
+    expect(stop.messageEn).toContain("Review not converging");
+    expect(stop.messageEn).toContain("consecutive rounds");
+  });
 });
 
 describe("reviewStallRounds (PI_REVIEW_STALL_ROUNDS)", () => {

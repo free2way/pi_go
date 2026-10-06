@@ -14,6 +14,28 @@ import { DEFAULT_LOCALE, t, type Locale, type MessageKey } from "../shared/i18n"
 export type DecisionNavTab = "checks" | "review" | "diff";
 export type DecisionGateId = DecisionBrief["gates"][number]["id"];
 
+/**
+ * Locale-aware rendering of the code-generated Decision Brief text
+ * (docs/24-i18n.md §9). The server always sends the Chinese field plus its
+ * English `*En` counterpart, so switching language re-renders from the payload
+ * already in memory (no refetch) and a missing `*En` (older payload / hand-made
+ * fixture) safely falls back to the Chinese text.
+ */
+export function decisionGateDetail(gate: DecisionBrief["gates"][number], locale: Locale = DEFAULT_LOCALE): string {
+  return locale === "en" && gate.detailEn ? gate.detailEn : gate.detail;
+}
+
+export function decisionRecommendationNote(brief: DecisionBrief, locale: Locale = DEFAULT_LOCALE): string {
+  return locale === "en" && brief.recommendation.noteEn ? brief.recommendation.noteEn : brief.recommendation.note;
+}
+
+export function decisionStopMessage(stopReason: DecisionBrief["stopReason"], locale: Locale = DEFAULT_LOCALE): string {
+  if (locale !== "en") return stopReason.message;
+  // A recorded event may predate locale-aware generation: `messageEn` is then
+  // absent and the original text is shown as-is (historically accurate).
+  return stopReason.messageEn || stopReason.message;
+}
+
 /** Catalog keys for the four gate labels (the labels live in the catalog). */
 export const decisionGateKeys: Record<DecisionGateId, MessageKey> = {
   checks: "decision.gate.checks",

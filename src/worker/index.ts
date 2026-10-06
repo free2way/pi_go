@@ -51,7 +51,38 @@ import { runGuardedMerge, type GuardedMergeResult, type MergeGuardGitExec } from
 import { WorkspaceLockManager, workspaceKeyFor } from "./workspace-lock.js";
 import { PiRunError, failureOutputForEvent } from "./agent-failure.js";
 import { captureFailedSubAgentWorktree } from "./subagent-artifacts.js";
-import { MAX_ROUNDS_MESSAGE, planRecovery, recoveryResumePhase, recoveryUpdateState } from "./run-recovery.js";
+import { planRecovery, recoveryResumePhase, recoveryUpdateState } from "./run-recovery.js";
+import {
+  CANCELLED_SUMMARY,
+  CANCELLED_TEXT,
+  CHECKS_BLOCKED_RETRY_SUMMARY,
+  changesRequestedRetryText,
+  changesRequestedText,
+  checksBlockedRetryText,
+  completionBlockedApprovedText,
+  completionBlockedText,
+  COMPLETION_BLOCKED_SUMMARY,
+  COMPLETION_BLOCKED_UNRESOLVED_SUMMARY,
+  budgetExhaustedText,
+  deadlineExceededText,
+  guardText,
+  INVALID_PROTOCOL_TEXT,
+  MAX_ROUNDS_TEXT,
+  reviewProviderErrorText,
+  runFailureText,
+  runLocale,
+  SANDBOX_UNAVAILABLE_SUMMARY,
+  severeRepeatLabels,
+  severeRepeatSummary,
+  severeRepeatText,
+  SNAPSHOT_DIVERGED_SUMMARY,
+  SNAPSHOT_FAILED_SUMMARY,
+  snapshotDivergedText,
+  snapshotFailedText,
+  storageErrorText,
+  type LocalizedText,
+} from "./runtime-locale.js";
+import { localeInstruction } from "./prompt-locale.js";
 import { callbackBodyExceedsInlineLimit, encodeCallbackBody, persistDiffArtifact, type DiffArtifactRef } from "./diff-artifacts.js";
 import { uploadRunArtifact } from "./artifact-upload.js";
 import { captureSnapshotHash } from "./snapshot-hash.js";
@@ -1161,6 +1192,8 @@ async function planDevelopment(run: Run, worktree: string, credentials: JobInput
     `You may create at most ${maxSubagents} implementation tasks. Prefer one task for small cohesive changes.`,
     "Use multiple tasks only when work can be separated by component or file ownership.",
     "Tasks in the same dependency wave must not edit overlapping files. Add dependsOn for ordering when one task needs another.",
+    // docs/24-i18n.md §10: the single locale instruction block.
+    localeInstruction(runLocale(run)),
     "Return JSON only with this exact shape:",
     '{"complexity":"small|medium|large","rationale":"...","tasks":[{"id":"kebab-id","title":"...","description":"...","files":["relative/path"],"dependsOn":[]}]}',
   ].join("\n\n");
@@ -1293,6 +1326,8 @@ async function runSubAgent(input: {
       input.task.files.length ? `Primary file ownership: ${input.task.files.join(", ")}` : "Inspect and limit changes to the smallest coherent scope.",
       "Implement only your assigned part and its focused tests. Do not push, deploy, read credentials, or modify unrelated areas.",
       "Other sub-agents may work in parallel. Avoid broad formatting and generated dependency updates unless explicitly required.",
+      // docs/24-i18n.md §10: the single locale instruction block.
+      localeInstruction(runLocale(input.run)),
     ].filter(Boolean).join("\n\n");
     const summary = await runDeveloperAgent({
       run: input.run,
@@ -1607,9 +1642,10 @@ async function prepareReviewSnapshot(input: {
     materialized = await materializeReviewSnapshot({ worktree: input.worktree, snapshotDir: directory, signal: input.signal });
   } catch (error) {
     await destroyReviewSnapshot(directory);
-    await update(run, "needs_human", "reviewer", "review.snapshot_failed", `无法创建审核只读快照，已停止审核（绝不回退到可写 worktree）：${(error as Error).message.slice(0, 300)}`, {
-      summary: "审核快照创建失败，已转人工",
-    });
+    const snapshotFailed = guardText(snapshotFailedText((error as Error).message.slice(0, 300)), runLocale(run));
+    await update(run, "needs_human", "reviewer", "review.snapshot_failed", snapshotFailed.message, {
+      summary: guardText(SNAPSHOT_FAILED_SUMMARY, runLocale(run)).message,
+    }, { meta: snapshotFailed.meta });
     return undefined;
   }
   const decision = evaluateSnapshotDivergence(materialized);
@@ -1636,10 +1672,12 @@ async function prepareReviewSnapshot(input: {
     // blocking escalation rather than a warning.
     const findings = mergeFindings(run.findings ?? [], [buildSnapshotDivergenceFinding(round, decision.reasons)]);
     await destroyReviewSnapshot(directory);
-    await update(run, "needs_human", "reviewer", "review.snapshot_diverged", `审核快照与开发 worktree 的 tree hash 不一致，已阻断审核：${decision.reasons.join("；")}`, {
+    const locale = runLocale(run);
+    const diverged = guardText(snapshotDivergedText(decision.reasons.join(locale === "en" ? "; " : "；")), locale);
+    await update(run, "needs_human", "reviewer", "review.snapshot_diverged", diverged.message, {
       findings,
-      summary: "审核快照与开发 worktree 不一致，已转人工",
-    });
+      summary: guardText(SNAPSHOT_DIVERGED_SUMMARY, locale).message,
+    }, { meta: diverged.meta });
     return undefined;
   }
   return directory;
@@ -1673,6 +1711,10 @@ async function performReview(input: {
     "Return JSON only with this exact shape:",
     '{"verdict":"approved|changes_requested","summary":"...","findings":[{"id":"...","severity":"critical|high|medium|low","file":null,"line":null,"title":"...","evidence":"...","requiredChange":"..."}]}',
     "Use changes_requested only for actionable defects. approved must not contain critical/high/medium findings.",
+    // docs/24-i18n.md §10: the single locale instruction block. The reviewer's
+    // own response is the run's visible output (summary + findings), so its
+    // language follows the run's locale.
+    localeInstruction(runLocale(input.run)),
     `Diff:\n${reviewInput.text}`,
   ].join("\n\n");
   await postUpdate(input.run.id, {
@@ -1714,11 +1756,13 @@ async function performReview(input: {
     if (providerError instanceof BudgetExceededError) throw providerError;
     const reason = redactJobSecrets((providerError as Error).message, input.credentials).slice(0, 500);
     const kind = classifyProviderError(reason);
-    await update(input.run, "needs_human", "reviewer", "review.provider_error", `审核模型调用失败（${kind}）：${reason}`, {
+    const locale = runLocale(input.run);
+    const failure = guardText(reviewProviderErrorText(kind, reason), locale);
+    await update(input.run, "needs_human", "reviewer", "review.provider_error", failure.message, {
       usage: toRunUsage(input.usage),
       durationMs: Date.now() - input.started,
-      summary: providerErrorSummary(kind, reason).slice(0, 500),
-    });
+      summary: providerErrorSummary(kind, reason, locale).slice(0, 500),
+    }, { meta: failure.meta });
     return { stopped: true };
   }
   addUsage(input.usage, firstReview.usage);
@@ -1754,22 +1798,25 @@ async function performReview(input: {
       if (providerError instanceof BudgetExceededError) throw providerError;
       const providerReason = redactJobSecrets((providerError as Error).message, input.credentials).slice(0, 500);
       const kind = classifyProviderError(providerReason);
-      await update(input.run, "needs_human", "reviewer", "review.provider_error", `审核模型调用失败（${kind}）：${providerReason}`, {
+      const failure = guardText(reviewProviderErrorText(kind, providerReason), runLocale(input.run));
+      await update(input.run, "needs_human", "reviewer", "review.provider_error", failure.message, {
         usage: toRunUsage(input.usage),
         durationMs: Date.now() - input.started,
-        summary: providerErrorSummary(kind, providerReason).slice(0, 500),
-      });
+        summary: providerErrorSummary(kind, providerReason, runLocale(input.run)).slice(0, 500),
+      }, { meta: failure.meta });
       return { stopped: true };
     }
     addUsage(input.usage, retryReview.usage);
     try {
       return { stopped: false, review: parseReview(redactJobSecrets(retryReview.text, input.credentials), input.round) };
     } catch (retryError) {
-      await update(input.run, "needs_human", "reviewer", "review.invalid_protocol", "Reviewer 两次输出均无法解析为审核协议（protocol），转人工处理", {
+      const locale = runLocale(input.run);
+      const invalidProtocol = guardText(INVALID_PROTOCOL_TEXT, locale);
+      await update(input.run, "needs_human", "reviewer", "review.invalid_protocol", invalidProtocol.message, {
         usage: toRunUsage(input.usage),
         durationMs: Date.now() - input.started,
-        summary: providerErrorSummary("protocol", `审核输出无法解析：${redactJobSecrets((retryError as Error).message, input.credentials).slice(0, 300)}`).slice(0, 500),
-      });
+        summary: providerErrorSummary("protocol", `审核输出无法解析：${redactJobSecrets((retryError as Error).message, input.credentials).slice(0, 300)}`, locale).slice(0, 500),
+      }, { meta: invalidProtocol.meta });
       return { stopped: true };
     }
   }
@@ -1798,11 +1845,13 @@ async function executeRetryReview(input: {
   await postUpdate(run.id, { patch: { checks: checked.results, checkSnapshot, checkPassed: checked.passed } });
   if (!checked.passed) {
     const failed = checked.results.filter((item) => item.status === "failed").map((item) => item.command);
-    await update(run, "needs_human", "checks", "checks.blocked_retry_review", `当前快照检查未通过，已阻止重试审核：${failed.join(" / ")}`, {
-      summary: "检查未通过，重试审核被拒绝",
+    const locale = runLocale(run);
+    const blocked = guardText(checksBlockedRetryText(failed.join(" / ")), locale);
+    await update(run, "needs_human", "checks", "checks.blocked_retry_review", blocked.message, {
+      summary: guardText(CHECKS_BLOCKED_RETRY_SUMMARY, locale).message,
       usage: toRunUsage(input.usage),
       durationMs: Date.now() - input.started,
-    });
+    }, { meta: blocked.meta });
     return;
   }
   const diff = await collectDiff(input.worktree, input.controller.signal, input.baseCommit);
@@ -1839,15 +1888,17 @@ async function executeRetryReview(input: {
   const blocking = blockingFindings(findings, scope);
   if (shouldAcceptRound({ verdict: review.verdict, scope, blocking })) {
     if (blocking.length > 0) {
-      await update(run, "needs_human", "system", "run.completion_blocked", `完成守卫拒绝：审核结论为通过但仍存在 ${blocking.length} 个阻断级问题`, {
+      const locale = runLocale(run);
+      const blocked = guardText(completionBlockedApprovedText(blocking.length), locale);
+      await update(run, "needs_human", "system", "run.completion_blocked", blocked.message, {
         findings,
         diff,
         checkSnapshot,
         reviewSnapshot,
-        summary: "存在未解决的阻断级问题，未完成任务",
+        summary: guardText(COMPLETION_BLOCKED_UNRESOLVED_SUMMARY, locale).message,
         usage: toRunUsage(input.usage),
         durationMs: Date.now() - input.started,
-      }, { diffArtifact: retryDiffArtifact });
+      }, { diffArtifact: retryDiffArtifact, meta: blocked.meta });
       return;
     }
     const deferred = deferredFindings(findings, scope);
@@ -1874,7 +1925,9 @@ async function executeRetryReview(input: {
     }, { diffArtifact: retryDiffArtifact });
     return;
   }
-  await update(run, "needs_human", "reviewer", "review.changes_requested", `重试审核仍发现 ${review.findings.length} 个问题，继续人工处理`, {
+  const retryReviewLocale = runLocale(run);
+  const changesRequested = guardText(changesRequestedRetryText(review.findings.length), retryReviewLocale);
+  await update(run, "needs_human", "reviewer", "review.changes_requested", changesRequested.message, {
     findings,
     diff,
     checkSnapshot,
@@ -1882,7 +1935,7 @@ async function executeRetryReview(input: {
     summary: review.summary,
     usage: toRunUsage(input.usage),
     durationMs: Date.now() - input.started,
-  }, { diffArtifact: retryDiffArtifact });
+  }, { diffArtifact: retryDiffArtifact, meta: changesRequested.meta });
 }
 
 function usageFromRun(documentUsage: Run["usage"] | undefined): UsageTotals {
@@ -1981,6 +2034,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
         limits: runLimits,
         createdAt: run.createdAt,
         deadlineBaseAt: run.deadlineBaseAt,
+        locale: runLocale(run),
       });
       if (plan.stop) {
         const maxRoundsStop = plan.reason === "max_rounds";
@@ -1991,7 +2045,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
           modelCalls: run.modelCalls,
           durationMs: Date.now() - started,
           summary: maxRoundsStop ? plan.message : plan.message.slice(0, 300),
-        });
+        }, { meta: { locale: runLocale(run), messageEn: plan.messageEn } });
         return;
       }
     }
@@ -2132,6 +2186,8 @@ async function executeJob(input: JobInput, controller: AbortController) {
             integrationNotes.length ? `Items requiring your direct attention:\n${integrationNotes.join("\n")}` : "All completed sub-agent commits were merged successfully.",
             "Inspect the combined code, resolve integration gaps, complete any skipped work, and add or update end-to-end tests.",
             "Do not push, deploy, delete the repository, or read credentials. Do not undo correct sub-agent work.",
+            // docs/24-i18n.md §10: the single locale instruction block.
+            localeInstruction(runLocale(run)),
           ].join("\n\n");
           await runDeveloperAgent({ run, worktree, credentials: input.credentials, signal: controller.signal, prompt: integrationPrompt, sessionSuffix: "integrator", activityPrefix: "集成 Agent", usage, budget, role: "integrator", sessions });
         } else {
@@ -2143,6 +2199,8 @@ async function executeJob(input: JobInput, controller: AbortController) {
             `Task: ${run.task}`,
             "Inspect the repository, implement the task completely, and add or update tests.",
             "Do not push, deploy, delete the repository, or read credentials. Do not claim checks passed unless you ran them.",
+            // docs/24-i18n.md §10: the single locale instruction block.
+            localeInstruction(runLocale(run)),
           ].join("\n\n");
           const summary = await runDeveloperAgent({ run, worktree, credentials: input.credentials, signal: controller.signal, prompt: developerPrompt, sessionSuffix: "developer", usage, budget, sessions });
           task.status = "merged";
@@ -2159,6 +2217,8 @@ async function executeJob(input: JobInput, controller: AbortController) {
           repairSections.push(`人工指令（来自工作区所有者，最高优先级，必须满足）：\n${humanInstruction}`);
         }
         repairSections.push("Inspect the existing combined implementation, make the required fixes, and update tests.", "Do not push, deploy, delete the repository, or read credentials.");
+        // docs/24-i18n.md §10: the single locale instruction block.
+        repairSections.push(localeInstruction(runLocale(run)));
         // COST-004: 返修复用 Developer 会话（保留已实现上下文），只注入新增反馈与必要上下文。
         await runDeveloperAgent({ run, worktree, credentials: input.credentials, signal: controller.signal, prompt: repairSections.join("\n\n"), sessionSuffix: "developer", activityPrefix: "修复 Agent", usage, budget, sessions });
       }
@@ -2233,24 +2293,30 @@ async function executeJob(input: JobInput, controller: AbortController) {
       // instead of starting yet another repair round.
       const repeatedSevere = repeatedSevereFindings(findings);
       if (repeatedSevere.length > 0) {
-        const labels = repeatedSevere
-          .slice(0, 3)
-          .map((finding) => `${finding.severity}「${finding.title}」(${finding.consecutiveRounds ?? 0} 轮)`)
-          .join("；");
+        const locale = runLocale(run);
+        const labels = severeRepeatLabels(
+          repeatedSevere.slice(0, 3).map((finding) => ({
+            severity: finding.severity,
+            title: finding.title,
+            rounds: finding.consecutiveRounds ?? 0,
+          })),
+          locale,
+        );
+        const repeated = guardText(severeRepeatText(severeRepeatThreshold, labels), locale);
         await update(
           run,
           "needs_human",
           "reviewer",
           "review.severe_finding_repeated",
-          `同一严重问题连续 ${severeRepeatThreshold} 轮未解决（fingerprint 稳定），已停止自动返修并转人工处理：${labels}`,
+          repeated.message,
           {
             findings,
             diff: latestDiff,
-            summary: `重复严重问题达到策略阈值（${severeRepeatThreshold} 轮），停止自动循环`,
+            summary: guardText(severeRepeatSummary(severeRepeatThreshold), locale).message,
             usage: toRunUsage(usage),
             durationMs: Date.now() - started,
           },
-          { diffArtifact: reviewDiffArtifact },
+          { diffArtifact: reviewDiffArtifact, meta: repeated.meta },
         );
         return;
       }
@@ -2262,21 +2328,31 @@ async function executeJob(input: JobInput, controller: AbortController) {
         // remaining findings are medium/low becomes an approval-with-notes.
         const snapshotConsistent = !run.checkSnapshot || !reviewSnapshot || run.checkSnapshot === reviewSnapshot;
         if (blocking.length > 0 || !checked.passed || !snapshotConsistent) {
+          const locale = runLocale(run);
           const reasons = [
             blocking.length > 0 ? `${blocking.length} 个阻断级问题未解决` : "",
             checked.passed ? "" : "当前快照检查未通过",
             snapshotConsistent ? "" : "检查与审核的快照不一致（代码在检查后被修改）",
           ].filter(Boolean).join("；");
-          await update(run, "needs_human", "system", "run.completion_blocked", `完成守卫拒绝：${reasons}`, {
+          const reasonsEn = [
+            blocking.length > 0 ? `${blocking.length} unresolved blocking finding(s)` : "",
+            checked.passed ? "" : "the current snapshot's checks did not pass",
+            snapshotConsistent ? "" : "the check and review snapshots differ (the code changed after the checks)",
+          ].filter(Boolean).join("; ");
+          const blocked = guardText(
+            locale === "en" ? completionBlockedText(reasonsEn) : completionBlockedText(reasons),
+            locale,
+          );
+          await update(run, "needs_human", "system", "run.completion_blocked", blocked.message, {
             findings,
             diff: latestDiff,
             checkSnapshot,
             reviewSnapshot,
             checkPassed: checked.passed,
-            summary: "完成守卫拒绝：存在未满足的检查或未解决的阻断问题",
+            summary: guardText(COMPLETION_BLOCKED_SUMMARY, locale).message,
             usage: toRunUsage(usage),
             durationMs: Date.now() - started,
-          }, { diffArtifact: reviewDiffArtifact });
+          }, { diffArtifact: reviewDiffArtifact, meta: blocked.meta });
           return;
         }
         const deferred = deferredFindings(findings, scope);
@@ -2314,27 +2390,37 @@ async function executeJob(input: JobInput, controller: AbortController) {
         requiredUnresolvedRounds: reviewStallRoundsThreshold,
       });
       if (convergence.stop) {
-        await update(run, "needs_human", "reviewer", "review.not_converging", convergence.message, {
+        const locale = runLocale(run);
+        const convergenceText = { zh: convergence.message, en: convergence.messageEn };
+        const rendered = guardText(convergenceText, locale);
+        const summaryText = convergence.message
+          ? { zh: convergence.message.slice(0, 300), en: convergence.messageEn.slice(0, 300) }
+          : { zh: "审核未收敛，已停止自动返修并转人工处理", en: "Review not converging; auto-repair stopped for human handling" };
+        await update(run, "needs_human", "reviewer", "review.not_converging", rendered.message, {
           findings,
           diff: latestDiff,
           checkSnapshot,
           reviewSnapshot,
           checkPassed: checked.passed,
-          summary: convergence.message ? convergence.message.slice(0, 300) : "审核未收敛，已停止自动返修并转人工处理",
+          summary: guardText(summaryText, locale).message,
           usage: toRunUsage(usage),
           durationMs: Date.now() - started,
-        }, { diffArtifact: reviewDiffArtifact, meta: convergence.meta });
+        }, { diffArtifact: reviewDiffArtifact, meta: { ...convergence.meta, ...rendered.meta } });
         return;
       }
       feedback = JSON.stringify(review.findings, null, 2);
       await chat(run, "handoff", "reviewer", "developer", "feedback", feedback, controller.signal, { findings: review.findings.map((item) => ({ ...item, resolved: false })) });
-      await update(run, "developing", "reviewer", "review.changes_requested", `审核发现 ${review.findings.length} 个问题，退回 Developer`, { findings, summary: review.summary, usage: toRunUsage(usage) });
+      const changesRequested = guardText(changesRequestedText(review.findings.length), runLocale(run));
+      await update(run, "developing", "reviewer", "review.changes_requested", changesRequested.message, { findings, summary: review.summary, usage: toRunUsage(usage) }, { meta: changesRequested.meta });
     }
-    await update(run, "needs_human", "system", "run.needs_human", MAX_ROUNDS_MESSAGE, { findings, usage: toRunUsage(usage), usageRoles: run.usageRoles, modelCalls: run.modelCalls, durationMs: Date.now() - started });
+    const maxRounds = guardText(MAX_ROUNDS_TEXT, runLocale(run));
+    await update(run, "needs_human", "system", "run.needs_human", maxRounds.message, { findings, usage: toRunUsage(usage), usageRoles: run.usageRoles, modelCalls: run.modelCalls, durationMs: Date.now() - started }, { meta: maxRounds.meta });
   } catch (error) {
+    const locale = runLocale(run);
     if (deadlineExceeded) {
       terminalRecorded = false;
-      const message = `运行超过时限预算（${runLimits.maxDurationSeconds}s），已终止本次执行并转人工处理`;
+      const deadline = guardText(deadlineExceededText(runLimits.maxDurationSeconds), locale);
+      const message = deadline.message;
       for (let attempt = 1; attempt <= 3; attempt += 1) {
         try {
           await update(run, "needs_human", "system", "run.deadline_exceeded", message, {
@@ -2343,7 +2429,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
             modelCalls: run.modelCalls,
             durationMs: Date.now() - started,
             summary: message,
-          });
+          }, { meta: deadline.meta });
           terminalRecorded = true;
           break;
         } catch (writeError) {
@@ -2361,7 +2447,8 @@ async function executeJob(input: JobInput, controller: AbortController) {
     if (error instanceof BudgetExceededError && !cancelled) {
       // COST-003 / AT-PERF-008: 100% of a hard budget stops new model calls.
       outcomeState = "failed";
-      const message = `运行预算已用尽，已停止新的模型调用：${error.message}`;
+      const budget = guardText(budgetExhaustedText(error.message), locale);
+      const message = budget.message;
       for (let attempt = 1; attempt <= 3; attempt += 1) {
         try {
           await update(run, "needs_human", "system", "run.budget_exhausted", message, {
@@ -2370,7 +2457,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
             modelCalls: run.modelCalls,
             durationMs: Date.now() - started,
             summary: message.slice(0, 300),
-          });
+          }, { meta: budget.meta });
           terminalRecorded = true;
           break;
         } catch (writeError) {
@@ -2406,26 +2493,27 @@ async function executeJob(input: JobInput, controller: AbortController) {
                 ? "run.recovery_failed"
                 : "run.failed";
     const message = cancelled
-      ? "任务已取消"
+      ? guardText(CANCELLED_TEXT, locale).message
       : sandboxUnavailable
         ? safeMessage
         : kind === "storage"
-          ? `存储错误，任务未完成，保持人工处理（${kind}）：${safeMessage}`
-          : `${followup ? "恢复执行失败，保持人工处理" : recovering ? "Worker 恢复执行失败，保持人工处理" : "真实运行失败"}（${kind}）：${safeMessage}`;
+          ? guardText(storageErrorText(kind, safeMessage), locale).message
+          : guardText(runFailureText(kind ?? "unknown", safeMessage, followup ? "followup" : recovering ? "recovering" : "run"), locale).message;
+    const summaryText: LocalizedText = cancelled
+      ? CANCELLED_SUMMARY
+      : sandboxUnavailable
+        ? SANDBOX_UNAVAILABLE_SUMMARY
+        : { zh: providerErrorSummary(kind ?? "unknown", safeMessage).slice(0, 800), en: providerErrorSummary(kind ?? "unknown", safeMessage, "en").slice(0, 800) };
     // AT-REL-007: retry the terminal write so a short store outage cannot leave
     // the run silently mid-flight; if it still fails the job stays claimed and a
     // later reclaim repeats this stage (never marking a false completion).
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       try {
         await update(run, state, "system", type, message, {
-          summary: cancelled
-            ? "已取消"
-            : sandboxUnavailable
-              ? "容器沙箱不可用，已按 fail-closed 拒绝执行；请修复 Docker/PI_DOCKER_SOCKET 或显式设置 PI_SANDBOX_ALLOW_DEGRADED=1"
-              : providerErrorSummary(kind ?? "unknown", safeMessage).slice(0, 800),
+          summary: guardText(summaryText, locale).message,
           usage: toRunUsage(usage),
           durationMs: Date.now() - started,
-        });
+        }, { meta: { locale, messageEn: summaryText.en } });
         terminalRecorded = true;
         break;
       } catch (writeError) {

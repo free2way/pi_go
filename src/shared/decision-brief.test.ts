@@ -518,3 +518,86 @@ describe("decision brief · buildDecisionBrief", () => {
     expect(brief.recommendation.action).toBe("continue");
   });
 });
+
+describe("decision brief · locale (docs/24-i18n.md §9)", () => {
+  const greenInput = {
+    criteria: [ac("AC#1", "修改 src/server/credential-vault.ts 实现凭据隔离：API Key 不得写入日志")],
+    findings: [
+      { id: "f1", stableKey: "src/server/credential-vault.ts|凭据隔离缺失", severity: "low" as const, resolved: false, file: "src/server/credential-vault.ts", title: "凭据隔离缺失", evidence: "日志中出现了完整 API Key，未做脱敏处理", consecutiveRounds: 0 },
+    ],
+    checks: [{ name: "单元测试", command: "npm test", status: "passed" }],
+    diffFiles: ["src/server/credential-vault.ts"],
+    diff: completeDiff,
+  };
+
+  it("defaults the recorded locale to zh and keeps the Chinese text byte-identical", () => {
+    const brief = buildDecisionBrief(greenInput);
+    expect(brief.locale).toBe("zh");
+    expect(brief.gates.every((gate) => gate.status === "green")).toBe(true);
+    expect(brief.gates[0].detail).toBe("1 项检查全部通过");
+    expect(brief.recommendation.note).toBe("四条硬门槛全绿，可接受交付。将记录的剩余项：low 1 条。");
+  });
+
+  it("always carries an English counterpart for every generated text", () => {
+    const brief = buildDecisionBrief(greenInput);
+    expect(brief.gates[0].detailEn).toBe("All 1 check(s) passed");
+    expect(brief.gates.map((gate) => typeof gate.detailEn)).toEqual(["string", "string", "string", "string"]);
+    expect(brief.recommendation.noteEn).toBe("All four hard gates are green; the delivery can be accepted. Recorded remaining items: 1 low.");
+    expect(brief.diff.detailEn).toContain("proven complete");
+    // Chinese fields are untouched by the presence of the English ones.
+    expect(brief.gates[0].detail).toBe("1 项检查全部通过");
+  });
+
+  it("records the requested locale without changing which text is generated", () => {
+    const brief = buildDecisionBrief({ ...greenInput, locale: "en" });
+    expect(brief.locale).toBe("en");
+    expect(brief.gates[0].detail).toBe("1 项检查全部通过");
+    expect(brief.gates[0].detailEn).toBe("All 1 check(s) passed");
+  });
+
+  it("renders the red blocking gate in English on detailEn", () => {
+    const brief = buildDecisionBrief({
+      criteria: [ac("AC#1", "实现凭据隔离：API Key 不得写入日志")],
+      findings: [
+        { id: "f1", severity: "high", resolved: false, file: "src/server/credential-vault.ts", title: "事务提交顺序颠倒", evidence: "并发写入时会覆盖前一次提交" },
+      ],
+      checks: [{ id: "check-1", name: "单元测试", command: "npm test", status: "failed", exitCode: 1 }],
+      diffFiles: ["src/server/credential-vault.ts"],
+      diff: { complete: false, reason: "truncated", inlineBytes: 10, recordedBytes: 20 },
+    });
+    const blocking = brief.gates.find((gate) => gate.id === "blocking");
+    expect(blocking?.status).toBe("red");
+    expect(blocking?.detail).toContain("仍有阻断级问题未解决");
+    expect(blocking?.detailEn).toContain("Blocking findings remain unresolved");
+    expect(blocking?.detailEn).toContain("with relevance that cannot be ruled out");
+    expect(blocking?.detailEn).toContain("change set is incomplete");
+    expect(brief.gates.find((gate) => gate.id === "checks")?.detailEn).toContain("1 check(s) failed");
+    expect(brief.gates.find((gate) => gate.id === "checks")?.detailEn).toContain("(npm test, exit 1)");
+  });
+
+  it("echoes the recorded event locale and its English variant from event meta", () => {
+    const brief = buildDecisionBrief({
+      findings: null,
+      events: [
+        {
+          type: "run.needs_human",
+          message: "Maximum review rounds reached; human handling required",
+          meta: { locale: "en", messageEn: "Maximum review rounds reached; human handling required" },
+        },
+      ],
+    });
+    expect(brief.stopReason.code).toBe("max_review_rounds");
+    expect(brief.stopReason.locale).toBe("en");
+    expect(brief.stopReason.messageEn).toContain("Maximum review rounds");
+  });
+
+  it("omits the event locale/messageEn for historical rows that predate it", () => {
+    const brief = buildDecisionBrief({
+      findings: null,
+      events: [{ type: "run.needs_human", message: "达到最大审核轮次" }],
+    });
+    expect(brief.stopReason.locale).toBeUndefined();
+    expect(brief.stopReason.messageEn).toBeUndefined();
+    expect(brief.stopReason.message).toBe("达到最大审核轮次");
+  });
+});

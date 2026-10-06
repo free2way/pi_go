@@ -171,6 +171,8 @@ export interface ConvergenceVerdict {
   persistingBlockingKeys: string[];
   /** Human-facing summary; empty when `stalled` is false. */
   message: string;
+  /** English rendering of `message` (docs/24-i18n.md §9); empty when not stalled. */
+  messageEn: string;
   perRound: RoundConvergence[];
 }
 
@@ -234,13 +236,20 @@ export function convergenceVerdict(
   const trailing = perRound.slice(Math.max(0, perRound.length - unresolvedStalledRounds));
   const persisting = unresolvedStalled ? persistingKeys(trailing) : [];
 
+  // `message` is the Chinese text (unchanged); `messageEn` is its English
+  // counterpart (docs/24-i18n.md §9). Both are empty when not stalled.
   let message = "";
+  let messageEn = "";
   if (newCountStalled && current && previous) {
     const roundsLabel = stalledRounds === 2 ? "连续两轮" : `连续 ${stalledRounds} 轮`;
+    const roundsLabelEn = stalledRounds === 2 ? "two consecutive rounds" : `${stalledRounds} consecutive rounds`;
     message = `审核未收敛：${roundsLabel}新增严重问题未下降（${previous.newBlocking}→${current.newBlocking}），建议缩小范围或拆分任务`;
+    messageEn = `Review not converging: new severe findings did not decrease for ${roundsLabelEn} (${previous.newBlocking}→${current.newBlocking}); narrow the scope or split the task`;
   } else if (unresolvedStalled && current) {
     const keys = persisting.slice(0, 3).join("，");
+    const keysEn = persisting.slice(0, 3).join(", ");
     message = `审核未收敛：同一批阻断问题连续 ${unresolvedStalledRounds} 轮未减少（当前 ${current.unresolvedBlocking} 个未解决阻断问题${keys ? `：${keys}` : ""}），建议缩小范围或拆分任务`;
+    messageEn = `Review not converging: the same blocking batch did not decrease for ${unresolvedStalledRounds} consecutive rounds (${current.unresolvedBlocking} unresolved blocking finding(s)${keysEn ? `: ${keysEn}` : ""}); narrow the scope or split the task`;
   }
 
   return {
@@ -253,6 +262,7 @@ export function convergenceVerdict(
     currentUnresolvedBlocking: current?.unresolvedBlocking ?? 0,
     persistingBlockingKeys: persisting,
     message,
+    messageEn,
     perRound,
   };
 }
@@ -268,7 +278,7 @@ export function convergenceStop(input: {
   enabled?: boolean;
   requiredStalledRounds?: number;
   requiredUnresolvedRounds?: number;
-}): { stop: false } | { stop: true; message: string; meta: Record<string, unknown> } {
+}): { stop: false } | { stop: true; message: string; messageEn: string; meta: Record<string, unknown> } {
   if (input.enabled === false) return { stop: false };
   const verdict = convergenceVerdict(convergenceHistory(input.findings, input.currentRound), {
     ...(input.requiredStalledRounds === undefined ? {} : { requiredStalledRounds: input.requiredStalledRounds }),
@@ -278,6 +288,9 @@ export function convergenceStop(input: {
   return {
     stop: true,
     message: verdict.message,
+    // English variant recorded as `meta.messageEn` so the Decision Brief can
+    // render either language (docs/24-i18n.md §9).
+    messageEn: verdict.messageEn,
     meta: {
       stalledRounds: verdict.stalledRounds,
       unresolvedStalledRounds: verdict.unresolvedStalledRounds,

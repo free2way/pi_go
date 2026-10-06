@@ -35,6 +35,7 @@
 
 import type { Finding } from "./types.js";
 import { findingFingerprint, normalizeFindingFile } from "./finding-fingerprint.js";
+import { DEFAULT_LOCALE, isLocale, type Locale } from "./i18n.js";
 
 export type GateStatus = "green" | "red" | "unknown";
 export type GateId = "checks" | "blocking" | "scope" | "acceptance";
@@ -68,6 +69,8 @@ export interface DecisionBriefDiffProvenance {
 /** Operator-facing diff provenance echoed on the brief (docs/22 §6). */
 export interface DecisionBriefDiffScope extends DecisionBriefDiffProvenance {
   detail: string;
+  /** English rendering of `detail` (docs/24-i18n.md §9); additive. */
+  detailEn?: string;
 }
 
 /**
@@ -101,6 +104,12 @@ export interface DecisionBriefGate {
   id: GateId;
   status: GateStatus;
   detail: string;
+  /**
+   * English rendering of `detail` (docs/24-i18n.md §9). Additive: `detail` keeps
+   * the Chinese text byte-for-byte. Always populated by `buildDecisionBrief`;
+   * optional so hand-built fixtures/older payloads stay valid.
+   */
+  detailEn?: string;
   /** Only the `blocking` gate carries its blocking findings (doc §6). */
   findings?: DecisionBriefFindingRef[];
 }
@@ -108,6 +117,19 @@ export interface DecisionBriefGate {
 export interface DecisionBriefStopReason {
   code: string;
   message: string;
+  /**
+   * English rendering of `message` when the recorded event carries one
+   * (`meta.messageEn`). Absent for events written before this change and for
+   * events whose text has no English variant — the client then renders
+   * `message`. The stored `message` is never rewritten (audit fidelity).
+   */
+  messageEn?: string;
+  /**
+   * Locale the recorded stop event was generated in (`meta.locale`). Absent when
+   * the event predates locale-aware generation, so a reader can tell which
+   * language `message` is actually in.
+   */
+  locale?: Locale;
   meta: Record<string, unknown>;
 }
 
@@ -129,9 +151,17 @@ export interface DecisionBriefRemainingItem {
 export interface DecisionBriefRecommendation {
   action: DecisionAction;
   note: string;
+  /**
+   * English rendering of `note` (docs/24-i18n.md §9). Additive: `note` stays the
+   * Chinese text so existing callers are byte-identical. Always populated, so the
+   * client can switch language without refetching.
+   */
+  noteEn?: string;
 }
 
 export interface DecisionBrief {
+  /** Locale the brief was requested in (`zh` default); recorded for audit. */
+  locale: Locale;
   stopReason: DecisionBriefStopReason;
   gates: DecisionBriefGate[];
   remaining: DecisionBriefRemainingItem[];
@@ -192,6 +222,14 @@ export interface DecisionBriefInput {
   diff?: DecisionBriefDiffProvenance | null;
   allowedPaths?: string[] | null;
   events?: DecisionBriefEventInput[] | null;
+  /**
+   * Locale the brief was requested in (docs/24-i18n.md §9). Additive and
+   * optional: omitted/invalid reads as `zh`, so existing callers keep the exact
+   * same output. It is recorded on the brief (and echoed from the stop event)
+   * but never changes which text is generated — the brief always carries both
+   * the Chinese field and its English `*En` counterpart.
+   */
+  locale?: Locale | null;
 }
 
 const SEVERITIES: ReadonlyArray<Finding["severity"]> = ["critical", "high", "medium", "low"];
@@ -416,29 +454,224 @@ export function evidenceSanity(finding: DecisionBriefFindingInput): boolean {
   return true;
 }
 
+/**
+ * Code-generated Decision Brief copy (docs/24-i18n.md §9).
+ *
+ * Every judgement string the brief renders is built from this table, so both
+ * languages come from one place and can be audited side by side. The `zh` column
+ * is byte-identical to the pre-i18n output: `gateChecks(checks)` with no locale
+ * therefore returns exactly what it always did. `en` is rendered into the
+ * additive `detailEn` / `noteEn` / `diff.detailEn` fields.
+ */
+interface BriefCopy {
+  listSep: string;
+  pathSep: string;
+  checksNone: string;
+  checksFailed: (count: number, labels: string) => string;
+  checkItem: (name: string, command: string | undefined, exit: string) => string;
+  checkNameFallback: string;
+  checkExit: (exitCode: number) => string;
+  checksPending: string;
+  checksGreen: (count: number) => string;
+  blockingPrefix: (summary: string) => string;
+  blockingCritical: (count: number) => string;
+  blockingHighs: (count: number, relevant: number, unresolved: number) => string;
+  blockingIncomplete: string;
+  blockingUnknownSeverity: (count: number) => string;
+  blockingGreenIgnoredHighs: (count: number) => string;
+  blockingGreen: string;
+  scopeMissing: string;
+  scopeEmpty: string;
+  scopeGenerated: (files: string) => string;
+  scopeOutside: (files: string) => string;
+  scopeIncomplete: (count: number) => string;
+  scopeGreen: (count: number) => string;
+  acceptanceNoCriteriaNoDiff: string;
+  acceptanceNoCriteria: string;
+  acceptanceNoDiff: string;
+  acceptanceNoChanges: (count: number) => string;
+  acceptanceMissing: (count: number, labels: string) => string;
+  acceptanceUnmapped: (count: number, labels: string) => string;
+  acceptanceGreen: (count: number) => string;
+  recoAcceptWithRemaining: (recorded: string) => string;
+  recoAcceptPlain: string;
+  recoMedium: (count: number) => string;
+  recoLow: (count: number) => string;
+  recoFalsePositives: (count: number) => string;
+  recoPersisting: (rounds: number) => string;
+  recoFixChecks: (detail: string) => string;
+  recoPrimaryStreak: (key: string, streak: number) => string;
+  recoPerRed: (key: string, extras: string) => string;
+  recoPerRedExtras: (count: number) => string;
+  recoRedGates: (labels: string) => string;
+  recoUnknown: (labels: string) => string;
+  recoUnknownNone: string;
+  diffComplete: string;
+  diffTruncated: string;
+  diffPartial: string;
+  diffMissingMetadata: string;
+  diffAbsent: string;
+}
+
+const BRIEF_COPY_ZH: BriefCopy = {
+  listSep: "；",
+  pathSep: "、",
+  checksNone: "没有检查记录，无法确认检查是否通过",
+  checksFailed: (count, labels) => `${count} 项检查未通过：${labels}`,
+  checkItem: (name, command, exit) => (command ? `${name}（${command}${exit}）` : `${name}${exit}`),
+  checkNameFallback: "检查",
+  checkExit: (exitCode) => `，exit ${exitCode}`,
+  checksPending: "存在未结束的检查，无法确认检查结果",
+  checksGreen: (count) => `${count} 项检查全部通过`,
+  blockingPrefix: (summary) => `仍有阻断级问题未解决：${summary}`,
+  blockingCritical: (count) => `${count} 个未解决 critical`,
+  blockingHighs: (count, relevant, unresolved) =>
+    `${count} 个未解决 high（${relevant} 个明确与 AC/DoD 相关，${unresolved} 个相关性无法排除）`,
+  blockingIncomplete:
+    "；改动清单不完整（inline diff 可能被截断），已按“相关性无法排除”处理，不得据此清除阻断项",
+  blockingUnknownSeverity: (count) => `${count} 条未解决问题的严重级别无法识别，无法排除阻断项`,
+  blockingGreenIgnoredHighs: (count) =>
+    `无未解决 critical；${count} 个 high 有明确证据表明与本故事 AC/DoD 无关（文件不在完整改动范围内且无共享关键词）`,
+  blockingGreen: "无未解决的 critical/high 问题",
+  scopeMissing: "缺少 diff 文件清单，无法核对改动范围",
+  scopeEmpty: "diff 文件清单为空，无法核对改动范围",
+  scopeGenerated: (files) => `diff 含生成物/脏文件：${files}`,
+  scopeOutside: (files) => `diff 超出允许路径：${files}`,
+  scopeIncomplete: (count) =>
+    `${count} 个已列出的改动文件均为源文件，但改动清单不完整（可能被截断），无法排除未列出的生成物/越界文件`,
+  scopeGreen: (count) => `${count} 个改动文件均为源文件，未发现生成物/脏文件`,
+  acceptanceNoCriteriaNoDiff: "无 AC/DoD 且缺少 diff，无法核对验收覆盖",
+  acceptanceNoCriteria: "故事未定义 AC/DoD，无额外覆盖要求",
+  acceptanceNoDiff: "缺少 diff 数据，无法核对验收覆盖",
+  acceptanceNoChanges: (count) => `未发现任何代码变更，${count} 条 AC/DoD 无从核对`,
+  acceptanceMissing: (count, labels) => `${count} 条 AC/DoD 指向的文件没有任何变更：${labels}`,
+  acceptanceUnmapped: (count, labels) => `${count} 条 AC/DoD 无法自动对应到变更或测试，需人工核对：${labels}`,
+  acceptanceGreen: (count) => `${count} 条 AC/DoD 均能对应到变更或测试`,
+  recoAcceptWithRemaining: (recorded) => `四条硬门槛全绿，可接受交付。将记录的剩余项：${recorded}。`,
+  recoAcceptPlain: "四条硬门槛全绿，无剩余问题，可接受交付。",
+  recoMedium: (count) => `medium ${count} 条`,
+  recoLow: (count) => `low ${count} 条`,
+  recoFalsePositives: (count) => `疑似误报 ${count} 条`,
+  recoPersisting: (rounds) =>
+    `同一批阻断问题连续 ${rounds} 轮未减少，方向可能不对：建议人工明确修法，或接受并记为技术债。`,
+  recoFixChecks: (detail) => `${detail}；请先修复检查再继续开发。`,
+  recoPrimaryStreak: (key, streak) =>
+    `优先修复 \`${key}\`（已返修 ${streak} 次未解决）；本次只改该点，不要改动其它文件。`,
+  recoPerRed: (key, extras) => `按红项逐条修复：\`${key}\`${extras}；不要改动其它文件。`,
+  recoPerRedExtras: (count) => (count > 1 ? ` 等 ${count} 项` : ""),
+  recoRedGates: (labels) => `存在未通过的门槛（${labels}），建议继续开发。`,
+  recoUnknown: (labels) => `数据不足（${labels}），无法确认可交付；建议继续开发或人工核对。`,
+  recoUnknownNone: "无法确认可交付，建议继续开发。",
+  diffComplete: "改动清单已证明完整（inline diff 与流水线记录的完整 diff 字节数一致）",
+  diffTruncated: "inline diff 被流水线截断，改动清单可能不完整，无法据此排除相关性或越界文件",
+  diffPartial: "inline diff 短于流水线记录的完整 diff 字节数，改动清单可能不完整",
+  diffMissingMetadata: "缺少可核对的完整 diff 元数据，无法证明改动清单完整",
+  diffAbsent: "没有 inline diff，无法确认改动范围",
+};
+
+const BRIEF_COPY_EN: BriefCopy = {
+  listSep: "; ",
+  pathSep: ", ",
+  checksNone: "No check records; cannot confirm whether the checks passed",
+  checksFailed: (count, labels) => `${count} check(s) failed: ${labels}`,
+  checkItem: (name, command, exit) => (command ? `${name} (${command}${exit})` : `${name}${exit}`),
+  checkNameFallback: "check",
+  checkExit: (exitCode) => `, exit ${exitCode}`,
+  checksPending: "Some checks have not finished; the result cannot be confirmed",
+  checksGreen: (count) => `All ${count} check(s) passed`,
+  blockingPrefix: (summary) => `Blocking findings remain unresolved: ${summary}`,
+  blockingCritical: (count) => `${count} unresolved critical`,
+  blockingHighs: (count, relevant, unresolved) =>
+    `${count} unresolved high (${relevant} clearly relevant to AC/DoD, ${unresolved} with relevance that cannot be ruled out)`,
+  blockingIncomplete:
+    '; the change set is incomplete (the inline diff may be truncated), so these were treated as "relevance cannot be ruled out" and must not be used to clear blockers',
+  blockingUnknownSeverity: (count) =>
+    `${count} unresolved finding(s) have an unrecognized severity; blockers cannot be ruled out`,
+  blockingGreenIgnoredHighs: (count) =>
+    `No unresolved critical; ${count} high finding(s) are proven unrelated to this story's AC/DoD (file outside the complete change set and no shared keywords)`,
+  blockingGreen: "No unresolved critical/high findings",
+  scopeMissing: "No diff file list; the change scope cannot be verified",
+  scopeEmpty: "The diff file list is empty; the change scope cannot be verified",
+  scopeGenerated: (files) => `The diff contains generated/dirty files: ${files}`,
+  scopeOutside: (files) => `The diff goes outside the allowed paths: ${files}`,
+  scopeIncomplete: (count) =>
+    `${count} listed changed file(s) are source files, but the change set is incomplete (it may be truncated); unlisted generated/out-of-scope files cannot be ruled out`,
+  scopeGreen: (count) => `All ${count} changed file(s) are source files; no generated/dirty files found`,
+  acceptanceNoCriteriaNoDiff: "No AC/DoD and no diff; acceptance coverage cannot be verified",
+  acceptanceNoCriteria: "The story defines no AC/DoD; no extra coverage is required",
+  acceptanceNoDiff: "No diff data; acceptance coverage cannot be verified",
+  acceptanceNoChanges: (count) => `No code changes found; ${count} AC/DoD item(s) cannot be verified`,
+  acceptanceMissing: (count, labels) => `${count} AC/DoD item(s) point at files that no change touches: ${labels}`,
+  acceptanceUnmapped: (count, labels) =>
+    `${count} AC/DoD item(s) cannot be mapped automatically to a change or a test; manual verification is required: ${labels}`,
+  acceptanceGreen: (count) => `All ${count} AC/DoD item(s) map to a change or a test`,
+  recoAcceptWithRemaining: (recorded) =>
+    `All four hard gates are green; the delivery can be accepted. Recorded remaining items: ${recorded}.`,
+  recoAcceptPlain: "All four hard gates are green; nothing remains; the delivery can be accepted.",
+  recoMedium: (count) => `${count} medium`,
+  recoLow: (count) => `${count} low`,
+  recoFalsePositives: (count) => `${count} suspected false positive(s)`,
+  recoPersisting: (rounds) =>
+    `The same blocking batch has not decreased for ${rounds} consecutive rounds; the direction may be wrong — a human should state the exact fix, or accept and record it as technical debt.`,
+  recoFixChecks: (detail) => `${detail}; fix the checks before continuing development.`,
+  recoPrimaryStreak: (key, streak) =>
+    `Fix \`${key}\` first (unresolved for ${streak} rounds); change only that item and do not touch other files.`,
+  recoPerRed: (key, extras) => `Fix the red items one by one: \`${key}\`${extras}; do not touch other files.`,
+  recoPerRedExtras: (count) => (count > 1 ? ` and ${count - 1} other item(s)` : ""),
+  recoRedGates: (labels) => `Some gates are not passing (${labels}); continue development.`,
+  recoUnknown: (labels) =>
+    `Insufficient data (${labels}); the delivery cannot be confirmed as acceptable — continue development or verify manually.`,
+  recoUnknownNone: "The delivery cannot be confirmed as acceptable; continue development.",
+  diffComplete: "The change set is proven complete (the inline diff matches the pipeline's recorded full diff byte count)",
+  diffTruncated:
+    "The pipeline truncated the inline diff, so the change set may be incomplete; relevance or out-of-scope files cannot be ruled out from it",
+  diffPartial: "The inline diff is shorter than the pipeline's recorded full diff byte count, so the change set may be incomplete",
+  diffMissingMetadata: "The full-diff metadata needed to verify completeness is missing; the change set cannot be proven complete",
+  diffAbsent: "No inline diff; the change scope cannot be confirmed",
+};
+
+/** `zh` unless the caller passes a supported locale. */
+function asLocale(locale: Locale | null | undefined): Locale {
+  return isLocale(locale) ? locale : DEFAULT_LOCALE;
+}
+
 /** `green` only when every recorded check passed; `unknown` with no check data. */
 export function gateChecks(checks: DecisionBriefCheckInput[] | null | undefined): DecisionBriefGate {
   const list = checks ?? [];
   if (list.length === 0) {
-    return { id: "checks", status: "unknown", detail: "没有检查记录，无法确认检查是否通过" };
+    return { id: "checks", status: "unknown", detail: BRIEF_COPY_ZH.checksNone, detailEn: BRIEF_COPY_EN.checksNone };
   }
   const failed = list.filter((check) => String(check.status ?? "").toLowerCase() === "failed");
   if (failed.length > 0) {
-    const labels = failed
-      .map((check) => {
-        const name = check.name?.trim() || check.id?.trim() || "检查";
-        const command = check.command?.trim();
-        const exit = typeof check.exitCode === "number" ? `，exit ${check.exitCode}` : "";
-        return command ? `${name}（${command}${exit}）` : `${name}${exit}`;
-      })
-      .join("；");
-    return { id: "checks", status: "red", detail: `${failed.length} 项检查未通过：${labels}` };
+    return {
+      id: "checks",
+      status: "red",
+      detail: BRIEF_COPY_ZH.checksFailed(failed.length, failedCheckLabels(failed, BRIEF_COPY_ZH)),
+      detailEn: BRIEF_COPY_EN.checksFailed(failed.length, failedCheckLabels(failed, BRIEF_COPY_EN)),
+    };
   }
   const settled = list.every((check) => String(check.status ?? "").toLowerCase() === "passed");
   if (!settled) {
-    return { id: "checks", status: "unknown", detail: "存在未结束的检查，无法确认检查结果" };
+    return { id: "checks", status: "unknown", detail: BRIEF_COPY_ZH.checksPending, detailEn: BRIEF_COPY_EN.checksPending };
   }
-  return { id: "checks", status: "green", detail: `${list.length} 项检查全部通过` };
+  return {
+    id: "checks",
+    status: "green",
+    detail: BRIEF_COPY_ZH.checksGreen(list.length),
+    detailEn: BRIEF_COPY_EN.checksGreen(list.length),
+  };
+}
+
+/** Renders the failed-check list in one language (`；` vs `; `, `（）` vs `()`). */
+function failedCheckLabels(failed: DecisionBriefCheckInput[], copy: BriefCopy): string {
+  return failed
+    .map((check) => {
+      const name = check.name?.trim() || check.id?.trim() || copy.checkNameFallback;
+      const command = check.command?.trim();
+      const exit = typeof check.exitCode === "number" ? copy.checkExit(check.exitCode) : "";
+      return copy.checkItem(name, command, exit);
+    })
+    .join(copy.listSep);
 }
 
 function normalizeSeverity(value: unknown): Finding["severity"] | undefined {
@@ -498,21 +731,11 @@ export function gateBlocking(
   const blocking = [...critical, ...blockingHighs];
 
   if (blocking.length > 0) {
-    const summary = [
-      critical.length ? `${critical.length} 个未解决 critical` : "",
-      blockingHighs.length
-        ? `${blockingHighs.length} 个未解决 high（${relevantHighs} 个明确与 AC/DoD 相关，${unresolvedHighs} 个相关性无法排除）`
-        : "",
-    ].filter(Boolean).join("；");
-    // Audit follow-up: say *why* an out-of-scope-looking high was not cleared,
-    // so a reader can tell this from a missing/unmapped-AC block.
-    const incompleteNote = !complete && unresolvedHighs > 0
-      ? "；改动清单不完整（inline diff 可能被截断），已按“相关性无法排除”处理，不得据此清除阻断项"
-      : "";
     return {
       id: "blocking",
       status: "red",
-      detail: `仍有阻断级问题未解决：${summary}${incompleteNote}`,
+      detail: blockingDetail(BRIEF_COPY_ZH, critical.length, blockingHighs.length, relevantHighs, unresolvedHighs, complete),
+      detailEn: blockingDetail(BRIEF_COPY_EN, critical.length, blockingHighs.length, relevantHighs, unresolvedHighs, complete),
       findings: blocking.map(toRef),
     };
   }
@@ -520,7 +743,8 @@ export function gateBlocking(
     return {
       id: "blocking",
       status: "unknown",
-      detail: `${indeterminate.length} 条未解决问题的严重级别无法识别，无法排除阻断项`,
+      detail: BRIEF_COPY_ZH.blockingUnknownSeverity(indeterminate.length),
+      detailEn: BRIEF_COPY_EN.blockingUnknownSeverity(indeterminate.length),
       findings: indeterminate.map(toRef),
     };
   }
@@ -528,11 +752,31 @@ export function gateBlocking(
   return {
     id: "blocking",
     status: "green",
-    detail: ignoredHighs > 0
-      ? `无未解决 critical；${ignoredHighs} 个 high 有明确证据表明与本故事 AC/DoD 无关（文件不在完整改动范围内且无共享关键词）`
-      : "无未解决的 critical/high 问题",
+    detail: ignoredHighs > 0 ? BRIEF_COPY_ZH.blockingGreenIgnoredHighs(ignoredHighs) : BRIEF_COPY_ZH.blockingGreen,
+    detailEn: ignoredHighs > 0 ? BRIEF_COPY_EN.blockingGreenIgnoredHighs(ignoredHighs) : BRIEF_COPY_EN.blockingGreen,
     findings: [],
   };
+}
+
+/**
+ * Renders the `blocking` gate's red detail in one language. Audit follow-up: the
+ * incomplete-change-set note says *why* an out-of-scope-looking high was not
+ * cleared, so a reader can tell this from a missing/unmapped-AC block.
+ */
+function blockingDetail(
+  copy: BriefCopy,
+  criticalCount: number,
+  highCount: number,
+  relevantHighs: number,
+  unresolvedHighs: number,
+  complete: boolean,
+): string {
+  const summary = [
+    criticalCount ? copy.blockingCritical(criticalCount) : "",
+    highCount ? copy.blockingHighs(highCount, relevantHighs, unresolvedHighs) : "",
+  ].filter(Boolean).join(copy.listSep);
+  const incompleteNote = !complete && unresolvedHighs > 0 ? copy.blockingIncomplete : "";
+  return `${copy.blockingPrefix(summary)}${incompleteNote}`;
 }
 
 /** Normalizes a diff path for scope/comparison. */
@@ -569,18 +813,19 @@ export function gateScope(
   diffComplete?: boolean | null,
 ): DecisionBriefGate {
   if (diffFiles === null || diffFiles === undefined) {
-    return { id: "scope", status: "unknown", detail: "缺少 diff 文件清单，无法核对改动范围" };
+    return { id: "scope", status: "unknown", detail: BRIEF_COPY_ZH.scopeMissing, detailEn: BRIEF_COPY_EN.scopeMissing };
   }
   const files = [...new Set(diffFiles.map(normalizeDiffPath).filter(Boolean))];
   if (files.length === 0) {
-    return { id: "scope", status: "unknown", detail: "diff 文件清单为空，无法核对改动范围" };
+    return { id: "scope", status: "unknown", detail: BRIEF_COPY_ZH.scopeEmpty, detailEn: BRIEF_COPY_EN.scopeEmpty };
   }
   const generated = files.filter(isGeneratedFile);
   if (generated.length > 0) {
     return {
       id: "scope",
       status: "red",
-      detail: `diff 含生成物/脏文件：${generated.slice(0, 6).join("、")}${generated.length > 6 ? " …" : ""}`,
+      detail: BRIEF_COPY_ZH.scopeGenerated(pathList(generated, BRIEF_COPY_ZH)),
+      detailEn: BRIEF_COPY_EN.scopeGenerated(pathList(generated, BRIEF_COPY_EN)),
     };
   }
   const allowed = (allowedPaths ?? []).map(normalizeDiffPath).filter(Boolean);
@@ -590,7 +835,8 @@ export function gateScope(
       return {
         id: "scope",
         status: "red",
-        detail: `diff 超出允许路径：${outside.slice(0, 6).join("、")}${outside.length > 6 ? " …" : ""}`,
+        detail: BRIEF_COPY_ZH.scopeOutside(pathList(outside, BRIEF_COPY_ZH)),
+        detailEn: BRIEF_COPY_EN.scopeOutside(pathList(outside, BRIEF_COPY_EN)),
       };
     }
   }
@@ -598,10 +844,21 @@ export function gateScope(
     return {
       id: "scope",
       status: "unknown",
-      detail: `${files.length} 个已列出的改动文件均为源文件，但改动清单不完整（可能被截断），无法排除未列出的生成物/越界文件`,
+      detail: BRIEF_COPY_ZH.scopeIncomplete(files.length),
+      detailEn: BRIEF_COPY_EN.scopeIncomplete(files.length),
     };
   }
-  return { id: "scope", status: "green", detail: `${files.length} 个改动文件均为源文件，未发现生成物/脏文件` };
+  return {
+    id: "scope",
+    status: "green",
+    detail: BRIEF_COPY_ZH.scopeGreen(files.length),
+    detailEn: BRIEF_COPY_EN.scopeGreen(files.length),
+  };
+}
+
+/** First six offending paths in one language (`、` vs `, `), with an ellipsis. */
+function pathList(files: string[], copy: BriefCopy): string {
+  return `${files.slice(0, 6).join(copy.pathSep)}${files.length > 6 ? " …" : ""}`;
 }
 
 /** File-path-looking tokens named directly in a criterion's text. */
@@ -648,17 +905,37 @@ export function gateAcceptance(
   const list = toCriteria(criteria);
   if (list.length === 0) {
     if (diffFiles === null || diffFiles === undefined) {
-      return { id: "acceptance", status: "unknown", detail: "无 AC/DoD 且缺少 diff，无法核对验收覆盖" };
+      return {
+        id: "acceptance",
+        status: "unknown",
+        detail: BRIEF_COPY_ZH.acceptanceNoCriteriaNoDiff,
+        detailEn: BRIEF_COPY_EN.acceptanceNoCriteriaNoDiff,
+      };
     }
-    return { id: "acceptance", status: "green", detail: "故事未定义 AC/DoD，无额外覆盖要求" };
+    return {
+      id: "acceptance",
+      status: "green",
+      detail: BRIEF_COPY_ZH.acceptanceNoCriteria,
+      detailEn: BRIEF_COPY_EN.acceptanceNoCriteria,
+    };
   }
   if (diffFiles === null || diffFiles === undefined) {
-    return { id: "acceptance", status: "unknown", detail: "缺少 diff 数据，无法核对验收覆盖" };
+    return {
+      id: "acceptance",
+      status: "unknown",
+      detail: BRIEF_COPY_ZH.acceptanceNoDiff,
+      detailEn: BRIEF_COPY_EN.acceptanceNoDiff,
+    };
   }
   const files = [...new Set(diffFiles.map(normalizeDiffPath).filter(Boolean))];
   const checkList = checks ?? [];
   if (files.length === 0) {
-    return { id: "acceptance", status: "red", detail: `未发现任何代码变更，${list.length} 条 AC/DoD 无从核对` };
+    return {
+      id: "acceptance",
+      status: "red",
+      detail: BRIEF_COPY_ZH.acceptanceNoChanges(list.length),
+      detailEn: BRIEF_COPY_EN.acceptanceNoChanges(list.length),
+    };
   }
   const missing: DecisionBriefCriterion[] = [];
   const unmapped: DecisionBriefCriterion[] = [];
@@ -672,17 +949,29 @@ export function gateAcceptance(
     return {
       id: "acceptance",
       status: "red",
-      detail: `${missing.length} 条 AC/DoD 指向的文件没有任何变更：${missing.map((item) => item.label || item.text).join("、")}`,
+      detail: BRIEF_COPY_ZH.acceptanceMissing(missing.length, criterionLabels(missing, BRIEF_COPY_ZH)),
+      detailEn: BRIEF_COPY_EN.acceptanceMissing(missing.length, criterionLabels(missing, BRIEF_COPY_EN)),
     };
   }
   if (unmapped.length > 0) {
     return {
       id: "acceptance",
       status: "unknown",
-      detail: `${unmapped.length} 条 AC/DoD 无法自动对应到变更或测试，需人工核对：${unmapped.map((item) => item.label || item.text).join("、")}`,
+      detail: BRIEF_COPY_ZH.acceptanceUnmapped(unmapped.length, criterionLabels(unmapped, BRIEF_COPY_ZH)),
+      detailEn: BRIEF_COPY_EN.acceptanceUnmapped(unmapped.length, criterionLabels(unmapped, BRIEF_COPY_EN)),
     };
   }
-  return { id: "acceptance", status: "green", detail: `${list.length} 条 AC/DoD 均能对应到变更或测试` };
+  return {
+    id: "acceptance",
+    status: "green",
+    detail: BRIEF_COPY_ZH.acceptanceGreen(list.length),
+    detailEn: BRIEF_COPY_EN.acceptanceGreen(list.length),
+  };
+}
+
+/** `AC#1、DoD#2` in one language. */
+function criterionLabels(items: DecisionBriefCriterion[], copy: BriefCopy): string {
+  return items.map((item) => item.label || item.text).join(copy.pathSep);
 }
 
 /** Event type → stop code, preserving the existing guard/needs_human vocabulary. */
@@ -729,10 +1018,16 @@ export function stopReasonFrom(events: DecisionBriefEventInput[] | null | undefi
     let code = STOP_REASON_CODES[type];
     if (!code && type.startsWith("guard.")) code = "guard";
     if (!code) continue;
+    const meta = slimMeta(event?.meta);
+    // Locale-aware events record the language they were written in and the
+    // English variant (`messageEn`) so a reader can render either; both are
+    // additive and absent on events written before docs/24-i18n.md §9.
     return {
       code,
       message: String(event?.message ?? "").trim(),
-      meta: slimMeta(event?.meta),
+      ...(typeof meta.messageEn === "string" && meta.messageEn.trim() ? { messageEn: meta.messageEn } : {}),
+      ...(isLocale(meta.locale) ? { locale: meta.locale } : {}),
+      meta,
     };
   }
   return { code: "unknown", message: "", meta: {} };
@@ -753,6 +1048,22 @@ export function recommendDecision(
   gates: DecisionBriefGate[],
   remaining: DecisionBriefRemainingItem[],
 ): DecisionBriefRecommendation {
+  const allGreen = gates.length > 0 && gates.every((gate) => gate.status === "green");
+  return {
+    action: allGreen ? "accept" : "continue",
+    note: recommendNote(BRIEF_COPY_ZH, gates, remaining, false),
+    // English variant of the same note (docs/24-i18n.md §9). The red `checks`
+    // gate detail embedded here reads the gate's own English text when present.
+    noteEn: recommendNote(BRIEF_COPY_EN, gates, remaining, true),
+  };
+}
+
+function recommendNote(
+  copy: BriefCopy,
+  gates: DecisionBriefGate[],
+  remaining: DecisionBriefRemainingItem[],
+  english: boolean,
+): string {
   const red = gates.filter((gate) => gate.status === "red");
   const unknown = gates.filter((gate) => gate.status === "unknown");
   const allGreen = gates.length > 0 && gates.every((gate) => gate.status === "green");
@@ -765,47 +1076,41 @@ export function recommendDecision(
     const low = remaining.filter((item) => item.severity === "low").length;
     const falsePositives = remaining.filter((item) => !item.evidenceOk).length;
     const recorded = [
-      medium ? `medium ${medium} 条` : "",
-      low ? `low ${low} 条` : "",
-      falsePositives ? `疑似误报 ${falsePositives} 条` : "",
+      medium ? copy.recoMedium(medium) : "",
+      low ? copy.recoLow(low) : "",
+      falsePositives ? copy.recoFalsePositives(falsePositives) : "",
     ].filter(Boolean);
-    return {
-      action: "accept",
-      note: recorded.length > 0
-        ? `四条硬门槛全绿，可接受交付。将记录的剩余项：${recorded.join("、")}。`
-        : "四条硬门槛全绿，无剩余问题，可接受交付。",
-    };
+    return recorded.length > 0
+      ? copy.recoAcceptWithRemaining(recorded.join(copy.pathSep))
+      : copy.recoAcceptPlain;
   }
 
   const parts: string[] = [];
   const persisting = pool.filter((item) => item.streak >= 3);
   if (persisting.length > 0) {
     const rounds = Math.max(...persisting.map((item) => item.streak));
-    parts.push(`同一批阻断问题连续 ${rounds} 轮未减少，方向可能不对：建议人工明确修法，或接受并记为技术债。`);
+    parts.push(copy.recoPersisting(rounds));
   }
 
   const checksGate = red.find((gate) => gate.id === "checks");
-  if (checksGate) parts.push(`${checksGate.detail}；请先修复检查再继续开发。`);
+  if (checksGate) parts.push(copy.recoFixChecks(english ? checksGate.detailEn ?? checksGate.detail : checksGate.detail));
 
   const primary = [...pool].sort(
     (a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity] || b.streak - a.streak || a.key.localeCompare(b.key),
   )[0];
   if (primary && primary.streak >= 2) {
-    parts.push(`优先修复 \`${fingerprintLabel(primary)}\`（已返修 ${primary.streak} 次未解决）；本次只改该点，不要改动其它文件。`);
+    parts.push(copy.recoPrimaryStreak(fingerprintLabel(primary), primary.streak));
   } else if (primary && red.some((gate) => gate.id === "blocking")) {
-    const extras = pool.length > 1 ? ` 等 ${pool.length} 项` : "";
-    parts.push(`按红项逐条修复：\`${fingerprintLabel(primary)}\`${extras}；不要改动其它文件。`);
+    parts.push(copy.recoPerRed(fingerprintLabel(primary), copy.recoPerRedExtras(pool.length)));
   } else if (!checksGate && red.length > 0) {
-    parts.push(`存在未通过的门槛（${red.map((gate) => gate.id).join("、")}），建议继续开发。`);
+    parts.push(copy.recoRedGates(red.map((gate) => gate.id).join(copy.pathSep)));
   }
 
   if (parts.length === 0) {
-    const unknownLabels = unknown.map((gate) => gate.id).join("、");
-    parts.push(unknownLabels
-      ? `数据不足（${unknownLabels}），无法确认可交付；建议继续开发或人工核对。`
-      : "无法确认可交付，建议继续开发。");
+    const unknownLabels = unknown.map((gate) => gate.id).join(copy.pathSep);
+    parts.push(unknownLabels ? copy.recoUnknown(unknownLabels) : copy.recoUnknownNone);
   }
-  return { action: "continue", note: parts.join(" ") };
+  return parts.join(" ");
 }
 
 function remainingItemOf(
@@ -835,17 +1140,22 @@ function remainingItemOf(
  * the same story.
  */
 export function diffScopeDetail(reason: DiffSetCompleteness): string {
+  return diffScopeDetailIn(BRIEF_COPY_ZH, reason);
+}
+
+/** English rendering of {@link diffScopeDetail} (docs/24-i18n.md §9). */
+function diffScopeDetailIn(copy: BriefCopy, reason: DiffSetCompleteness): string {
   switch (reason) {
     case "complete":
-      return "改动清单已证明完整（inline diff 与流水线记录的完整 diff 字节数一致）";
+      return copy.diffComplete;
     case "truncated":
-      return "inline diff 被流水线截断，改动清单可能不完整，无法据此排除相关性或越界文件";
+      return copy.diffTruncated;
     case "partial":
-      return "inline diff 短于流水线记录的完整 diff 字节数，改动清单可能不完整";
+      return copy.diffPartial;
     case "missing-metadata":
-      return "缺少可核对的完整 diff 元数据，无法证明改动清单完整";
+      return copy.diffMissingMetadata;
     default:
-      return "没有 inline diff，无法确认改动范围";
+      return copy.diffAbsent;
   }
 }
 
@@ -859,7 +1169,14 @@ function normalizeDiffProvenance(input: DecisionBriefInput): DecisionBriefDiffSc
   const inlineBytes = raw?.inlineBytes ?? null;
   const recordedBytes = raw?.recordedBytes ?? null;
   if (raw?.complete === true) {
-    return { complete: true, reason: "complete", inlineBytes, recordedBytes, detail: diffScopeDetail("complete") };
+    return {
+      complete: true,
+      reason: "complete",
+      inlineBytes,
+      recordedBytes,
+      detail: diffScopeDetailIn(BRIEF_COPY_ZH, "complete"),
+      detailEn: diffScopeDetailIn(BRIEF_COPY_EN, "complete"),
+    };
   }
   const hasFiles = (input.diffFiles ?? []).some((file) => typeof file === "string" && file.trim() !== "");
   const reason: DiffSetCompleteness = raw?.reason && raw.reason !== "complete"
@@ -867,7 +1184,14 @@ function normalizeDiffProvenance(input: DecisionBriefInput): DecisionBriefDiffSc
     : hasFiles
       ? "missing-metadata"
       : "absent";
-  return { complete: false, reason, inlineBytes, recordedBytes, detail: diffScopeDetail(reason) };
+  return {
+    complete: false,
+    reason,
+    inlineBytes,
+    recordedBytes,
+    detail: diffScopeDetailIn(BRIEF_COPY_ZH, reason),
+    detailEn: diffScopeDetailIn(BRIEF_COPY_EN, reason),
+  };
 }
 
 /**
@@ -884,7 +1208,13 @@ export function buildDecisionBrief(input: DecisionBriefInput): DecisionBrief {
   const diff = normalizeDiffProvenance(input);
   const diffComplete = diff.complete;
   const blockingGate: DecisionBriefGate = input.findings === null || input.findings === undefined
-    ? { id: "blocking", status: "unknown", detail: "缺少审核问题数据，无法确认是否存在阻断项", findings: [] }
+    ? {
+        id: "blocking",
+        status: "unknown",
+        detail: "缺少审核问题数据，无法确认是否存在阻断项",
+        detailEn: "No review finding data; cannot confirm whether blockers exist",
+        findings: [],
+      }
     : gateBlocking(findings, criteria, input.diffFiles, diffComplete);
   const gates: DecisionBriefGate[] = [
     gateChecks(checks),
@@ -901,6 +1231,7 @@ export function buildDecisionBrief(input: DecisionBriefInput): DecisionBrief {
     );
 
   return {
+    locale: asLocale(input.locale),
     stopReason: stopReasonFrom(input.events),
     gates,
     remaining,

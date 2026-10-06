@@ -408,4 +408,30 @@ describe("decision brief aggregation (docs/22 §6)", () => {
     const zeroLength = await collectDecisionBriefInput(db, run);
     expect(zeroLength.diff).toMatchObject({ complete: false, reason: "missing-metadata", recordedBytes: null });
   });
+
+  it("records the requester's locale and returns the English counterparts", async () => {
+    const db = await createTestDb();
+    const store = new PostgresRunStore(db);
+    const run = makeRun({ checks: [check()], diff });
+    await store.createRun(run, { runId: run.id, round: 1, source: "system", type: "run.created", message: "created", at: at(0) });
+    // A locale-aware stop event records its locale and the English variant.
+    await event(store, run, {
+      type: "run.needs_human",
+      message: "Maximum review rounds reached; human handling required",
+      meta: { locale: "en", messageEn: "Maximum review rounds reached; human handling required", durationMs: 9 },
+    });
+
+    const english = await readDecisionBrief(db, run, "en");
+    expect(english.locale).toBe("en");
+    expect(english.stopReason.code).toBe("max_review_rounds");
+    expect(english.stopReason.locale).toBe("en");
+    expect(english.stopReason.messageEn).toContain("Maximum review rounds");
+    expect(english.gates.find((gate) => gate.id === "checks")?.detail).toBe("1 项检查全部通过");
+    expect(english.gates.find((gate) => gate.id === "checks")?.detailEn).toBe("All 1 check(s) passed");
+
+    // Omitting the locale (every pre-existing caller) reads as Chinese.
+    const chinese = await readDecisionBrief(db, run);
+    expect(chinese.locale).toBe("zh");
+    expect(chinese.gates.find((gate) => gate.id === "checks")?.detail).toBe("1 项检查全部通过");
+  });
 });
