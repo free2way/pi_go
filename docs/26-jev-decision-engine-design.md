@@ -452,6 +452,18 @@ Authorization: Bearer <TYPESAFE_API_KEY>
 
 所有尝试共享一个 3 秒总预算。`AbortSignal` 必须真正取消底层请求。
 
+## 12.5 成本口径（额度与价目表）
+
+决策平面不像 Pi 运行时那样有 provider 上报的 `usage.cost`，因此成本由本地口径给：
+`input_tokens/output_tokens` × **价目表**（`model-prices.json`，按 `effectiveFrom` 取最新一行），
+落在 `decision_evaluations.estimated_cost_usd`；而"买了多少额度"是**人工录入**的
+（`provider-credits.json` / 界面 / `PUT /api/provider-credits`）。
+
+两条不可退让的语义：**没录入额度是「未录入」而不是 $0.00**；**模型不在价目表里 → 该次调用未计价，
+已花只是下界（界面显示 `≥`）**。角色用量（developer/reviewer）不受影响——那里用的是 provider
+自己上报的 `usage.cost`。实现：`src/shared/model-prices.ts`、`src/shared/provider-credits.ts`、
+`src/server/provider-credits-routes.ts`。
+
 ## 13. 持久化与审计
 
 新增 `decision_evaluations` 表，建议字段如下：

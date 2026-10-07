@@ -94,6 +94,9 @@ services:
       HOST: 0.0.0.0
       PORT: 3100
       PI_AUTH_MODE: development
+      # development 模式下的缺省身份：浏览器不带 x-pigo-dev-email 头时用它，否则控制台永远是 developer@localhost（非管理员），管理员操作没有入口。
+      # 生产不使用 development 模式（构造函数会拒绝 NODE_ENV=production 的组合）。
+      PI_DEV_DEFAULT_EMAIL: ${PI_DEV_DEFAULT_EMAIL:-}
       PI_DATA_FILE: /app/data/runs.json
       # The mounted host credential file — deliberately NOT /tmp. The stack uses
       # one shared vault; /tmp would silently create an empty throwaway vault.

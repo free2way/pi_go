@@ -180,6 +180,31 @@ cd source && docker compose -f deploy/docker/compose.demo.yaml \
 只被 web 读。宿主机 `/app/pi-agent/compose.yaml` 决定哪些变量能进容器——它曾落后仓库一整段 Jev 变量
 （导致"改了 .env 却不生效"），新增 compose 变量时务必同步宿主机副本。
 
+## 额度与价目表（人工录入）
+
+provider 的**账户余额查不到**（仓库只调 System One 的业务端点），所以"买了多少额度"由人录入；
+"花了多少"由决策审计的 `input_tokens/output_tokens` × 价目表算出。两份都是宿主侧文件：
+
+| 文件（宿主） | 容器内 | 内容 |
+| --- | --- | --- |
+| `${PIGO_DEMO_DATA_DIR}/provider-credits.json` | `/app/data/provider-credits.json` | 人工额度：`{ "credits": [{ "provider": "typesafe", "creditedUsd": 10 }] }`（权限 600） |
+| `${PIGO_DEMO_DATA_DIR}/model-prices.json` | `/app/data/model-prices.json` | 价目表：`{ "entries": [{ "provider": "typesafe", "model": "jev-1.13.0", "inputPerMTok": 0.15, "outputPerMTok": 0.6 }] }` |
+
+三条操作方式（任选其一）：
+
+1. **界面**：控制台「系统状态」页的 **COST / Provider 额度** 卡片，管理员可直接填金额并保存。
+2. **API**：`GET /api/provider-credits` 读；`PUT /api/provider-credits` 写
+   （body `{provider, creditedUsd, currency?, note?}`，**仅管理员**，非法值 422、文件损坏 409）。
+3. **直接改文件**：改完下一次读取即生效（无需重启；读取失败/损坏会如实上报 `integrity`）。
+
+语义（与 AT-JEV-062 一致，界面按此显示）：
+**没录入额度 = 「未录入」，不是 $0.00**；**模型不在价目表里 = 该次调用未计价**，已花显示为
+**下界（`≥ …`）**，绝不把缺价当免费。
+
+浏览器缺省身份：`PI_DEV_DEFAULT_EMAIL`（demo 设成 `bobo.2000@gmail.com`）。development 模式下身份
+只来自 `x-pigo-dev-email` 头，缺省若仍是 `developer@localhost`（非管理员），管理员操作在界面上
+就没有入口。该变量只在 development 分支生效（`NODE_ENV=production` + development 会被拒绝）。
+
 ## 常用命令
 
 ```sh
