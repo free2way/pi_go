@@ -14,8 +14,14 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { localizeError } from "../shared/i18n";
+import type { ProviderCreditsResponse } from "../shared/provider-credits-api";
 import { api, type DecisionMetricsResponse, type SystemStatusResponse } from "./api";
 import { useT } from "./i18n";
+import {
+  parseCreditInput,
+  providerCreditNotices,
+  providerCreditRows,
+} from "./provider-credits-view";
 import {
   activeRunsSummary,
   databaseLabel,
@@ -49,11 +55,21 @@ const formatTimestamp = (value: string | null | undefined, locale: Locale = DEFA
 };
 
 /** SYS-01: read-only system status dashboard with 15s auto-refresh. */
-export function SystemStatusPage() {
+export interface SystemStatusPageProps {
+  /** 额度录入是管理员操作（服务端也会再判一次，UI 只是不显示无权限的表单）。 */
+  isAdmin?: boolean;
+}
+
+export function SystemStatusPage({ isAdmin = false }: SystemStatusPageProps = {}) {
   const { t, locale } = useT();
   const [status, setStatus] = useState<SystemStatusResponse>();
   const [metrics, setMetrics] = useState<DecisionMetricsResponse>();
   const [metricsFailed, setMetricsFailed] = useState(false);
+  const [credits, setCredits] = useState<ProviderCreditsResponse>();
+  const [creditProvider, setCreditProvider] = useState("typesafe");
+  const [creditAmount, setCreditAmount] = useState("");
+  const [creditSaving, setCreditSaving] = useState(false);
+  const [creditMessage, setCreditMessage] = useState("");
   const [error, setError] = useState("");
   const [refreshing, setRefreshing] = useState(false);
   const [paused, setPaused] = useState(false);
@@ -74,6 +90,12 @@ export function SystemStatusPage() {
     } catch {
       setMetrics(undefined);
       setMetricsFailed(true);
+    }
+    // AT-JEV-062: 额度同样是独立、尽力而为的读数：失败不能影响其它面板。
+    try {
+      setCredits(await api.providerCredits());
+    } catch {
+      setCredits(undefined);
     } finally {
       setRefreshing(false);
     }
@@ -86,6 +108,26 @@ export function SystemStatusPage() {
     const timer = setInterval(() => { void load(); }, REFRESH_MS);
     return () => clearInterval(timer);
   }, [paused, load]);
+
+  const saveCredit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const amount = parseCreditInput(creditAmount);
+    if (amount === undefined) {
+      setCreditMessage(t("credits.form.invalid"));
+      return;
+    }
+    setCreditSaving(true);
+    try {
+      await api.setProviderCredit({ provider: creditProvider, creditedUsd: amount });
+      setCreditMessage(t("credits.form.saved"));
+      setCreditAmount("");
+      setCredits(await api.providerCredits());
+    } catch (cause) {
+      setCreditMessage(localizeError(locale, cause as { code?: string; message?: string }, t("credits.form.invalid")));
+    } finally {
+      setCreditSaving(false);
+    }
+  };
 
   const deployments = status?.deployments ?? null;
   const database = status?.infrastructure.database;
@@ -245,6 +287,47 @@ export function SystemStatusPage() {
                   {metrics.metrics.truncated ? <div className="sys-hint">{t("decisions.metrics.truncated", { limit: metrics.window.limit })}</div> : null}
                 </>
               ) : <div className="sys-row"><span>{t("decisions.metrics.title")}</span><strong>{t("system.loading")}</strong></div>}
+            </div>
+          </section>
+
+          {/* AT-JEV-062: 额度是人工录入的（余额查不到），已花由审计 token × 价目表算出。
+              未录入显示「未录入」，存在未计价调用时金额带 ≥ —— 绝不把缺价当成 0。 */}
+          <section className="panel sys-card sys-card-wide">
+            <div className="panel-head"><div><span className="eyebrow">COST</span><h3>{t("credits.title")}</h3></div><DollarSign size={15} /></div>
+            <div className="sys-body">
+              {credits ? (
+                <>
+                  {providerCreditNotices(credits, locale).map((notice, index) => (
+                    <div key={`credit-notice-${index}`} className="sys-hint">{notice}</div>
+                  ))}
+                  {providerCreditRows(credits, locale).map((row) => (
+                    <div key={row.key} className="sys-row">
+                      <span>{row.label}</span>
+                      <strong className={row.tone === "error" ? "is-warn" : row.tone === "ok" ? "is-ok" : ""}>{row.value}</strong>
+                    </div>
+                  ))}
+                  {isAdmin ? (
+                    <form className="sys-row" onSubmit={saveCredit}>
+                      <label htmlFor="credit-provider">{t("credits.form.label", { currency: credits.currency })}</label>
+                      <select id="credit-provider" value={creditProvider} onChange={(event) => setCreditProvider(event.target.value)}>
+                        {[...new Set(["typesafe", ...credits.credits.map((entry) => entry.provider).filter(Boolean)])].map((provider) => (
+                          <option key={provider} value={provider}>{provider}</option>
+                        ))}
+                      </select>
+                      <input
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        value={creditAmount}
+                        onChange={(event) => setCreditAmount(event.target.value)}
+                        aria-label={t("credits.form.label", { currency: credits.currency })}
+                      />
+                      <button type="submit" disabled={creditSaving}>{t("credits.form.save")}</button>
+                      {creditMessage ? <span className="sys-hint">{creditMessage}</span> : null}
+                    </form>
+                  ) : <div className="sys-hint">{t("credits.form.adminOnly")}</div>}
+                </>
+              ) : <div className="sys-row"><span>{t("credits.title")}</span><strong className="is-warn">{t("system.unavailable")}</strong></div>}
             </div>
           </section>
         </div>

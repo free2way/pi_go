@@ -11,7 +11,8 @@ import { dirname, join } from "node:path";
 import { EMPTY_MODEL_PRICE_TABLE, parseModelPriceTable, type ModelPriceTable } from "../shared/model-prices.js";
 import { EMPTY_PROVIDER_CREDIT_BOOK, parseProviderCreditBook, type ProviderCreditBook } from "../shared/provider-credits.js";
 
-export type ConfigIntegrity = "ok" | "missing" | "invalid";
+import type { ConfigIntegrity } from "../shared/provider-credits-api.js";
+export type { ConfigIntegrity };
 
 export interface ConfigFileState<T> {
   value: T;

@@ -1908,7 +1908,7 @@ export function App() {
         </header>
 
         {view === "system" ? (
-          <SystemStatusPage />
+          <SystemStatusPage isAdmin={Boolean(user?.isAdmin)} />
         ) : view === "models" ? (
           <ModelsPage config={config} onChanged={() => { void api.config().then(setConfig); }} />
         ) : view === "workspaces" ? (

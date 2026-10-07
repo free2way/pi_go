@@ -19,36 +19,17 @@ import {
   parseProviderCreditBook,
   setProviderCredit,
   summarizeProviderSpend,
-  type CreditStatus,
   type ProviderCreditBook,
   type ProviderSpend,
   type SpendRow,
 } from "../shared/provider-credits.js";
+import {
+  PROVIDER_CREDITS_PATH,
+  type ProviderCreditUpdateResponse,
+  type ProviderCreditsResponse,
+} from "../shared/provider-credits-api.js";
 import type { ConfigFileState } from "./provider-cost-config.js";
-
-export const PROVIDER_CREDITS_PATH = "/api/provider-credits";
-
-export interface ProviderCreditsResponse {
-  schemaVersion: 1;
-  currency: string;
-  computedAt: string;
-  /** 每个 provider 一行：额度（可能未录入）+ 已花费（可能只是下界）。 */
-  credits: CreditStatus[];
-  /** 审计里出现过的 provider 的原始花费聚合（便于核对"为什么是这个数"）。 */
-  spend: ProviderSpend[];
-  source: {
-    creditsFile: string;
-    creditsIntegrity: ConfigFileState<ProviderCreditBook>["integrity"];
-    creditsDetail?: string;
-    pricesFile: string;
-    pricesIntegrity: ConfigFileState<ModelPriceTable>["integrity"];
-    pricesDetail?: string;
-    /** 计价时读到的审计行数（受审计读取上限约束，界面据此判断是否为全量）。 */
-    rows: number;
-    /** true 表示读取被上限截断，已花费只是已读部分的合计。 */
-    truncated: boolean;
-  };
-}
+export { PROVIDER_CREDITS_PATH };
 
 export interface ProviderCreditsRouteDeps {
   sessionAuthorized?: (request: FastifyRequest) => boolean;
@@ -209,6 +190,10 @@ export function registerProviderCreditsRoutes(app: FastifyInstance, deps: Provid
     }
     const body = await snapshot();
     const status = body.credits.find((row) => row.provider === input.provider);
-    return { ...body, updated: status ?? { provider: input.provider, currency: body.currency, spentUsd: 0, spentComplete: false, level: "unknown" } };
+    const response: ProviderCreditUpdateResponse = {
+      ...body,
+      updated: status ?? { provider: input.provider, currency: body.currency, spentUsd: 0, spentComplete: false, level: "unknown" },
+    };
+    return response;
   });
 }

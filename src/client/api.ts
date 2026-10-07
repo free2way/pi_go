@@ -1,3 +1,4 @@
+import type { ProviderCreditUpdate, ProviderCreditUpdateResponse, ProviderCreditsResponse } from "../shared/provider-credits-api";
 import type { AgileMetricsResponse, ReleaseRetrospective, ReleaseSummary } from "../shared/agile-metrics";
 import type { DecisionBrief } from "../shared/decision-brief";
 import type { DecisionAuditProjection } from "../shared/decision-audit";
@@ -189,6 +190,10 @@ export const api = {
    * The server window/threshold are configured by env, not by the caller.
    */
   decisionMetrics: () => request<DecisionMetricsResponse>("/api/decisions/metrics"),
+  /** AT-JEV-062：人工录入的 provider 额度 + 由决策审计算出的已花费（运营读数）。 */
+  providerCredits: () => request<ProviderCreditsResponse>("/api/provider-credits"),
+  setProviderCredit: (body: ProviderCreditUpdate) =>
+    request<ProviderCreditUpdateResponse>("/api/provider-credits", { method: "PUT", body: JSON.stringify(body) }),
   artifacts: (id: string) => request<{ artifacts: RunArtifact[] }>(`/api/runs/${id}/artifacts`),
   artifactDownloadUrl: (id: string, artifactId: string) => `/api/runs/${id}/artifacts/${encodeURIComponent(artifactId)}/download`,
   /** A1: full run patch (regenerated on the worker when no artifact body exists). */
