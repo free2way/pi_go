@@ -705,3 +705,206 @@ describe("AgileService release publish", () => {
     expect(stories[0]).toMatchObject({ status: "blocked", reason: "等待上游" });
   });
 });
+
+describe("AgileService sprint editing", () => {
+  it("更新冲刺的名称、目标、状态与起止日期", async () => {
+    const { service, project } = await seed();
+    const sprint = await service.createSprint("user_a", {
+      projectId: project.id,
+      name: "Sprint 1",
+      goal: "完成登录",
+      startDate: "2026-01-01",
+      endDate: "2026-01-14",
+    });
+    expect(sprint).toMatchObject({ name: "Sprint 1", goal: "完成登录", status: "planned", startDate: "2026-01-01", endDate: "2026-01-14" });
+
+    const patched = await service.updateSprint(["user_a"], sprint.id, {
+      name: "Sprint 1 改名",
+      goal: "完成登录与鉴权",
+      status: "active",
+      startDate: "2026-01-02",
+      endDate: "2026-01-15",
+    });
+    expect(patched).toMatchObject({
+      name: "Sprint 1 改名",
+      goal: "完成登录与鉴权",
+      status: "active",
+      startDate: "2026-01-02",
+      endDate: "2026-01-15",
+    });
+  });
+
+  it("目标传空串清空为 \"\"、日期传 null 清空为 null", async () => {
+    const { service, project } = await seed();
+    const sprint = await service.createSprint("user_a", {
+      projectId: project.id,
+      name: "Sprint 1",
+      goal: "完成登录",
+      startDate: "2026-01-01",
+      endDate: "2026-01-14",
+    });
+
+    const cleared = await service.updateSprint(["user_a"], sprint.id, { goal: "", startDate: null, endDate: null });
+    expect(cleared).toMatchObject({ goal: "", startDate: null, endDate: null });
+  });
+
+  it("省略字段保留原值，只有显式传入的字段被改写", async () => {
+    const { service, project } = await seed();
+    const sprint = await service.createSprint("user_a", { projectId: project.id, name: "Sprint 1", goal: "完成登录", startDate: "2026-01-01" });
+
+    const patched = await service.updateSprint(["user_a"], sprint.id, { status: "closed" });
+    expect(patched).toMatchObject({ name: "Sprint 1", goal: "完成登录", startDate: "2026-01-01", status: "closed" });
+  });
+
+  it("非 owner 编辑冲刺返回 SPRINT_NOT_FOUND，管理员可以编辑他人冲刺", async () => {
+    const { service, project } = await seed();
+    const sprint = await service.createSprint("user_a", { projectId: project.id, name: "Sprint 1" });
+
+    await expect(service.updateSprint(["user_b"], sprint.id, { name: "越权改名" })).rejects.toMatchObject({ code: "SPRINT_NOT_FOUND", status: 404 });
+    // 管理员可编辑他人冲刺
+    expect((await service.updateSprint(["user_b"], sprint.id, { name: "管理员改名" }, true)).name).toBe("管理员改名");
+  });
+});
+
+describe("AgileService story editing", () => {
+  it("编辑故事的标题、描述、验收标准、完成定义与优先级", async () => {
+    const { service, project } = await seed();
+    const story = await service.createStory("user_a", {
+      projectId: project.id,
+      title: "限流",
+      description: "给 session 加限流",
+      acceptanceCriteria: ["返回 429"],
+      definitionOfDone: ["测试通过"],
+      priority: "should",
+    });
+
+    const patched = await service.updateStory(["user_a"], story.id, {
+      title: "登录限流",
+      description: "给登录接口加限流",
+      acceptanceCriteria: ["返回 429", "可重试"],
+      definitionOfDone: ["单测通过", "已上线"],
+      priority: "must",
+    });
+    expect(patched).toMatchObject({ title: "登录限流", description: "给登录接口加限流", priority: "must" });
+    expect(patched.acceptanceCriteria).toEqual(["返回 429", "可重试"]);
+    expect(patched.definitionOfDone).toEqual(["单测通过", "已上线"]);
+  });
+
+  it("编辑估算、并发、预算与开发/评审模型", async () => {
+    const { service, project } = await seed();
+    const story = await service.createStory("user_a", { projectId: project.id, title: "限流" });
+
+    const patched = await service.updateStory(["user_a"], story.id, {
+      estimate: 8,
+      maxParallel: 3,
+      budget: { maxTokens: 1000, maxCostUsd: 1, maxModelCalls: 5, maxDurationSeconds: 60 },
+      developerModel: { provider: "deepseek", model: "flash" },
+      reviewerModel: { provider: "openai-proxy", model: "gpt" },
+    });
+    expect(patched).toMatchObject({ estimate: 8, maxParallel: 3 });
+    expect(patched.budget).toEqual({ maxTokens: 1000, maxCostUsd: 1, maxModelCalls: 5, maxDurationSeconds: 60 });
+    expect(patched.developerModel).toEqual({ provider: "deepseek", model: "flash" });
+    expect(patched.reviewerModel).toEqual({ provider: "openai-proxy", model: "gpt" });
+  });
+
+  it("把故事放入冲刺，sprintId: null 等于放回 backlog", async () => {
+    const { service, project } = await seed();
+    const sprint = await service.createSprint("user_a", { projectId: project.id, name: "Sprint 1" });
+    const story = await service.createStory("user_a", { projectId: project.id, title: "故事" });
+
+    expect((await service.updateStory(["user_a"], story.id, { sprintId: sprint.id })).sprintId).toBe(sprint.id);
+    expect((await service.updateStory(["user_a"], story.id, { sprintId: null })).sprintId).toBeNull();
+  });
+
+  it("工作区可编辑并可用 null 清空", async () => {
+    const { service, project } = await seed();
+    const story = await service.createStory("user_a", { projectId: project.id, title: "故事" });
+
+    expect((await service.updateStory(["user_a"], story.id, { workspaceId: "ws_1" })).workspaceId).toBe("ws_1");
+    expect((await service.updateStory(["user_a"], story.id, { workspaceId: null })).workspaceId).toBeNull();
+  });
+
+  it("描述传空串清空为 \"\"、验收标准与完成定义传空数组清空为 []", async () => {
+    const { service, project } = await seed();
+    const story = await service.createStory("user_a", {
+      projectId: project.id,
+      title: "限流",
+      description: "给 session 加限流",
+      acceptanceCriteria: ["返回 429"],
+      definitionOfDone: ["测试通过"],
+    });
+
+    const cleared = await service.updateStory(["user_a"], story.id, { description: "", acceptanceCriteria: [], definitionOfDone: [] });
+    expect(cleared.description).toBe("");
+    expect(cleared.acceptanceCriteria).toEqual([]);
+    expect(cleared.definitionOfDone).toEqual([]);
+  });
+
+  it("估算、并发、预算与开发/评审模型可传 null 清空", async () => {
+    const { service, project } = await seed();
+    const story = await service.createStory("user_a", {
+      projectId: project.id,
+      title: "限流",
+      estimate: 5,
+      maxParallel: 2,
+      budget: { maxTokens: 1000, maxCostUsd: 1, maxModelCalls: 5, maxDurationSeconds: 60 },
+      developerModel: { provider: "deepseek", model: "flash" },
+      reviewerModel: { provider: "openai-proxy", model: "gpt" },
+    });
+
+    const cleared = await service.updateStory(["user_a"], story.id, {
+      estimate: null,
+      maxParallel: null,
+      budget: null,
+      developerModel: null,
+      reviewerModel: null,
+    });
+    expect(cleared).toMatchObject({ estimate: null, maxParallel: null, budget: null, developerModel: null, reviewerModel: null });
+  });
+
+  it("省略字段保留原值，只有显式传入的字段被改写", async () => {
+    const { service, project } = await seed();
+    const story = await service.createStory("user_a", {
+      projectId: project.id,
+      title: "原始标题",
+      description: "原始描述",
+      priority: "must",
+      estimate: 5,
+    });
+
+    const patched = await service.updateStory(["user_a"], story.id, { title: "新标题" });
+    expect(patched).toMatchObject({ title: "新标题", description: "原始描述", priority: "must", estimate: 5 });
+  });
+
+  it("每次编辑都刷新 updatedAt 且不改动 createdAt", async () => {
+    const db = await createTestDb();
+    let clock = "2026-02-01T00:00:00.000Z";
+    const service = new AgileService(db, () => clock);
+    const project = await service.createProject("user_a", { name: "认证服务", key: "AUTH" });
+    const story = await service.createStory("user_a", { projectId: project.id, title: "原始标题" });
+
+    clock = "2026-02-02T00:00:00.000Z";
+    const patched = await service.updateStory(["user_a"], story.id, { title: "新标题" });
+    expect(patched.updatedAt).toBe("2026-02-02T00:00:00.000Z");
+    expect(patched.updatedAt).not.toBe(story.updatedAt);
+    expect(patched.createdAt).toBe(story.createdAt);
+  });
+
+  it("把故事指派到其它项目的冲刺返回 SPRINT_NOT_FOUND (422)", async () => {
+    const { service, project } = await seed();
+    const other = await service.createProject("user_a", { name: "支付", key: "PAY" });
+    const sprint = await service.createSprint("user_a", { projectId: other.id, name: "Sprint 支付" });
+    const story = await service.createStory("user_a", { projectId: project.id, title: "故事" });
+
+    await expect(service.updateStory(["user_a"], story.id, { sprintId: sprint.id })).rejects.toMatchObject({ code: "SPRINT_NOT_FOUND", status: 422 });
+  });
+
+  it("非 owner 编辑故事返回 STORY_NOT_FOUND，管理员可以编辑他人故事", async () => {
+    const { service, project } = await seed();
+    const story = await service.createStory("user_a", { projectId: project.id, title: "故事" });
+
+    await expect(service.updateStory(["user_b"], story.id, { title: "越权改名" })).rejects.toMatchObject({ code: "STORY_NOT_FOUND", status: 404 });
+    // 管理员可编辑他人故事
+    expect((await service.updateStory(["user_b"], story.id, { title: "管理员改名" }, true)).title).toBe("管理员改名");
+  });
+});

@@ -1,14 +1,14 @@
-import { FolderCog, BarChart3, ClipboardList, Copy, Download, LayoutTemplate, ListChecks, LoaderCircle, Pencil, Plus, Rocket, RotateCcw, Trash2, X } from "lucide-react";
+import { FolderCog, BarChart3, ClipboardList, Copy, Download, LayoutTemplate, ListChecks, LoaderCircle, Pencil, Plus, Rocket, RotateCcw, Save, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { DEFAULT_LOCALE, intlLocale, localizeError, t, type Locale, type MessageKey } from "../shared/i18n";
 import { useT } from "./i18n";
 import { runStateKey } from "./requirement-history";
-import { applyModelTemplate, RELEASE_STATUSES, STORY_PRIORITIES, STORY_STATUSES, type AgileProject, type AgileRelease, type AgileSprint, type AgileStory, type ModelTemplate, type ReleaseDeployRecord, type ReleaseStatus, type StoryDetail, type StoryPriority, type StoryStatus } from "../shared/agile";
+import { applyModelTemplate, RELEASE_STATUSES, SPRINT_STATUSES, STORY_PRIORITIES, STORY_STATUSES, type AgileProject, type AgileRelease, type AgileSprint, type AgileStory, type ModelTemplate, type ReleaseDeployRecord, type ReleaseStatus, type SprintStatus, type StoryDetail, type StoryPriority, type StoryStatus } from "../shared/agile";
 import type { AgileMetricsResponse, ReleaseRetrospective, ReleaseSummary } from "../shared/agile-metrics";
 import type { ConfigStatus, ModelCatalogResponse, Workspace } from "../shared/types";
 import { api } from "./api";
-import { agileFormErrorMessage, buildReleaseInput, buildTemplateInput, parseModelSelection } from "./agile-forms";
-import { boardColumnKey, columnPoints, estimateLabel, groupStoriesByColumn, priorityKey, priorityLabel, RELEASE_DEPLOY_ACTION_KEYS, releaseDeployAction, releaseExportFilename, releaseExportJson, splitLines, storyReference, storyStatusKey , projectContentsLabel, projectDeletionWarning } from "./agile-view";
+import { agileFormErrorMessage, buildReleaseInput, buildSprintInput, buildStoryInput, buildTemplateInput, sprintToFormValues, storyToFormValues, STORY_ESTIMATES } from "./agile-forms";
+import { boardColumnKey, columnPoints, estimateLabel, groupStoriesByColumn, priorityKey, priorityLabel, RELEASE_DEPLOY_ACTION_KEYS, releaseDeployAction, releaseExportFilename, releaseExportJson, storyReference, storyStatusKey , projectContentsLabel, projectDeletionWarning } from "./agile-view";
 
 /** Catalog key for the sprint/release/deploy badges (labels live in the catalog). */
 const sprintStatusKey = (status: AgileSprint["status"]): MessageKey => `agile.sprintStatus.${status}` as MessageKey;
@@ -25,10 +25,6 @@ function formatDuration(seconds: number, locale: Locale = DEFAULT_LOCALE): strin
   if (seconds >= 3_600) return t(locale, "agile.duration.hours", { value: (seconds / 3_600).toFixed(1) });
   if (seconds >= 60) return t(locale, "agile.duration.minutes", { value: Math.round(seconds / 60) });
   return t(locale, "agile.duration.seconds", { value: Math.round(seconds) });
-}
-
-function parseModel(value: string): { provider: string; model: string } | undefined {
-  return parseModelSelection(value);
 }
 
 /** Sprint 3 batch 1: project/story planning on top of the existing run engine. */
@@ -94,10 +90,17 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
   // new-project form
   const [projectName, setProjectName] = useState("");
   const [projectKey, setProjectKey] = useState("");
-  // new-sprint form
+  // new-sprint form — `sprintManageId` empty = create mode, otherwise the edited sprint.
+  const [sprintManageId, setSprintManageId] = useState("");
   const [sprintName, setSprintName] = useState("");
   const [sprintGoal, setSprintGoal] = useState("");
-  // new-story form
+  const [sprintStart, setSprintStart] = useState("");
+  const [sprintEnd, setSprintEnd] = useState("");
+  const [sprintFormStatus, setSprintFormStatus] = useState<SprintStatus>("planned");
+  // new-story form — `storyManageId` empty = create mode, otherwise the edited story.
+  // One form instance serves both, exactly like 「发布管理」: fill it with
+  // `storyToFormValues` to edit, and `saveStory` picks POST or PATCH.
+  const [storyManageId, setStoryManageId] = useState("");
   const [storyTitle, setStoryTitle] = useState("");
   const [storyDescription, setStoryDescription] = useState("");
   const [storyCriteria, setStoryCriteria] = useState("");
@@ -270,19 +273,55 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
     }
   };
 
-  const createSprint = async (event: React.FormEvent) => {
+  // 冲刺表单: create + edit share one form (`sprintManageId` decides POST vs PATCH),
+  // mirroring 「发布管理」. Every field is sent, so clearing goal/dates sticks
+  // (server: omitted = keep, `null`/`""` = clear).
+  const resetSprintForm = () => {
+    setSprintManageId("");
+    setSprintName("");
+    setSprintGoal("");
+    setSprintStart("");
+    setSprintEnd("");
+    setSprintFormStatus("planned");
+  };
+
+  const closeSprintForm = () => {
+    resetSprintForm();
+    setPanel("none");
+  };
+
+  const editSprint = (sprint: AgileSprint) => {
+    const values = sprintToFormValues(sprint);
+    setSprintManageId(sprint.id);
+    setSprintName(values.name);
+    setSprintGoal(values.goal);
+    setSprintStart(values.startDate);
+    setSprintEnd(values.endDate);
+    setSprintFormStatus(values.status);
+    setPanel("sprint");
+    setError("");
+  };
+
+  const saveSprint = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!projectId) { setError(t("agile.error.selectProjectFirst")); return; }
+    const built = buildSprintInput({ name: sprintName, goal: sprintGoal, startDate: sprintStart, endDate: sprintEnd, status: sprintFormStatus }, locale);
+    if (!built.ok) { setError(built.message); return; }
+    const editing = sprintManageId !== "";
     setBusy("sprint");
     setError("");
     try {
-      const sprint = await api.createSprint({ projectId, name: sprintName.trim(), goal: sprintGoal.trim() });
-      setSprints((current) => [sprint, ...current]);
-      setSprintName("");
-      setSprintGoal("");
-      setPanel("none");
+      if (editing) {
+        const updated = await api.patchSprint(sprintManageId, built.input);
+        setSprints((current) => current.map((item) => (item.id === updated.id ? updated : item)));
+        setNotice(t("agile.sprintForm.updated"));
+      } else {
+        const sprint = await api.createSprint({ projectId, ...built.input });
+        setSprints((current) => [sprint, ...current]);
+      }
+      closeSprintForm();
     } catch (cause) {
-      setError(localizeError(locale, cause as { code?: string; message?: string }, t("agile.error.createSprint")));
+      setError(agileFormErrorMessage(cause, t(editing ? "agile.error.patchSprint" : "agile.error.createSprint"), locale));
     } finally {
       setBusy("");
     }
@@ -354,45 +393,96 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
     }
   };
 
-  const createStory = async (event: React.FormEvent) => {
+  // 故事表单: create + edit share one form, same switch as the sprint form above.
+  const resetStoryForm = () => {
+    setStoryManageId("");
+    setStoryTitle("");
+    setStoryDescription("");
+    setStoryCriteria("");
+    setStoryDod("");
+    setStoryEstimate("");
+    setStoryMaxParallel("");
+    setStoryDeveloper("");
+    setStoryReviewer("");
+    setStoryWorkspace("");
+    setStorySprint("");
+    setStoryTemplate("");
+    setStoryPriority("should");
+    setBudgetTokens("");
+    setBudgetCost("");
+    setBudgetCalls("");
+    setBudgetSeconds("");
+  };
+
+  const closeStoryForm = () => {
+    resetStoryForm();
+    setPanel("none");
+  };
+
+  /** Fill the story form from an existing story (list row, board card or detail panel). */
+  const editStory = (story: AgileStory) => {
+    const values = storyToFormValues(story);
+    setStoryManageId(story.id);
+    setStoryTitle(values.title);
+    setStoryDescription(values.description);
+    setStoryCriteria(values.acceptanceCriteria);
+    setStoryDod(values.definitionOfDone);
+    setStoryPriority(values.priority);
+    setStoryEstimate(values.estimate);
+    setStorySprint(values.sprintId);
+    setStoryWorkspace(values.workspaceId);
+    setStoryDeveloper(values.developerModel);
+    setStoryReviewer(values.reviewerModel);
+    setStoryMaxParallel(values.maxParallel);
+    setBudgetTokens(values.budgetTokens);
+    setBudgetCost(values.budgetCostUsd);
+    setBudgetCalls(values.budgetModelCalls);
+    setBudgetSeconds(values.budgetDurationSeconds);
+    setStoryTemplate("");
+    setPanel("story");
+    setError("");
+    setNotice("");
+  };
+
+  const saveStory = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!projectId) { setError(t("agile.error.selectProjectFirst")); return; }
+    const built = buildStoryInput({
+      title: storyTitle,
+      description: storyDescription,
+      acceptanceCriteria: storyCriteria,
+      definitionOfDone: storyDod,
+      priority: storyPriority,
+      estimate: storyEstimate,
+      sprintId: storySprint,
+      workspaceId: storyWorkspace,
+      developerModel: storyDeveloper,
+      reviewerModel: storyReviewer,
+      maxParallel: storyMaxParallel,
+      budgetTokens,
+      budgetCostUsd: budgetCost,
+      budgetModelCalls: budgetCalls,
+      budgetDurationSeconds: budgetSeconds,
+    }, locale);
+    if (!built.ok) { setError(built.message); return; }
+    const editing = storyManageId !== "";
     setBusy("story");
     setError("");
-    const budgetGiven = [budgetTokens, budgetCost, budgetCalls, budgetSeconds].some((value) => value.trim() !== "");
     try {
-      const story = await api.createStory({
-        projectId,
-        title: storyTitle.trim(),
-        description: storyDescription.trim(),
-        acceptanceCriteria: splitLines(storyCriteria),
-        definitionOfDone: splitLines(storyDod),
-        priority: storyPriority,
-        estimate: storyEstimate ? Number(storyEstimate) : null,
-        sprintId: storySprint || null,
-        workspaceId: storyWorkspace || null,
-        developerModel: parseModel(storyDeveloper) ?? null,
-        reviewerModel: parseModel(storyReviewer) ?? null,
-        ...(budgetGiven
-          ? { budget: { maxTokens: Number(budgetTokens) || 0, maxCostUsd: Number(budgetCost) || 0, maxModelCalls: Number(budgetCalls) || 0, maxDurationSeconds: Number(budgetSeconds) || 0 } }
-          : {}),
-        ...(storyMaxParallel.trim() ? { maxParallel: Number(storyMaxParallel) } : {}),
-      });
-      setStories((current) => [story, ...current]);
-      setStoryTitle("");
-      setStoryDescription("");
-      setStoryCriteria("");
-      setStoryDod("");
-      setStoryEstimate("");
-      setStoryMaxParallel("");
-      setBudgetTokens("");
-      setBudgetCost("");
-      setBudgetCalls("");
-      setBudgetSeconds("");
-      setPanel("none");
-      setSelectedId(story.id);
+      if (editing) {
+        const updated = await api.patchStory(storyManageId, built.input);
+        setStories((current) => current.map((item) => (item.id === updated.id ? updated : item)));
+        // Keep the open detail panel in step (it is the same story object).
+        setDetail((current) => (current && current.id === updated.id ? { ...current, ...updated } : current));
+        setNotice(t("agile.storyForm.updated"));
+      } else {
+        const story = await api.createStory({ projectId, ...built.input });
+        setStories((current) => [story, ...current]);
+        setSelectedId(story.id);
+      }
+      closeStoryForm();
     } catch (cause) {
-      setError(localizeError(locale, cause as { code?: string; message?: string }, t("agile.error.createStory")));
+      setError(agileFormErrorMessage(cause, t(editing ? "agile.error.patchStory" : "agile.error.createStory"), locale));
     } finally {
       setBusy("");
     }
@@ -653,6 +743,13 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
     }
   };
 
+  // 打开上方表单面板时滚到可见处：这些面板在按钮行下方，而「编辑」入口分布在
+  // 故事列表 / 详情面板（页面中部到尾部），不滚动就会被当成"点了没反应"。
+  useEffect(() => {
+    if (panel !== "story" && panel !== "sprint" && panel !== "project") return;
+    document.querySelector(".ws-forms")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [panel, storyManageId, sprintManageId]);
+
   return (
     <div className="workspaces-page">
       <section className="ws-heading">
@@ -664,8 +761,8 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
         <div className="ws-heading-actions">
           <button className={`button secondary ${panel === "manage" ? "active" : ""}`} onClick={() => { setPanel(panel === "manage" ? "none" : "manage"); setError(""); setNotice(""); setConfirmDeleteId(""); }}><FolderCog size={15} />{t("agile.manageProjects")}</button>
           <button className="button secondary" onClick={() => { setPanel(panel === "project" ? "none" : "project"); setError(""); }}><Plus size={15} />{t("agile.newProject")}</button>
-          <button className="button secondary" disabled={!projectId} onClick={() => { setPanel(panel === "sprint" ? "none" : "sprint"); setError(""); }}><Plus size={15} />{t("agile.newSprint")}</button>
-          <button className="button secondary" disabled={!projectId} onClick={() => { setPanel(panel === "story" ? "none" : "story"); setError(""); }}><Plus size={15} />{t("agile.newStory")}</button>
+          <button className="button secondary" disabled={!projectId} onClick={() => { if (panel === "sprint") { setPanel("none"); } else { resetSprintForm(); setPanel("sprint"); setError(""); } }}><Plus size={15} />{t("agile.newSprint")}</button>
+          <button className="button secondary" disabled={!projectId} onClick={() => { if (panel === "story") { setPanel("none"); } else { resetStoryForm(); setPanel("story"); setError(""); } }}><Plus size={15} />{t("agile.newStory")}</button>
           <button className={`button secondary ${panel === "templates" ? "active" : ""}`} onClick={() => { setPanel(panel === "templates" ? "none" : "templates"); setError(""); }}><LayoutTemplate size={15} />{t("agile.templates")}</button>
           <button className={`button secondary ${panel === "metrics" ? "active" : ""}`} disabled={!projectId} onClick={() => { setPanel(panel === "metrics" ? "none" : "metrics"); setError(""); }}><BarChart3 size={15} />{t("agile.metrics")}</button>
           <button className={`button secondary ${panel === "release" ? "active" : ""}`} disabled={!projectId || releases.length === 0} onClick={() => { setPanel(panel === "release" ? "none" : "release"); setError(""); }}><Rocket size={15} />{t("agile.releaseReview")}</button>
@@ -689,22 +786,32 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
           </form>
         )}
         {panel === "sprint" && (
-          <form className="ws-form" onSubmit={createSprint}>
-            <div className="ws-form-head"><div><span className="eyebrow">NEW SPRINT</span><h3>{t("agile.sprintForm.title")}</h3></div><button className="icon-button" type="button" onClick={() => setPanel("none")}><X size={16} /></button></div>
+          <form className="ws-form" onSubmit={saveSprint}>
+            <div className="ws-form-head"><div><span className="eyebrow">{sprintManageId ? "EDIT SPRINT" : "NEW SPRINT"}</span><h3>{t(sprintManageId ? "agile.sprintForm.edit" : "agile.sprintForm.title")}</h3></div><button className="icon-button" type="button" onClick={closeSprintForm}><X size={16} /></button></div>
             <p className="ws-form-help">{t("agile.sprintForm.help")}</p>
             <label>{t("agile.sprintForm.name")}<input value={sprintName} onChange={(event) => setSprintName(event.target.value)} placeholder="Sprint 1" autoFocus /></label>
             <label>{t("agile.sprintForm.goal")}<input value={sprintGoal} onChange={(event) => setSprintGoal(event.target.value)} placeholder={t("agile.sprintForm.goalPlaceholder")} /></label>
+            <div className="agile-form-row">
+              <label>{t("agile.sprintForm.startDate")}<input type="date" value={sprintStart} onChange={(event) => setSprintStart(event.target.value)} /></label>
+              <label>{t("agile.sprintForm.endDate")}<input type="date" value={sprintEnd} onChange={(event) => setSprintEnd(event.target.value)} /></label>
+            </div>
+            <label>{t("agile.sprintForm.status")}
+              <select value={sprintFormStatus} onChange={(event) => setSprintFormStatus(event.target.value as SprintStatus)}>
+                {SPRINT_STATUSES.map((value) => <option key={value} value={value}>{t(sprintStatusKey(value))}</option>)}
+              </select>
+            </label>
             <div className="ws-form-actions">
-              <button type="button" className="button secondary" onClick={() => setPanel("none")}>{t("common.cancel")}</button>
+              <button type="button" className="button secondary" onClick={closeSprintForm}>{t("common.cancel")}</button>
               <button type="submit" className="button primary" disabled={busy === "sprint" || !sprintName.trim()}>
-                {busy === "sprint" ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />}{t("agile.projectForm.create")}
+                {busy === "sprint" ? <LoaderCircle className="spin" size={15} /> : sprintManageId ? <Save size={15} /> : <Plus size={15} />}
+                {t(sprintManageId ? "common.save" : "agile.projectForm.create")}
               </button>
             </div>
           </form>
         )}
         {panel === "story" && (
-          <form className="ws-form" onSubmit={createStory}>
-            <div className="ws-form-head"><div><span className="eyebrow">NEW STORY</span><h3>{t("agile.storyForm.title")}</h3></div><button className="icon-button" type="button" onClick={() => setPanel("none")}><X size={16} /></button></div>
+          <form className="ws-form" onSubmit={saveStory}>
+            <div className="ws-form-head"><div><span className="eyebrow">{storyManageId ? "EDIT STORY" : "NEW STORY"}</span><h3>{t(storyManageId ? "agile.storyForm.edit" : "agile.storyForm.title")}</h3></div><button className="icon-button" type="button" onClick={closeStoryForm}><X size={16} /></button></div>
             <label>{t("agile.storyForm.titleField")}<input value={storyTitle} onChange={(event) => setStoryTitle(event.target.value)} placeholder={t("agile.storyForm.titlePlaceholder")} autoFocus /></label>
             <label>{t("agile.storyForm.description")}<textarea rows={3} value={storyDescription} onChange={(event) => setStoryDescription(event.target.value)} placeholder={t("agile.storyForm.descriptionPlaceholder")} /></label>
             <label>{t("agile.storyForm.criteria")}<textarea rows={3} value={storyCriteria} onChange={(event) => setStoryCriteria(event.target.value)} placeholder={t("agile.storyForm.criteriaPlaceholder")} /></label>
@@ -718,7 +825,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
               <label>{t("agile.storyForm.estimate")}
                 <select value={storyEstimate} onChange={(event) => setStoryEstimate(event.target.value)}>
                   <option value="">{t("agile.estimate.none")}</option>
-                  {[1, 2, 3, 5, 8, 13].map((value) => <option key={value} value={value}>{estimateLabel(value)}</option>)}
+                  {STORY_ESTIMATES.map((value) => <option key={value} value={value}>{estimateLabel(value, locale)}</option>)}
                 </select>
               </label>
             </div>
@@ -774,9 +881,10 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
               <label>{t("agile.storyForm.budgetSeconds")}<input inputMode="numeric" value={budgetSeconds} onChange={(event) => setBudgetSeconds(event.target.value)} placeholder={t("agile.storyForm.unlimited")} /></label>
             </div>
             <div className="ws-form-actions">
-              <button type="button" className="button secondary" onClick={() => setPanel("none")}>{t("common.cancel")}</button>
+              <button type="button" className="button secondary" onClick={closeStoryForm}>{t("common.cancel")}</button>
               <button type="submit" className="button primary" disabled={busy === "story" || storyTitle.trim().length < 2}>
-                {busy === "story" ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />}{t("agile.storyForm.createStory")}
+                {busy === "story" ? <LoaderCircle className="spin" size={15} /> : storyManageId ? <Save size={15} /> : <Plus size={15} />}
+                {t(storyManageId ? "common.save" : "agile.storyForm.createStory")}
               </button>
             </div>
           </form>
@@ -877,6 +985,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
                         </span>
                       )}
                       <div className="agile-card-actions">
+                        <button type="button" onClick={() => editStory(story)}>{t("common.edit")}</button>
                         {story.status !== "blocked"
                           ? <button type="button" disabled={busy === `block:${story.id}`} onClick={() => void blockStory(story)}>{t("agile.block")}</button>
                           : <button type="button" disabled={busy === `unblock:${story.id}`} onClick={() => void unblockStory(story)}>{t("agile.unblock")}</button>}
@@ -900,6 +1009,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
                       <span><strong>{story.title}</strong><small>{t(storyStatusKey(story.status))} · {sprintLabel(story.sprintId)}</small></span>
                     </button>
                     <div className="agile-story-actions">
+                      <button type="button" disabled={busy === `status:${story.id}`} onClick={() => editStory(story)}>{t("common.edit")}</button>
                       {story.status !== "ready" && <button type="button" disabled={busy === `status:${story.id}`} onClick={() => void patchStatus(story, "ready")}>{t("agile.markReady")}</button>}
                       <button type="button" className="danger" disabled={busy === `delete:${story.id}`} onClick={() => void removeStory(story)}><Trash2 size={12} /></button>
                     </div>
@@ -916,6 +1026,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
                   <div className="agile-sprint-row" key={sprint.id}>
                     <span><strong>{sprint.name}</strong><small>{t(sprintStatusKey(sprint.status))}{sprint.goal ? ` · ${sprint.goal}` : ""}</small></span>
                     <div>
+                      <button type="button" onClick={() => editSprint(sprint)}>{t("common.edit")}</button>
                       {sprint.status !== "active" && <button type="button" disabled={busy === `sprint:${sprint.id}`} onClick={() => void setSprintStatus(sprint, "active")}>{t("agile.sprint.start")}</button>}
                       {sprint.status === "active" && <button type="button" disabled={busy === `sprint:${sprint.id}`} onClick={() => void setSprintStatus(sprint, "closed")}>{t("agile.sprint.close")}</button>}
                     </div>
@@ -1335,6 +1446,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
           </div>
 
           <div className="agile-detail-actions">
+            <button type="button" className="button secondary" onClick={() => editStory(detail)}><Pencil size={15} />{t("common.edit")}</button>
             {detail.status !== "ready" && detail.status !== "blocked" && <button type="button" className="button secondary" disabled={busy === `status:${detail.id}`} onClick={() => void patchStatus(detail, "ready")}>{t("agile.markReady")}</button>}
             {detail.status !== "blocked"
               ? <button type="button" className="button secondary" disabled={busy === `block:${detail.id}`} onClick={() => void blockStory(detail)}>{t("agile.block")}</button>

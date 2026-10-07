@@ -4,7 +4,7 @@ import type { DecisionBrief } from "../shared/decision-brief";
 import type { DecisionAuditProjection } from "../shared/decision-audit";
 import type { DecisionMetricsResponse } from "../shared/decision-metrics";
 export type { DecisionMetricsResponse } from "../shared/decision-metrics";
-import type { AgileProject, AgileRelease, AgileSprint, AgileStory, ReleaseDeployRecord, ModelTemplate, StoryDetail, StoryPriority, StoryStatus } from "../shared/agile";
+import type { AgileProject, AgileRelease, AgileSprint, AgileStory, ReleaseDeployRecord, ModelTemplate, RunBudget, StoryDetail, StoryPriority, StoryStatus } from "../shared/agile";
 import type { ConfigStatus, CredentialStatus, CurrentUser, ModelCatalogResponse, ModelSelection, Run, RunArtifact, RunEvent, RunRoundsResponse, RunState, Workspace, AccountDetail, AccountSummary, AccountWorkspaceOption, WorkspacePermission } from "../shared/types";
 import { LOCALE_TAGS, type Locale } from "../shared/i18n";
 
@@ -254,7 +254,7 @@ export const api = {
     maxParallel?: number | null;
   }) => request<AgileStory>("/api/stories", { method: "POST", body: JSON.stringify(body) }),
   story: (id: string) => request<StoryDetail>(`/api/stories/${id}`),
-  patchStory: (id: string, body: { status?: StoryStatus; sprintId?: string | null; acceptanceCriteria?: string[]; definitionOfDone?: string[]; priority?: StoryPriority; estimate?: number | null; description?: string; title?: string }) =>
+  patchStory: (id: string, body: { status?: StoryStatus; sprintId?: string | null; workspaceId?: string | null; acceptanceCriteria?: string[]; definitionOfDone?: string[]; priority?: StoryPriority; estimate?: number | null; description?: string; title?: string; developerModel?: ModelSelection | null; reviewerModel?: ModelSelection | null; budget?: RunBudget | null; maxParallel?: number | null }) =>
     request<AgileStory>(`/api/stories/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   deleteStory: (id: string) => request<void>(`/api/stories/${id}`, { method: "DELETE" }),
   submitStory: (id: string, body: { mode: "demo" | "real"; workspaceId?: string; checks?: string[] } = { mode: "real" }) =>
@@ -272,7 +272,7 @@ export const api = {
     request<StoryDetail>(`/api/stories/${encodeURIComponent(id)}/reopen`, { method: "POST", body: JSON.stringify({}) }),
   sprints: (projectId?: string) =>
     request<{ sprints: AgileSprint[] }>(`/api/sprints${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ""}`),
-  createSprint: (body: { projectId: string; name: string; goal?: string; startDate?: string | null; endDate?: string | null }) =>
+  createSprint: (body: { projectId: string; name: string; goal?: string; startDate?: string | null; endDate?: string | null; status?: "planned" | "active" | "closed" }) =>
     request<AgileSprint>("/api/sprints", { method: "POST", body: JSON.stringify(body) }),
   patchSprint: (id: string, body: { name?: string; goal?: string; status?: "planned" | "active" | "closed"; startDate?: string | null; endDate?: string | null }) =>
     request<AgileSprint>(`/api/sprints/${id}`, { method: "PATCH", body: JSON.stringify(body) }),

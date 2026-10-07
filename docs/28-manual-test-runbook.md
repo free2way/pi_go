@@ -378,9 +378,9 @@
   1) 「敏捷」页点「**新建项目**」（`agile.newProject`，`:1298`）→ 表单标题「**新建项目**」
      （`agile.projectForm.title`，`:1553`）：填「**项目名称**」（`:1555`，占位符「认证服务」，`:1556`）与
      「**项目前缀**」（`:1557`，占位符 `AUTH`；2–10 位、字母开头、同用户下唯一，规则见 `:1554`）→
-     点「**创建**」（`agile.projectForm.create`，`:1558`；`src/client/AgilePage.tsx:658-659`）。
+     点「**创建**」（`agile.projectForm.create`，`:1558`；`src/client/AgilePage.tsx:782`）。
   2) 点「**新建冲刺**」（`agile.newSprint`，`:1299`）→「**新建冲刺**」表单（`:1559`）：「**冲刺名称**」
-     （`:1561`，占位符 `Sprint 1`）+「**冲刺目标**」（`:1562`）→「**创建**」（`AgilePage.tsx:672-673`）。
+     （`:1561`，占位符 `Sprint 1`）+「**冲刺目标**」（`:1562`）→「**创建**」（`AgilePage.tsx:806`）。
   3) 点「**新建故事**」（`agile.newStory`，`:1300`）→「**新建用户故事**」表单（`:1564`）：
      「**标题**」（`:1565`）、「**描述**」（`:1567`）、「**验收标准（每行一条）**」（`:1569`）、
      「**完成定义（每行一条）**」（`:1571`）、「**优先级**」（`:1573`，选项 必须/应该/可以/本次不做，`:1349-1352`）、
@@ -393,24 +393,42 @@
   （`agile.storyStatus.backlog`，`:1353`）。
 - 怎么判定通过：点故事卡片打开右侧详情面板，「**验收标准**」（`agile.detail.criteria`，`:1404`）能看到你填的每条；
   「**工作区**」（`agile.detail.workspace`，`:1403`）显示 `pi_go`。
-- 失败先看哪里：红条「创建故事失败」（`agile.error.createStory`，`:1851`）/「请先创建或选择项目」
-  （`agile.error.selectProjectFirst`，`:1848`）；表单级错误见 `agile.error.form*`（`:1867-1883`）。
+- 失败先看哪里：红条「创建故事失败」（`agile.error.createStory`，`:1999`）/「请先创建或选择项目」
+  （`agile.error.selectProjectFirst`，`:1996`）；表单级错误见 `agile.error.form*`（`:2029-2045`，含新的
+  `agile.error.formStoryTitle`/`formStoryCriteria`/`formSprintDates` 等编辑校验文案）。
 - 风险：`[会改数据/不可逆]`（删除故事见 §7）
+
+**编辑已建的冲刺 / 故事**（新建表单兼作编辑表单，与「发布管理」同一套做法）：
+
+- 冲刺：在「**冲刺与发布**」面板的冲刺行点「**编辑**」（`common.edit`，`AgilePage.tsx:1028`）→ 顶部表单切换为
+  「**编辑冲刺**」（`agile.sprintForm.edit`）并**预填**该冲刺 → 可改「**冲刺名称**」「**冲刺目标**」以及新增的
+  「**开始日期**」「**结束日期**」「**状态**」（`agile.sprintForm.startDate/endDate/status`）→ 点「**保存**」
+  （`common.save`）。状态为下拉选择，`planned → active → closed` 任意互转都允许（服务端无状态机守卫）。
+- 故事：三个入口——看板卡片（`AgilePage.tsx:987`）、故事列表行（`:1011`）、详情面板动作区（`:1448`），
+  都点「**编辑**」→ 表单切换为「**编辑用户故事**」（`agile.storyForm.edit`，`:813`）并预填全部字段：
+  标题/描述/验收标准/完成定义/优先级/估算/冲刺/工作区/模板/最大并行/开发模型/审核模型/四个预算字段 →
+  点「**保存**」（`common.save`）。
+- 打开表单时会自动滚动到表单处（`AgilePage.tsx:749`）——编辑入口在页面中部/尾部，不滚动会被误认为"点了没反应"。
+- 清空语义：表单**总是提交全部字段**，所以把某个字段清空再保存就是**真的清空**（服务端规则：省略字段 = 保留原值，
+  `null`/空串 = 清空；`sprintId` 清空 = 放回待办）。校验失败会在表单上方显示 `agile.error.form*` 的中文提示。
+- 注意：编辑**不修改故事状态**（请求体里没有 `status`）——状态仍由看板按钮与运行结果驱动；因此编辑不会与
+  "读时按 run 结果校正状态"的逻辑打架。
+- 风险：`[会改数据]`（可改回，但描述/验收标准被清空即丢失原内容）
 
 ### 4.3 标为「就绪」并提交为运行
 
 - 目的：进入主链路，看清「提交为运行」到底做了什么。
 - 前置：§4.2 的故事存在且工作区已选。
 - 操作：
-  1) 点「**标为就绪**」（`agile.markReady`，`:1320`；按钮 `AgilePage.tsx:828`、`:1262`）。
-  2) 详情面板右下点「**提交为运行**」（`agile.detail.submit`，`:1413`；按钮 `AgilePage.tsx:1271`）。
+  1) 点「**标为就绪**」（`agile.markReady`，`:1320`；按钮 `AgilePage.tsx:1012`、`:1449`）。
+  2) 详情面板右下点「**提交为运行**」（`agile.detail.submit`，`:1413`；按钮 `AgilePage.tsx:1459`）。
      `status !== "ready"` 时按钮**禁用**，旁边提示「只有「就绪」状态的故事可以提交为运行。」
      （`agile.detail.hintNotReady`，`:1415`）。
   3) 弹浏览器确认框：「将故事「{title}」提交为真实运行？\n\n任务文本会包含描述、验收标准与完成定义，
-     检查命令来自所选工作区。」（`agile.detail.submitConfirm`，`:1414`；`AgilePage.tsx:391`）→ 确认。
+     检查命令来自所选工作区。」（`agile.detail.submitConfirm`，`:1414`；`AgilePage.tsx:506`）→ 确认。
 - 会发生什么（`mode` 的含义）：`mode` 由 `config.realRunsAvailable` 决定 —— 为真即 **"real"**
   （真实运行：会改 worktree、花 token、检查命令来自所选工作区），否则回落 **"demo"**
-  （`AgilePage.tsx:390`；两模式文案见 `createRun.modeReal`/`createRun.modeDemo`，`:247-248`）。
+  （`AgilePage.tsx:504`；两模式文案见 `createRun.modeReal`/`createRun.modeDemo`，`:247-248`）。
   生产体检通过时是 **real**，面板底部会写「将以真实运行执行，检查命令来自所选工作区。」
   （`agile.detail.hintReal`，`:1417`）。
 - 期望结果：故事状态转「**开发中**」（`agile.storyStatus.in_progress`，`:1355`）；详情里

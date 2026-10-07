@@ -1,4 +1,14 @@
-import { RELEASE_STATUSES, type ReleaseStatus, type RunBudget } from "../shared/agile";
+import {
+  RELEASE_STATUSES,
+  SPRINT_STATUSES,
+  STORY_PRIORITIES,
+  type AgileSprint,
+  type AgileStory,
+  type ReleaseStatus,
+  type RunBudget,
+  type SprintStatus,
+  type StoryPriority,
+} from "../shared/agile";
 import type { ModelSelection } from "../shared/types";
 import { DEFAULT_LOCALE, t, type Locale, type MessageKey } from "../shared/i18n";
 
@@ -131,6 +141,229 @@ export function buildReleaseInput(values: ReleaseFormValues, locale: Locale = DE
   return {
     ok: true,
     input: { name, version, notes: values.notes.trim(), status: values.status, storyIds: values.storyIds },
+  };
+}
+
+export interface SprintFormValues {
+  name: string;
+  goal: string;
+  startDate: string;
+  endDate: string;
+  status: SprintStatus;
+}
+
+export interface SprintInput {
+  name: string;
+  goal: string;
+  startDate: string | null;
+  endDate: string | null;
+  status: SprintStatus;
+}
+
+export type SprintInputResult =
+  | { ok: true; input: SprintInput }
+  | { ok: false; message: string };
+
+/**
+ * Shape the 「新建冲刺/编辑冲刺」 form into the body shared by `POST /api/sprints`
+ * and `PATCH /api/sprints/:id`.
+ *
+ * The body is always complete (never partial): the form is the source of truth,
+ * and the service treats an omitted field as "keep" while `null`/`""` means
+ * "clear" (`updateSprint`: goal → `""`, dates → `NULL`). That is what makes
+ * clearing a goal or a date in the edit form actually stick.
+ *
+ * Server-side the contract is only `max(40)` for the dates — no format check —
+ * so the client also refuses an end date earlier than the start date.
+ */
+export function buildSprintInput(values: SprintFormValues, locale: Locale = DEFAULT_LOCALE): SprintInputResult {
+  const name = values.name.trim();
+  if (!name) return { ok: false, message: t(locale, "agile.error.formSprintName") };
+  if (name.length > 120) return { ok: false, message: t(locale, "agile.error.formSprintNameLength") };
+  if (values.goal.length > 4_000) return { ok: false, message: t(locale, "agile.error.formSprintGoalLength") };
+  const startDate = values.startDate.trim() || null;
+  const endDate = values.endDate.trim() || null;
+  // `YYYY-MM-DD` compares correctly as a string; anything else is left to the server.
+  if (startDate && endDate && /^\d{4}-\d{2}-\d{2}$/.test(startDate) && /^\d{4}-\d{2}-\d{2}$/.test(endDate) && endDate < startDate) {
+    return { ok: false, message: t(locale, "agile.error.formSprintDates") };
+  }
+  if (!SPRINT_STATUSES.includes(values.status)) return { ok: false, message: t(locale, "agile.error.formSprintStatus") };
+  return { ok: true, input: { name, goal: values.goal.trim(), startDate, endDate, status: values.status } };
+}
+
+/** Fill the sprint form from an existing sprint (edit mode). */
+export function sprintToFormValues(sprint: AgileSprint): SprintFormValues {
+  return {
+    name: sprint.name,
+    goal: sprint.goal,
+    startDate: sprint.startDate ?? "",
+    endDate: sprint.endDate ?? "",
+    status: sprint.status,
+  };
+}
+
+/** Estimation points the story form offers — mirrors the zod union in the server contract. */
+export const STORY_ESTIMATES = [1, 2, 3, 5, 8, 13] as const;
+export type StoryEstimate = (typeof STORY_ESTIMATES)[number];
+
+export interface StoryFormValues {
+  title: string;
+  description: string;
+  /** Raw textarea, one criterion per line. */
+  acceptanceCriteria: string;
+  /** Raw textarea, one item per line. */
+  definitionOfDone: string;
+  priority: StoryPriority;
+  /** `""` = 未估算. */
+  estimate: string;
+  /** `""` = 留在待办. */
+  sprintId: string;
+  /** `""` = 未指定工作区. */
+  workspaceId: string;
+  /** `provider::model` picker value; `""` = 默认. */
+  developerModel: string;
+  reviewerModel: string;
+  maxParallel: string;
+  budgetTokens: string;
+  budgetCostUsd: string;
+  budgetModelCalls: string;
+  budgetDurationSeconds: string;
+}
+
+export interface StoryInput {
+  title: string;
+  description: string;
+  acceptanceCriteria: string[];
+  definitionOfDone: string[];
+  priority: StoryPriority;
+  estimate: StoryEstimate | null;
+  sprintId: string | null;
+  workspaceId: string | null;
+  developerModel: ModelSelection | null;
+  reviewerModel: ModelSelection | null;
+  maxParallel: number | null;
+  budget: RunBudget | null;
+}
+
+export type StoryInputResult =
+  | { ok: true; input: StoryInput }
+  | { ok: false; message: string };
+
+/** Split a textarea into trimmed, non-empty list items (`textList` in the contract). */
+function textList(raw: string): string[] {
+  return raw
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+}
+
+/**
+ * Shape the 「新建故事/编辑故事」 form into the body shared by `POST /api/stories`
+ * and `PATCH /api/stories/:id`.
+ *
+ * Same "the form is the source of truth" rule as `buildSprintInput`: every field
+ * is sent, so emptying one clears it server-side (`description: ""`,
+ * `acceptanceCriteria: []`, and `null` for estimate/models/budget/maxParallel/
+ * sprintId/workspaceId). `status` is deliberately **not** part of this body — it
+ * is driven by the board actions, and a PATCH that carried a stale status could
+ * fight the run-derived status the server reconciles on read.
+ */
+export function buildStoryInput(values: StoryFormValues, locale: Locale = DEFAULT_LOCALE): StoryInputResult {
+  const title = values.title.trim();
+  if (title.length < 2) return { ok: false, message: t(locale, "agile.error.formStoryTitle") };
+  if (title.length > 200) return { ok: false, message: t(locale, "agile.error.formStoryTitleLength") };
+  if (values.description.length > 4_000) return { ok: false, message: t(locale, "agile.error.formStoryDescriptionLength") };
+
+  const acceptanceCriteria = textList(values.acceptanceCriteria);
+  const definitionOfDone = textList(values.definitionOfDone);
+  for (const item of [...acceptanceCriteria, ...definitionOfDone]) {
+    if (item.length > 500) return { ok: false, message: t(locale, "agile.error.formStoryListItem") };
+  }
+  if (acceptanceCriteria.length > 30) return { ok: false, message: t(locale, "agile.error.formStoryCriteria") };
+  if (definitionOfDone.length > 30) return { ok: false, message: t(locale, "agile.error.formStoryDod") };
+  if (!STORY_PRIORITIES.includes(values.priority)) return { ok: false, message: t(locale, "agile.error.formStoryPriority") };
+
+  let estimate: StoryEstimate | null = null;
+  if (values.estimate.trim() !== "") {
+    const parsed = Number(values.estimate);
+    if (!(STORY_ESTIMATES as readonly number[]).includes(parsed)) return { ok: false, message: t(locale, "agile.error.formStoryEstimate") };
+    estimate = parsed as StoryEstimate;
+  }
+
+  let maxParallel: number | null = null;
+  if (values.maxParallel.trim() !== "") {
+    const parsed = Number(values.maxParallel);
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 32) return { ok: false, message: t(locale, "agile.error.formMaxParallel") };
+    maxParallel = parsed;
+  }
+
+  const budgetFields: Array<{ key: keyof RunBudget; raw: string; integer: boolean }> = [
+    { key: "maxTokens", raw: values.budgetTokens, integer: true },
+    { key: "maxCostUsd", raw: values.budgetCostUsd, integer: false },
+    { key: "maxModelCalls", raw: values.budgetModelCalls, integer: true },
+    { key: "maxDurationSeconds", raw: values.budgetDurationSeconds, integer: true },
+  ];
+  let budget: RunBudget | null = null;
+  if (budgetFields.some((field) => field.raw.trim() !== "")) {
+    const built: RunBudget = { maxTokens: 0, maxCostUsd: 0, maxModelCalls: 0, maxDurationSeconds: 0 };
+    for (const field of budgetFields) {
+      const parsed = parseBudgetField(field.raw);
+      if (parsed === null || (parsed !== undefined && field.integer && !Number.isInteger(parsed))) {
+        return { ok: false, message: t(locale, "agile.error.formBudgetNumber", { field: t(locale, budgetLabelKey(field.key)) }) };
+      }
+      built[field.key] = parsed ?? 0;
+    }
+    budget = built;
+  }
+
+  return {
+    ok: true,
+    input: {
+      title,
+      description: values.description.trim(),
+      acceptanceCriteria,
+      definitionOfDone,
+      priority: values.priority,
+      estimate,
+      sprintId: values.sprintId.trim() || null,
+      workspaceId: values.workspaceId.trim() || null,
+      developerModel: parseModelSelection(values.developerModel) ?? null,
+      reviewerModel: parseModelSelection(values.reviewerModel) ?? null,
+      maxParallel,
+      budget,
+    },
+  };
+}
+
+const BUDGET_LABEL_KEYS: Record<keyof RunBudget, MessageKey> = {
+  maxTokens: "agile.error.budgetTokens",
+  maxCostUsd: "agile.error.budgetCost",
+  maxModelCalls: "agile.error.budgetCalls",
+  maxDurationSeconds: "agile.error.budgetSeconds",
+};
+
+function budgetLabelKey(key: keyof RunBudget): MessageKey {
+  return BUDGET_LABEL_KEYS[key];
+}
+
+/** Fill the story form from an existing story (edit mode). */
+export function storyToFormValues(story: AgileStory): StoryFormValues {
+  return {
+    title: story.title,
+    description: story.description,
+    acceptanceCriteria: story.acceptanceCriteria.join("\n"),
+    definitionOfDone: story.definitionOfDone.join("\n"),
+    priority: story.priority,
+    estimate: story.estimate === null ? "" : String(story.estimate),
+    sprintId: story.sprintId ?? "",
+    workspaceId: story.workspaceId ?? "",
+    developerModel: story.developerModel ? `${story.developerModel.provider}::${story.developerModel.model}` : "",
+    reviewerModel: story.reviewerModel ? `${story.reviewerModel.provider}::${story.reviewerModel.model}` : "",
+    maxParallel: story.maxParallel === null ? "" : String(story.maxParallel),
+    budgetTokens: story.budget ? String(story.budget.maxTokens) : "",
+    budgetCostUsd: story.budget ? String(story.budget.maxCostUsd) : "",
+    budgetModelCalls: story.budget ? String(story.budget.maxModelCalls) : "",
+    budgetDurationSeconds: story.budget ? String(story.budget.maxDurationSeconds) : "",
   };
 }
 
