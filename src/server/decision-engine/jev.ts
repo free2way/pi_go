@@ -13,7 +13,7 @@
  * URL/model/key-staleness resets it (`401/403` opens until the config changes).
  */
 
-import { checkPayloadLimits, questionSchemaHash, redactText } from "./redaction.js";
+import { checkPayloadLimits, questionSchemaHash, redactText, truncateChars } from "./redaction.js";
 import { mapProviderResponse } from "./response-schema.js";
 import type { DecisionEngine, DecisionEngineConfig, DecisionEvaluation, DecisionQuestion, DecisionRequest, DecisionStatus, FallbackReason } from "./types.js";
 import type { EngineDeps } from "./disabled.js";
@@ -367,7 +367,7 @@ async function describeProviderError(response: Response): Promise<string> {
   // Provider-authored strings are free text: a validation error may echo request
   // content. Run them through the same redactor used for outbound state so no
   // secret/PII can reach the log even with the diagnostic enabled.
-  const safe = (value: unknown, maxChars: number) => redactText(String(value ?? "")).slice(0, maxChars);
+  const safe = (value: unknown, maxChars: number) => truncateChars(redactText(String(value ?? "")), maxChars);
   const detail = record.detail;
   if (Array.isArray(detail)) {
     for (const item of detail.slice(0, 8)) {

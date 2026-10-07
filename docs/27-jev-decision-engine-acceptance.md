@@ -444,6 +444,9 @@ PI_JEV_ALLOW_SOURCE=false
 | Unit | `src/server/decision-engine/review-triage.test.ts` | 状态投影、问题集、分批与批次隔离 |
 | Unit | `src/server/decision-engine/prompt-injection.test.ts` | AT-JEV-053：注入不改 schema、只作数据、未知返回整体拒绝、决策路径无 I/O |
 | Unit | `src/server/decision-engine/replay.test.ts`（fixture `fixtures/replay-review-triage.json`） | AT-JEV-065：脱敏 fixture 回放、出站载荷钉住、概率抖动与模型漂移不改 outcome |
+| Unit | `src/server/decision-engine/locale-consistency.test.ts` | AT-JEV-025（本地半边）：多脚本编码不丢失、代理对不被切断、CJK 上限 fail-closed |
+| Unit | `src/server/decision-engine/deterministic-priority.test.ts` | AT-JEV-083（本地半边）：七类弱项的确定性代码优先、超预算 fail-closed、逐问题粒度 |
+| Unit | `src/server/decision-engine/option-order.test.ts` | AT-JEV-082（本地半边）：名称键与顺序无关、位置键按请求顺序翻译、enforce 保持关闭 |
 | Integration | `src/server/decision-engine/integration.test.ts` | 本地 HTTP server：重试、熔断、超时、取消、鉴权 |
 | Worker | `src/worker/decision-triage.test.ts` | worker 侧调用点、verdict→triage 顺序 |
 | Worker | `src/worker/decision-integration.test.ts` | worker 端到端接入（注入 transport，无网络） |
@@ -483,8 +486,8 @@ npm run report:at-coverage
 
 局限（诚实声明）：这是**引用级**检查，不是覆盖率证明。编号出现在测试标题或注释里只表示
 "有人声称该测试映射到这条用例"，**不等于**该用例描述的行为已被断言证明。`uncited` 是可靠信号
-（无人声称覆盖）；`cited` 仍需人工核对断言内容。截至本次更新：61 条用例中 49 条 cited、12 条 uncited
-（`uncited` = `025 / 030–035 / 082 / 083 / 090 / 091 / 093`）。
+（无人声称覆盖）；`cited` 仍需人工核对断言内容。截至本次更新：61 条用例中 52 条 cited、9 条 uncited
+（`uncited` = `030–035 / 090 / 091 / 093`）。
 
 已知缺口（无自动化证据，不得在阶段升级时当作已验收）：
 
@@ -496,8 +499,11 @@ npm run report:at-coverage
 - **AT-JEV-080（真实 API 最小调用）**：由在线 opt-in 套件引用（需 `PI_JEV_LIVE=1` + 真 key）。
 - **AT-JEV-090 / 091（配置回滚、引擎回滚）**：**有手工演练证据**（2026-10-06 demo 实测，步骤与结果记录在
   docs/25「决策平面回滚演练」），但未被任何测试引用，因此本脚本仍报 uncited——脚本只识别测试引用。
-- **AT-JEV-030～035（Planner 路由）、082/083（选项顺序敏感、模型弱项）、
-  093（Enforce 自动降级）**：无自动化引用，多为阶段 3/4 或校准类用例。
+- **AT-JEV-030～035（Planner 路由）、093（Enforce 自动降级）**：无自动化引用，多为阶段 3/4 用例。
+- **AT-JEV-025 / 082 / 083 的供应商侧半边**：本地半边已由新增用例覆盖（见下），但
+  "同一语义中英样本的**语义差异**"（025）、"同一 choice 换顺序后**分布变化多少** + 约定阈值"
+  （082）、"七类弱项的实际**测准率 / jaggedness 报告**"（083）都需要真 key 评估与评估报告
+  （AT-JEV-071 类），**仍未覆盖**，不得据此把 policy 用于 enforce。
 
 已被证据补齐（本次更新移出缺口清单）：
 
@@ -517,6 +523,29 @@ npm run report:at-coverage
   相同（含影子采样 `shouldSampleShadow` 稳定）；同一“桶”内的概率抖动与模型版本漂移（`jev-1.13.0`→`1.14.0`）
   不改变 outcome，只有越过政策阈值（certainty 归零、分布变平）才记为 `uncertain`，此时 assist 也不施加结果
   （`none`）；模型版本只被记录、不参与 outcome。
+- **AT-JEV-025（中英文一致性，本地半边 + 一个真实缺陷修复）**：`locale-consistency.test.ts`（5 例）。
+  **修复**：`redactExcerpt` 原用 `slice(0, maxChars)`，当截断点落在代理对中间会留下孤立高代理
+  （`"\ud83d"`），JSON 里是非法转义且无法经 UTF-8 往返——即 AT 禁止的"编码导致的字段丢失"。
+  新增 `truncateChars`（按字符边界、不切断代理对）并用于 excerpt、Jev 诊断文本、保留清理错误文本、
+  指标读取告警共 4 处；回归用例用"199 字符 + emoji"精确复现该边界（修复前必失败）。用例还覆盖：
+  中文任务/AC 走完整链路（投影保留文本、合同有效、shadow 不施加结果）、emoji/国旗/RTL/组合音标
+  经脱敏与序列化后完整、CJK token 估计不低估（≥ 字符数、≥ bytes/4）、超预算 fail-closed 且 detail
+  不回显内容、中英两版合同均有效且问题 schema 与语言无关（只数据不同）。
+  **仍未覆盖**：供应商侧"同一语义中英文样本"的语义差异评估（需 071）。
+- **AT-JEV-083（模型已知弱项，本地半边）**：`deterministic-priority.test.ts`（11 例）。逐条覆盖 AT 列出的
+  七类弱项（数值比较/计数/日期/间接引用/长无关上下文/矛盾条件/对抗内容）：确定性门失败时，**即使
+  enforce 已 allowlist 且答案极自信也不施加结果**（并给出"无门失败时会施加"的对照，证明拒绝只因确定性
+  信号）；检查项结果由确定性计算决定（`allPassed`/`failedNames` 不受任何模型字段影响）；单条 finding
+  超预算 → 该批拒绝且不二次截断（预算由两批实测 token 夹出）、其余批照常外呼且引擎调用次数精确；
+  run 级验收标准灌满 → 全部批次 fail-closed、**零外呼**；记录保持**逐问题**粒度（8 问 8 答，仅一题
+  uncertain ⇒ assist 不施加结果，全自信 ⇒ 给建议），使报告能按问题类拆分而非用一个总准确率掩盖弱项。
+  **仍未覆盖**：供应商侧实际测准率与 jaggedness 报告（需 071）。
+- **AT-JEV-082（选项顺序敏感性，本地半边）**：`option-order.test.ts`（4 例）。断言顺序敏感性 **不由我方
+  管道引入**：名称键答案在三种选项顺序下映射出同一 value、同一政策结果；位置键（线上 `"0","1",…` +
+  `legend`）必须按**请求里的等级顺序**翻译，并钉住 `weighted_score` 属位置语义这一真实耦合——护栏是
+  生产模板恒为低→高且生成的问题保持该顺序；不确定性判定只看取值分布；**阈值未约定、顺序敏感性未测量
+  之前 enforce 必须保持关闭**（默认不 allowlist 任何 kind，且 enforce 被降级为 assist）。
+  **仍未覆盖**：供应商侧"换顺序后分布变化多少"的测量与约定阈值（需 071）。
 
 - **AT-JEV-061（usage 独立归类）**：`src/server/decision-usage.ts` 读取时聚合（不落库、无迁移）+
   `GET /api/runs/:id` 接线；证据：`decision-usage.test.ts`、`decision-usage-route.test.ts`；

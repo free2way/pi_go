@@ -30,6 +30,7 @@ import type {
   DecisionMetricsWindow,
 } from "../../shared/decision-metrics.js";
 import { DECISION_METRIC_STATUSES } from "../../shared/decision-metrics.js";
+import { truncateChars } from "./redaction.js";
 
 /** The row projection the metrics need; a full audit record is assignable to it. */
 export interface DecisionMetricRow {
@@ -420,7 +421,7 @@ export function createDecisionMetricsSweeper(deps: DecisionMetricsSweeperDeps): 
       rows = await deps.listRecent({ sinceIso, limit: DECISION_METRICS_MAX_ROWS + 1 });
     } catch (error) {
       deps.warn?.("decision metrics sweep failed; alerts unchanged", {
-        error: (error as Error)?.message?.slice(0, 200) ?? String(error),
+        error: truncateChars((error as Error)?.message ?? String(error), 200),
       });
       return undefined;
     }
@@ -503,7 +504,7 @@ export async function readDecisionMetrics(input: {
     };
   } catch (error) {
     input.warn?.("decision metrics read failed; serving an empty aggregate", {
-      error: (error as Error)?.message?.slice(0, 200) ?? String(error),
+      error: truncateChars((error as Error)?.message ?? String(error), 200),
     });
     return { available: false, metrics: emptyDecisionMetrics(circuits), window, computedAt: at.toISOString(), enabled: true };
   }

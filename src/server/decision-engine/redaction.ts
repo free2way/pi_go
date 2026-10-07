@@ -213,10 +213,29 @@ export interface PayloadMeasurement {
   bytes: number;
 }
 
+/**
+ * Cuts text at a character boundary without splitting a surrogate pair.
+ *
+ * `String.prototype.slice` counts UTF-16 code units, so a plain cut can leave a
+ * lone high surrogate (`"\ud83d"`). That text is not round-trippable through
+ * UTF-8, reaches the provider as a broken `\ud83d` escape and silently corrupts
+ * the finding field — the encoding loss AT-JEV-025 forbids (docs/27 §7.7;
+ * observed with a 199-char title followed by an emoji at `TITLE_MAX_CHARS`).
+ */
+export function truncateChars(value: string | null | undefined, maxChars: number): string {
+  const text = String(value ?? "");
+  if (!Number.isFinite(maxChars) || maxChars <= 0) return "";
+  if (text.length <= maxChars) return text;
+  const cut = text.slice(0, Math.floor(maxChars));
+  const last = cut.charCodeAt(cut.length - 1);
+  // A high surrogate on the boundary belongs to a pair whose low half was cut off.
+  return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
+}
+
 /** Redacted, bounded excerpt for a provider payload. */
 export function redactExcerpt(value: string | null | undefined, maxChars = EXCERPT_MAX_CHARS): string {
   const text = redactText(String(value ?? "")).trim();
-  return text.length > maxChars ? text.slice(0, maxChars) : text;
+  return truncateChars(text, maxChars);
 }
 
 function questionList(questions: Record<string, DecisionQuestion> | undefined) {

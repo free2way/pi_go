@@ -353,6 +353,9 @@ GET /api/runs/:runId/decisions
   因此兜底不会让模型"知道"问题已修。
 - 不发送完整 diff、完整文件内容、终端日志、环境变量、凭据或绝对本机路径。
 - `taskSummary`、AC 和 excerpt 都必须经过 secret/PII redaction。
+- 截断按**字符边界**进行且不切断 UTF-16 代理对（`truncateChars`）：`slice` 落在 emoji/astral
+  字符中间会留下孤立代理，JSON 里变成非法 `\ud83d` 转义且无法经 UTF-8 往返——这正是
+  AT-JEV-025 禁止的"编码导致的字段丢失"。诊断/保留日志的同类截断走同一助手。
 - 超出 payload 上限时先裁剪非关键摘要；仍超限则 fallback，不静默截断问题定义。
 
 ### 9.3 固定问题

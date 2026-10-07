@@ -34,6 +34,7 @@ import {
   type DecisionAuditRetentionPolicy,
 } from "../../shared/decision-retention.js";
 import type { DecisionAuditPruneResult, DecisionAuditPruneStore } from "./audit-store.js";
+import { truncateChars } from "./redaction.js";
 
 /**
  * Minimum spacing between sweeps. Deliberately shorter than the worker's hourly
@@ -85,7 +86,7 @@ function defaultWarn(message: string, details: Record<string, unknown>): void {
 
 function errorText(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error ?? "");
-  return message.slice(0, 300);
+  return truncateChars(message, 300);
 }
 
 /**
