@@ -580,14 +580,44 @@ unknown
 
 ### 16.1 指标
 
-- `pigo_decision_requests_total{kind,mode,status}`
-- `pigo_decision_latency_ms{kind,provider}`
-- `pigo_decision_fallback_total{kind,reason}`
-- `pigo_decision_disagreement_total{kind}`
-- `pigo_decision_applied_total{kind,outcome}`
-- `pigo_decision_input_tokens_total{kind}`
-- `pigo_decision_estimated_cost_usd_total{kind}`
-- `pigo_decision_circuit_state{provider}`
+> 状态（实现对齐，2026-10）：本节原先列的是「建议的 Prometheus 指标名」，但**并没有** Prometheus exporter，也没有 `/metrics` 文本端点。已落地的是一个只读聚合接口 + 运维页面卡片 + 进程内告警巡检；下表按「已实现 / 未实现」如实标注。
+
+**已实现 —— 数据来源与暴露面**
+
+| 能力 | 落点 |
+| --- | --- |
+| 纯计算（分位、比率、熔断汇总） | `src/server/decision-engine/metrics.ts` |
+| 窗口查询（`created_at >= since`，`ORDER BY created_at DESC LIMIT n`，不做迁移） | `DecisionAuditStore.listRecent({ sinceIso, limit })`（`audit-store.ts`） |
+| 只读聚合接口 | `GET /api/decisions/metrics`（`registerDecisionRoutes`，登录会话鉴权，**owner 无关**，返回 `DecisionMetricsResponse`） |
+| 运维可见性 | 「系统状态」页 `src/client/SystemStatusPage.tsx` 的「决策平面监控」卡片（只读、15s 自动刷新） |
+| 告警巡检 | web 进程内 `setInterval`，仅当 `PI_DECISION_ENGINE≠disabled` 时计算（否则零查询） |
+
+`GET /api/decisions/metrics` 返回的指标（全部为窗口内聚合，**不含** run id / evaluation id / 外发 payload / 密钥）：
+
+- `total`、`byStatus{completed,fallback,rejected,disabled,...}`、`byFallbackReason{reason:count}`
+- `validResponseRate = completed / total`、`fallbackRate = fallback / total`（**空窗口为 `null`，不是 0**）
+- `latency{p50,p95,p99,max,samples}`：**nearest-rank** 定义，即排序后第 `⌈p·n⌉` 小的**实际观测值**（1-based，夹在 `[1,n]`）；无样本时全部为 `null`、`samples=0`
+- `models{requested → [resolved...]}`：用于观察别名漂移（同一别名解析出多个版本）
+- `circuits{total,open,authLocked,halfOpen,states[]}`：`states` 仅列非闭合熔断，字段为 `scope`/`model`/`state`/`authLocked`（标识符，不含密钥）
+- `truncated`：单次读取有上限（`DECISION_METRICS_MAX_ROWS = 5000`），命中上限时聚合为最新 N 条的下界
+- 外层 `window{hours,since,limit}`、`computedAt`、`enabled`、`available`（读取失败时 `available:false` 降级，绝不 500）
+
+**已实现 —— 告警 key 与阈值变量**（`AlertManager` 负责去重/冷却，可选 `PI_ALERT_WEBHOOK`）
+
+| 告警 key | 级别 | 触发条件（且样本 ≥ `MIN_SAMPLES`） | 阈值变量（默认） |
+| --- | --- | --- | --- |
+| `decision_fallback_rate` | warning | `fallbackRate > 阈值` | `PI_DECISION_ALERT_FALLBACK_RATE`（0.2） |
+| `decision_valid_response_rate` | warning | `validResponseRate < 阈值` | `PI_DECISION_ALERT_VALID_RATE`（0.8） |
+| `decision_p95_latency` | warning | `p95 > 阈值` | `PI_DECISION_ALERT_P95_MS`（2000） |
+| `decision_circuit_open` | critical | 任一熔断 `open` 或 `authLocked` | 无（状态即触发） |
+
+指标回到阈值内会 `AlertManager.clear(key)` 重新武装；样本数 `PI_DECISION_ALERT_MIN_SAMPLES`（20）。窗口 `PI_DECISION_METRICS_WINDOW_HOURS`（24），巡检间隔 `PI_DECISION_METRICS_INTERVAL_SECONDS`（300）。`authLocked` 的**即时**告警仍由既有的 `jev_authentication_failed` 承担（每次认证失败一条），这里的 `decision_circuit_open` 只是聚合看板式的持续状态告警。
+
+**未实现（如实说明）**
+
+- 没有 Prometheus exporter，没有 `/metrics` 文本端点，也没有 `pigo_decision_*` 系列的 Prometheus 指标名（原清单中的 `pigo_decision_disagreement_total`、`pigo_decision_applied_total`、token/成本累计等均未落地）。
+- 没有 16.3 的数据质量指标（人工标签一致率、高风险召回、Brier/ECE、planner 分歧率）。
+- 决策平面的 token/成本有单独的读路径（`decision-usage.ts`，AT-JEV-061/062），未并入本接口的指标。
 
 ### 16.2 日志字段
 

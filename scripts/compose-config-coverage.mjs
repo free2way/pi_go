@@ -81,6 +81,16 @@ export const CRITICAL_ENV = {
     // The worker only needs the on/off day count to decide whether to trigger.
     "PI_DECISION_AUDIT_RETENTION_DAYS",
     "PI_DECISION_AUDIT_RETENTION_MAX_ROWS",
+    // docs/26 §16.1 / AT-JEV L2: decision-plane monitoring. The web owns the
+    // audit table and the sweep; empty values fall back to the documented
+    // defaults (24h window, 300s interval, 20% fallback / 80% valid / 2000ms p95,
+    // 20 min samples). Only the web reads these.
+    "PI_DECISION_METRICS_WINDOW_HOURS",
+    "PI_DECISION_METRICS_INTERVAL_SECONDS",
+    "PI_DECISION_ALERT_FALLBACK_RATE",
+    "PI_DECISION_ALERT_VALID_RATE",
+    "PI_DECISION_ALERT_P95_MS",
+    "PI_DECISION_ALERT_MIN_SAMPLES",
     "TYPESAFE_API_KEY",
   ],
   worker: [

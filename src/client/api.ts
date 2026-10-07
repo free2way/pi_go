@@ -1,6 +1,8 @@
 import type { AgileMetricsResponse, ReleaseRetrospective, ReleaseSummary } from "../shared/agile-metrics";
 import type { DecisionBrief } from "../shared/decision-brief";
 import type { DecisionAuditProjection } from "../shared/decision-audit";
+import type { DecisionMetricsResponse } from "../shared/decision-metrics";
+export type { DecisionMetricsResponse } from "../shared/decision-metrics";
 import type { AgileProject, AgileRelease, AgileSprint, AgileStory, ReleaseDeployRecord, ModelTemplate, StoryDetail, StoryPriority, StoryStatus } from "../shared/agile";
 import type { ConfigStatus, CredentialStatus, CurrentUser, ModelCatalogResponse, ModelSelection, Run, RunArtifact, RunEvent, RunRoundsResponse, RunState, Workspace, AccountDetail, AccountSummary, AccountWorkspaceOption, WorkspacePermission } from "../shared/types";
 import { LOCALE_TAGS, type Locale } from "../shared/i18n";
@@ -182,6 +184,11 @@ export const api = {
    */
   decisions: (id: string, limit?: number) =>
     request<{ decisions: DecisionAuditProjection[] }>(`/api/runs/${id}/decisions${limit ? `?limit=${limit}` : ""}`),
+  /**
+   * docs/26 §16.1: read-only decision-plane monitoring aggregate (owner-agnostic).
+   * The server window/threshold are configured by env, not by the caller.
+   */
+  decisionMetrics: () => request<DecisionMetricsResponse>("/api/decisions/metrics"),
   artifacts: (id: string) => request<{ artifacts: RunArtifact[] }>(`/api/runs/${id}/artifacts`),
   artifactDownloadUrl: (id: string, artifactId: string) => `/api/runs/${id}/artifacts/${encodeURIComponent(artifactId)}/download`,
   /** A1: full run patch (regenerated on the worker when no artifact body exists). */

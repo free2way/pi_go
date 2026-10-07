@@ -159,6 +159,16 @@ export class CircuitBreaker {
     return "open";
   }
 
+  /**
+   * Read-only view of the auth lock for the metrics snapshot (docs/26 §16.1).
+   * `state()` already reports `open` while locked, but the aggregate alert has to
+   * distinguish an operator-actionable credential lock from a self-healing
+   * provider outage, so the flag is exposed without changing any behaviour.
+   */
+  isAuthLocked(): boolean {
+    return this.authLocked;
+  }
+
   allow(): boolean {
     if (!this.isOpen()) return true;
     if (this.authLocked || !this.cooldownElapsed() || this.probeInFlight) return false;
@@ -207,6 +217,15 @@ export class CircuitBreaker {
 const breakers = new Map<string, CircuitBreaker>();
 
 /**
+ * Fingerprint → the identity parts it was built from, kept ALONGSIDE the map so
+ * the read-only metrics snapshot can report `scope`/`baseUrl`/`model` without
+ * re-parsing the fingerprint (a base URL may legitimately contain `|`). This is
+ * metadata for observability only: it never influences breaker behaviour, and it
+ * carries no key material (the fingerprint's last segment is `key`/`no-key`).
+ */
+const breakerMeta = new Map<string, { scope: string; baseUrl: string; model: string }>();
+
+/**
  * Breaker identity. `scope` is the credential source the caller resolved the key
  * from (e.g. `vault:<userId>` or `env`), so one user's revoked/bad key can never
  * latch the breaker for everyone else — a real cross-tenant hazard found in
@@ -224,12 +243,45 @@ function getBreaker(config: DecisionEngineConfig, scope: string | undefined): Ci
   if (existing) return existing;
   const created = new CircuitBreaker();
   breakers.set(fingerprint, created);
+  breakerMeta.set(fingerprint, { scope: scope ?? "default", baseUrl: config.baseUrl, model: config.model });
   return created;
 }
 
 /** Test hook: clears every in-process breaker. */
 export function resetDecisionCircuitBreakers(): void {
   breakers.clear();
+  breakerMeta.clear();
+}
+
+/** One circuit's read-only identity + state, as reported by the metrics snapshot. */
+export interface DecisionCircuitSnapshotEntry {
+  /** Credential source identity (e.g. `vault:<userId>` / `env`); never the key. */
+  scope: string;
+  baseUrl: string;
+  model: string;
+  state: CircuitState;
+  authLocked: boolean;
+}
+
+/**
+ * Read-only snapshot of every in-process breaker (docs/26 §16.1). It is the only
+ * way the metrics surface observes circuit state: nothing here mutates a
+ * breaker, and the projection carries no key and no Authorization material —
+ * `scope` is the *identity of the credential source*, not the credential.
+ */
+export function decisionCircuitSnapshot(): DecisionCircuitSnapshotEntry[] {
+  const entries: DecisionCircuitSnapshotEntry[] = [];
+  for (const [fingerprint, breaker] of breakers) {
+    const meta = breakerMeta.get(fingerprint);
+    entries.push({
+      scope: meta?.scope ?? "default",
+      baseUrl: meta?.baseUrl ?? "",
+      model: meta?.model ?? "",
+      state: breaker.state(),
+      authLocked: breaker.isAuthLocked(),
+    });
+  }
+  return entries;
 }
 
 function delay(ms: number, signal: AbortSignal): Promise<void> {

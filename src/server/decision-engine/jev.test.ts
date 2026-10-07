@@ -7,6 +7,7 @@ import {
   CircuitBreaker,
   buildProviderRequestBody,
   createJevEngine,
+  decisionCircuitSnapshot,
   mapQuestionToProvider,
   resetDecisionCircuitBreakers,
 } from "./jev.js";
@@ -499,5 +500,32 @@ describe("breaker isolation (P1 code review)", () => {
     expect((await second.evaluate(request({ evaluationId: "de_same" }))).fallbackReason).toBe("circuit_open");
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     resetDecisionCircuitBreakers();
+  });
+});
+
+describe("decisionCircuitSnapshot (docs/26 §16.1)", () => {
+  it("is empty before any breaker exists, and after the reset hook", () => {
+    resetDecisionCircuitBreakers();
+    expect(decisionCircuitSnapshot()).toEqual([]);
+  });
+
+  it("reports scope/baseUrl/model/state from the live breaker without any key material", async () => {
+    const fetchImpl = vi.fn(async () => json({ detail: "invalid api key" }, 401));
+    const engine = createJevEngine(config(), { fetchImpl: fetchImpl as unknown as typeof fetch, breakerScope: "vault:user-a" });
+    await engine.evaluate(request({ evaluationId: "de_snapshot" }));
+
+    const snapshot = decisionCircuitSnapshot();
+    expect(snapshot).toHaveLength(1);
+    expect(snapshot[0]).toEqual({
+      scope: "vault:user-a",
+      baseUrl: DECISION_ENGINE_DEFAULTS.baseUrl,
+      model: DECISION_ENGINE_DEFAULTS.model,
+      state: "open",
+      authLocked: true,
+    });
+    // The snapshot never carries the credential, only the source identity.
+    expect(JSON.stringify(snapshot)).not.toContain(API_KEY);
+    resetDecisionCircuitBreakers();
+    expect(decisionCircuitSnapshot()).toEqual([]);
   });
 });

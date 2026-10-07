@@ -32,8 +32,11 @@ import {
 } from "./decision-engine/audit-store.js";
 import { createDecisionAuditRetentionSweeper } from "./decision-engine/audit-retention.js";
 import { createAdmissionController, type AdmissionController } from "./decision-engine/admission.js";
+import { decisionCircuitSnapshot } from "./decision-engine/jev.js";
+import { readDecisionMetrics, resolveDecisionMetricsConfig, type DecisionMetricCircuit } from "./decision-engine/metrics.js";
 import { canonicalJson, questionSchemaHash, sha256Hex, stateManifest } from "./decision-engine/redaction.js";
 import type { Alert } from "./alerts.js";
+import type { DecisionMetricsResponse } from "../shared/decision-metrics.js";
 import {
   runReviewTriageBatches,
   type ReviewTriageBatch,
@@ -141,6 +144,21 @@ export interface DecisionRouteDeps {
    * `console.warn`, matching `createDecisionAuditRetentionSweeper`.
    */
   warn?: (message: string, details: Record<string, unknown>) => void;
+  /**
+   * docs/26 §16.1: session gate for the read-only metrics route. Unlike the
+   * internal routes (worker bearer token) the metrics surface is for a logged-in
+   * session; production wires `(request) => Boolean(auth.user(request))`, which
+   * the app's global `preHandler` has already populated for `/api/*`. It is a
+   * seam (not a hard dependency on `Authenticator`) so a bare-Fastify test can
+   * assert the 401. Absent ⇒ the route fails closed with 401.
+   */
+  sessionAuthorized?: (request: FastifyRequest) => boolean;
+  /**
+   * Read-only circuit snapshot for the metrics route. Defaults to
+   * `decisionCircuitSnapshot()` (the in-process breakers); injectable so a test
+   * can assert the rollup without mutating adapter state.
+   */
+  circuits?: () => readonly DecisionMetricCircuit[];
 }
 
 /** Whitelisted, redacted projection of one audit row (docs/26 §8.2). */
@@ -231,6 +249,16 @@ export const DECISION_EVALUATE_PATH = "/api/internal/decisions/evaluate";
  * Same internal-token auth as the other `/api/internal/*` routes.
  */
 export const DECISION_AUDIT_RETENTION_PATH = "/api/internal/decisions/audit/retention";
+
+/**
+ * docs/26 §16.1: read-only decision-plane monitoring. Unlike the two internal
+ * routes above it is a normal session route (the app's global `preHandler`
+ * authenticates `/api/*`), because the data is an owner-agnostic operational
+ * aggregate with no per-run and no per-owner detail — the same audience as
+ * `GET /api/system/status`. It never returns a key, an outbound payload, a run
+ * id or an evaluation id.
+ */
+export const DECISION_METRICS_PATH = "/api/decisions/metrics";
 
 /**
  * Deterministic evaluation id: `runId + kind + policyVersion + stateHash`
@@ -1098,4 +1126,61 @@ export function registerDecisionRoutes(app: FastifyInstance, deps: DecisionRoute
       return { decisions };
     },
   );
+
+  /**
+   * docs/26 §16.1: read-only decision-plane monitoring for the operations
+   * dashboard. Session-authenticated (see `sessionAuthorized`), aggregate-only.
+   *
+   * The window comes from `PI_DECISION_METRICS_WINDOW_HOURS` (env, invalid ⇒
+   * default) — there is no query parameter to escape. A store without the
+   * `listRecent` seam, or a failing read, degrades to `available: false` with an
+   * explicit empty metrics shape and a warn line: this route never 500s and
+   * never guesses a value.
+   */
+  app.get(DECISION_METRICS_PATH, async (request, reply) => {
+    if (!deps.sessionAuthorized?.(request)) return reply.code(401).send({ error: "Unauthorized" });
+    const loaded = deps.loadConfig(deps.env);
+    const enabled = loaded.ok && loaded.config.engine !== "disabled";
+    const config = resolveDecisionMetricsConfig(deps.env);
+    const warn = deps.warn ?? ((message, details) => app.log.warn(details, message));
+    const circuits = () => deps.circuits?.() ?? decisionCircuitSnapshot();
+    const listRecent = deps.audit.listRecent?.bind(deps.audit);
+    if (!listRecent) {
+      warn("decision metrics unavailable: the audit store has no listRecent seam", {});
+      const degraded = await readDecisionMetrics({
+        enabled: false,
+        windowHours: config.windowHours,
+        listRecent: async () => [],
+        circuits,
+        ...(deps.now ? { now: deps.now } : {}),
+        warn,
+      });
+      const body: DecisionMetricsResponse = {
+        schemaVersion: 1,
+        available: false,
+        enabled,
+        window: degraded.window,
+        computedAt: degraded.computedAt,
+        metrics: degraded.metrics,
+      };
+      return body;
+    }
+    const read = await readDecisionMetrics({
+      enabled,
+      windowHours: config.windowHours,
+      listRecent,
+      circuits,
+      ...(deps.now ? { now: deps.now } : {}),
+      warn,
+    });
+    const body: DecisionMetricsResponse = {
+      schemaVersion: 1,
+      available: read.available,
+      enabled: read.enabled,
+      window: read.window,
+      computedAt: read.computedAt,
+      metrics: read.metrics,
+    };
+    return body;
+  });
 }

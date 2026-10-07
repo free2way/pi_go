@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   Database,
   DollarSign,
+  Gauge,
   ListChecks,
   LoaderCircle,
   Pause,
@@ -13,7 +14,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { localizeError } from "../shared/i18n";
-import { api, type SystemStatusResponse } from "./api";
+import { api, type DecisionMetricsResponse, type SystemStatusResponse } from "./api";
 import { useT } from "./i18n";
 import {
   activeRunsSummary,
@@ -28,6 +29,14 @@ import {
   storageLabel,
   workerLabel,
 } from "./system-status-view";
+import {
+  decisionCircuitRows,
+  decisionCircuitSummary,
+  decisionMetricsNotice,
+  decisionMetricsRows,
+  decisionMetricsWindowLabel,
+  decisionModelAliasRows,
+} from "./decision-metrics-view";
 import { DEFAULT_LOCALE, intlLocale, t, type Locale } from "../shared/i18n";
 
 const REFRESH_MS = 15_000;
@@ -43,6 +52,8 @@ const formatTimestamp = (value: string | null | undefined, locale: Locale = DEFA
 export function SystemStatusPage() {
   const { t, locale } = useT();
   const [status, setStatus] = useState<SystemStatusResponse>();
+  const [metrics, setMetrics] = useState<DecisionMetricsResponse>();
+  const [metricsFailed, setMetricsFailed] = useState(false);
   const [error, setError] = useState("");
   const [refreshing, setRefreshing] = useState(false);
   const [paused, setPaused] = useState(false);
@@ -54,6 +65,15 @@ export function SystemStatusPage() {
       setError("");
     } catch (cause) {
       setError(localizeError(locale, cause as { code?: string; message?: string }, t("system.loadFailed")));
+    }
+    // The decision-plane card is an independent, best-effort read: a failure
+    // must never blank the rest of the dashboard.
+    try {
+      setMetrics(await api.decisionMetrics());
+      setMetricsFailed(false);
+    } catch {
+      setMetrics(undefined);
+      setMetricsFailed(true);
     } finally {
       setRefreshing(false);
     }
@@ -185,6 +205,46 @@ export function SystemStatusPage() {
                   {failures.truncated ? <div className="sys-hint">{t("system.failures.truncated")}</div> : null}
                 </>
               ) : <div className="sys-row"><span>{t("system.failures.stat")}</span><strong className="is-warn">{t("system.unavailable")}</strong></div>}
+            </div>
+          </section>
+
+          {/* docs/26 §16.1: read-only decision-plane monitoring. Aggregate-only
+              (no payload/secret/run id); thresholds and the window are server-side. */}
+          <section className="panel sys-card sys-card-wide">
+            <div className="panel-head"><div><span className="eyebrow">DECISION PLANE</span><h3>{t("decisions.metrics.title")}</h3></div><Gauge size={15} /></div>
+            <div className="sys-body">
+              {metricsFailed && !metrics ? (
+                <div className="sys-row"><span>{t("decisions.metrics.title")}</span><strong className="is-warn">{t("system.unavailable")}</strong></div>
+              ) : metrics ? (
+                <>
+                  {decisionMetricsNotice(metrics, locale) ? <div className="sys-hint">{decisionMetricsNotice(metrics, locale)}</div> : null}
+                  <div className="sys-row"><span>{t("decisions.metrics.window")}</span><strong>{decisionMetricsWindowLabel(metrics, locale)}</strong></div>
+                  {!decisionMetricsNotice(metrics, locale) && decisionMetricsRows(metrics.metrics, locale).map((row) => (
+                    <div key={row.key} className="sys-row"><span>{row.label}</span><strong className={row.muted ? "is-warn" : ""}>{row.value}</strong></div>
+                  ))}
+                  <div className="sys-row">
+                    <span>{t("decisions.metrics.circuits")}</span>
+                    <strong className={decisionCircuitSummary(metrics.metrics.circuits, locale).tone === "error" ? "is-warn" : "is-ok"}>{decisionCircuitSummary(metrics.metrics.circuits, locale).label}</strong>
+                  </div>
+                  {decisionCircuitRows(metrics.metrics.circuits, locale).length ? (
+                    <ul className="sys-list">
+                      {decisionCircuitRows(metrics.metrics.circuits, locale).map((row) => (
+                        <li key={row.key}><code>{row.model || row.scope}</code><span className={row.tone === "error" ? "is-warn" : ""}>{row.label}</span></li>
+                      ))}
+                    </ul>
+                  ) : null}
+                  {!decisionMetricsNotice(metrics, locale) ? (
+                    decisionModelAliasRows(metrics.metrics.models, locale).length ? (
+                      <ul className="sys-list">
+                        {decisionModelAliasRows(metrics.metrics.models, locale).map((row) => (
+                          <li key={row.key}><code>{row.requested}</code><span className={row.tone === "warn" ? "is-warn" : ""}>{row.label}</span></li>
+                        ))}
+                      </ul>
+                    ) : <div className="sys-hint">{t("decisions.metrics.models.none")}</div>
+                  ) : null}
+                  {metrics.metrics.truncated ? <div className="sys-hint">{t("decisions.metrics.truncated", { limit: metrics.window.limit })}</div> : null}
+                </>
+              ) : <div className="sys-row"><span>{t("decisions.metrics.title")}</span><strong>{t("system.loading")}</strong></div>}
             </div>
           </section>
         </div>

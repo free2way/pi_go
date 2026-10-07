@@ -24,6 +24,14 @@ import type { DecisionEvaluationRecord } from "./types.js";
 export const DECISION_AUDIT_MAX_ROWS = 200;
 export const DECISION_AUDIT_DEFAULT_ROWS = 50;
 
+/**
+ * Hard ceiling for one metrics-window read (`listRecent`). It is deliberately
+ * larger than what the metrics surface asks for (`DECISION_METRICS_MAX_ROWS + 1`
+ * in `metrics.ts`), so the caller can still detect "the window was truncated" by
+ * fetching one row past its own cap.
+ */
+export const DECISION_RECENT_MAX_ROWS = 20_000;
+
 const COLUMNS = [
   "id",
   "run_id",
@@ -86,6 +94,18 @@ export interface DecisionAuditPruneStore {
   pruneOlderThan(cutoffIso: string, maxRows?: number): Promise<DecisionAuditPruneResult>;
 }
 
+/** Bounded, newest-first window read for the metrics surface (docs/26 §16.1). */
+export interface DecisionAuditRecentQuery {
+  /**
+   * Inclusive lower bound (`created_at >= sinceIso`). `created_at` is a
+   * fixed-width ISO-8601 UTC TEXT column, so a lexicographic `>=` is exactly a
+   * chronological comparison — the same basis documented on `pruneOlderThan`.
+   */
+  sinceIso: string;
+  /** Newest-first row cap; clamped to `[1, DECISION_RECENT_MAX_ROWS]`. */
+  limit?: number;
+}
+
 /** Small surface the routes depend on, so tests can inject a fake. */
 export interface DecisionAuditStoreLike {
   findByIdempotencyKey(idempotencyKey: string): Promise<DecisionEvaluationRecord | undefined>;
@@ -103,6 +123,12 @@ export interface DecisionAuditStoreLike {
     requestedModel: string,
     excludeEvaluationId: string,
   ): Promise<DecisionEvaluationRecord | undefined>;
+  /**
+   * docs/26 §16.1: bounded newest-first window read for the monitoring metrics.
+   * Optional so the frozen read/write fakes keep compiling; a store without it
+   * makes the metrics surface degrade to `available: false` instead of failing.
+   */
+  listRecent?(query: DecisionAuditRecentQuery): Promise<DecisionEvaluationRecord[]>;
 }
 
 function str(value: unknown): string {
@@ -260,6 +286,24 @@ export class DecisionAuditStore implements DecisionAuditStoreLike, DecisionAudit
     const rows = (await this.db.query(
       `SELECT ${COLUMNS} FROM decision_evaluations WHERE run_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2`,
       [runId, bounded],
+    )).rows;
+    return rows.map(decisionRowToRecord);
+  }
+
+  /**
+   * docs/26 §16.1: the newest rows of one time window, newest first. The read is
+   * owner-agnostic (the metrics are an operational aggregate, not a per-user
+   * projection) and bounded, so the monitoring sweep can never scan the whole
+   * table. Time basis: `created_at` is a fixed-width ISO-8601 UTC TEXT column, so
+   * `created_at >= $1` is a chronological comparison — the same reasoning (and
+   * the same `new Date(...).toISOString()` cutoff string) as `pruneOlderThan`;
+   * no `timestamptz` cast is used, so pg-mem and real PostgreSQL agree.
+   */
+  async listRecent(query: DecisionAuditRecentQuery): Promise<DecisionEvaluationRecord[]> {
+    const limit = Math.min(Math.max(Math.trunc(query.limit ?? DECISION_RECENT_MAX_ROWS) || DECISION_RECENT_MAX_ROWS, 1), DECISION_RECENT_MAX_ROWS);
+    const rows = (await this.db.query(
+      `SELECT ${COLUMNS} FROM decision_evaluations WHERE created_at >= $1 ORDER BY created_at DESC, id DESC LIMIT $2`,
+      [query.sinceIso, limit],
     )).rows;
     return rows.map(decisionRowToRecord);
   }

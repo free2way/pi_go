@@ -36,7 +36,8 @@ import { readDecisionBrief } from "./decision-brief.js";
 import { readDecisionUsageSafe } from "./decision-usage.js";
 import { DecisionAuditStore } from "./decision-engine/audit-store.js";
 import { createDecisionEngine, loadDecisionEngineConfig } from "./decision-engine/index.js";
-import { resetDecisionCircuitBreakers } from "./decision-engine/jev.js";
+import { resetDecisionCircuitBreakers, decisionCircuitSnapshot } from "./decision-engine/jev.js";
+import { createDecisionMetricsSweeper } from "./decision-engine/metrics.js";
 import { buildReviewTriageBatches } from "./decision-engine/review-triage.js";
 import { decisionEngineStatus, registerDecisionRoutes, type DecisionEngineStatus } from "./decision-routes.js";
 import { buildAcceptanceSnapshot } from "./acceptance.js";
@@ -3283,6 +3284,16 @@ registerDecisionRoutes(app, {
   internalAuthorized: (request) => safeTokenMatch(request.headers.authorization),
   ownerKeysFor,
   readVaultKey,
+  // docs/26 §16.1: the metrics route is a normal session route (owner-agnostic
+  // operational aggregate); the global preHandler has already resolved the user.
+  sessionAuthorized: (request) => {
+    try {
+      return Boolean(auth.user(request));
+    } catch {
+      return false;
+    }
+  },
+  circuits: () => decisionCircuitSnapshot(),
   // AT-JEV-081: a `jev-latest` alias that starts resolving to a new model version
   // raises one deduplicated warning through the existing AlertManager (structured
   // log + optional PI_ALERT_WEBHOOK). Details carry ids and version strings only.
@@ -3330,5 +3341,28 @@ const jobRecoveryTimer = setInterval(() => {
   void expireStaleReleaseDeploys();
 }, 60_000);
 jobRecoveryTimer.unref?.();
+
+// docs/26 §16.1 / AT-JEV L2 gate: the decision-plane metrics sweep. It runs in
+// the web process (the only process that owns `decision_evaluations`) and only
+// when the plane is configured to produce evaluations — a default `disabled`
+// deployment performs zero queries here. Interval and thresholds come from the
+// `PI_DECISION_METRICS_*` / `PI_DECISION_ALERT_*` env (invalid ⇒ documented
+// default). Alerts go through the same `AlertManager` as every other
+// infrastructure alert, so dedup/cooldown/webhook behaviour is unchanged.
+const decisionMetricsSweeper = createDecisionMetricsSweeper({
+  env: process.env,
+  enabled: () => {
+    const loaded = loadDecisionEngineConfig(process.env, { allowMissingApiKey: true });
+    return loaded.ok && loaded.config.engine !== "disabled";
+  },
+  listRecent: (query) => decisionAudit.listRecent(query),
+  circuits: () => decisionCircuitSnapshot(),
+  raise: (alert) => {
+    alerts.raise(alert);
+  },
+  clear: (key) => alerts.clear(key),
+  warn: (message, details) => app.log.warn(details, message),
+});
+decisionMetricsSweeper.start();
 
 await app.listen({ port, host });

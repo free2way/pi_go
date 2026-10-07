@@ -142,6 +142,15 @@ services:
       # worker only needs the day count to gate its hourly trigger.
       PI_DECISION_AUDIT_RETENTION_DAYS: ${PI_DECISION_AUDIT_RETENTION_DAYS:-}
       PI_DECISION_AUDIT_RETENTION_MAX_ROWS: ${PI_DECISION_AUDIT_RETENTION_MAX_ROWS:-}
+      # docs/26 §16.1: decision-plane monitoring (web only). Empty = documented
+      # default (24h window / 300s interval / 20% fallback / 80% valid / 2000ms
+      # p95 / 20 samples).
+      PI_DECISION_METRICS_WINDOW_HOURS: ${PI_DECISION_METRICS_WINDOW_HOURS:-}
+      PI_DECISION_METRICS_INTERVAL_SECONDS: ${PI_DECISION_METRICS_INTERVAL_SECONDS:-}
+      PI_DECISION_ALERT_FALLBACK_RATE: ${PI_DECISION_ALERT_FALLBACK_RATE:-}
+      PI_DECISION_ALERT_VALID_RATE: ${PI_DECISION_ALERT_VALID_RATE:-}
+      PI_DECISION_ALERT_P95_MS: ${PI_DECISION_ALERT_P95_MS:-}
+      PI_DECISION_ALERT_MIN_SAMPLES: ${PI_DECISION_ALERT_MIN_SAMPLES:-}
       TYPESAFE_API_KEY: ${TYPESAFE_API_KEY:-}
     ports:
       # Primary demo endpoint. The bind address is required and stays outside
