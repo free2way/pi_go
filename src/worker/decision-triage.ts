@@ -99,6 +99,11 @@ export function createReviewTriageTrigger(options: ReviewTriageTriggerOptions): 
  * verdict must already be durable before any decision-plane call, so a decision
  * outage can never precede, block or influence it. A failed verdict write
  * short-circuits and the triage is not attempted at all.
+ *
+ * The call itself is FIRE-AND-FORGET (P2, code review): awaiting it let a slow or
+ * latched decision plane delay the review path by up to the request timeout
+ * (10s), which contradicts docs/26 §15.1 — the plane is an enhancement, never a
+ * dependency. The trigger already swallows its own failures.
  */
 export async function recordVerdictThenReviewTriage<T>(input: {
   runId: string;
@@ -106,6 +111,6 @@ export async function recordVerdictThenReviewTriage<T>(input: {
   trigger: (runId: string) => Promise<void>;
 }): Promise<T> {
   const verdict = await input.recordVerdict();
-  await input.trigger(input.runId);
+  void input.trigger(input.runId).catch(() => undefined);
   return verdict;
 }

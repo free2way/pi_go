@@ -29,6 +29,13 @@ export interface DecisionEngineDeps {
    * never turn those engines into an outbound call.
    */
   resolveApiKey?: () => string | undefined;
+  /**
+   * AT-JEV/P1 (review): breaker isolation scope — the identity of the credential
+   * source (`vault:<userId>` / `env`), never the key itself. Only the `jev`
+   * engine uses it; it prevents one tenant's revoked key from latching the
+   * shared breaker for everyone.
+   */
+  breakerScope?: string;
 }
 
 /**
@@ -81,6 +88,6 @@ export function createDecisionEngine(config: DecisionEngineConfig, deps: Decisio
       ? createDisabledEngine(config, engineDeps)
       : config.engine === "mock"
         ? createMockEngine(config, engineDeps)
-        : createJevEngine(config, { ...engineDeps, fetchImpl: deps.fetchImpl, resolveApiKey: deps.resolveApiKey });
+        : createJevEngine(config, { ...engineDeps, fetchImpl: deps.fetchImpl, resolveApiKey: deps.resolveApiKey, breakerScope: deps.breakerScope });
   return createPolicyEngine(base, config, deps);
 }

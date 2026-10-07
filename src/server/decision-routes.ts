@@ -74,7 +74,7 @@ export type BuildDecisionBatches = (input: ReviewTriageInput) => ReviewTriageBat
 /** Frozen contract of `createDecisionEngine`. */
 export type CreateDecisionEngine = (
   config: DecisionEngineConfig,
-  deps?: { fetchImpl?: typeof fetch; resolveApiKey?: () => string | undefined },
+  deps?: { fetchImpl?: typeof fetch; resolveApiKey?: () => string | undefined; breakerScope?: string },
 ) => DecisionEngine;
 
 /**
@@ -789,6 +789,10 @@ export async function evaluateDecisionForRun(
   // vault) then the platform env; `mock` never touches the vault (deliverable:
   // no lookup, no probe, no extra query for a non-jev engine).
   let resolveApiKey: (() => string | undefined) | undefined;
+  // P1 (review): isolate the breaker per credential SOURCE so one user's revoked
+  // key cannot latch it for every other caller. The scope is the source identity
+  // (`vault:<userId>` / `env`) — never the key material.
+  let breakerScope = "none";
   if (config.engine === "jev") {
     const resolved = await resolveDecisionApiKey(run.ownerId, deps);
     if (resolved.key === undefined) {
@@ -810,6 +814,7 @@ export async function evaluateDecisionForRun(
     // `hasApiKey` means "a key is resolvable for this request"; the key material
     // itself is never stored in the config object.
     config = { ...config, hasApiKey: true };
+    breakerScope = resolved.source === "vault" ? `vault:${run.ownerId}` : resolved.source === "env" ? "env" : "none";
     // Read by the engine at call time; the resolver returns the key resolved for
     // THIS run, so a rotated vault credential is picked up on the next evaluation.
     resolveApiKey = () => resolved.key;
@@ -845,7 +850,7 @@ export async function evaluateDecisionForRun(
   // Everything below holds the admission slot (when wired); the `finally` is the
   // single release point, so no early return or thrown error can leak capacity.
   try {
-    return await evaluateAdmittedBatches(input, deps, run, config, resolveApiKey, now);
+    return await evaluateAdmittedBatches(input, deps, run, config, resolveApiKey, breakerScope, now);
   } finally {
     admission?.release();
   }
@@ -863,6 +868,7 @@ async function evaluateAdmittedBatches(
   run: Run,
   config: DecisionEngineConfig,
   resolveApiKey: (() => string | undefined) | undefined,
+  breakerScope: string,
   now: string,
 ): Promise<DecisionEvaluateOutcome> {
   // The batch builder owns redaction/allowlisting and the payload limits. Its
@@ -935,7 +941,7 @@ async function evaluateAdmittedBatches(
     entries.map((entry) => deps.audit.findByIdempotencyKey(entry.evaluationId)),
   );
 
-  const engine = deps.createEngine(config, resolveApiKey ? { resolveApiKey } : undefined);
+  const engine = deps.createEngine(config, resolveApiKey ? { resolveApiKey, breakerScope } : undefined);
   const thrown = new Map<string, FallbackReason>();
   const dispatchStarted = Date.now();
   const runResult = await runReviewTriageBatches({

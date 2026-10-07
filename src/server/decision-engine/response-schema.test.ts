@@ -263,3 +263,35 @@ describe("mapProviderResponse — live System One contract", () => {
     expect(result.ok).toBe(false);
   });
 });
+
+describe("mapProviderResponse — distribution completeness (P1 code review)", () => {
+  it("rejects a distribution that covers only some of the requested options", () => {
+    // Sums to ~1 but omits `material`: previously accepted, which would store a
+    // partial answer and quietly bias calibration data.
+    const result = mapProviderResponse(
+      response({ ...validAnswer(), q_choice: { choice: "material", confidence: 0.9, probabilities: { none: 0.5, possible: 0.5 } } }),
+      request,
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.detail).toContain("incomplete");
+  });
+
+  it("rejects a score distribution that omits a level", () => {
+    const result = mapProviderResponse(
+      response({
+        ...validAnswer(),
+        q_score: { score: 2.4, confidence: 0.7, probabilities: { none: 0.1, low: 0.2, medium: 0.7 } },
+      }),
+      request,
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.detail).toContain("incomplete");
+  });
+
+  it("still accepts a distribution that covers every requested level", () => {
+    const result = mapProviderResponse(response(validAnswer()), request);
+    expect(result.ok).toBe(true);
+  });
+});

@@ -110,6 +110,15 @@ function distributionOf(
   for (const key of Object.keys(values)) {
     if (!allowedSet.has(key)) return { ok: false, detail: `${questionId}: unknown ${label} "${key}"` };
   }
+  // A distribution that merely SUMS to ~1 is not enough: it must cover every
+  // option/level the server asked about. A partial map (e.g. 2 of 3 choices)
+  // would otherwise be stored as a valid answer and quietly bias the
+  // calibration data — one incomplete answer rejects the whole evaluation,
+  // exactly like every other malformed field (docs/26 §6.3).
+  const missing = allowed.filter((key) => !Object.prototype.hasOwnProperty.call(values, key));
+  if (missing.length > 0) {
+    return { ok: false, detail: `${questionId}: incomplete ${label} distribution (missing ${missing.slice(0, 4).join(", ")})` };
+  }
   const entries = Object.values(values);
   if (!entries.every((value) => Number.isFinite(value) && value >= 0 && value <= 1)) {
     return { ok: false, detail: `${questionId}: ${label} probability out of range` };

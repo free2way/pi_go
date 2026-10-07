@@ -165,3 +165,32 @@ describe("recordVerdictThenReviewTriage (review-stage ordering)", () => {
     expect(verdict).toEqual({ verdict: "changes_requested" });
   });
 });
+
+describe("recordVerdictThenReviewTriage never blocks on the plane (P2 code review)", () => {
+  it("resolves as soon as the verdict is durable, even if the triage call hangs", async () => {
+    const started = Date.now();
+    const verdict = await recordVerdictThenReviewTriage({
+      runId: "run_hanging",
+      recordVerdict: async () => "recorded",
+      // A decision plane that never answers must not delay the review path.
+      trigger: () => new Promise<void>(() => undefined),
+    });
+    expect(verdict).toBe("recorded");
+    expect(Date.now() - started).toBeLessThan(200);
+  });
+
+  it("still records the verdict before the trigger starts", async () => {
+    const sequence: string[] = [];
+    await recordVerdictThenReviewTriage({
+      runId: "run_order",
+      recordVerdict: async () => {
+        sequence.push("verdict");
+        return 1;
+      },
+      trigger: async () => {
+        sequence.push("triage");
+      },
+    });
+    expect(sequence).toEqual(["verdict", "triage"]);
+  });
+});

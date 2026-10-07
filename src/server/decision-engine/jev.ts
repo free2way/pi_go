@@ -13,7 +13,7 @@
  * URL/model/key-staleness resets it (`401/403` opens until the config changes).
  */
 
-import { checkPayloadLimits, questionSchemaHash } from "./redaction.js";
+import { checkPayloadLimits, questionSchemaHash, redactText } from "./redaction.js";
 import { mapProviderResponse } from "./response-schema.js";
 import type { DecisionEngine, DecisionEngineConfig, DecisionEvaluation, DecisionQuestion, DecisionRequest, DecisionStatus, FallbackReason } from "./types.js";
 import type { EngineDeps } from "./disabled.js";
@@ -36,6 +36,12 @@ export interface JevDeps extends EngineDeps {
    * The returned value never leaves this module.
    */
   resolveApiKey?: () => string | undefined;
+  /**
+   * Breaker isolation scope: the *identity of the credential source* (e.g.
+   * `vault:<userId>` / `env`), never the key. Without it a single user's revoked
+   * key would latch the shared breaker for every other caller.
+   */
+  breakerScope?: string;
 }
 
 export interface ProviderQuestion {
@@ -200,13 +206,20 @@ export class CircuitBreaker {
 
 const breakers = new Map<string, CircuitBreaker>();
 
-/** Breaker identity: change the config and the breaker starts fresh. */
-export function circuitFingerprint(config: DecisionEngineConfig): string {
-  return `${config.baseUrl}|${config.model}|${config.hasApiKey ? "key" : "no-key"}`;
+/**
+ * Breaker identity. `scope` is the credential source the caller resolved the key
+ * from (e.g. `vault:<userId>` or `env`), so one user's revoked/bad key can never
+ * latch the breaker for everyone else — a real cross-tenant hazard found in
+ * review: the breaker used to be keyed on `baseUrl|model|hasApiKey` alone, and an
+ * auth failure latches it until a reset. It carries no key material: only the
+ * *identity of the source*, never the secret itself.
+ */
+export function circuitFingerprint(config: DecisionEngineConfig, scope = "default"): string {
+  return `${scope}|${config.baseUrl}|${config.model}|${config.hasApiKey ? "key" : "no-key"}`;
 }
 
-function getBreaker(config: DecisionEngineConfig): CircuitBreaker {
-  const fingerprint = circuitFingerprint(config);
+function getBreaker(config: DecisionEngineConfig, scope: string | undefined): CircuitBreaker {
+  const fingerprint = circuitFingerprint(config, scope);
   const existing = breakers.get(fingerprint);
   if (existing) return existing;
   const created = new CircuitBreaker();
@@ -299,20 +312,24 @@ async function describeProviderError(response: Response): Promise<string> {
     parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : undefined;
   if (!record) return `bodyKind=${typeof parsed} len=${text.length}`;
   const parts: string[] = [];
+  // Provider-authored strings are free text: a validation error may echo request
+  // content. Run them through the same redactor used for outbound state so no
+  // secret/PII can reach the log even with the diagnostic enabled.
+  const safe = (value: unknown, maxChars: number) => redactText(String(value ?? "")).slice(0, maxChars);
   const detail = record.detail;
   if (Array.isArray(detail)) {
     for (const item of detail.slice(0, 8)) {
       const entry = item && typeof item === "object" ? (item as Record<string, unknown>) : undefined;
       if (!entry) continue;
       const loc = Array.isArray(entry.loc) ? entry.loc.map((value) => String(value)).join(".") : "-";
-      parts.push(`loc=${loc} msg=${String(entry.msg ?? "").slice(0, 120)} type=${String(entry.type ?? "")}`);
+      parts.push(`loc=${loc} msg=${safe(entry.msg, 120)} type=${safe(entry.type, 40)}`);
     }
   } else if (typeof detail === "string") {
-    parts.push(`detail=${detail.slice(0, 160)}`);
+    parts.push(`detail=${safe(detail, 160)}`);
   }
   for (const key of ["error", "message", "error_type"]) {
     const value = record[key];
-    if (typeof value === "string") parts.push(`${key}=${value.slice(0, 160)}`);
+    if (typeof value === "string") parts.push(`${key}=${safe(value, 160)}`);
   }
   return `keys=[${Object.keys(record).join(",")}] ${parts.join(" | ")}`;
 }
@@ -346,7 +363,7 @@ export function createJevEngine(config: DecisionEngineConfig, deps: JevDeps = {}
       const built = buildProviderRequestBody(request, config);
       if (!built.ok) return fail("payload_rejected", built.detail, "rejected");
 
-      const breaker = getBreaker(config);
+      const breaker = getBreaker(config, deps.breakerScope);
       if (!breaker.allow()) return fail("circuit_open", "circuit breaker is open");
 
       if (callerSignal?.aborted) {

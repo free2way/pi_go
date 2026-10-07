@@ -244,6 +244,13 @@ describe("jev engine — retry table", () => {
             type: "missing",
             input: { echoed: "SECRET-ECHO-MUST-NOT-BE-LOGGED" },
           },
+          {
+            // P1 (code review): provider-authored free text may echo request
+            // content, so it must be redacted before it reaches the log.
+            loc: ["body", "state"],
+            msg: "Invalid value: sk-DUMMY-LEAK-VIA-MSG-0123456789",
+            type: "value_error",
+          },
         ],
       };
       process.env.PI_JEV_DIAG = "1";
@@ -258,6 +265,8 @@ describe("jev engine — retry table", () => {
       expect(logged).not.toContain(API_KEY);
       expect(logged).not.toContain("SECRET-ECHO-MUST-NOT-BE-LOGGED");
       expect(logged).not.toContain("echoed");
+      // P1 (code review): provider-authored text is redacted before logging.
+      expect(logged).not.toContain("sk-DUMMY-LEAK-VIA-MSG-0123456789");
 
       warn.mockClear();
       delete process.env.PI_JEV_DIAG;
@@ -450,5 +459,45 @@ describe("CircuitBreaker", () => {
     expect(breaker.allow()).toBe(false);
     clock.advance(BREAKER_COOLDOWN_MS);
     expect(breaker.allow()).toBe(true);
+  });
+});
+
+describe("breaker isolation (P1 code review)", () => {
+  it("does not let one credential scope latch another scope's breaker", async () => {
+    resetDecisionCircuitBreakers();
+    // Tenant A resolves a revoked key: its 401 latches A's breaker only.
+    const badFetch = vi.fn(async () => json({ detail: "invalid api key" }, 401));
+    const engineA = createJevEngine(config(), {
+      fetchImpl: badFetch as unknown as typeof fetch,
+      breakerScope: "vault:user-a",
+    });
+    expect((await engineA.evaluate(request())).fallbackReason).toBe("authentication_failed");
+
+    // Tenant B (different scope, valid key) must still be able to evaluate.
+    const goodFetch = vi.fn(async () => json(validBody()));
+    const engineB = createJevEngine(config(), {
+      fetchImpl: goodFetch as unknown as typeof fetch,
+      breakerScope: "vault:user-b",
+    });
+    const forB = await engineB.evaluate(request({ evaluationId: "de_b" }));
+    expect(forB.status).toBe("completed");
+    expect(goodFetch).toHaveBeenCalledTimes(1);
+
+    // ...while A stays latched (no unbounded retry, zero further outbound calls).
+    const second = await engineA.evaluate(request({ evaluationId: "de_a2" }));
+    expect(second.fallbackReason).toBe("circuit_open");
+    expect(badFetch).toHaveBeenCalledTimes(1);
+    resetDecisionCircuitBreakers();
+  });
+
+  it("keeps sharing the breaker within the same scope", async () => {
+    resetDecisionCircuitBreakers();
+    const fetchImpl = vi.fn(async () => json({ detail: "nope" }, 401));
+    const first = createJevEngine(config(), { fetchImpl: fetchImpl as unknown as typeof fetch, breakerScope: "vault:user-a" });
+    await first.evaluate(request());
+    const second = createJevEngine(config(), { fetchImpl: fetchImpl as unknown as typeof fetch, breakerScope: "vault:user-a" });
+    expect((await second.evaluate(request({ evaluationId: "de_same" }))).fallbackReason).toBe("circuit_open");
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    resetDecisionCircuitBreakers();
   });
 });
