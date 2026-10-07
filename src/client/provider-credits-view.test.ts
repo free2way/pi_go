@@ -49,6 +49,14 @@ const response = (over: Partial<ProviderCreditsResponse> = {}): ProviderCreditsR
 });
 
 describe("金额与档位文案", () => {
+  it("小于 0.01 的金额给足有效位（Jev 单次 $0.00004 不能被显示成 $0.00）", () => {
+    expect(formatCreditAmount(0.000755, "USD")).toBe("$0.000755");
+    expect(formatCreditAmount(0.000042, "USD")).toBe("$0.000042");
+    expect(formatCreditAmount(0, "USD")).toBe("$0.00");
+    expect(formatCreditAmount(0.01, "USD")).toBe("$0.01");
+    expect(formatCreditAmount(9.999, "USD")).toBe("$10.00");
+  });
+
   it("金额两位小数；USD/CNY 用符号，其它币种用代码", () => {
     expect(formatCreditAmount(9.5, "USD")).toBe("$9.50");
     expect(formatCreditAmount(9.5, "CNY")).toBe("¥9.50");

@@ -37,10 +37,19 @@ export function creditLevelTone(level: CreditStatus["level"]): CreditTone {
   return LEVEL_TONES[level] ?? "muted";
 }
 
-/** 金额：统一两位小数，避免同一卡片里出现两种精度。 */
+/**
+ * 金额：常规两位小数；**小于 0.01 时给足有效位**（Jev 单次评估约 $0.00004，两位小数会把它
+ * 显示成 $0.00 —— 那等于谎报成"没花钱"）。零仍然显示 $0.00（零是事实）。
+ */
 export function formatCreditAmount(value: number | undefined, currency: string, locale: Locale = DEFAULT_LOCALE): string {
   if (value === undefined || !Number.isFinite(value)) return t(locale, "credits.unknownAmount");
   const symbol = currency === "USD" ? "$" : currency === "CNY" ? "¥" : `${currency} `;
+  if (value === 0) return `${symbol}0.00`;
+  if (value < 0.01) {
+    // 六位小数，去掉尾随零：0.000755 → "$0.000755"
+    const precise = value.toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
+    return `${symbol}${precise}`;
+  }
   return `${symbol}${value.toFixed(2)}`;
 }
 
