@@ -150,8 +150,10 @@ git add -A && git commit -q -m "fixture-small-auth"
 - **为什么任务要求 Agent 提交**（实测结论）：Worker 从不提交单 Agent 工作树的改动，而
   `POST /api/runs/:id/merge` 只是把**运行分支** fast-forward 到默认分支。若改动未提交到运行分支，
   该「合并」会退化为静默空操作（`run.merge.commit === run.baseSha`，工作区 HEAD 不变），
-  审核通过的成果根本不会交付到工作区。因此任务显式要求真实提交（这是真实动作，不是模拟），
-  并用「HEAD 推进到新提交」的断言守住这条路径——一旦回退为空操作，用例即失败。
+  审核通过的成果根本不会交付到工作区。产品的修复是**按轮由产品侧把本轮工作树改动提交到运行分支**
+  （见 `src/worker/round-commit.ts`），因此任务文本明确**禁止 agent 自行 `commit`/`push`**（避免与产品
+  提交打架），并由检查 `[ "$(git rev-parse HEAD)" != "<base>" ]` 强制本轮确有新提交、由「HEAD 推进到
+  merge.commit」的断言守住交付路径——一旦回退为空操作，用例即失败。
 - **OTP 登录**是生产专属（Cloudflare Access）。demo 部署用 development 身份头
   `x-pigo-dev-email`，本用例**不伪造** OTP 步骤——它只在生产验收环境覆盖，其余步骤全部真实执行。
 - **合并后发布**：`POST /api/runs/:id/merge` 只写 `run.merge`/`run.merged`，**从不**触发
@@ -264,3 +266,96 @@ printf 'PIGO-E2E-CANARY-%s\n' "$(head -c 16 /dev/urandom | od -An -tx1 | tr -d '
 其它 spec：`auth.spec.ts`、`workspaces.spec.ts`、`runs.spec.ts`、`errors.spec.ts`、
 `reconnect.spec.ts`、`i18n.spec.ts`、`mobile.spec.ts`（`@mobile`，用 `--project=mobile` 运行）、
 `decision-engine.spec.ts`（JEV shadow 契约，见上文）。
+
+### Story：从创建任务到部署交付（手动执行，`story-delivery.spec.ts`）
+
+一个**叙事化、端到端、opt-in** 的完整交付闭环用例，供你亲自在自己的部署上跑，用来找问题：
+创建任务 → 开发 → 检查 → 独立审核 → **人工闸门（绝不自动合并）** → 管理员合并 → **显式发布**
+→ 交付结果核验。它不是 `docs/05` §13 的验收场景，**不参与** `npm run gate:acceptance`：
+它是真实闭环，会真的消耗 provider token 与时间（一次完整开发 + 独立审核 + 发布），
+让门禁每次都跑它既慢又贵。因此设了**双开关**——只有 `PI_E2E_LIVE=1` **且** `PI_E2E_STORY=1`
+时才真正执行，否则 `test.skip(true, …)` 并给出可操作的原因。（验收门 `scripts/e2e-suite-result.mjs`
+只对 `REQUIRED_E2E_SCENARIOS` 里的必需场景施加「跳过即失败」的门控，本用例不在其中，
+所以它被跳过不会改变门禁的任何判定。）
+
+#### 前置条件
+
+- **demo/验收栈可达**：`PI_E2E_BASE_URL` 指向一个在运行的部署（默认 `http://127.0.0.1:3100`）。
+- **真实运行可用**：`/api/config/status` 报告 `realRunsAvailable=true`（即部署侧
+  `PI_REAL_RUNS_ENABLED=true` + `PI_INTERNAL_TOKEN` + ≥1 个已配置的 provider 凭据）。
+- **身份**：demo 部署用 development 身份头 `x-pigo-dev-email`（`PI_E2E_DEV_EMAIL`）；
+  生产用 Cloudflare Access OTP，套件不自带登录流程。**该身份必须是管理员**——
+  人工合并 `POST /api/runs/:id/merge` 与显式发布 `POST /api/runs/:id/publish` 都是管理员专属
+  （非管理员会在 Step 0 以精确原因跳过）。
+- **受控工作区**：默认用部署 projects 根目录下的夹具 `fixture-small-auth`（测试自行
+  `POST /api/workspaces/register` 注册、结束时 `DELETE /api/workspaces/:id` 注销，见上文
+  「E2E-01b 夹具与人工闸门（部署侧）」）。也可用 `PI_E2E_WORKSPACE_PATH` 指定别的相对路径，
+  或用 `PI_E2E_WORKSPACE_ID` 直接指向一个已注册的受控工作区。仓库必须**干净**
+  （否则 run preflight 直接 409 `WORKSPACE_DIRTY`）。
+- **模型目录**：`/api/models` 里至少各有一个可选用于 `developer` 与 `reviewer` 的模型
+  （`selectableRoles`）；测试显式钉住它们，不继承部署默认。
+- **可选**：发布钩子。未配置时 Step 7 会以 409 + 明确 code 断言「显式拒绝且不写 release 记录」；
+  配置了（`PI_POST_MERGE_DEPLOY_HOOK`，webhook 还需 `PI_POST_MERGE_DEPLOY_TOKEN` +
+  `PI_PUBLIC_ORIGIN`）时同一用例断言 `run.release` + `run.release_started`/终态事件。两种情形用例都通过。
+- **本机有代理时**：直连内网/局域网部署要设 `NO_PROXY`（见下面命令）。
+
+#### 一条可直接复制的命令
+
+```sh
+cd /Volumes/STORAGE_Jackyhu/code/pi_go
+export PATH="$HOME/.nvm/versions/node/v24.14.0/bin:$PATH"
+
+export PI_E2E_BASE_URL=http://192.168.2.235:3101       # 你的部署地址
+export PI_E2E_DEV_EMAIL=bobo.2000@gmail.com            # 必须是管理员
+export PI_E2E_LIVE=1 PI_E2E_STORY=1                    # 双开关（缺一即跳过）
+export NO_PROXY="localhost,127.0.0.1,192.168.2.235"    # 本机有代理时必须；否则直连内网会失败
+export no_proxy="$NO_PROXY"
+
+# 可选：等待预算与发布环境名
+# export PI_E2E_STORY_TIMEOUT_MS=900000    # 等待运行到达终态，默认 15 分钟
+# export PI_E2E_STORY_SETTLE_MS=60000      # 终态后等决策证据落盘，默认 60 秒
+# export PI_E2E_STORY_ENVIRONMENT=demo     # 发布环境名，默认 demo
+
+npx playwright test tests/e2e/story-delivery.spec.ts --project=chromium --reporter=list
+```
+
+只做静态自检（不连部署、不花 token）：
+
+```sh
+npx playwright test tests/e2e/story-delivery.spec.ts --list
+```
+
+#### 每一步证明什么、预计耗时、失败时先看哪里
+
+每一步先把 `{type:"step"}`（以及 `note`/`run`/`merge`/`release`/`summary`）写进 Playwright
+annotation，再断言；最后 `console.log` 一张汇总表并输出 `STORY_DELIVERY_OK`。任何一步失败时，
+测试会先打印「STORY 失败现场证据」块（失败步骤、state/merge/release、事件类型清单、rounds、
+制品 sha256、决策行、全部事件日志），**再抛出**原始断言错误——先看那段现场块，再按下面定位。
+
+| 步骤 | 证明什么 | 预计耗时 | 失败时先看哪里 |
+| --- | --- | --- | --- |
+| Step 0 前置体检 | `/api/health` 可达；身份是管理员；`realRunsAvailable=true`；记录 `decisionEngine`；受控工作区干净且有 `git.head`；developer/reviewer 均有可选模型 | < 5s | 直接是 `test.skip` + 可操作原因（非 FAIL）：按原因设置对应变量/夹具/账号 |
+| Step 1 story 场景 | `POST /api/runs` 返回 **201**，初始状态处于活跃态，`workspaceId`/`baseSha`/钉住的 developer+reviewer 与前置一致 | < 5s | `POST /api/runs` 的 HTTP 体（409 `WORKSPACE_DIRTY`、400 校验失败等原文都在断言信息里） |
+| Step 2 开发与检查 | 轮询到终态（期望 `completed`）；`review.started` 出现；`GET /rounds` 的最后一个 verdict 是 `approved`；提交的检查全部 `passed`/exit 0；无 `check.failed` | 2–12 分钟（模型速度决定） | 断言信息里附完整事件日志；看 `run.state`/`summary` 是否为 `needs_human`（审核退回）或 `failed` |
+| Step 3 交付物证据 | `run.diff` 非空、只触碰本次交付物、含本次唯一 marker；`/artifacts` 有 diff 制品；下载 body 与 `run.diff` 逐字节一致；制品记录的 **sha256/bytes 与下载 body 实测一致** | < 5s | `touched=[…]`（多改了文件）、`run.diff` 全文、制品列表 |
+| Step 4 人工闸门 | **合并前**：`run.merge` 为空、无 `run.merged`/`run.release_*` 事件、刷新后的工作区 HEAD **未移动**且不 dirty（产品绝不自动合并/发布） | < 5s | 若此处失败说明出现了自动合并/发布，或运行改动了工作树——看事件日志里的 `run.merged`/`run.release_*` |
+| Step 5 管理员合并 | `POST /merge` 返回 200 + `commit/strategy/targetBranch/mergedAt/mergedBy`；恰好一条 `run.merged`（meta 同 commit/操作者，seq 晚于 `review.approved`）；刷新后默认分支 HEAD **前移且 === `merge.commit`**（`!==` 基线）且不 dirty | < 10s | 若 200 但 HEAD 未动 → E2E-01b 记录的「无声 no-op」：worker 没把本轮工作树改动提交到任务分支（409 `RUN_NOT_MERGE_READY` 则是终态不是 completed） |
+| Step 6 决策平面见证 | 引擎启用且有 finding 时：`/decisions` 至少一行 `review_triage`，脱敏投影字段完整、key 集合白名单、无 `apiKey/authorization/payload` 等敏感键、`stateManifest` 是脱敏摘要且不含密钥形状串、成本未知时缺省而非 `0`；每个 `decision.requested` 恰好一个 `completed\|fallback`（同 `evaluationId`、requested 在前、晚于 `review.started`）。引擎未启用 / 本轮 0 finding → **如实标注「本轮无决策证据」**并断言零决策证据自洽 | 0–60s（等证据落盘） | 若引擎是 `shadow`/`assist`/`enforce` 且本轮有 finding 却**没有**决策证据 → 这是真实缺陷（worker 未设 `PI_JEV_MODE`，或构建缺 docs/26 §9.1 调用点）；断言信息点名了这两处 |
+| Step 7 显式发布 | `POST /publish`：**未配置钩子** → 409 + `RELEASE_NOT_CONFIGURED`（或 `RELEASE_AUTH/CALLBACK_NOT_CONFIGURED`）等明确 code，且**不写** `run.release`、无 `run.release_*` 事件；**已配置** → 200 + `run.release.status ∈ succeeded\|triggered\|failed`、`commit === merge.commit`、恰好一条 `run.release_started` + 匹配终态事件 | < 30s（含 webhook 触发） | 断言信息里带服务端返回体（`code`/`error`）；先看是「未配置」（400/409 原文）还是「已配置但发布失败」（终态事件文案） |
+| Step 8 交付结果核验 | `GET /api/deployments` 可达且返回 `records`；若部署日志里有本次 `merge.commit` 的记录则断言其状态不为 `failed`，否则**如实记录**「未回写本次 commit」；刷新后默认分支 HEAD 仍 `=== merge.commit` 且工作区干净 | < 5s | `log.available`/`records` 条数；若日志未回写，检查发布钩子是否真的写了 `/app/pi-agent/backups/deploy.log`（`PI_DEPLOY_LOG`） |
+| Step 9 总结报告 | 打印一张表（run id、轮次/verdict、diff 行数、artifact sha256 前 12 位、merge commit/strategy、release status、决策条数与成本语义、总耗时）并以 `STORY_DELIVERY_OK` 收尾 | < 5s | 表格本身就是交付凭证，可直接贴给同事 |
+
+预计总耗时：**约 3–15 分钟**（Step 2 的模型延迟占绝大部分；`PI_E2E_STORY_TIMEOUT_MS` 默认给了 15 分钟）。
+
+#### 要点与边界
+
+- **双开关**：`PI_E2E_LIVE=1` 且 `PI_E2E_STORY=1`，缺一即 `test.skip` 并说明怎么开。
+  它**不参与**验收门禁，原因就是上面说的——它会真实消耗 token。
+- **人工闸门是核心**：Step 4 在合并**之前**断言「没有自动合并」，Step 5 才由管理员合并，
+  并断言默认分支 HEAD 真的前移。这是 E2E-01b 记录的「fast-forward 到基线的静默 no-op」回归护栏。
+- **决策平面见证不是静默通过**：无证据时一定写入 annotation 说明「无决策证据 + 引擎状态 + 原因」
+  并断言零证据自洽；引擎启用且本轮有 finding 却无证据就是 FAIL。
+- **只看不改**：用例本身只读（外加创建运行、注册/注销夹具、合并、发布这些产品 API），
+  不修改仓库里任何基线文件；它创建的交付物叫 `pigo-story-e2e.txt`，唯一 marker 形如 `PIGO-STORY-<时间戳>`。
+- **并发限制**：与 E2E-01b/E2E-08 相同，夹具在测试期间处于注册状态，**同一部署上只跑一个测试进程**。
+- **OTP 不伪造**：demo 用 `x-pigo-dev-email`；生产 OTP 登录不在本用例范围内，它只断言实际拿到的身份。
