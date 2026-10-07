@@ -292,6 +292,8 @@ GET /api/runs/:runId/decisions
 
 该接口只返回已脱敏的状态摘要、问题定义、回答、应用结果和性能数据，不返回 API Key 或外发 payload 原文。
 
+运行详情页的**「决策审计」标签页**消费该接口（客户端 `src/client/DecisionsPanel.tsx` + 纯函数 `src/client/decisions-view.ts`）：逐条卡片展示状态/模式/提供方/模型（含 requested → resolved 的漂移可见性）/策略版本/截断哈希/时延/tokens/应用结果与回答（三型 + 概率/确信度/置信度/加权分）。成本缺失时显示**「未知」**（沿用 AT-JEV-062 语义，绝不显示 `$0.000`）；**不渲染 `stateManifest`**（只取稳定的计数摘要），面板文案明确标注「只读 · 脱敏投影」。共享类型镜像 `src/shared/decision-audit.ts` 配漂移守卫测试，避免与服务端投影字段漂移。
+
 ### 8.3 认证与幂等
 
 - evaluate API 只接受现有 worker 内部身份，不接受浏览器 Session 直接调用。
