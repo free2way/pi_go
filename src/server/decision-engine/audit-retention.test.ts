@@ -368,7 +368,7 @@ describe("AT-JEV-056 retention sweeper", () => {
   });
 
   it("never rejects: a failing store logs one bounded warning and the loop continues", async () => {
-    const SECRET = "sk-DO-NOT-LEAK-0123456789";
+    const SECRET = "sk-DUMMY-DO-NOT-LEAK-0123456789";
     const warn = vi.fn();
     const sweep = createDecisionAuditRetentionSweeper({
       store: {

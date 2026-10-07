@@ -40,7 +40,7 @@ const OWNER = "owner-a";
 const VAULT_KEY_1 = "sk-DUMMY-REVOKED-KEY-000111222333";
 const VAULT_KEY_2 = "sk-DUMMY-ROTATED-KEY-444555666777";
 /** Raw provider error body content that must never reach an alert or a row. */
-const PROVIDER_BODY_MARKER = "invalid api key sk-PROVIDER-BODY-DO-NOT-LEAK";
+const PROVIDER_BODY_MARKER = "invalid api key sk-DUMMY-PROVIDER-BODY-DO-NOT-LEAK";
 const RAW_STATE_MARKER = "SECRET-STATE-SNIPPET-DO-NOT-LEAK";
 
 const directories: string[] = [];

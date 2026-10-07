@@ -48,6 +48,7 @@ import {
   Plus,
   RotateCcw,
   Rocket,
+  Scale,
   Search,
   ShieldCheck,
   Sparkles,
@@ -86,6 +87,7 @@ import {
   decisionRemainingGroupKey,
 } from "./decision-brief-view";
 import { AgilePage } from "./AgilePage";
+import { DecisionsPanel } from "./DecisionsPanel";
 import { HistoryPage } from "./HistoryPage";
 import { requirementSummary, runStateKey } from "./requirement-history";
 import { batchCleanupConfirmMessage, cleanupFinishedConfirmMessage, cleanupStorageDetailLines, summarizeCleanupStorage } from "./run-cleanup-view";
@@ -101,7 +103,7 @@ import { AccountsPage } from "./AccountsPage";
 import { SystemStatusPage } from "./SystemStatusPage";
 import { WorkspacesPage } from "./WorkspacesPage";
 
-type Tab = "activity" | "agents" | "review" | "diff" | "checks" | "budget";
+type Tab = "activity" | "agents" | "review" | "diff" | "checks" | "budget" | "decisions";
 type FlowNodeData = {
   label: string;
   caption: string;
@@ -2020,6 +2022,7 @@ export function App() {
                     ["diff", "Diff", FileCode2],
                     ["checks", t("topology.tabs.checks"), ListChecks],
                     ["budget", t("topology.tabs.budget"), Braces],
+                    ["decisions", t("topology.tabs.decisions"), Scale],
                   ] as const).map(([key, label, Icon]) => (
                     <button className={tab === key ? "active" : ""} key={key} onClick={() => setTab(key)}><Icon size={14} />{label}</button>
                   ))}
@@ -2031,6 +2034,7 @@ export function App() {
                   {tab === "diff" && <DiffPanel run={activeRun} artifacts={artifacts} mergeRequestConfigured={config?.mergeRequestConfigured} />}
                   {tab === "checks" && <ChecksPanel run={activeRun} />}
                   {tab === "budget" && <BudgetPanel run={activeRun} />}
+                  {tab === "decisions" && <DecisionsPanel run={activeRun} config={config} />}
                 </div>
               </section>
             </div>

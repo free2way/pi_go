@@ -891,3 +891,41 @@ button.agile-metrics-row:hover strong { color: #c3d274; }
 @media (max-width: 720px) {
   .locale-select { font-size: 11px; }
 }
+
+/* ---------- 决策审计 (docs/26 §8.2): read-only redacted decision-audit panel ---------- */
+.decisions-panel { display: flex; flex-direction: column; gap: 12px; padding: 2px; }
+.decisions-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.decisions-head p { margin: 5px 0 0; color: var(--panel-dim); font-size: var(--panel-fs-sm); line-height: var(--panel-lh); max-width: 560px; }
+.decisions-readonly { flex: 0 0 auto; color: #9fb0bf; background: #101419; border: 1px solid #262d34; border-radius: 999px; padding: 4px 9px; font: 500 9px "DM Mono", monospace; }
+.decisions-engine { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.decisions-notice { color: #d9a06c; font-size: var(--panel-fs-sm); line-height: var(--panel-lh); }
+.decisions-count { color: #5f6974; font: 9px "DM Mono", monospace; letter-spacing: .08em; }
+.decisions-list { display: flex; flex-direction: column; gap: 10px; }
+.decisions-card { border: 1px solid #1f252c; background: #0f1317; border-radius: 9px; padding: 11px 12px; display: flex; flex-direction: column; gap: 10px; }
+.decisions-card-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.decisions-tag { color: #98a2ac; background: #101419; border: 1px solid #262d34; border-radius: 6px; padding: 4px 8px; font: 500 9px "DM Mono", monospace; }
+.decisions-time { margin-left: auto; color: #6d7782; font: 9px "DM Mono", monospace; }
+.decisions-meta { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 7px 12px; }
+.decisions-meta > span { min-width: 0; }
+.decisions-meta em { display: block; color: #5f6974; font: 8px "DM Mono", monospace; letter-spacing: .09em; text-transform: uppercase; font-style: normal; }
+.decisions-meta code, .decisions-meta strong { display: block; margin-top: 3px; font-size: 10px; word-break: break-all; }
+.decisions-meta code { color: #c3cad1; font-family: "DM Mono", monospace; }
+.decisions-meta strong { color: var(--panel-text); font-weight: 600; }
+.decisions-meta code.is-drift { color: #d9a06c; }
+.decisions-meta strong.is-unknown { color: #d9a06c; }
+.decisions-line { display: flex; align-items: baseline; gap: 7px; flex-wrap: wrap; font-size: var(--panel-fs-sm); color: var(--panel-text); }
+.decisions-line em { color: #5f6974; font: 8px "DM Mono", monospace; letter-spacing: .09em; text-transform: uppercase; font-style: normal; }
+.decisions-line code { color: #c3cad1; font: 9px "DM Mono", monospace; }
+.decisions-line.is-warn code { color: #d9a06c; }
+.decisions-answers { border: 1px solid #1f252c; border-radius: 8px; overflow: hidden; }
+.decisions-answers-title { padding: 7px 11px; background: #12161b; color: #5f6974; font: 8px "DM Mono", monospace; letter-spacing: .09em; }
+.decisions-answers-head, .decisions-answers-row { display: grid; grid-template-columns: minmax(110px, 1.4fr) .7fr .9fr minmax(120px, 1.6fr); gap: 8px; padding: 7px 11px; align-items: baseline; }
+.decisions-answers-head { border-top: 1px solid #1a1f25; color: #5f6974; font: 8px "DM Mono", monospace; letter-spacing: .09em; }
+.decisions-answers-row { border-top: 1px solid #1a1f25; font-size: 10px; color: #c3cad1; }
+.decisions-answers-row code { color: #c3cad1; font: 9px "DM Mono", monospace; word-break: break-all; }
+.model-verify.error { color: var(--red); border-color: rgba(242,113,113,.22); background: rgba(242,113,113,.06); }
+.model-verify.muted { color: #98a2ac; border-color: #262d34; background: #101419; }
+@media (max-width: 720px) {
+  .decisions-answers-head, .decisions-answers-row { grid-template-columns: 1fr 1fr; }
+}
+
