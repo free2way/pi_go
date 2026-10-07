@@ -164,6 +164,12 @@ export function setProviderCredit(book: ProviderCreditBook, input: { provider: s
   return { ...book, credits: [...others, entry].sort((a, b) => a.provider.localeCompare(b.provider)) };
 }
 
+/**
+ * 不计费的 provider：mock 的评估从未离开本机、disabled 是纯本地兜底，它们的成本是**确定的 0**，
+ * 不是"未知"。把它们算成未计价会让整块显示成「≥ …」，反而把真实花费说得更不可信。
+ */
+export const FREE_PROVIDERS: ReadonlySet<string> = new Set(["mock", "disabled"]);
+
 function tokensOf(value: number | undefined): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return 0;
   return Math.max(0, Math.trunc(value));
@@ -209,9 +215,15 @@ export function summarizeProviderSpend(rows: readonly SpendRow[], lookup: SpendP
     const outputTokens = tokensOf(row.outputTokens);
     current.inputTokens += inputTokens;
     current.outputTokens += outputTokens;
-    const model = String(row.resolvedModel || row.requestedModel || "").trim();
-    const price = lookup.priceFor?.(provider, model);
-    if (!price) {
+    const resolved = String(row.resolvedModel ?? "").trim();
+    const requested = String(row.requestedModel ?? "").trim();
+    // 先按 resolved（线上真实版本）计价，没有再退回 requested（别名）：供应商换版本而运维
+    // 还没登记新价时，成本不至于整段掉进"未计价"。别名与版本价的差异由漂移告警（AT-JEV-081）暴露。
+    const price = lookup.priceFor?.(provider, resolved) ?? (requested && requested !== resolved ? lookup.priceFor?.(provider, requested) : undefined);
+    if (FREE_PROVIDERS.has(provider)) {
+      // 免费 provider：计次但不计钱，也不影响 complete（0 是事实，不是未知）。
+      current.pricedCalls += 1;
+    } else if (!price) {
       current.unpricedCalls += 1;
       current.complete = false;
     } else {

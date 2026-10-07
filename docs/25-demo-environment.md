@@ -188,7 +188,7 @@ provider 的**账户余额查不到**（仓库只调 System One 的业务端点�
 | 文件（宿主） | 容器内 | 内容 |
 | --- | --- | --- |
 | `${PIGO_DEMO_DATA_DIR}/provider-credits.json` | `/app/data/provider-credits.json` | 人工额度：`{ "credits": [{ "provider": "typesafe", "creditedUsd": 10 }] }`（权限 600） |
-| `${PIGO_DEMO_DATA_DIR}/model-prices.json` | `/app/data/model-prices.json` | 价目表：`{ "entries": [{ "provider": "typesafe", "model": "jev-1.13.0", "inputPerMTok": 0.15, "outputPerMTok": 0.6 }] }` |
+| `${PIGO_DEMO_DATA_DIR}/model-prices.json` | `/app/data/model-prices.json` | 价目表：`{ "entries": [{ "provider": "typesafe", "model": "jev-latest", "inputPerMTok": 0.042, "outputPerMTok": 0.042 }] }`（demo 现用值，来自运营口径） |
 
 三条操作方式（任选其一）：
 
@@ -200,6 +200,11 @@ provider 的**账户余额查不到**（仓库只调 System One 的业务端点�
 语义（与 AT-JEV-062 一致，界面按此显示）：
 **没录入额度 = 「未录入」，不是 $0.00**；**模型不在价目表里 = 该次调用未计价**，已花显示为
 **下界（`≥ …`）**，绝不把缺价当免费。
+
+计价的匹配顺序：先按审计行的 `resolved_model`（线上真实版本）查价，没有再退回 `requested_model`
+（别名）——供应商换版本而运维还没登记新价时，成本不至于整段掉进"未计价"；版本与别名价差由别名
+漂移告警（AT-JEV-081）暴露。`mock` / `disabled` 属于**确定的 0**（评估从未离开本机），计次但不
+计钱、也不会把整块标成"不完整"。
 
 浏览器缺省身份：`PI_DEV_DEFAULT_EMAIL`（demo 设成 `bobo.2000@gmail.com`）。development 模式下身份
 只来自 `x-pigo-dev-email` 头，缺省若仍是 `developer@localhost`（非管理员），管理员操作在界面上

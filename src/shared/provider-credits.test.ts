@@ -120,15 +120,36 @@ describe("summarizeProviderSpend", () => {
     // 0.15 + 0.3 = 0.45，未计价的第三行不产生金额（也不假装免费）
     expect(typesafe?.usd).toBe(0.45);
 
+    // mock/disabled 是确定的 0（免费），不是"未知"：计次但不影响 complete。
     const mock = spend.find((entry) => entry.provider === "mock");
-    expect(mock).toMatchObject({ pricedCalls: 0, unpricedCalls: 1, usd: 0, complete: false });
+    expect(mock).toMatchObject({ pricedCalls: 1, unpricedCalls: 0, usd: 0, complete: true });
     expect(spend.map((entry) => entry.provider)).toEqual(["mock", "typesafe"]);
   });
 
-  it("没有价目表时全部记为未计价（绝不返回 0 当作已算清）", () => {
+  it("resolved 版本没有价格时退回 requested 别名价（别名漂移不至于把成本算没）", () => {
+    const spend = summarizeProviderSpend(
+      [{ provider: "typesafe", requestedModel: "jev-latest", resolvedModel: "jev-9.9.9", inputTokens: 1_000_000, outputTokens: 0 }],
+      { priceFor: (provider, model) => (provider === "typesafe" && model === "jev-latest" ? { inputPerMTok: 0.042, outputPerMTok: 0.042 } : undefined) },
+    );
+    expect(spend[0]).toMatchObject({ pricedCalls: 1, unpricedCalls: 0, usd: 0.042, complete: true });
+    // 版本行存在时优先用版本价
+    const versioned = summarizeProviderSpend(
+      [{ provider: "typesafe", requestedModel: "jev-latest", resolvedModel: "jev-9.9.9", inputTokens: 1_000_000, outputTokens: 0 }],
+      {
+        priceFor: (provider, model) =>
+          provider === "typesafe" ? (model === "jev-9.9.9" ? { inputPerMTok: 1, outputPerMTok: 1 } : { inputPerMTok: 0.042, outputPerMTok: 0.042 }) : undefined,
+      },
+    );
+    expect(versioned[0]).toMatchObject({ usd: 1, complete: true });
+  });
+
+  it("没有价目表时全部记为未计价（绝不返回 0 当作已算清）；免费 provider 例外", () => {
     const spend = summarizeProviderSpend(rows);
-    expect(spend.every((entry) => entry.complete === false)).toBe(true);
+    const paid = spend.filter((entry) => entry.provider !== "mock");
+    expect(paid.every((entry) => entry.complete === false)).toBe(true);
     expect(spend.find((entry) => entry.provider === "typesafe")?.unpricedCalls).toBe(3);
+    // 免费 provider 即使没有价目表也是 complete（0 是事实）
+    expect(spend.find((entry) => entry.provider === "mock")).toMatchObject({ complete: true, usd: 0 });
   });
 
   it("空输入 → 空结果；无 provider 的行被忽略", () => {
