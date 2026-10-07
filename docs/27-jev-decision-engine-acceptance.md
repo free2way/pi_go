@@ -503,22 +503,59 @@ suite 默认身份是 `developer@localhost`，而 demo 的凭据配在管理员 
 `missingRealRunsReason()` 现在会把这条诊断直接写进跳过原因里（点名当前身份与
 `configuredProviders`），不要再退回成裸的 `realRunsAvailable=false`。
 
-demo 环境**无法**满足的两个必需场景（需要专属环境形态，不是缺陷）：
+**E2E-05（越权审核模型）在 demo 上也不需要额外配置**——模型目录里已有合规组合：
+`deepseek / deepseek-flash` 的 `selectableRoles = ["developer"]`（**不含 reviewer**）且 provider 凭据
+`verified=true`，正是"凭据有效但无权用于审核角色"。2026-10-07 实测通过（1.4 秒；pre-queue 拦截 ⇒
+不创建运行、不消耗额度）：
 
-- **E2E-05**：需要一个「凭据有效但无权用于审核角色」的 reviewer 模型（`PI_E2E_PREFLIGHT_PROVIDER`/`_MODEL`）。
-- **E2E-07**：需要把部署配置成「预算只够 Planning」（`PI_RUN_MAX_TOKENS`/`PI_RUN_MAX_COST_USD` + 对应的 `PI_E2E_BUDGET_*`）。
+```sh
+PI_E2E_BASE_URL=http://192.168.2.235:3101 PI_E2E_DEV_EMAIL=bobo.2000@gmail.com \
+PI_E2E_LIVE=1 PI_E2E_PREFLIGHT_PROVIDER=deepseek PI_E2E_PREFLIGHT_MODEL=deepseek-flash \
+PI_E2E_PREFLIGHT_CODE=MODEL_NOT_ALLOWED \
+  npx playwright test tests/e2e/acceptance.spec.ts -g 'E2E-05' --project=chromium
+```
 
-在 demo 上跑门禁时，这两条要么按上表补齐配置，要么**显式接受偏差**（脚本只认这个开关，且原因必填）：
+（这三个 `PI_E2E_PREFLIGHT_*` 是**测试侧**变量，命令行传入即可；部署侧只需"目录里有 `selectableRoles`
+不含 reviewer 的模型 + 该 provider 凭据已配置"。换环境时用 `/api/models` 找任意这样的组合。）
+
+**E2E-07（预算停止）在 demo 上是可以跑的**，配方如下（2026-10-07 实测通过，2.0 分钟）：
+
+```sh
+# 1) 把 demo 改成「预算只够 Planning」：备份 → 改 demo.env → 重建容器（web 与 worker 都要生效）
+cp -p /app/pi-agent/demo.env /app/pi-agent/demo.env.bak-pre-e2e07
+sed -i 's/^PI_RUN_MAX_TOKENS=.*/PI_RUN_MAX_TOKENS=20000/' /app/pi-agent/demo.env
+cd /app/pi-agent/source && docker compose -p pigo-demo -f deploy/docker/compose.demo.yaml \
+  --env-file /app/pi-agent/demo.env up -d demo-web demo-worker
+
+# 2) 用例期望值必须与部署一致（用例会核对 run 创建时冻结的 run.budget，不一致会点名该改的变量）
+PI_E2E_BASE_URL=http://192.168.2.235:3101 PI_E2E_DEV_EMAIL=bobo.2000@gmail.com \
+PI_E2E_LIVE=1 PI_E2E_BUDGET_TOKENS=20000 \
+  npx playwright test tests/e2e/acceptance.spec.ts -g 'E2E-07' --project=chromium
+
+# 3) 跑完还原预算（默认 60000 / $0.50），否则后续 demo 运行都会被 20000 截断
+cp -p /app/pi-agent/demo.env.bak-pre-e2e07 /app/pi-agent/demo.env
+cd /app/pi-agent/source && docker compose -p pigo-demo -f deploy/docker/compose.demo.yaml \
+  --env-file /app/pi-agent/demo.env up -d demo-web demo-worker
+```
+
+实测结果：80% 预警 → 达上限停止调用 → 进入 `needs_human` → 制品保留，全部通过。
+
+**9 个必需场景现在都能在 demo 上执行并已分别实测通过**，但**一次门禁跑无法同时包含 E2E-07**：
+E2E-07 要求部署处于「预算只够 Planning」（`20000`），而 E2E-01b/02/04/06/08 需要预算足够跑完真实
+闭环——两者互斥。所以标准做法是：门禁主跑一次（含 E2E-05，偏差开关只为 E2E-07 打开），E2E-07 按上面
+的配方单跑并把结果记在证据里。开关只认下面这个变量，且原因必填：
 
 ```sh
 export PI_E2E_ALLOW_REQUIRED_SKIPS=1
-export PI_E2E_ALLOW_REQUIRED_SKIPS_REASON='demo 缺少 E2E-05（越权审核模型）与 E2E-07（Planning-only 预算部署）所需配置；其余必需场景已在 PI_E2E_LIVE=1 下实测通过（E2E 26/26）'
+export PI_E2E_ALLOW_REQUIRED_SKIPS_REASON='E2E-07 需要部署处于 Planning-only 预算（20000），与其余真实场景所需的充足预算互斥；已按 §8.0 配方单跑通过（2.0 分钟），其余 8 个必需场景在同一环境实测通过'
 ```
 
-两个已验证的实测数字（2026-10-07，demo 目标、提交 `809dc5b`）：带 `PI_E2E_LIVE=1` 时
-E2E **26 执行 / 26 通过 / 0 失败**（含 Worker 崩溃恢复与恶意仓库隔离）；接受 E2E-05/07 偏差时
-门禁 **8 passed / 0 failed / 0 skipped**。真实场景会在 demo 上创建约 30+ 个运行，
-跑完记得按需清理（`POST /api/runs/batch` 的 `action: "cleanup"`，按 owner 身份分批 ≤50）。
+已验证的实测数字（2026-10-07，demo 目标、提交 `809dc5b`）：带 `PI_E2E_LIVE=1` 时
+E2E **26 执行 / 26 通过 / 0 失败**（含 Worker 崩溃恢复与恶意仓库隔离）；**E2E-05** 单跑通过
+（1.4 秒，`deepseek/deepseek-flash` + `MODEL_NOT_ALLOWED`，pre-queue 拦截故不建运行、不耗额度）；
+**E2E-07** 按 §8.0 配方单跑通过（2.0 分钟）；门禁 **8 passed / 0 failed / 0 skipped**（偏差仅在 E2E-07）。
+真实场景会在 demo 上创建约 30+ 个运行，跑完记得按需清理
+（`POST /api/runs/batch` 的 `action: "cleanup"`，按 owner 身份分批 ≤50）。
 
 ### 8.1 AT 追溯矩阵（引用级检查）
 
@@ -539,6 +576,15 @@ E2E **26 执行 / 26 通过 / 0 失败**（含 Worker 崩溃恢复与恶意仓�
   `PI_JEV_LIVE=1` + 真 key；它**不断言** p95 ≤ 2s / p99 ≤ 3s 阈值，不构成门禁级证据。
   执行方式：`PI_JEV_LIVE=1 PI_JEV_LIVE_CALLS=100 TYPESAFE_API_KEY=<key> npm run test:jev:live`
   （合成状态，不碰任何 run/审计表）。
+
+  **回填模板**（执行人跑完填入，值必须来自那次运行的输出；`<key>` 只进环境变量，绝不落盘）：
+
+  | 执行人 | 日期(本地) | 出口区域 | 模型(请求→解析) | Calls | 成功 | p50 | p95 | p99 | max | p95≤2s / p99≤3s |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | （待填） | | | | | | | | | | |
+
+  判定口径：只有 100 次调用全部成功才计入"通过"；出现失败（含 429/超时）时按 docs/26 §12 的降级
+  路径记录，并把失败计数一并写在上表下方——**不得**只报成功那部分的时延。
 - **AT-JEV-080（真实 API 最小调用）**：由在线 opt-in 套件引用（需 `PI_JEV_LIVE=1` + 真 key）。
 - **AT-JEV-090 / 091（配置回滚、引擎回滚）**：**有手工演练证据**（2026-10-06 demo 实测，步骤与结果记录在
   docs/25「决策平面回滚演练」），但未被任何测试引用，因此本脚本仍报 uncited——脚本只识别测试引用。

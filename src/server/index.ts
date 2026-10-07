@@ -40,6 +40,8 @@ import { resetDecisionCircuitBreakers, decisionCircuitSnapshot } from "./decisio
 import { createDecisionMetricsSweeper } from "./decision-engine/metrics.js";
 import { buildReviewTriageBatches } from "./decision-engine/review-triage.js";
 import { decisionEngineStatus, registerDecisionRoutes, type DecisionEngineStatus } from "./decision-routes.js";
+import { registerProviderCreditsRoutes } from "./provider-credits-routes.js";
+import { readModelPriceTable, readProviderCreditBook, writeProviderCreditBook } from "./provider-cost-config.js";
 import { buildAcceptanceSnapshot } from "./acceptance.js";
 import { batchItemFailure, batchItemSuccess, parseBatchRunIds, summarizeBatch, MAX_BATCH_RUN_IDS, type BatchItemOutcome } from "./batch-runs.js";
 import { buildDeploymentStatus, parseDeployLog, resolveDeployLogPath, type DeploymentStatus } from "./deployments.js";
@@ -3298,6 +3300,31 @@ registerDecisionRoutes(app, {
   // raises one deduplicated warning through the existing AlertManager (structured
   // log + optional PI_ALERT_WEBHOOK). Details carry ids and version strings only.
   raiseAlert: (alert) => alerts.raise(alert),
+});
+
+/**
+ * AT-JEV-062：provider 额度是**人工录入**的（账户余额查不到），已花费由决策审计的
+ * token × 价目表算出。GET 是运营读数（与会话内其它读数同级、owner-agnostic、不含任何
+ * run/评估 id 与密钥）；PUT 是管理员操作，与工作区注册/合并/发布同一档。
+ */
+registerProviderCreditsRoutes(app, {
+  sessionAuthorized: (request) => {
+    try {
+      return Boolean(auth.user(request));
+    } catch {
+      return false;
+    }
+  },
+  isAdmin: async (request) => identities.isAdmin(auth.user(request).id),
+  readCredits: () => readProviderCreditBook({ env: process.env, warn: (message, details) => app.log.warn(details, message) }),
+  writeCredits: (book) => {
+    writeProviderCreditBook(book, { env: process.env });
+  },
+  readPrices: () => readModelPriceTable({ env: process.env, warn: (message, details) => app.log.warn(details, message) }),
+  // 已花费要覆盖"从有审计以来"：下界取 epoch（created_at 是定宽 ISO 文本，字典序即时间序）。
+  // 审计读取有行数上限，超过时会如实把 spentComplete 标成 false（金额只是已读部分的下界）。
+  listRecent: (options) => decisionAudit.listRecent({ sinceIso: new Date(0).toISOString(), limit: options.limit }),
+  warn: (message, details) => app.log.warn(details, message),
 });
 
 const currentDir = path.dirname(fileURLToPath(import.meta.url));
