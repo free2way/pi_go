@@ -197,6 +197,33 @@ cd source && docker compose -f deploy/docker/compose.demo.yaml \
 只被 web 读。宿主机 `/app/pi-agent/compose.yaml` 决定哪些变量能进容器——它曾落后仓库一整段 Jev 变量
 （导致"改了 .env 却不生效"），新增 compose 变量时务必同步宿主机副本。
 
+## 生产发布（`deploy/docker/deploy-prod.sh`）
+
+demo 那套"在宿主上从源码构建"的模型对生产同样成立，但生产多三条硬约束，脚本按这个顺序执行：
+
+```sh
+PIGO_SSH_PW=<密码> bash deploy/docker/deploy-prod.sh
+```
+
+1. **回滚三件套先就位**（任何一步失败就停，不带着"没有回滚"继续）：
+   - 给现有镜像打 `local/pigo-web|worker:pre-<时间戳>` 标签；
+   - `tar` 备份 `pigo-web-data` 卷（含 vault）到 `${PIGO_PROD_DIR}/pigo-web-data-<时间戳>.tgz`；
+   - 备份 `.env` 与整个 `source/`。
+2. **只改构建输入**：宿主权威的 `compose.yaml` 与 `.env` 内容不动，`.env` 只自增
+   `PI_WEB_VERSION`（源码哈希未变则跳过，避免无意义升版；哈希存 `${PIGO_PROD_DIR}/.deployed-src-hash`）。
+3. **发布后按运行产物核对**：比对 web 容器里的 `dist/server/index.js` 与镜像内同一文件
+   （比内容，不比镜像 ID —— Docker 28 每次 build 都会刷新 provenance 元数据）；worker 的
+   输入是 `src/worker` + `src/shared`，本轮改动常不落在其 bundle 里，因此只记录哈希（可与
+   demo 的 worker 对账，两边同源应逐字节一致）。
+
+回滚：重打 `0.1.0` 标签 → `docker compose -p pi-agent -f compose.yaml up -d web worker` →
+`.env` 版本号还原。**生产与 demo 的额度/价目表是两份独立文件**：demo 是宿主挂载的
+`demo-data/*.json`，生产是卷 `pigo-web-data:/app/data/*.json`（用一次性容器挂载该卷写入，
+写完 `chmod 600` + `chown 1000:1000`）。
+
+生产控制台在 Cloudflare Access 之后（未认证访问 `/api/health` 返回 302 属预期），因此发布后
+的"界面读数"需要人以管理员身份登录确认；能用机器核对的是产物哈希、容器健康与库里的审计行。
+
 ## 额度与价目表（人工录入）
 
 provider 的**账户余额查不到**（仓库只调 System One 的业务端点），所以"买了多少额度"由人录入；
