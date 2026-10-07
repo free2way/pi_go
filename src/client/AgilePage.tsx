@@ -783,6 +783,53 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
         )}
       </div>
 
+      {panel === "manage" && (
+        <section className="panel agile-metrics">
+          <div className="panel-head"><div><span className="eyebrow">PROJECT MANAGEMENT</span><h3>{t("agile.manageProjects")}</h3></div><FolderCog size={15} /></div>
+          <div className="agile-metrics-body">
+            <p className="agile-hint">{t("agile.manage.hint")}</p>
+            {projects.length === 0 ? (
+              <div className="agile-hint">{t("agile.manage.empty")}</div>
+            ) : (
+              <div className="agile-release-list">
+                {projects.map((project) => (
+                  <div className="agile-manage-row" key={project.id}>
+                    <main>
+                      <div><b>{project.name}</b><code>{project.key}</code></div>
+                      <span className="agile-hint">{projectContentsLabel(project, locale)}</span>
+                      {confirmDeleteId === project.id && (
+                        <span className="agile-manage-warning">{projectDeletionWarning(project, locale)}</span>
+                      )}
+                    </main>
+                    <div className="agile-manage-actions">
+                      {confirmDeleteId === project.id ? (
+                        <>
+                          <button type="button" className="button secondary" onClick={() => setConfirmDeleteId("")}>{t("agile.manage.cancel")}</button>
+                          <button
+                            type="button"
+                            className="button primary"
+                            disabled={busy === "delete-project"}
+                            onClick={() => void confirmDeleteProject(project)}
+                          >
+                            {busy === "delete-project" ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}
+                            {t("agile.manage.deleteConfirm")}
+                          </button>
+                        </>
+                      ) : (
+                        <button type="button" className="button secondary" onClick={() => { setConfirmDeleteId(project.id); setError(""); }}>
+                          <Trash2 size={15} />{t("agile.manage.delete")}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </section>
+      )}
+
+
       {error && <div className="form-error">{error}</div>}
       {notice && <div className="demo-notice">{notice}</div>}
       {loading && <div className="ws-empty"><LoaderCircle className="spin" size={20} /><span>{t("agile.loading")}</span></div>}
@@ -892,51 +939,6 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
         </>
       )}
 
-      {panel === "manage" && (
-        <section className="panel agile-metrics">
-          <div className="panel-head"><div><span className="eyebrow">PROJECT MANAGEMENT</span><h3>{t("agile.manageProjects")}</h3></div><FolderCog size={15} /></div>
-          <div className="agile-metrics-body">
-            <p className="agile-hint">{t("agile.manage.hint")}</p>
-            {projects.length === 0 ? (
-              <div className="agile-hint">{t("agile.manage.empty")}</div>
-            ) : (
-              <div className="agile-release-list">
-                {projects.map((project) => (
-                  <div className="agile-manage-row" key={project.id}>
-                    <main>
-                      <div><b>{project.name}</b><code>{project.key}</code></div>
-                      <span className="agile-hint">{projectContentsLabel(project, locale)}</span>
-                      {confirmDeleteId === project.id && (
-                        <span className="agile-manage-warning">{projectDeletionWarning(project, locale)}</span>
-                      )}
-                    </main>
-                    <div className="agile-manage-actions">
-                      {confirmDeleteId === project.id ? (
-                        <>
-                          <button type="button" className="button secondary" onClick={() => setConfirmDeleteId("")}>{t("agile.manage.cancel")}</button>
-                          <button
-                            type="button"
-                            className="button primary"
-                            disabled={busy === "delete-project"}
-                            onClick={() => void confirmDeleteProject(project)}
-                          >
-                            {busy === "delete-project" ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}
-                            {t("agile.manage.deleteConfirm")}
-                          </button>
-                        </>
-                      ) : (
-                        <button type="button" className="button secondary" onClick={() => { setConfirmDeleteId(project.id); setError(""); }}>
-                          <Trash2 size={15} />{t("agile.manage.delete")}
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        </section>
-      )}
 
       {panel === "templates" && (
         <section className="panel agile-metrics agile-templates">
