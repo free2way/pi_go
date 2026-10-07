@@ -557,6 +557,33 @@ E2E **26 执行 / 26 通过 / 0 失败**（含 Worker 崩溃恢复与恶意仓�
 真实场景会在 demo 上创建约 30+ 个运行，跑完记得按需清理
 （`POST /api/runs/batch` 的 `action: "cleanup"`，按 owner 身份分批 ≤50）。
 
+### 8.05 密钥泄露事件与扫描规则（2026-10-07）
+
+**发生了什么**：`src/server/decision-engine/redaction.test.ts` 的测试夹具里有一把**真实形状的
+Google API key**（红action 规则要求一个真实形态的样例，当时直接用了真值）。它随 `44286b32`
+（10-06「接入 Jev 决策引擎 阶段 0+1」）进入公开仓库，并经 `8e1b3c54`、`52b6b239` 一路带到
+10-07 才发现。
+
+**为什么门禁没拦住**：`scripts/secret-scan.sh` 当时**没有 Google API key 规则**（只有
+private-key / openai / aws / github / jwt / bearer / pg-uri），所以每次 `npm run scan:secrets`
+都报 OK。已补 `google-api-key`（`AIza` + 35 位）规则；加上"新接入一个外部服务就同步补一条规则"
+作为流程要求——规则集的覆盖面就是扫描器的盲区边界。
+
+**处置**：
+1. 当前版本：夹具改为显式占位（`AIzaSyDUMMY-not-a-real-key…`，形状合规、规则仍命中）。
+2. 历史：用 `git filter-repo --replace-text`（**正则**匹配 `AIza[0-9A-Za-z_-]{35}`，全程不读取
+   明文）重写全部历史并强推 `main`；`main` 及所有可达 ref 里已无非占位命中（已用全量 blob
+   扫描验证）。
+3. ⚠️ **残留风险（实测）**：GitHub **仍按旧提交 SHA 直接提供旧 blob**——改写后
+   `raw.githubusercontent.com/…/44286b32…/src/server/decision-engine/redaction.test.ts` 等
+   旧 URL 依然返回 **200**。因此：
+   - **轮换密钥是唯一有效的补救**（历史改写不能替代它）；
+   - 需要彻底清除，得走 GitHub Support 的"移除敏感数据"请求，或把仓库改为私有；
+   - 任何在此前克隆过仓库的副本仍持有明文。
+
+**不可退让的规则**：测试夹具只能用**显式假标记**（`DUMMY` / `example.com` / `not-a-real`…）；
+真实密钥只进环境变量或密钥库，绝不进仓库——`scan:secrets` 的放行只认这些假标记。
+
 ### 8.1 AT 追溯矩阵（引用级检查）
 
 `npm run report:at-coverage` 解析本文档 §7.1–§7.9 与 §12 的 `AT-JEV-xxx` 标题，并在
