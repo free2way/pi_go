@@ -17,6 +17,9 @@
 #      worker 的输入是 `src/worker` + `src/shared`，本次改动常不落在其 bundle 里，
 #      所以只**记录**它的哈希，并可与 demo 的 worker 对账。
 #
+#   单行 `expect { -re ... }` 会被 Tcl 当成"一个 pattern"整块匹配、永远匹配不上（第一次跑生产
+#   脚本时踩到）：块内必须换行写，照 deploy-demo.sh 的形状。
+#
 # 环境变量（都有默认值）：PIGO_DEPLOY_HOST、PIGO_PROD_DIR、PIGO_PROD_PROJECT、
 # PIGO_PROD_COMPOSE、PIGO_PROD_ENV_FILE、PIGO_PROD_VOLUME、PIGO_PROD_VERSION_KEY。
 set -uo pipefail
@@ -86,6 +89,19 @@ if [ "\$SRC_HASH" = "\$PREV_HASH" ]; then
 else
   NEW_VERSION=\$(printf '%s' "\$OLD_VERSION" | awk -F. '{printf "%d.%d.%d", \$1, \$2, \$3+1}')
   sed -i "s/^${VERSION_KEY}=.*/${VERSION_KEY}=\$NEW_VERSION/" ${ENV_FILE}
+  # web 与 worker 的版本戳都要动：两侧对不上会让人怀疑发布没生效（首次真跑就踩到了）。
+  python3 - "$NEW_VERSION" <<'PYVER'
+import pathlib, re, sys
+version = sys.argv[1]
+p = pathlib.Path("/app/pi-agent/.env")
+text = p.read_text()
+for key in ("PI_WEB_VERSION", "PI_WORKER_VERSION"):
+    if re.search(rf'^{key}=', text, re.M):
+        text = re.sub(rf'^{key}=.*$', f'{key}={version}', text, flags=re.M)
+    else:
+        text += f"\n{key}={version}\n"
+p.write_text(text)
+PYVER
   echo "  \$OLD_VERSION -> \$NEW_VERSION (src hash \$SRC_HASH)"
 fi
 
@@ -111,7 +127,7 @@ worker_hash=\$(docker exec "${PROJECT}-worker-1" sha256sum /app/worker.js 2>/dev
 echo "  web bundle: image=\$img_hash container=\$run_hash"
 [ -n "\$img_hash" ] && [ "\$img_hash" = "\$run_hash" ] || { echo "RUNNING_BUNDLE_MISMATCH"; exit 7; }
 echo "  worker bundle: \$worker_hash（输入为 src/worker+src/shared；常与上一版相同）"
-echo "  web 版本戳: \$(docker inspect "\$WEB_CONTAINER" --format '{{range .Config.Env}}{{if eq (printf \"%.11s\" .) \"PI_WEB_VERS\"}}{{.}}{{end}}{{end}}')"
+echo "  web 版本戳: \$(docker exec "\$WEB_CONTAINER" printenv PI_WEB_VERSION 2>/dev/null)"
 docker ps --format '  {{.Names}} {{.Image}} {{.Status}}' | grep ${PROJECT}
 echo "PROD_DEPLOY_DONE"
 REMOTE
@@ -121,13 +137,21 @@ cat > "$EXPECT_SCP" <<SCPEXPECT
 set timeout 600
 log_user 1
 spawn sh -c "scp -o StrictHostKeyChecking=accept-new -o NumberOfPasswordPrompts=1 $TARBALL $REMOTE_SCRIPT ${HOST}:/tmp/"
-expect { -re "assword:" { send "\\$env(PIGO_SSH_PW)\\r"; exp_continue } timeout { puts "SCP_TIMEOUT"; exit 3 } eof { puts "SCP_OK" } }
+expect {
+  -re "assword:" { send "\$env(PIGO_SSH_PW)\r"; exp_continue }
+  timeout { puts "SCP_TIMEOUT"; exit 3 }
+  eof { puts "SCP_OK" }
+}
 SCPEXPECT
 cat > "$EXPECT_SSH" <<SSHEXPECT
 set timeout 1800
 log_user 1
 spawn sh -c "ssh -o StrictHostKeyChecking=accept-new -o NumberOfPasswordPrompts=1 -o ConnectTimeout=10 ${HOST} 'cp /tmp/$(basename "$TARBALL") /tmp/pigo-src.tar.gz && bash /tmp/$(basename "$REMOTE_SCRIPT")'"
-expect { -re "assword:" { send "\\$env(PIGO_SSH_PW)\\r"; exp_continue } timeout { puts "REMOTE_TIMEOUT"; exit 4 } eof { puts "SSH_DONE" } }
+expect {
+  -re "assword:" { send "\$env(PIGO_SSH_PW)\r"; exp_continue }
+  timeout { puts "REMOTE_TIMEOUT"; exit 4 }
+  eof { puts "SSH_DONE" }
+}
 SSHEXPECT
 
 scp_log="$(expect -f "$EXPECT_SCP" 2>&1)"
