@@ -36,6 +36,7 @@ import { readDecisionBrief } from "./decision-brief.js";
 import { readDecisionUsageSafe } from "./decision-usage.js";
 import { DecisionAuditStore } from "./decision-engine/audit-store.js";
 import { createDecisionEngine, loadDecisionEngineConfig } from "./decision-engine/index.js";
+import { resetDecisionCircuitBreakers } from "./decision-engine/jev.js";
 import { buildReviewTriageBatches } from "./decision-engine/review-triage.js";
 import { decisionEngineStatus, registerDecisionRoutes, type DecisionEngineStatus } from "./decision-routes.js";
 import { buildAcceptanceSnapshot } from "./acceptance.js";
@@ -778,6 +779,13 @@ app.put("/api/credentials", async (request, reply) => {
       status = await vault.markUnverified(userId, write.provider);
     }
   }
+  // AT-JEV-092: a revoked/replaced TypeSafe key must be recoverable by the
+  // operator action our alert asks for. The decision plane's breaker is keyed by
+  // `baseUrl|model|hasApiKey` (never the key itself), so a new credential alone
+  // could NOT clear an auth-latched breaker — it stayed open until a process
+  // restart. Storing a credential is exactly when a fresh attempt is legitimate,
+  // and resetting carries no key material.
+  if (writes.length > 0) resetDecisionCircuitBreakers();
   return status;
 });
 

@@ -31,7 +31,7 @@ export const CASE_HEADING = /^#{3,4}\s+(AT-JEV-\d{3})\s*·\s*(.+?)\s*$/;
 export const AT_ID = /AT-JEV-\d{3}/g;
 
 const SRC_DIRS = ["src"];
-const TEST_DIRS = ["tests/e2e", "tests/live"];
+const TEST_DIRS = ["tests/e2e", "tests/live", "tests/perf"];
 const SCRIPT_DIR = "scripts";
 const SKIP_DIRS = new Set(["node_modules", "dist", ".git", "coverage", "test-results"]);
 

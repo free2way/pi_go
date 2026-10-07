@@ -77,6 +77,11 @@ Jev 调用放在服务端网关而不是浏览器、代码执行沙箱或子代�
 
 - API Key 只保存在服务端。
 - 统一处理字段裁剪、脱敏、限流、超时、重试和熔断。
+
+  **实现现状（2026-10-06 复核）**：字段裁剪/脱敏/超时/重试/熔断均已实现；**本平面当前没有自己的
+  速率或并发上限**——`src/server/rate-limit.ts` 的 `RateLimiter` 只接在凭据写入、创建运行、运行操作
+  上，`evaluateDecisionForRun` 未挂载。现存的过载保护是"事后"的：熔断（连续 5 次可归因失败）+
+  worker 侧 `PI_MAX_ACTIVE_JOBS`（≤4，每个活跃运行至多一个在飞 triage 调用）。见 AT-JEV-072 的压测结论。
 - 统一记录实际模型版本、策略版本、概率、时延和回退原因。
 - 后续可以替换供应商或增加本地规则引擎，而不改业务调用方。
 - 防止模型结果直接获得执行权限。
@@ -472,6 +477,17 @@ Authorization: Bearer <TYPESAFE_API_KEY>
 比较 `resolved_model`；不同则经 `AlertManager` 发一条 `jev_model_drift` 警告（去重 900s，
 可选 `PI_ALERT_WEBHOOK`）。告警 details 只含 requested/previous/current 版本与 evaluationId。
 
+**凭据被拒（AT-JEV-092）**：结果落在 `authentication_failed` 时发一条 `jev_authentication_failed`
+（critical）告警，仅对这个原因发（本地无 key 的 `missing_credentials` 不是凭据被拒，不告警）；
+details 只含 provider/evaluationId/runId/at。去重同样交给 `AlertManager`。
+
+**保留与清理（AT-JEV-056）**：`PI_DECISION_AUDIT_RETENTION_DAYS`（**默认 0 = 永不删除**）+
+`PI_DECISION_AUDIT_RETENTION_MAX_ROWS`（单次上限，默认 0 = 不限）。worker 的小时级维护 tick
+触发 `POST /api/internal/decisions/audit/retention`（内部 token 鉴权），只删本表中
+`created_at` 严格早于 cutoff 的行（该列是写入端 `toISOString()` 的定宽 ISO-8601 UTC，字典序即时间序），
+**不触碰 runs/run_events/artifacts**。清理行为当前以结构化 warn + HTTP 响应留痕——
+**缺口**：仓库没有通用运维审计载体，durable 的清理审计记录需要新表/新列，本轮未做。
+
 建议增加索引：`run_id`、`kind + created_at`、`status + created_at`、`resolved_model + policy_version`。
 
 事件流增加：
@@ -526,6 +542,11 @@ Jev 是增强能力，不是主链路依赖。任何 Jev 故障都返回结构�
 - 熔断期间不发外部请求，直接返回 `circuit_open`。
 - 60 秒后只允许一个 half-open 探测请求。
 - 401/403 直接打开熔断并触发配置告警，直到凭据状态改变。
+  **凭据状态如何改变（AT-JEV-092 实测补充）**：熔断按其身份 `baseUrl|model|hasApiKey` 缓存，**不含密钥本身**，
+  且认证失败会把熔断**永久锁死**（`authLocked`，不看冷却）。因此"换一把新 key"本身不会自动恢复——
+  为此在**凭据写入成功后调用 `resetDecisionCircuitBreakers()`**（`src/server/index.ts` 的
+  `PUT /api/credentials`，不携带任何密钥材料），使告警里指引的操作（"到模型与凭据页更换 key"）真的能恢复。
+  注意：恢复只在**新的 state/evaluationId** 上可见，同一 state 的重放按设计仍返回旧的 401 审计行（幂等键确定）。
 - 熔断状态不跨进程持久化作为第一阶段要求；多实例部署时通过指标观察，后续可集中化。
 
 ### 15.3 标准 fallback reason

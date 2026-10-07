@@ -27,8 +27,10 @@ import type { Run } from "../shared/types.js";
 import {
   DECISION_AUDIT_DEFAULT_ROWS,
   DECISION_AUDIT_MAX_ROWS,
+  type DecisionAuditPruneStore,
   type DecisionAuditStoreLike,
 } from "./decision-engine/audit-store.js";
+import { createDecisionAuditRetentionSweeper } from "./decision-engine/audit-retention.js";
 import { canonicalJson, questionSchemaHash, sha256Hex, stateManifest } from "./decision-engine/redaction.js";
 import type { Alert } from "./alerts.js";
 import {
@@ -203,6 +205,14 @@ export const decisionEvaluateSchema = z
   .strict();
 
 export const DECISION_EVALUATE_PATH = "/api/internal/decisions/evaluate";
+
+/**
+ * AT-JEV-056: internal trigger for one decision-audit retention sweep. The
+ * worker owns the cadence (its maintenance tick), the web owns the policy and
+ * the SQL, exactly like `POST /api/internal/jobs/pending` re-queues stale jobs.
+ * Same internal-token auth as the other `/api/internal/*` routes.
+ */
+export const DECISION_AUDIT_RETENTION_PATH = "/api/internal/decisions/audit/retention";
 
 /**
  * Deterministic evaluation id: `runId + kind + policyVersion + stateHash`
@@ -571,6 +581,48 @@ async function raiseModelDriftIfNeeded(
 }
 
 /**
+ * AT-JEV-092: a credential rejection (HTTP 401/403 → `authentication_failed`) is
+ * the ONE decision-plane failure an operator must act on, so it gets its own
+ * CRITICAL alert instead of disappearing among the self-healing fallbacks. The
+ * adapter has already locked its circuit breaker at that point (no retry, no
+ * further outbound call), and a NEW key is the only cure — hence the actionable
+ * message. A fresh key + a restart recovers (see `circuitFingerprint` in
+ * `jev.ts`: the breaker is cached per config fingerprint, not per key value).
+ *
+ * ONLY a real outbound rejection qualifies. `disabled` / `missing_credentials`
+ * mean "no key is configured locally": that is a configuration problem, it never
+ * reaches the provider and it must NOT page anyone as a revoked credential.
+ * `payload_rejected`/`contract_invalid`/`circuit_open` are equally excluded:
+ * this guard is the single, explicit discriminator.
+ *
+ * Deduplication and cooldown stay in `AlertManager` (production wires
+ * `alerts.raise`): this helper is called once per newly persisted row and never
+ * de-duplicates on its own. It raises nothing when no sink is injected.
+ *
+ * Details carry identifiers only — never the key, the Authorization header, the
+ * outbound payload or a provider error body.
+ */
+function raiseAuthenticationFailureIfNeeded(
+  record: DecisionEvaluationRecord,
+  deps: DecisionRouteDeps,
+  at: string,
+): void {
+  if (record.status !== "fallback" && record.status !== "rejected") return;
+  if (record.fallbackReason !== "authentication_failed") return;
+  deps.raiseAlert?.({
+    key: "jev_authentication_failed",
+    severity: "critical",
+    message: "Jev 凭据被拒绝（HTTP 401/403）：决策评估暂停，请在「模型与凭据」页更换 TypeSafe key",
+    details: {
+      provider: record.provider,
+      evaluationId: record.evaluationId,
+      runId: record.runId,
+      at,
+    },
+  });
+}
+
+/**
  * Business-safe fallback for a batch that was never dispatched (`payload_rejected`
  * for an over-limit finding set) or whose engine call threw. It is persisted and
  * evented exactly like a provider fallback, so one bad batch is visible in the
@@ -816,6 +868,10 @@ export async function evaluateDecisionForRun(
     if (created) {
       await appendDecisionEvents(persisted, run, deps, { index: entry.index, count: entries.length });
       if (persisted.status === "completed") await raiseModelDriftIfNeeded(persisted, deps, now);
+      // AT-JEV-092: exactly one alert per newly persisted credential rejection
+      // (`AlertManager` owns the 900s per-key cooldown). A replay never reaches
+      // this branch because the idempotency lookup above returns the stored row.
+      raiseAuthenticationFailureIfNeeded(persisted, deps, now);
     }
     records.push(persisted);
   }
@@ -830,6 +886,16 @@ export async function evaluateDecisionForRun(
   };
 }
 
+/**
+ * AT-JEV-056: probes the audit store for the retention seam. It is checked
+ * structurally (not added to `DecisionAuditStoreLike`) so every existing fake —
+ * tests that only exercise the read/write surface — keeps compiling.
+ */
+function asPruneStore(audit: DecisionAuditStoreLike): DecisionAuditPruneStore | undefined {
+  const candidate = audit as Partial<DecisionAuditPruneStore>;
+  return typeof candidate.pruneOlderThan === "function" ? (candidate as DecisionAuditPruneStore) : undefined;
+}
+
 /** Registers both decision-plane routes on the app. */
 export function registerDecisionRoutes(app: FastifyInstance, deps: DecisionRouteDeps) {
   app.post(DECISION_EVALUATE_PATH, async (request, reply) => {
@@ -840,6 +906,36 @@ export function registerDecisionRoutes(app: FastifyInstance, deps: DecisionRoute
     }
     const result = await evaluateDecisionForRun(parsed.data, deps);
     return reply.code(result.status).send(result.body);
+  });
+
+  /**
+   * AT-JEV-056 (docs/27 §7.6): one throttled retention sweep, triggered by the
+   * worker's maintenance loop. It is idempotent and safe to call often: the
+   * sweeper is off by default (`PI_DECISION_AUDIT_RETENTION_DAYS=0`) and
+   * throttled otherwise, and it never throws — a failure is reported as a warn
+   * line and as `sweep: null` here. The response echoes the cleanup record
+   * (policy values, cutoff, deleted count, deleted window) so the caller can
+   * carry it; note the durable-audit gap documented in
+   * `decision-engine/audit-retention.ts`.
+   */
+  const pruneStore = asPruneStore(deps.audit);
+  const sweepAuditRetention = pruneStore
+    ? createDecisionAuditRetentionSweeper({
+        store: pruneStore,
+        env: deps.env,
+        ...(deps.now ? { now: deps.now } : {}),
+        warn: (message, details) => app.log.warn(details, message),
+      })
+    : undefined;
+  app.post(DECISION_AUDIT_RETENTION_PATH, async (request, reply) => {
+    if (!deps.internalAuthorized(request)) return reply.code(401).send({ error: "Unauthorized" });
+    if (!sweepAuditRetention) {
+      // Only a store without the retention seam (an old/injected fake) lands
+      // here; the production store implements it.
+      return reply.code(501).send({ ok: false, error: "Decision audit retention is not supported by this store" });
+    }
+    const sweep = await sweepAuditRetention();
+    return { ok: true, skipped: sweep === undefined, sweep: sweep ?? null };
   });
 
   app.get<{ Params: { runId: string }; Querystring: { limit?: string } }>(

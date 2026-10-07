@@ -76,6 +76,11 @@ export const CRITICAL_ENV = {
     "PI_JEV_SHADOW_SAMPLE_RATE",
     "PI_JEV_POLICY_VERSION",
     "PI_JEV_ALLOW_SOURCE",
+    // AT-JEV-056: decision-audit retention. The web owns the policy because it
+    // owns the database (0 = never delete, the default; empty falls back to 0).
+    // The worker only needs the on/off day count to decide whether to trigger.
+    "PI_DECISION_AUDIT_RETENTION_DAYS",
+    "PI_DECISION_AUDIT_RETENTION_MAX_ROWS",
     "TYPESAFE_API_KEY",
   ],
   worker: [
@@ -120,6 +125,10 @@ export const CRITICAL_ENV = {
     "PI_SANDBOX_EXTRA_ENV",
     // decision plane / Jev opt-in trigger (docs/26)
     "PI_JEV_MODE",
+    // AT-JEV-056: the worker only GATES the retention trigger on the day count
+    // (the web owns the window + row cap and performs the delete), so only the
+    // day count has to reach this service.
+    "PI_DECISION_AUDIT_RETENTION_DAYS",
   ],
 };
 

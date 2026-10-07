@@ -136,6 +136,12 @@ services:
       PI_JEV_SHADOW_SAMPLE_RATE: ${PI_JEV_SHADOW_SAMPLE_RATE:-}
       PI_JEV_POLICY_VERSION: ${PI_JEV_POLICY_VERSION:-}
       PI_JEV_ALLOW_SOURCE: ${PI_JEV_ALLOW_SOURCE:-}
+      # AT-JEV-056: decision-audit retention. Empty (default) resolves to 0 = never
+      # delete; a positive day count removes `decision_evaluations` rows older than
+      # that window. MAX_ROWS caps one sweep (empty/0 = no operator cap). Mirror
+      # BOTH into the worker: it gates its hourly trigger on the day count.
+      PI_DECISION_AUDIT_RETENTION_DAYS: ${PI_DECISION_AUDIT_RETENTION_DAYS:-}
+      PI_DECISION_AUDIT_RETENTION_MAX_ROWS: ${PI_DECISION_AUDIT_RETENTION_MAX_ROWS:-}
       TYPESAFE_API_KEY: ${TYPESAFE_API_KEY:-}
     ports:
       - target: 3100
@@ -251,6 +257,10 @@ services:
       PI_SANDBOX_EXTRA_ENV: ${PI_SANDBOX_EXTRA_ENV:-}
       # Decision plane (docs/26): opt-in Jev trigger mode. Empty = off (default).
       PI_JEV_MODE: ${PI_JEV_MODE:-}
+      # AT-JEV-056: gate for the hourly decision-audit retention trigger. Empty/0
+      # (default) = no HTTP call at all; a positive day count makes this worker ask
+      # the web for one sweep per hour (the web owns the window and the row cap).
+      PI_DECISION_AUDIT_RETENTION_DAYS: ${PI_DECISION_AUDIT_RETENTION_DAYS:-}
     volumes:
       - ./workspace:/workspace
       # The worker creates the per-task sandbox containers through the Docker

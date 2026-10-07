@@ -98,6 +98,7 @@ import {
   shouldRetryProviderAttempt,
 } from "./review-performance.js";
 import { createReviewTriageTrigger, jevReviewTriageEnabled, recordVerdictThenReviewTriage } from "./decision-triage.js";
+import { createAuditRetentionTrigger } from "./audit-retention.js";
 
 const port = Number(process.env.PORT || 3200);
 const host = process.env.HOST || "localhost";
@@ -475,6 +476,19 @@ const jobApi = {
 const reviewTriageEnabled = jevReviewTriageEnabled(process.env);
 const triggerReviewTriage = createReviewTriageTrigger({
   enabled: reviewTriageEnabled,
+  send: (pathName, init, timeoutMs) => internalRequest(pathName, init, timeoutMs),
+});
+
+/**
+ * AT-JEV-056 (docs/27 §7.6): the decision-audit retention trigger. It rides the
+ * existing 60s maintenance tick below and self-throttles to an hourly internal
+ * call, where the web (the only process with a database) performs the sweep.
+ * `PI_DECISION_AUDIT_RETENTION_DAYS` is read once at module scope: when it is
+ * unset/blank/`0` (the default) the trigger is a strict no-op — no HTTP call and
+ * no log line — and a failure is swallowed into one bounded warning so the
+ * maintenance loop is never disturbed.
+ */
+const triggerAuditRetention = createAuditRetentionTrigger({
   send: (pathName, init, timeoutMs) => internalRequest(pathName, init, timeoutMs),
 });
 
@@ -2960,6 +2974,10 @@ server.listen(port, host, () => {
     void reclaimPendingJobs();
     // A deferred job whose holder went stale (crash) has no release event.
     void drainDeferredJobs();
+    // AT-JEV-056: hourly (self-throttled) decision-audit retention sweep. A
+    // no-op unless PI_DECISION_AUDIT_RETENTION_DAYS is a positive integer, and
+    // it never rejects, so it cannot affect the maintenance loop.
+    void triggerAuditRetention();
   }, 60_000);
   timer.unref?.();
 });

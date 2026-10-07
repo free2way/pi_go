@@ -137,6 +137,11 @@ services:
       PI_JEV_SHADOW_SAMPLE_RATE: ${PI_JEV_SHADOW_SAMPLE_RATE:-}
       PI_JEV_POLICY_VERSION: ${PI_JEV_POLICY_VERSION:-}
       PI_JEV_ALLOW_SOURCE: ${PI_JEV_ALLOW_SOURCE:-}
+      # AT-JEV-056: decision-audit retention, off by default (empty = 0 = never
+      # delete). Both knobs reach the demo web (it owns the database); the demo
+      # worker only needs the day count to gate its hourly trigger.
+      PI_DECISION_AUDIT_RETENTION_DAYS: ${PI_DECISION_AUDIT_RETENTION_DAYS:-}
+      PI_DECISION_AUDIT_RETENTION_MAX_ROWS: ${PI_DECISION_AUDIT_RETENTION_MAX_ROWS:-}
       TYPESAFE_API_KEY: ${TYPESAFE_API_KEY:-}
     ports:
       # Primary demo endpoint. The bind address is required and stays outside
@@ -245,6 +250,9 @@ services:
       PI_SESSION_REUSE: ${PI_SESSION_REUSE:-on}
       # Decision plane (docs/26): opt-in Jev trigger mode. Empty = off (default).
       PI_JEV_MODE: ${PI_JEV_MODE:-}
+      # AT-JEV-056: gate for the hourly decision-audit retention trigger. Empty/0
+      # (default) = no HTTP call; a positive day count asks demo-web for a sweep.
+      PI_DECISION_AUDIT_RETENTION_DAYS: ${PI_DECISION_AUDIT_RETENTION_DAYS:-}
     volumes:
       # SINGLE workspace-root mount (see demo-web). Host <root> <=> /workspace, so
       # repositories are real subdirectories at <root>/projects/<repo> and run

@@ -481,29 +481,51 @@ npm run report:at-coverage
 
 局限（诚实声明）：这是**引用级**检查，不是覆盖率证明。编号出现在测试标题或注释里只表示
 "有人声称该测试映射到这条用例"，**不等于**该用例描述的行为已被断言证明。`uncited` 是可靠信号
-（无人声称覆盖）；`cited` 仍需人工核对断言内容。截至本次更新：61 条用例中 42 条 cited、19 条 uncited。
+（无人声称覆盖）；`cited` 仍需人工核对断言内容。截至本次更新：61 条用例中 47 条 cited、14 条 uncited
+（`uncited` = `025 / 030–035 / 053 / 065 / 082 / 083 / 090 / 091 / 093`）。
 
 已知缺口（无自动化证据，不得在阶段升级时当作已验收）：
 
-- **AT-JEV-025（中英文一致性）**：无任何测试引用。
-- **AT-JEV-070 / 072 / 073（Mock 开销、并发限流、大批 Findings 容量）**：无自动化证据。
+- **AT-JEV-025（中英文一致性）**：无任何测试引用（计划随 P4 中文校准一起做）。
 - **AT-JEV-071（Live 时延）**：`tests/live/jev-contract.test.ts` 仅记录 p50/p95/max 日志，且需
-  `PI_JEV_LIVE=1`；它**不断言** p95 ≤ 2s / p99 ≤ 3s 阈值，不构成门禁级证据。
+  `PI_JEV_LIVE=1` + 真 key；它**不断言** p95 ≤ 2s / p99 ≤ 3s 阈值，不构成门禁级证据。
+  执行方式：`PI_JEV_LIVE=1 PI_JEV_LIVE_CALLS=100 TYPESAFE_API_KEY=<key> npm run test:jev:live`
+  （合成状态，不碰任何 run/审计表）。
 - **AT-JEV-080（真实 API 最小调用）**：由在线 opt-in 套件引用（需 `PI_JEV_LIVE=1` + 真 key）。
-- **AT-JEV-030～035（Planner 路由）、053、056、065、082、083、090～093**：当前无自动化引用，
-  多为阶段 3/4 或运维演练用例。
+- **AT-JEV-090 / 091（配置回滚、引擎回滚）**：**有手工演练证据**（2026-10-06 demo 实测，步骤与结果记录在
+  docs/25「决策平面回滚演练」），但未被任何测试引用，因此本脚本仍报 uncited——脚本只识别测试引用。
+- **AT-JEV-030～035（Planner 路由）、053（提示注入）、065（决策回放）、082/083（选项顺序敏感、模型弱项）、
+  093（Enforce 自动降级）**：无自动化引用，多为阶段 3/4 或校准类用例。
 
 已被证据补齐（本次更新移出缺口清单）：
 
 - **AT-JEV-061（usage 独立归类）**：`src/server/decision-usage.ts` 读取时聚合（不落库、无迁移）+
-  `GET /api/runs/:id` 接线；证据：`decision-usage.test.ts`、`decision-usage-route.test.ts`。
+  `GET /api/runs/:id` 接线；证据：`decision-usage.test.ts`、`decision-usage-route.test.ts`；
+  线上（demo）实测 run 详情出现 `role:"decision"`（tokens 128/0、calls 1、`unpricedCalls` 1），
+  其余角色与 `usage.estimatedCost` 未被污染。
 - **AT-JEV-062（成本未知不得显示 $0.00）**：`RunRoleUsage.unpricedCalls` + 客户端纯函数
   `roleCostDisplay/roleCostLabel`（角色行与**面板汇总行**同一判定）+ zh/en 文案；
-  证据：`src/client/budget-roles-view.test.ts`。
+  证据：`src/client/budget-roles-view.test.ts`；浏览器实测：角色行显示「未知」、汇总行显示 `≥ $0.004`、
+  并出现「有 1 次调用未计价…」提示。
 - **AT-JEV-081（别名漂移告警）**：`decision-drift.test.ts`（首次观测/同版本不告警、版本变化恰好一次、
   幂等重放不告警、未接线静默 no-op、基线查询失败不影响评估）；生产经 `AlertManager`
   （key `jev_model_drift`，900s 去重）出结构化日志 + 可选 `PI_ALERT_WEBHOOK`。
-  触发路径的真实漂移只有在供应商更换版本时才会发生：单测覆盖触发逻辑，线上只验证"同版本不误报"。
+  触发路径的真实漂移只有在供应商更换版本时才会发生：单测覆盖触发逻辑，线上验证"同版本不误报"
+  （真外发 4839/994 tok、审计 6→7、0 告警）。
+- **AT-JEV-056（数据保留和删除）**：`decision-retention.ts`（配置解析）+ `audit-retention.ts`（清理器）+
+  worker 小时级触发 + 内部路由；证据：`audit-retention.test.ts`（20 例，含"默认 0 时一条 SQL 都不发"）。
+  **缺口**：清理行为只有结构化 warn + HTTP 响应，durable 审计记录需要新表（仓库无通用运维审计载体）。
+- **AT-JEV-092（凭据撤销）**：`decision-auth-alert.test.ts`（7 例：401/403 恰好一条告警且 details 无敏感字段、
+  重放不重复、多批次仍一条、未注入 sink 静默、`missing_credentials` 不告警）。**实测缺口已修补**：
+  原先换 key 不会自动重置被锁死的熔断（只证明"重启 + 新 key → completed"），现已在校验通过的凭据写入后
+  调用 `resetDecisionCircuitBreakers()`，告警指引的动作真的可恢复。
+- **AT-JEV-070 / 072 / 073（Mock 开销、并发限流、大批 Findings 容量）**：`tests/perf/decision-perf.test.ts`
+  （opt-in：`PI_DECISION_PERF=1 npm run test:decision:perf`，不进默认门禁）。本机实测：500 次 mock 评估
+  （warmup 50）p50 ≈ 0.27ms、p95 ≈ 0.36ms ≤ 50ms、堆增量 ≈ 0.05MiB（`--expose-gc`）；2× 峰值（8 并发，
+  峰值取自 worker `PI_MAX_ACTIVE_JOBS` ≤ 4）全部完成、p95 ≈ 2.6ms，429 与熔断（阈值 5）均安全回退且过载期零外呼；
+  100 findings @ `PI_JEV_REVIEW_MAX_FINDINGS=50` → 2 批次 / 2 次外部请求 / 2 条审计 / 400 个问题（每 finding 4 问）。
+  **缺口（072 结构性）**：决策平面自身**没有**速率或并发上限，唯一内部过载保护是熔断（事后），
+  唯一全局上限是 worker 的 `PI_MAX_ACTIVE_JOBS`；docs/26 §6 已据实修正原先"统一处理限流"的表述。
 
 
 ## 9. Shadow 统计验收
