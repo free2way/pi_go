@@ -10,6 +10,8 @@
 #   - OpenAI-style keys              sk-…  (sk-proj-…, sk-ant-…, …)
 #   - AWS access key ids             AKIA…/ASIA… + 16 uppercase alnum
 #   - GitHub tokens                  ghp_…, github_pat_…
+#   - Google API keys                AIza… + 35 chars（2026-10-07 补：曾有一把真实
+#     Google key 被当成测试夹具提交进仓库，当时没有这条规则所以漏过）
 #   - JWTs / long Bearer literals    eyJ….….…, "Bearer <>=20 chars>"
 #   - PostgreSQL URIs with a password user:password@host
 #
@@ -105,6 +107,7 @@ PATTERN_IDS=(
   "openai-key"
   "aws-access-key"
   "github-token"
+  "google-api-key"
   "jwt"
   "bearer-literal"
   "pg-uri"
@@ -114,6 +117,7 @@ PATTERN_REGEXES=(
   'sk-[A-Za-z0-9_-]{20,}'
   '(AKIA|ASIA)[0-9A-Z]{16}'
   'ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,}'
+  'AIza[0-9A-Za-z_-]{35}'
   'eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}'
   '[Bb]earer[[:space:]]+[A-Za-z0-9._~+/=-]{20,}'
   '(postgres|postgresql)://[^/[:space:]@]+:[^/[:space:]@]+@[^/[:space:]]+'
