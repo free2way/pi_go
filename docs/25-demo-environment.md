@@ -193,3 +193,35 @@ scripts/demo-env.sh down     # 停止但**不**删除卷与宿主工作区目录
 
 端口：主入口 `PIGO_DEMO_WEB_PORT`（默认 3101，绑定 `PIGO_DEMO_WEB_BIND_ADDRESS`）；
 仅供脚本与 Playwright 使用的回环入口 `127.0.0.1:3102`（`PIGO_DEMO_WEB_LOOPBACK_PORT`）。
+
+## 部署：源码同步 + 重建镜像
+
+demo 的两个镜像都是**在宿主上从源码构建**的（`Dockerfile.web` / `Dockerfile.worker` 里
+`COPY src` + `npm run build`），所以"部署新提交" = 同步构建输入 + 重建镜像：
+
+```sh
+PIGO_SSH_PW=<密码> bash deploy/docker/deploy-demo.sh
+```
+
+脚本做的与**绝不**做的：
+
+- 只同步构建输入（`package.json`、`package-lock.json`、`tsconfig.json`、`vite.config.ts`、
+  `index.html`、`src/`、`deploy/docker/` 下的 Dockerfile 等）；**绝不覆盖**宿主权威的
+  `deploy/docker/compose.demo.yaml` 与 `/app/pi-agent/demo.env`（解压前后各校验一次哈希）。
+- 解压前把旧 `source/` 打包成 `/app/pi-agent/source-backup-<时间戳>.tar.gz`（回滚用）。
+- 构建前后核对服务名（`demo-web` / `demo-worker`，不是 `web` / `worker`）。
+- 结束条件只有五个硬断言：解压成功、宿主权威配置哈希未变、`compose build`/`up` 退出码 0、
+  运行中容器的服务端 bundle 与镜像内 bundle **逐字节相同**（比内容，不比镜像 ID）、外部
+  `GET /api/health` 返回 200。远端步骤必须打印自己的 `DEPLOY_DONE` 标记才算成功——"目标健康"
+  不能冒充"部署执行了"。
+
+四个来自真实事故的坑（脚本已内置守卫，改脚本时别拆掉）：
+
+1. **macOS `tar` 的 exclude 前缀**：写 `./deploy/...` 会静默失配，把宿主权威文件打进包；
+   脚本打包后立刻复查包内是否含 `compose.demo.yaml` / `demo.env`，含则拒绝继续。
+2. **远端多命令必须整体加引号**（`ssh host 'cmd1 && cmd2'`）：否则 `&&` 之后的命令由**本地**
+   shell 接管（曾导致本地 `bash` 去找远端脚本路径而报 "No such file or directory"）。
+3. **Docker 28 + containerd 镜像存储下，每次 build 都会刷新 provenance 元数据**，tag 的镜像 ID
+   会变而内容不变——所以"运行中的容器 == 刚构建的镜像"只能比 bundle 哈希，比 ID 会误报。
+4. **缓存命中是正确行为**：构建输入没变时 Docker 不重建（Created 时间不变），按时间硬断言会
+   误报；脚本只打印 `REBUILT` / `CACHE_HIT` 供人判断。

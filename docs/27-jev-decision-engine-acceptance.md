@@ -477,6 +477,49 @@ npm run report:at-coverage
 
 `npm run test:jev:live` 不进入每个 PR 的强制门禁，建议在手动 workflow 或受控 nightly 中运行。在线测试失败应通知负责人并阻止模式升级，但不应因供应商瞬时故障阻止无关代码合并。`npm run report:at-coverage` 默认退出码为 0（报告性质），`--strict` 才在存在 uncited 用例时以 1 退出。
 
+### 8.0 验收门禁怎么跑（含 demo 目标与必需变量）
+
+`node scripts/acceptance-gate.mjs` 的 8 个步骤永远全部必需（可选步骤会被转成 FAIL），其中两步
+依赖外部环境，缺变量不是 SKIP 而是 FAIL：
+
+```sh
+# 1) 真 PostgreSQL：postgres 容器不发布 5432，只能从宿主取它**当前**的容器 IP（重启会变）再本地转发
+IP=$(ssh free2way@192.168.2.235 docker exec pi-agent-postgres-1 cat /etc/hosts | grep -vE '^127\.' | head -1 | cut -f1)
+ssh -N -L 15432:$IP:5432 free2way@192.168.2.235      # 另开一个终端保持（重复开会因已占用直接退出）
+# 2) 真实浏览器 + 真实运行的场景（demo 栈）
+export PI_E2E_BASE_URL=http://192.168.2.235:3101
+export PI_E2E_DEV_EMAIL=bobo.2000@gmail.com     # ← 必须是与部署中凭据同属一个身份
+export PI_E2E_LIVE=1                            # 打开真实运行场景（真实调用 + 在 demo 建运行）
+export PI_E2E_CRASH_COMMAND='bash /tmp/pigo-kill-worker.sh'   # E2E-06 崩溃演练
+export PI_DATABASE_URL='postgresql://pigo:<pw>@127.0.0.1:15432/pigo_demo'
+export NO_PROXY=192.168.2.235,localhost,127.0.0.1
+node scripts/acceptance-gate.mjs
+```
+
+**最容易踩的坑**：`realRunsAvailable` 是**按身份**判定的（凭据在 vault 里归属于请求身份）。
+suite 默认身份是 `developer@localhost`，而 demo 的凭据配在管理员 `bobo.2000@gmail.com` 名下，
+所以漏掉 `PI_E2E_DEV_EMAIL` 时所有真实场景会静默跳过、门禁报 FAIL 且原因只写
+`realRunsAvailable=false`——看起来像部署坏了。`tests/e2e/fixtures.ts` 的
+`missingRealRunsReason()` 现在会把这条诊断直接写进跳过原因里（点名当前身份与
+`configuredProviders`），不要再退回成裸的 `realRunsAvailable=false`。
+
+demo 环境**无法**满足的两个必需场景（需要专属环境形态，不是缺陷）：
+
+- **E2E-05**：需要一个「凭据有效但无权用于审核角色」的 reviewer 模型（`PI_E2E_PREFLIGHT_PROVIDER`/`_MODEL`）。
+- **E2E-07**：需要把部署配置成「预算只够 Planning」（`PI_RUN_MAX_TOKENS`/`PI_RUN_MAX_COST_USD` + 对应的 `PI_E2E_BUDGET_*`）。
+
+在 demo 上跑门禁时，这两条要么按上表补齐配置，要么**显式接受偏差**（脚本只认这个开关，且原因必填）：
+
+```sh
+export PI_E2E_ALLOW_REQUIRED_SKIPS=1
+export PI_E2E_ALLOW_REQUIRED_SKIPS_REASON='demo 缺少 E2E-05（越权审核模型）与 E2E-07（Planning-only 预算部署）所需配置；其余必需场景已在 PI_E2E_LIVE=1 下实测通过（E2E 26/26）'
+```
+
+两个已验证的实测数字（2026-10-07，demo 目标、提交 `809dc5b`）：带 `PI_E2E_LIVE=1` 时
+E2E **26 执行 / 26 通过 / 0 失败**（含 Worker 崩溃恢复与恶意仓库隔离）；接受 E2E-05/07 偏差时
+门禁 **8 passed / 0 failed / 0 skipped**。真实场景会在 demo 上创建约 30+ 个运行，
+跑完记得按需清理（`POST /api/runs/batch` 的 `action: "cleanup"`，按 owner 身份分批 ≤50）。
+
 ### 8.1 AT 追溯矩阵（引用级检查）
 
 `npm run report:at-coverage` 解析本文档 §7.1–§7.9 与 §12 的 `AT-JEV-xxx` 标题，并在

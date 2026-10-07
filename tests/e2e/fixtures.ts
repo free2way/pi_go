@@ -29,7 +29,36 @@ export const E2E_WORKSPACE_PATH = process.env.PI_E2E_WORKSPACE_PATH;
  */
 export const E2E_LIVE_ACCEPTANCE = process.env.PI_E2E_LIVE === "1";
 
-export type ConfigStatus = { demoMode: boolean; realRunsAvailable: boolean };
+/** The identity the suite falls back to when `PI_E2E_DEV_EMAIL` is unset. */
+export const DEFAULT_E2E_DEV_EMAIL = "developer@localhost";
+
+export type ConfigStatus = {
+  demoMode: boolean;
+  realRunsAvailable: boolean;
+  configuredProviders?: string[];
+  verifiedProviders?: string[];
+};
+
+/**
+ * The skip reason every live scenario uses when `/api/config/status` reports
+ * `realRunsAvailable: false`, plus a diagnosis for the two very different causes.
+ *
+ * `realRunsAvailable` is resolved PER IDENTITY: provider credentials live in the
+ * vault under the *requesting* user, so a suite pointed at an identity the
+ * deployment never configured sees `configuredProviders: []` and every live
+ * scenario skips — which looks exactly like a broken deployment. That cost two
+ * full gate runs on 2026-10-07: the default `developer@localhost` has no
+ * credentials on the demo deployment, while `PI_E2E_DEV_EMAIL=bobo.2000@gmail.com`
+ * does, and the suite's own reason never said so.
+ */
+export function missingRealRunsReason(scenario: string, config: ConfigStatus): string {
+  const providers = config.configuredProviders ?? [];
+  const base = `${scenario} 需要真实运行环境：/api/config/status 报告 realRunsAvailable=false（需 PI_REAL_RUNS_ENABLED=true、PI_INTERNAL_TOKEN 以及至少一个已配置的 provider 凭据）。`;
+  if (providers.length === 0) {
+    return `${base} 诊断：本次请求的身份是 x-pigo-dev-email=${E2E_DEV_EMAIL}，其 configuredProviders=[]——凭据按身份隔离，身份没有凭据就一定没有真实运行。请把 PI_E2E_DEV_EMAIL 指向部署中已配置凭据的身份（demo 部署是 bobo.2000@gmail.com），不要用默认的 ${DEFAULT_E2E_DEV_EMAIL}。`;
+  }
+  return `${base} 诊断：该身份已配置 ${providers.join("、")}，所以问题在部署开关（PI_REAL_RUNS_ENABLED / PI_INTERNAL_TOKEN），不是凭据。`;
+}
 
 /** Reads `/api/config/status`; asserts the probe itself succeeded. */
 export async function configStatus(request: APIRequestContext): Promise<ConfigStatus> {

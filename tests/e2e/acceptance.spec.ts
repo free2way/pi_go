@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import type { APIRequestContext, Page } from "@playwright/test";
-import { E2E_LIVE_ACCEPTANCE, configStatus, expect, openRunByTitle, stopRun, test } from "./fixtures";
+import { E2E_LIVE_ACCEPTANCE, configStatus, expect, missingRealRunsReason, openRunByTitle, stopRun, test } from "./fixtures";
 
 /**
  * Acceptance-scenario coverage map for docs/05-acceptance-test-specification.md §13
@@ -700,7 +700,7 @@ test.describe("E2E-01 单 Agent 完整闭环", () => {
     const config = await configStatus(request);
     test.skip(
       !config.realRunsAvailable,
-      "E2E-01b 需要真实运行环境：/api/config/status 报告 realRunsAvailable=false（需 PI_REAL_RUNS_ENABLED=true、PI_INTERNAL_TOKEN 以及至少一个已配置的 provider 凭据）。",
+      missingRealRunsReason("E2E-01b", config),
     );
 
     // Explicit, exact pins (never the deployment defaults).
@@ -1183,7 +1183,7 @@ test.describe("E2E-02 检查失败自动返修", () => {
     const config = await configStatus(request);
     test.skip(
       !config.realRunsAvailable,
-      "E2E-02 需要真实运行环境：/api/config/status 报告 realRunsAvailable=false（需 PI_REAL_RUNS_ENABLED=true、PI_INTERNAL_TOKEN 以及至少一个已配置的 provider 凭据）。",
+      missingRealRunsReason("E2E-02", config),
     );
 
     const workspaceId = await resolveAcceptanceWorkspace(request);
@@ -1484,7 +1484,7 @@ test.describe("E2E-04 并行 Sub Agent", () => {
     const config = await configStatus(request);
     test.skip(
       !config.realRunsAvailable,
-      "E2E-04 需要真实运行环境：/api/config/status 报告 realRunsAvailable=false（需 PI_REAL_RUNS_ENABLED=true、PI_INTERNAL_TOKEN 以及至少一个已配置的 provider 凭据）。",
+      missingRealRunsReason("E2E-04", config),
     );
 
     const workspaceId = await resolveAcceptanceWorkspace(request);
@@ -1776,7 +1776,7 @@ test.describe("E2E-05 Provider 故障不浪费开发成本", () => {
     const config = await configStatus(request);
     test.skip(
       !config.realRunsAvailable,
-      "E2E-05 需要真实运行环境：/api/config/status 报告 realRunsAvailable=false（需 PI_REAL_RUNS_ENABLED=true、PI_INTERNAL_TOKEN 以及至少一个已配置的 provider 凭据）。",
+      missingRealRunsReason("E2E-05", config),
     );
 
     const workspaceId = await resolveAcceptanceWorkspace(request);
@@ -1983,7 +1983,7 @@ test.describe("E2E-06 Worker 崩溃恢复", () => {
     const config = await configStatus(request);
     test.skip(
       !config.realRunsAvailable,
-      "E2E-06 需要真实运行环境：/api/config/status 报告 realRunsAvailable=false（需 PI_REAL_RUNS_ENABLED=true、PI_INTERNAL_TOKEN 以及至少一个已配置的 provider 凭据）。",
+      missingRealRunsReason("E2E-06", config),
     );
 
     const workspaceId = await resolveAcceptanceWorkspace(request);
@@ -2249,7 +2249,7 @@ test.describe("E2E-07 预算停止", () => {
     const config = await configStatus(request);
     test.skip(
       !config.realRunsAvailable,
-      "E2E-07 需要真实运行环境：/api/config/status 报告 realRunsAvailable=false（需 PI_REAL_RUNS_ENABLED=true、PI_INTERNAL_TOKEN 以及至少一个已配置的 provider 凭据）。",
+      missingRealRunsReason("E2E-07", config),
     );
 
     const workspaceId = await resolveAcceptanceWorkspace(request);
@@ -2580,7 +2580,7 @@ test.describe("E2E-08 恶意仓库隔离", () => {
     const config = await configStatus(request);
     test.skip(
       !config.realRunsAvailable,
-      "E2E-08 需要真实运行环境：/api/config/status 报告 realRunsAvailable=false（需 PI_REAL_RUNS_ENABLED=true、PI_INTERNAL_TOKEN 以及至少一个已配置的 provider 凭据）。",
+      missingRealRunsReason("E2E-08", config),
     );
 
     const developer = await resolveRoleSelection(request, "developer");
