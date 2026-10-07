@@ -434,7 +434,7 @@ PI_JEV_ALLOW_SOURCE=false
 | 层级 | 实际测试文件 | 重点 |
 | --- | --- | --- |
 | Unit | `src/server/decision-engine/config.test.ts` | 默认值、严格配置、凭据缺失 |
-| Unit | `src/server/decision-engine/redaction.test.ts` | 密钥/PII 脱敏、payload 上限、状态与 schema hash |
+| Unit | `src/server/decision-engine/redaction-rules.test.ts`（原 `redaction.test.ts` 迁入） | 密钥/PII 脱敏、payload 上限、状态与 schema hash |
 | Unit | `src/server/decision-engine/response-schema.test.ts` | 三类输出映射、畸形响应、live 字段形状 |
 | Unit | `src/server/decision-engine/policy.test.ts` | 模式门控、不可变规则、低置信度 |
 | Unit | `src/server/decision-engine/jev.test.ts` | 请求映射、headers、错误映射、重试表、熔断、取消 |
@@ -580,6 +580,10 @@ private-key / openai / aws / github / jwt / bearer / pg-uri），所以每次 `n
    - **轮换密钥是唯一有效的补救**（历史改写不能替代它）；
    - 需要彻底清除，得走 GitHub Support 的"移除敏感数据"请求，或把仓库改为私有；
    - 任何在此前克隆过仓库的副本仍持有明文。
+
+**后续处置**：该文件随后在 GitHub 上被整文件删除（`fef7fb3`）。为不丢覆盖，用例已整体迁到
+`src/server/decision-engine/redaction-rules.test.ts`，夹具全部保留为显式占位；原文件名只在本文档的
+事件记录里出现（作为历史）。
 
 **不可退让的规则**：测试夹具只能用**显式假标记**（`DUMMY` / `example.com` / `not-a-real`…）；
 真实密钥只进环境变量或密钥库，绝不进仓库——`scan:secrets` 的放行只认这些假标记。
