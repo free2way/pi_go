@@ -115,6 +115,23 @@ web 进程没有任何工作区文件系统读取或 `git` 子进程——`src/s
 
 ## 决策平面（Jev）在演示环境的配置
 
+当前 demo 状态（2026-10-07 起）：`PI_DECISION_ENGINE=jev`、`PI_JEV_MODE=shadow`、
+`PI_JEV_MODEL` 未设置（取默认 `jev-latest`）。web 侧 `/api/config/status` 应报
+`engine: jev / mode: shadow`，在录入 typesafe Key 之前会是 `configured: false` +
+`reason: missing_credentials`——**这是预期状态**：决策调用走 fallback 并记一条审计行，
+不阻塞真实运行、也不触发告警（`missing_credentials` 刻意不告警）。
+
+录入 Key：控制台「模型与凭据」→ **TYPESAFE** 卡片（该卡片即使没有模型目录条目也始终可见，
+否则运维无法录入/轮换决策平面的 Key）→ 粘贴 → 「安全保存」。Key 存进按身份隔离的加密 vault，
+落在 `bobo.2000@gmail.com` 名下。录入后重新加载页面即可看到 `/api/config/status` 变为
+`configured: true`。
+
+角色用量不受影响：developer/reviewer 的成本仍取 provider 上报的 `usage.cost`；只有决策平面
+（provider `typesafe`）走本地价目表。审计行的 `provider` 字段是**如实**记录的
+（`typesafe` / `mock` / `disabled`），`mock`/`disabled` 恒为确定的 0 成本，不会把"已花"标成
+不完整。
+
+
 决策平面（`src/server/decision-engine/**`，docs/26）默认 **`disabled`/`off`：零外发、
 零行为变化**，生产不需要任何配置。演示环境把它打开成**确定性的 mock + shadow**，用于演示与
 验收「决策只见证、不改判」的契约：
