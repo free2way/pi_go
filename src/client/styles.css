@@ -929,3 +929,11 @@ button.agile-metrics-row:hover strong { color: #c3d274; }
   .decisions-answers-head, .decisions-answers-row { grid-template-columns: 1fr 1fr; }
 }
 
+
+/* 需求历史分页（每 10 条一页） */
+.history-pager { display: flex; align-items: center; justify-content: center; gap: 14px; padding: 14px 0 4px; }
+.history-pager-info { display: flex; flex-direction: column; align-items: center; gap: 2px; color: #c3cad1; font-size: 11px; }
+.history-pager-info small { color: #5f6974; font: 9px "DM Mono", monospace; }
+@media (max-width: 720px) {
+  .history-pager { flex-wrap: wrap; gap: 10px; }
+}

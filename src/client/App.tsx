@@ -103,6 +103,12 @@ import { AccountsPage } from "./AccountsPage";
 import { SystemStatusPage } from "./SystemStatusPage";
 import { WorkspacesPage } from "./WorkspacesPage";
 
+/**
+ * 侧栏「最近任务」只列最近的 N 个（需求）：完整列表在「需求历史」页
+ * （可搜索 / 筛状态 / 分页）。新建的运行一定是最新的，因此始终可见。
+ */
+const RECENT_RUNS_LIMIT = 5;
+
 type Tab = "activity" | "agents" | "review" | "diff" | "checks" | "budget" | "decisions";
 type FlowNodeData = {
   label: string;
@@ -1846,7 +1852,7 @@ export function App() {
           </div>
         )}
         <div className="run-list">
-          {runs.map((item) => (
+          {runs.slice(0, RECENT_RUNS_LIMIT).map((item) => (
             <div className={`run-item ${selectedId === item.id ? "selected" : ""}`} key={item.id}>
               <label className="run-select" title={t("batch.selectTitle")}>
                 <input type="checkbox" checked={batchSelected.has(item.id)} onChange={() => toggleBatch(item.id)} />

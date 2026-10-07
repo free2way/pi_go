@@ -4,6 +4,7 @@ import type { Run, RunState } from "../shared/types";
 import { localizeError } from "../shared/i18n";
 import { api } from "./api";
 import { useT } from "./i18n";
+import { paginate } from "./history-view";
 import {
   RUN_STATE_OPTIONS,
   copyTextForRun,
@@ -34,6 +35,13 @@ export function HistoryPage({ runs, onOpenRun }: {
   const [error, setError] = useState("");
   const [expandedId, setExpandedId] = useState<string>();
   const [copiedId, setCopiedId] = useState<string>();
+  /** 需求：需求历史按每 10 条分页（1-based；越界页码由 paginate 夹紧）。 */
+  const [page, setPage] = useState(1);
+
+  // 过滤条件变化时回到第 1 页，避免"筛完停在空页"。
+  useEffect(() => {
+    setPage(1);
+  }, [debouncedQuery, state]);
 
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedQuery(query.trim()), DEBOUNCE_MS);
@@ -71,6 +79,8 @@ export function HistoryPage({ runs, onOpenRun }: {
   };
 
   const filtering = Boolean(debouncedQuery || state);
+  // 需求：每 10 条一页（作用在已过滤列表上）。
+  const paged = paginate(items, page);
 
   return (
     <section className="history-page">
@@ -110,7 +120,7 @@ export function HistoryPage({ runs, onOpenRun }: {
             <span>{filtering ? t("history.emptyFiltered") : t("history.empty")}</span>
           </div>
         )}
-        {items.map((run) => {
+        {paged.items.map((run) => {
           const expanded = expandedId === run.id;
           const notes = humanNotesOf(run);
           return (
@@ -162,6 +172,31 @@ export function HistoryPage({ runs, onOpenRun }: {
           );
         })}
       </div>
+
+      {paged.pageCount > 1 && (
+        <nav className="history-pager" aria-label={t("history.pagerAria")}>
+          <button
+            type="button"
+            className="button secondary"
+            disabled={paged.page <= 1}
+            onClick={() => setPage(paged.page - 1)}
+          >
+            {t("history.prev")}
+          </button>
+          <span className="history-pager-info">
+            {t("history.pageOf", { page: paged.page, pages: paged.pageCount })}
+            <small>{t("history.pageRange", { from: paged.from, to: paged.to, total: paged.total })}</small>
+          </span>
+          <button
+            type="button"
+            className="button secondary"
+            disabled={paged.page >= paged.pageCount}
+            onClick={() => setPage(paged.page + 1)}
+          >
+            {t("history.next")}
+          </button>
+        </nav>
+      )}
     </section>
   );
 }
