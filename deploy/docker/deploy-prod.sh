@@ -90,7 +90,7 @@ else
   NEW_VERSION=\$(printf '%s' "\$OLD_VERSION" | awk -F. '{printf "%d.%d.%d", \$1, \$2, \$3+1}')
   sed -i "s/^${VERSION_KEY}=.*/${VERSION_KEY}=\$NEW_VERSION/" ${ENV_FILE}
   # web 与 worker 的版本戳都要动：两侧对不上会让人怀疑发布没生效（首次真跑就踩到了）。
-  python3 - "$NEW_VERSION" <<'PYVER'
+  python3 - "\$NEW_VERSION" <<'PYVER'
 import pathlib, re, sys
 version = sys.argv[1]
 p = pathlib.Path("/app/pi-agent/.env")
