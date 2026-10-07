@@ -118,7 +118,7 @@ function parseJson<T>(value: string | null, fallback: T): T {
   }
 }
 
-function toProject(row: ProjectRow): AgileProject {
+function toProject(row: ProjectRow, counts?: { stories: number; sprints: number; releases: number }): AgileProject {
   return {
     id: row.id,
     ownerId: row.owner_id,
@@ -127,6 +127,7 @@ function toProject(row: ProjectRow): AgileProject {
     description: row.description,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    ...(counts ? { counts } : {}),
   };
 }
 
@@ -282,7 +283,34 @@ export class AgileService {
       `SELECT * FROM agile_projects WHERE owner_id IN (${placeholders(ownerKeys, 1)}) ORDER BY updated_at DESC`,
       ownerKeys,
     )).rows as unknown as ProjectRow[];
-    return rows.map(toProject);
+    if (rows.length === 0) return [];
+    // 子对象计数单独查（三张表各一次分组），在 JS 里合并。相关子查询在 pg-mem（测试库）里
+    // 不被支持，而这种写法在 pg-mem 与真 PostgreSQL 上行为一致。
+    const counts = await this.countProjectChildren(rows.map((row) => row.id));
+    return rows.map((row) => toProject(row, counts.get(row.id)));
+  }
+
+  /** `project_id → {stories, sprints, releases}`；只查给定的项目集合。 */
+  private async countProjectChildren(ids: string[]): Promise<Map<string, { stories: number; sprints: number; releases: number }>> {
+    const list = placeholders(ids, 1);
+    const [stories, sprints, releases] = await Promise.all([
+      this.db.query(`SELECT project_id, COUNT(*)::int AS count FROM agile_stories WHERE project_id IN (${list}) GROUP BY project_id`, ids),
+      this.db.query(`SELECT project_id, COUNT(*)::int AS count FROM agile_sprints WHERE project_id IN (${list}) GROUP BY project_id`, ids),
+      this.db.query(`SELECT project_id, COUNT(*)::int AS count FROM agile_releases WHERE project_id IN (${list}) GROUP BY project_id`, ids),
+    ]);
+    const map = new Map<string, { stories: number; sprints: number; releases: number }>();
+    const apply = (rows: Array<{ project_id: string; count: number }> | unknown[], key: "stories" | "sprints" | "releases") => {
+      for (const row of rows as Array<{ project_id: string; count: number }>) {
+        const entry = map.get(row.project_id) ?? { stories: 0, sprints: 0, releases: 0 };
+        entry[key] = Number(row.count) || 0;
+        map.set(row.project_id, entry);
+      }
+    };
+    apply(stories.rows, "stories");
+    apply(sprints.rows, "sprints");
+    apply(releases.rows, "releases");
+    for (const id of ids) if (!map.has(id)) map.set(id, { stories: 0, sprints: 0, releases: 0 });
+    return map;
   }
 
   async getProject(ownerKeys: string[], id: string, isAdmin = false): Promise<AgileProject> {

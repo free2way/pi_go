@@ -235,6 +235,15 @@
 
 ### 3.3 敏捷
 
+> 新增（2026-10-07）：敏捷工具栏多了「**项目管理**」（`agile.manageProjects`）。面板按项目列出
+> 名称/前缀与**子对象真实计数**（迭代 · story · 发布），每行可「删除」；删除是**两步确认**——第一次点
+> 删除会就地展开「将一并删除 N 个迭代、M 个 story、K 个发布，且不可恢复。」，再点「确认删除」才执行。
+> 服务端在一个事务里级联清理 `story_runs → agile_stories → agile_sprints → agile_releases →
+> agile_projects`（owner 或管理员可删），删除后项目选择器会自动切到剩余的第一个项目。
+> 验证要点：删除后该项目的四个计数应立刻从列表消失，且 `GET /api/agile/projects` 不再返回它。
+> 生产上请只删除你确实不再需要的项目——级联不可恢复。
+
+
 - 操作：左栏「**敏捷**」（`nav.agile`，`:127`；按钮 `src/client/App.tsx:1815`）。
 - 看什么/期望：顶部七个按钮「**新建项目**」「**新建冲刺**」「**新建故事**」「**模板管理**」「**度量**」
   「**发布回顾**」「**发布管理**」（`agile.newProject`/`newSprint`/`newStory`/`templates`/`metrics`/`releaseReview`/`releaseManage`，

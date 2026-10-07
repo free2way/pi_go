@@ -139,6 +139,11 @@ export interface AgileProject {
   description: string;
   createdAt: string;
   updatedAt: string;
+  /**
+   * 该项目下的子对象数量（story / 迭代 / 发布）。只有**列表**接口会带它，
+   * 用途是"删除前如实告知会一并删掉什么"，单项读取不带（避免无谓的查询）。
+   */
+  counts?: { stories: number; sprints: number; releases: number };
 }
 
 export interface AgileStory {

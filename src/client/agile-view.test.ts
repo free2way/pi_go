@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { RELEASE_DEPLOY_STALE_MS } from "../shared/agile.js";
-import { deriveStoryStatus, type AgileStory } from "../shared/agile";
+import { deriveStoryStatus, type AgileProject, type AgileStory } from "../shared/agile";
 import type { ReleaseRetrospective, ReleaseSummary } from "../shared/agile-metrics";
-import { columnPoints, estimateKey, estimateLabel, groupStoriesByColumn, priorityKey, priorityLabel, releaseDeployAction, releaseExportFilename, releaseExportJson, splitLines, storyReference, boardColumnKey, RELEASE_DEPLOY_ACTION_KEYS } from "./agile-view";
+import { columnPoints, estimateKey, estimateLabel, groupStoriesByColumn, priorityKey, priorityLabel, releaseDeployAction, releaseExportFilename, releaseExportJson, splitLines, storyReference, boardColumnKey, RELEASE_DEPLOY_ACTION_KEYS , projectContentsLabel, projectDeletionWarning } from "./agile-view";
 import { t } from "../shared/i18n";
 
 function story(overrides: Partial<AgileStory>): AgileStory {
@@ -166,5 +166,34 @@ describe("releaseDeployAction", () => {
   it("exposes catalog keys for the publish button", () => {
     expect(t("zh", RELEASE_DEPLOY_ACTION_KEYS.retry)).toBe("重试部署");
     expect(t("en", RELEASE_DEPLOY_ACTION_KEYS.retry)).toBe("Retry deploy");
+  });
+});
+
+describe("项目管理（删除前告知）", () => {
+  const project = (counts?: AgileProject["counts"]): AgileProject => ({
+    id: "proj_1",
+    ownerId: "user_a",
+    name: "身份与权限",
+    key: "AUTH",
+    description: "",
+    createdAt: "2026-10-07T00:00:00.000Z",
+    updatedAt: "2026-10-07T00:00:00.000Z",
+    ...(counts ? { counts } : {}),
+  });
+
+  it("内容摘要用真实计数；没有计数时不编造", () => {
+    expect(projectContentsLabel(project({ sprints: 3, stories: 12, releases: 2 }))).toBe("3 个迭代 · 12 个 story · 2 个发布");
+    expect(projectContentsLabel(project({ sprints: 0, stories: 0, releases: 0 }))).toBe("0 个迭代 · 0 个 story · 0 个发布");
+    expect(projectContentsLabel(project())).toBe("");
+    expect(projectContentsLabel(project({ sprints: 1, stories: 1, releases: 1 }), "en")).toBe("1 sprints · 1 stories · 1 releases");
+  });
+
+  it("删除警告写明会级联删掉什么（空项目也如实说 0）", () => {
+    expect(projectDeletionWarning(project({ sprints: 2, stories: 5, releases: 1 }))).toBe(
+      "将一并删除 2 个迭代、5 个 story、1 个发布，且不可恢复。",
+    );
+    expect(projectDeletionWarning(project({ sprints: 0, stories: 0, releases: 0 }))).toContain("0 个迭代");
+    // 没有计数（单项读取）时退化成通用措辞，不假装知道数量
+    expect(projectDeletionWarning(project())).toContain("0 个迭代");
   });
 });

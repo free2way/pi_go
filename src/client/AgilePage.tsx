@@ -1,4 +1,4 @@
-import { BarChart3, ClipboardList, Copy, Download, LayoutTemplate, ListChecks, LoaderCircle, Pencil, Plus, Rocket, RotateCcw, Trash2, X } from "lucide-react";
+import { FolderCog, BarChart3, ClipboardList, Copy, Download, LayoutTemplate, ListChecks, LoaderCircle, Pencil, Plus, Rocket, RotateCcw, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { DEFAULT_LOCALE, intlLocale, localizeError, t, type Locale, type MessageKey } from "../shared/i18n";
 import { useT } from "./i18n";
@@ -8,7 +8,7 @@ import type { AgileMetricsResponse, ReleaseRetrospective, ReleaseSummary } from 
 import type { ConfigStatus, ModelCatalogResponse, Workspace } from "../shared/types";
 import { api } from "./api";
 import { agileFormErrorMessage, buildReleaseInput, buildTemplateInput, parseModelSelection } from "./agile-forms";
-import { boardColumnKey, columnPoints, estimateLabel, groupStoriesByColumn, priorityKey, priorityLabel, RELEASE_DEPLOY_ACTION_KEYS, releaseDeployAction, releaseExportFilename, releaseExportJson, splitLines, storyReference, storyStatusKey } from "./agile-view";
+import { boardColumnKey, columnPoints, estimateLabel, groupStoriesByColumn, priorityKey, priorityLabel, RELEASE_DEPLOY_ACTION_KEYS, releaseDeployAction, releaseExportFilename, releaseExportJson, splitLines, storyReference, storyStatusKey , projectContentsLabel, projectDeletionWarning } from "./agile-view";
 
 /** Catalog key for the sprint/release/deploy badges (labels live in the catalog). */
 const sprintStatusKey = (status: AgileSprint["status"]): MessageKey => `agile.sprintStatus.${status}` as MessageKey;
@@ -46,7 +46,11 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
-  const [panel, setPanel] = useState<"none" | "project" | "sprint" | "story" | "metrics" | "release" | "templates" | "releases">("none");
+  const [panel, setPanel] = useState<"none" | "project" | "sprint" | "story" | "metrics" | "release" | "templates" | "releases" | "manage">("none");
+  /** 正在二次确认删除的项目 id（空 = 没有待确认的删除）。 */
+  const [confirmDeleteId, setConfirmDeleteId] = useState("");
+  /** 成功类提示（与 error 分开：删除成功不该显示成错误）。 */
+  const [notice, setNotice] = useState("");
   const [templates, setTemplates] = useState<ModelTemplate[]>([]);
   const [models, setModels] = useState<ModelCatalogResponse>();
   const [metrics, setMetrics] = useState<AgileMetricsResponse>();
@@ -239,6 +243,28 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
       setPanel("none");
     } catch (cause) {
       setError(localizeError(locale, cause as { code?: string; message?: string }, t("agile.error.createProject")));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  /**
+   * 删除项目：服务端在一个事务里级联清理（story_runs → stories → sprints → releases → 项目），
+   * 因此先做二次确认，确认文案里如实列出会一并删掉的数量（计数来自项目列表接口）。
+   */
+  const confirmDeleteProject = async (project: AgileProject) => {
+    setBusy("delete-project");
+    setError("");
+    setNotice("");
+    try {
+      await api.agileDeleteProject(project.id);
+      const result = await api.agileProjects();
+      setProjects(result.projects);
+      if (projectId === project.id) setProjectId(result.projects[0]?.id ?? "");
+      setConfirmDeleteId("");
+      setNotice(t("agile.manage.deleted", { name: project.name }));
+    } catch (cause) {
+      setError(localizeError(locale, cause as { code?: string; message?: string }, t("agile.error.deleteProject")));
     } finally {
       setBusy("");
     }
@@ -636,6 +662,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
           <p>{t("agile.subtitle")}</p>
         </div>
         <div className="ws-heading-actions">
+          <button className={`button secondary ${panel === "manage" ? "active" : ""}`} onClick={() => { setPanel(panel === "manage" ? "none" : "manage"); setError(""); setNotice(""); setConfirmDeleteId(""); }}><FolderCog size={15} />{t("agile.manageProjects")}</button>
           <button className="button secondary" onClick={() => { setPanel(panel === "project" ? "none" : "project"); setError(""); }}><Plus size={15} />{t("agile.newProject")}</button>
           <button className="button secondary" disabled={!projectId} onClick={() => { setPanel(panel === "sprint" ? "none" : "sprint"); setError(""); }}><Plus size={15} />{t("agile.newSprint")}</button>
           <button className="button secondary" disabled={!projectId} onClick={() => { setPanel(panel === "story" ? "none" : "story"); setError(""); }}><Plus size={15} />{t("agile.newStory")}</button>
@@ -757,6 +784,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
       </div>
 
       {error && <div className="form-error">{error}</div>}
+      {notice && <div className="demo-notice">{notice}</div>}
       {loading && <div className="ws-empty"><LoaderCircle className="spin" size={20} /><span>{t("agile.loading")}</span></div>}
       {!loading && projects.length === 0 && (
         <div className="ws-empty"><ClipboardList size={26} /><strong>{t("agile.noProjects")}</strong><span>{t("agile.noProjectsHint")}</span></div>
@@ -862,6 +890,52 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
             </section>
           </div>
         </>
+      )}
+
+      {panel === "manage" && (
+        <section className="panel agile-metrics">
+          <div className="panel-head"><div><span className="eyebrow">PROJECT MANAGEMENT</span><h3>{t("agile.manageProjects")}</h3></div><FolderCog size={15} /></div>
+          <div className="agile-metrics-body">
+            <p className="agile-hint">{t("agile.manage.hint")}</p>
+            {projects.length === 0 ? (
+              <div className="agile-hint">{t("agile.manage.empty")}</div>
+            ) : (
+              <div className="agile-release-list">
+                {projects.map((project) => (
+                  <div className="agile-manage-row" key={project.id}>
+                    <main>
+                      <div><b>{project.name}</b><code>{project.key}</code></div>
+                      <span className="agile-hint">{projectContentsLabel(project, locale)}</span>
+                      {confirmDeleteId === project.id && (
+                        <span className="agile-manage-warning">{projectDeletionWarning(project, locale)}</span>
+                      )}
+                    </main>
+                    <div className="agile-manage-actions">
+                      {confirmDeleteId === project.id ? (
+                        <>
+                          <button type="button" className="button secondary" onClick={() => setConfirmDeleteId("")}>{t("agile.manage.cancel")}</button>
+                          <button
+                            type="button"
+                            className="button primary"
+                            disabled={busy === "delete-project"}
+                            onClick={() => void confirmDeleteProject(project)}
+                          >
+                            {busy === "delete-project" ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}
+                            {t("agile.manage.deleteConfirm")}
+                          </button>
+                        </>
+                      ) : (
+                        <button type="button" className="button secondary" onClick={() => { setConfirmDeleteId(project.id); setError(""); }}>
+                          <Trash2 size={15} />{t("agile.manage.delete")}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </section>
       )}
 
       {panel === "templates" && (

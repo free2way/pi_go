@@ -1,4 +1,4 @@
-import { BOARD_COLUMNS, boardColumnFor, RELEASE_DEPLOY_STALE_MS, type AgileStory, type BoardColumnId, type ReleaseDeployRecord, type ReleaseStatus, type SprintStatus, type StoryPriority, type StoryStatus } from "../shared/agile";
+import { BOARD_COLUMNS, boardColumnFor, type AgileProject, RELEASE_DEPLOY_STALE_MS, type AgileStory, type BoardColumnId, type ReleaseDeployRecord, type ReleaseStatus, type SprintStatus, type StoryPriority, type StoryStatus } from "../shared/agile";
 import type { ReleaseRetrospective, ReleaseSummary } from "../shared/agile-metrics";
 import { DEFAULT_LOCALE, t, type Locale, type MessageKey } from "../shared/i18n";
 
@@ -169,4 +169,20 @@ export function releaseDeployAction(deploy: ReleaseDeployRecord | null | undefin
     return Number.isFinite(age) && age >= RELEASE_DEPLOY_STALE_MS ? "retry" : "waiting";
   }
   return "done";
+}
+
+/** 项目内容摘要：`3 个迭代 · 12 个 story · 2 个发布`（计数由列表接口提供）。 */
+export function projectContentsLabel(project: AgileProject, locale: Locale = DEFAULT_LOCALE): string {
+  const counts = project.counts;
+  if (!counts) return "";
+  return t(locale, "agile.manage.contents", { sprints: counts.sprints, stories: counts.stories, releases: counts.releases });
+}
+
+/**
+ * 删除前的如实告知。服务端会在一个事务里级联清理 story_runs → stories → sprints → releases → 项目，
+ * 所以这里必须把"会一并删掉什么"说清楚；没有计数时退化成通用措辞（不假装知道数量）。
+ */
+export function projectDeletionWarning(project: AgileProject, locale: Locale = DEFAULT_LOCALE): string {
+  const counts = project.counts ?? { sprints: 0, stories: 0, releases: 0 };
+  return t(locale, "agile.manage.warning", { sprints: counts.sprints, stories: counts.stories, releases: counts.releases });
 }

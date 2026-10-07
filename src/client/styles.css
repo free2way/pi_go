@@ -694,6 +694,13 @@ button { color: inherit; }
 .agile-priority.priority-wont { color: #6b7680; }
 
 .agile-grid { display: grid; grid-template-columns: 1.4fr 1fr; gap: 12px; margin-top: 12px; }
+/* 项目管理（删除）：一行一个项目，右侧是删除/确认操作 */
+.agile-manage-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid rgba(255,255,255,.06); border-radius: 8px; background: rgba(255,255,255,.02); }
+.agile-manage-row main { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.agile-manage-row b { font-size: 10px; color: #d8e0cf; }
+.agile-manage-row code { margin-left: 6px; font-size: 9px; color: #8d9a84; }
+.agile-manage-warning { color: #d9a86b; font-size: 9px; }
+.agile-manage-actions { display: flex; gap: 8px; flex: 0 0 auto; }
 .agile-story-list, .agile-sprint-list, .agile-release-list { display: flex; flex-direction: column; padding: 10px 14px 14px; gap: 6px; }
 .agile-story-row { display: flex; align-items: center; gap: 8px; border: 1px solid transparent; border-radius: 8px; padding: 6px 8px; }
 .agile-story-row:hover { background: #0d1115; }

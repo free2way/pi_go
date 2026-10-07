@@ -225,6 +225,8 @@ export const api = {
   deleteRun: (id: string) => request<void>(`/api/runs/${id}`, { method: "DELETE" }),
   // ---------------------------------------------------------------- agile
   agileProjects: () => request<{ projects: AgileProject[] }>("/api/agile/projects"),
+  /** 删除项目：服务端在同一事务里级联清理 story_runs → stories → sprints → releases → 项目。 */
+  agileDeleteProject: (id: string) => request<void>(`/api/agile/projects/${encodeURIComponent(id)}`, { method: "DELETE" }),
   createAgileProject: (body: { name: string; key: string; description?: string }) =>
     request<AgileProject>("/api/agile/projects", { method: "POST", body: JSON.stringify(body) }),
   agileStories: (params: { projectId?: string; sprintId?: string; status?: StoryStatus } = {}) => {

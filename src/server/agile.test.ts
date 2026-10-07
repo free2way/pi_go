@@ -82,6 +82,26 @@ describe("AgileService projects", () => {
     await expect(service.createProject("user_b", { name: "另一个", key: project.key })).resolves.toMatchObject({ key: "AUTH" });
   });
 
+  it("列表接口带子对象计数（删除前如实告知），单项读取不带", async () => {
+    const { service, project } = await seed();
+    await service.createStory("user_a", { projectId: project.id, title: "故事一" });
+    await service.createStory("user_a", { projectId: project.id, title: "故事二" });
+    await service.createSprint("user_a", { projectId: project.id, name: "Sprint 1" });
+    await service.createRelease("user_a", { projectId: project.id, name: "v1", version: "1.0.0" });
+
+    const [listed] = await service.listProjects(["user_a"]);
+    expect(listed.counts).toEqual({ stories: 2, sprints: 1, releases: 1 });
+
+    // 单项读取不带计数（避免多余查询），字段是 optional
+    const single = await service.getProject(["user_a"], project.id);
+    expect(single.counts).toBeUndefined();
+
+    // 空项目是 0，不是缺字段
+    const empty = await service.createProject("user_a", { name: "空项目", key: "EMPTY" });
+    const listedEmpty = (await service.listProjects(["user_a"])).find((row) => row.id === empty.id);
+    expect(listedEmpty?.counts).toEqual({ stories: 0, sprints: 0, releases: 0 });
+  });
+
   it("cascades deletes to stories, sprints, releases and run links", async () => {
     const { db, service, project } = await seed();
     const story = await service.createStory("user_a", { projectId: project.id, title: "故事一" });
