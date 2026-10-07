@@ -31,6 +31,7 @@ import {
   type DecisionAuditStoreLike,
 } from "./decision-engine/audit-store.js";
 import { createDecisionAuditRetentionSweeper } from "./decision-engine/audit-retention.js";
+import { createAdmissionController, type AdmissionController } from "./decision-engine/admission.js";
 import { canonicalJson, questionSchemaHash, sha256Hex, stateManifest } from "./decision-engine/redaction.js";
 import type { Alert } from "./alerts.js";
 import {
@@ -123,6 +124,23 @@ export interface DecisionRouteDeps {
    * drift detection still runs, it just has no sink to report to.
    */
   raiseAlert?: (alert: Alert) => void;
+  /**
+   * AT-JEV-072: the decision plane's own pre-dispatch concurrency gate. The
+   * evaluate route acquires one slot before it builds a batch or calls the
+   * provider, and releases it when the request finishes (success, fallback or
+   * throw). `registerDecisionRoutes` ALWAYS installs one (cap from
+   * `PI_DECISION_MAX_CONCURRENT`, default 4), so the production route is always
+   * bounded; a direct `evaluateDecisionForRun` caller that omits it runs
+   * unbounded (the pre-existing behaviour) so the core stays unit-testable in
+   * isolation.
+   */
+  admission?: AdmissionController;
+  /**
+   * Structured log sink for the (process-throttled) admission rejection warn.
+   * `registerDecisionRoutes` wires `app.log.warn`; direct callers default to
+   * `console.warn`, matching `createDecisionAuditRetentionSweeper`.
+   */
+  warn?: (message: string, details: Record<string, unknown>) => void;
 }
 
 /** Whitelisted, redacted projection of one audit row (docs/26 §8.2). */
@@ -657,11 +675,71 @@ function buildFallbackEvaluation(input: {
 }
 
 /**
+ * AT-JEV-072: the decision plane's own concurrency cap, read at the route layer
+ * (like the audit-retention knobs), NOT folded into the strict
+ * `loadDecisionEngineConfig` schema: a bad value must degrade to the documented
+ * default here rather than reject the whole configuration.
+ *
+ * Why 4: the worker clamps `PI_MAX_ACTIVE_JOBS` to [1, 4] and runs at most one
+ * in-flight triage call per active run, so 4 is the *normal* peak. The cap is
+ * therefore meant to cover normal load and only bite on an anomalous burst.
+ */
+export const DECISION_MAX_CONCURRENT_ENV = "PI_DECISION_MAX_CONCURRENT";
+export const DECISION_MAX_CONCURRENT_DEFAULT = 4;
+
+/**
+ * Resolves the cap from the environment. Absent/blank/non-numeric/`0`/negative
+ * all fall back to {@link DECISION_MAX_CONCURRENT_DEFAULT}; `0` is deliberately
+ * NOT an "unlimited" escape hatch here (that stays a pure-module capability,
+ * reachable only by calling `createAdmissionController` directly).
+ */
+export function decisionMaxConcurrent(env: NodeJS.ProcessEnv): number {
+  const rawValue = env[DECISION_MAX_CONCURRENT_ENV];
+  const value = rawValue === undefined ? Number.NaN : Number(String(rawValue).trim());
+  if (!Number.isFinite(value) || value < 1) return DECISION_MAX_CONCURRENT_DEFAULT;
+  return Math.floor(value);
+}
+
+/**
+ * One admission rejection warn per process per minute. The throttle state is
+ * keyed by the deps object (one per app/process in production), so an operator
+ * cannot be flooded by a sustained burst while a fresh test still observes the
+ * first line.
+ */
+const ADMISSION_WARN_INTERVAL_MS = 60_000;
+const admissionWarnState = new WeakMap<DecisionRouteDeps, { lastWarnAt: number }>();
+
+/** Emits at most one warn per window, carrying the live admission counters. */
+function warnAdmissionRejected(deps: DecisionRouteDeps, admission: AdmissionController, nowMs: number): void {
+  let state = admissionWarnState.get(deps);
+  if (!state) {
+    state = { lastWarnAt: 0 };
+    admissionWarnState.set(deps, state);
+  }
+  if (nowMs - state.lastWarnAt < ADMISSION_WARN_INTERVAL_MS) return;
+  state.lastWarnAt = nowMs;
+  const warn = deps.warn ?? ((message: string, details: Record<string, unknown>) => console.warn(`${message} ${JSON.stringify(details)}`));
+  warn("decision-plane admission control rejected a request; it fell back safely", {
+    inFlight: admission.inFlight,
+    maxConcurrent: admission.maxConcurrent,
+    rejected: admission.rejected,
+  });
+}
+
+/**
  * Core of the internal evaluate route. Returns the business-safe result for
  * every outcome; only `runId` lookup failure is a request error. Each batch is
  * evaluated, persisted and evented independently: an over-limit or failing batch
  * never prevents the remaining batches from being recorded and never fails the
  * run (docs/26 §9.2/§15.1).
+ *
+ * AT-JEV-072: when an admission controller is wired, this function reserves a
+ * slot AFTER the cheap config/credential gates and BEFORE any batch construction,
+ * provider call or audit write. A saturated plane short-circuits with the same
+ * business-safe shape as the `missing_credentials` early return: HTTP 200,
+ * `status:"fallback"`, `fallbackReason:"rate_limited"`, zero outbound calls and
+ * zero audit rows. Whatever happens afterwards (fallback, throw, success), the
+ * slot is released in `finally`, so a failure can never leak capacity.
  */
 export async function evaluateDecisionForRun(
   input: { runId: string; kind: DecisionKind },
@@ -737,6 +815,56 @@ export async function evaluateDecisionForRun(
     resolveApiKey = () => resolved.key;
   }
 
+  // AT-JEV-072 admission gate. Placed after the local configuration/credential
+  // gates (a `disabled`/`missing_credentials` request never reaches the provider
+  // anyway, so it must not consume a slot) and before any batch construction,
+  // provider call or audit write. Same business-safe early-return shape as
+  // `missing_credentials` above: HTTP 200, no audit row, no event, no outbound
+  // call — the worker can simply retry, and its next round re-triggers the
+  // evaluation.
+  const admission = deps.admission;
+  if (admission && !admission.tryAcquire()) {
+    warnAdmissionRejected(deps, admission, Date.now());
+    return {
+      status: 200,
+      body: disabledResponse({
+        runId: run.id,
+        kind: input.kind,
+        mode: config.mode,
+        status: "fallback",
+        fallbackReason: "rate_limited",
+        detail:
+          `decision-plane concurrency limit reached (in flight ${admission.inFlight}/${admission.maxConcurrent}, ` +
+          `rejected ${admission.rejected}); the request safely fell back without any outbound call — ` +
+          "retry shortly, the next worker round will re-trigger it",
+        createdAt: now,
+      }),
+    };
+  }
+
+  // Everything below holds the admission slot (when wired); the `finally` is the
+  // single release point, so no early return or thrown error can leak capacity.
+  try {
+    return await evaluateAdmittedBatches(input, deps, run, config, resolveApiKey, now);
+  } finally {
+    admission?.release();
+  }
+}
+
+/**
+ * The admitted portion of one evaluate request (docs/26 §9.2/§15.1): build the
+ * payload-safe batches, dispatch them, persist one audit row per batch and
+ * return the projection. Split out of `evaluateDecisionForRun` so the admission
+ * `try/finally` can wrap it without touching the many existing early returns.
+ */
+async function evaluateAdmittedBatches(
+  input: { runId: string; kind: DecisionKind },
+  deps: DecisionRouteDeps,
+  run: Run,
+  config: DecisionEngineConfig,
+  resolveApiKey: (() => string | undefined) | undefined,
+  now: string,
+): Promise<DecisionEvaluateOutcome> {
   // The batch builder owns redaction/allowlisting and the payload limits. Its
   // evaluationId input is provisional: the real per-batch id must incorporate
   // the builder's `stateHash` (docs/26 §8.3), so it is re-derived below.
@@ -898,13 +1026,26 @@ function asPruneStore(audit: DecisionAuditStoreLike): DecisionAuditPruneStore | 
 
 /** Registers both decision-plane routes on the app. */
 export function registerDecisionRoutes(app: FastifyInstance, deps: DecisionRouteDeps) {
+  /**
+   * AT-JEV-072: the evaluate route always runs behind an admission controller.
+   * The cap comes from `PI_DECISION_MAX_CONCURRENT` (default 4); the warn sink is
+   * the app logger. Built ONCE per registration so the counter is process-wide
+   * (one controller per app), and so the WeakMap-keyed warning throttle sees a
+   * stable deps identity.
+   */
+  const evaluateDeps: DecisionRouteDeps = {
+    ...deps,
+    admission: deps.admission ?? createAdmissionController({ maxConcurrent: decisionMaxConcurrent(deps.env) }),
+    warn: deps.warn ?? ((message, details) => app.log.warn(details, message)),
+  };
+
   app.post(DECISION_EVALUATE_PATH, async (request, reply) => {
     if (!deps.internalAuthorized(request)) return reply.code(401).send({ error: "Unauthorized" });
     const parsed = decisionEvaluateSchema.safeParse(request.body ?? {});
     if (!parsed.success) {
       return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
     }
-    const result = await evaluateDecisionForRun(parsed.data, deps);
+    const result = await evaluateDecisionForRun(parsed.data, evaluateDeps);
     return reply.code(result.status).send(result.body);
   });
 

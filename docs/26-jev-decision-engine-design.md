@@ -78,10 +78,16 @@ Jev 调用放在服务端网关而不是浏览器、代码执行沙箱或子代�
 - API Key 只保存在服务端。
 - 统一处理字段裁剪、脱敏、限流、超时、重试和熔断。
 
-  **实现现状（2026-10-06 复核）**：字段裁剪/脱敏/超时/重试/熔断均已实现；**本平面当前没有自己的
-  速率或并发上限**——`src/server/rate-limit.ts` 的 `RateLimiter` 只接在凭据写入、创建运行、运行操作
-  上，`evaluateDecisionForRun` 未挂载。现存的过载保护是"事后"的：熔断（连续 5 次可归因失败）+
-  worker 侧 `PI_MAX_ACTIVE_JOBS`（≤4，每个活跃运行至多一个在飞 triage 调用）。见 AT-JEV-072 的压测结论。
+  **实现现状（2026-10-06 复核，已补齐限流）**：字段裁剪/脱敏/超时/重试/熔断均已实现；本平面**自带
+  并发准入控制**——`src/server/decision-engine/admission.ts`，由 `registerDecisionRoutes` 恒定安装，
+  上限取 `PI_DECISION_MAX_CONCURRENT`（**默认 4**，非法/空/0 回落默认；为什么是 4：worker 的
+  `PI_MAX_ACTIVE_JOBS ≤ 4` 且每个活跃运行至多一个在飞 triage 调用，故 4 是正常峰值）。饱和时
+  **在批构建与任何外呼之前**返回业务安全回退（`status:"fallback"`、`fallbackReason:"rate_limited"`），
+  **零外呼、零审计行、零事件**，并输出节流后的 warn；未注入控制器而直接调用 `evaluateDecisionForRun`
+  的路径不受限（保持核心可单测）。实测：8 路并发、上限 4 → 恰好 4 路进入、4 路安全回退，
+  在飞峰值 4（`tests/perf/decision-perf.test.ts` AT-JEV-072）。
+  注意 `src/server/rate-limit.ts` 的 `RateLimiter`（窗口式速率限制）仍只用于凭据写入/创建运行/运行操作，
+  **不**用于本平面——两者语义不同（并发准入 vs 速率窗口），不要混用。
 - 统一记录实际模型版本、策略版本、概率、时延和回退原因。
 - 后续可以替换供应商或增加本地规则引擎，而不改业务调用方。
 - 防止模型结果直接获得执行权限。

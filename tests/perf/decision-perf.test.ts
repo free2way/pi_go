@@ -26,10 +26,12 @@
  *    conclusive when V8 GC is exposed (this config passes `--expose-gc` to the
  *    worker). Without GC the threshold is deliberately wide and is documented as
  *    a weak signal.
- *  - AT-JEV-072: the decision plane has NO rate limiter and NO concurrency cap.
- *    The only internal overload protection is the Jev circuit breaker; the only
- *    global bound is the worker's own `PI_MAX_ACTIVE_JOBS`. This file pins that
- *    reality instead of inventing a limiter (see the "GAP" case).
+ *  - AT-JEV-072: the decision plane has its own pre-dispatch concurrency cap
+ *    (`PI_DECISION_MAX_CONCURRENT`, default 4, installed by `registerDecisionRoutes`;
+ *    see `decision-engine/admission.ts`). Saturation returns a business-safe
+ *    `rate_limited` fallback with zero outbound calls and no audit row. The
+ *    circuit breaker remains the *failure* protection; a direct
+ *    `evaluateDecisionForRun` caller that omits the controller is unbounded.
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -52,12 +54,14 @@ import type {
   DecisionRequest,
 } from "../../src/server/decision-engine/types.js";
 import {
+  decisionMaxConcurrent,
   evaluateDecisionForRun,
   type CreateDecisionEngine,
   type DecisionRunStore,
   type DecisionRouteDeps,
 } from "../../src/server/decision-routes.js";
 import { RateLimiter } from "../../src/server/rate-limit.js";
+import { createAdmissionController } from "../../src/server/decision-engine/admission.js";
 import type { Finding, Run } from "../../src/shared/types.js";
 
 const PERF_ENABLED = process.env.PI_DECISION_PERF === "1";
@@ -209,7 +213,7 @@ interface PerfHarness {
 /** In-memory decision-route harness: real config loading, real batch builder, fake persistence. */
 function createHarness(
   runs: Run[],
-  options: { env?: NodeJS.ProcessEnv; createEngine?: CreateDecisionEngine } = {},
+  options: { env?: NodeJS.ProcessEnv; createEngine?: CreateDecisionEngine; admission?: DecisionRouteDeps["admission"] } = {},
 ): PerfHarness {
   const byId = new Map(runs.map((run) => [run.id, run]));
   const audit = createMemoryAudit();
@@ -244,6 +248,7 @@ function createHarness(
     buildBatches: (input) => buildReviewTriageBatches(input),
     internalAuthorized: () => true,
     ownerKeysFor: () => [OWNER],
+    ...(options.admission ? { admission: options.admission } : {}),
   };
   return { deps, audit, events, engineCalls };
 }
@@ -479,18 +484,22 @@ suite("AT-JEV-072 · concurrency and rate limiting (docs/27 §7.8)", () => {
     );
   });
 
-  it("[AT-JEV-072] GAP · the decision plane has no concurrency cap: a 2× peak burst actually reaches the engine", async () => {
-    // Documents the gap honestly instead of inventing a limiter: with N concurrent
-    // evaluations there is no internal queue/limit, so N engine calls are made in
-    // parallel. If a decision-plane limiter is ever added, this assertion (and the
-    // §8.1 wording) must be updated — that is the point of pinning it.
-    const runs = Array.from({ length: OVERLOAD_CONCURRENCY }, (_value, index) => makeRun(`run_perf_072_gap_${index}`, 2));
+  it("[AT-JEV-072] the admission cap bounds a 2× peak burst: the excess falls back safely with zero outbound calls", async () => {
+    // The production route ALWAYS installs an admission controller
+    // (`registerDecisionRoutes` → `createAdmissionController` with the cap from
+    // `PI_DECISION_MAX_CONCURRENT`, default 4). This case drives the same
+    // controller through `evaluateDecisionForRun` so the bound is measured, not
+    // assumed: a burst of 2× peak must reach the engine at most `cap` times.
+    const cap = decisionMaxConcurrent({} as NodeJS.ProcessEnv);
+    const runs = Array.from({ length: OVERLOAD_CONCURRENCY }, (_value, index) => makeRun(`run_perf_072_admission_${index}`, 2));
     let inFlight = 0;
     let maxInFlight = 0;
+    let dispatches = 0;
     const createEngine: CreateDecisionEngine = (config, engineDeps) => {
       const inner = createDecisionEngine(config, engineDeps);
       return {
         evaluate: async (request, signal) => {
+          dispatches += 1;
           inFlight += 1;
           maxInFlight = Math.max(maxInFlight, inFlight);
           try {
@@ -502,16 +511,27 @@ suite("AT-JEV-072 · concurrency and rate limiting (docs/27 §7.8)", () => {
         },
       };
     };
-    const harness = createHarness(runs, { createEngine });
+    const admission = createAdmissionController({ maxConcurrent: cap });
+    const harness = createHarness(runs, { createEngine, admission });
 
     const bodies = (
       await Promise.all(runs.map((run) => evaluateDecisionForRun({ runId: run.id, kind: "review_triage" }, harness.deps)))
     ).map((result) => completed(result));
 
-    expect(bodies.every((body) => body.status === "completed")).toBe(true);
-    expect(maxInFlight).toBe(OVERLOAD_CONCURRENCY);
+    const completedCount = bodies.filter((body) => body.status === "completed").length;
+    const rejected = bodies.filter((body) => body.fallbackReason === "rate_limited");
+    expect(maxInFlight).toBeLessThanOrEqual(cap);
+    expect(completedCount).toBe(cap);
+    expect(rejected).toHaveLength(OVERLOAD_CONCURRENCY - cap);
+    // A rejected admission never dispatches and never writes an audit row: the
+    // admitted run has exactly one row, a rejected run has none.
+    expect(dispatches).toBe(cap);
+    expect(await harness.audit.store.listByRun(runs[0].id)).toHaveLength(1);
+    const rejectedRun = runs.find((run) => !bodies.some((body) => body.runId === run.id && body.status === "completed"))!;
+    expect(await harness.audit.store.listByRun(rejectedRun.id)).toHaveLength(0);
     console.log(
-      `[AT-JEV-072] gap probe: burst=${OVERLOAD_CONCURRENCY} observedMaxInFlight=${maxInFlight} (no decision-plane limiter)`,
+      `[AT-JEV-072] admission probe: burst=${OVERLOAD_CONCURRENCY} cap=${cap} admitted=${completedCount} ` +
+        `rejected=${rejected.length} observedMaxInFlight=${maxInFlight} dispatches=${dispatches}`,
     );
   }, 120_000);
 });

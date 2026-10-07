@@ -524,8 +524,10 @@ npm run report:at-coverage
   （warmup 50）p50 ≈ 0.27ms、p95 ≈ 0.36ms ≤ 50ms、堆增量 ≈ 0.05MiB（`--expose-gc`）；2× 峰值（8 并发，
   峰值取自 worker `PI_MAX_ACTIVE_JOBS` ≤ 4）全部完成、p95 ≈ 2.6ms，429 与熔断（阈值 5）均安全回退且过载期零外呼；
   100 findings @ `PI_JEV_REVIEW_MAX_FINDINGS=50` → 2 批次 / 2 次外部请求 / 2 条审计 / 400 个问题（每 finding 4 问）。
-  **缺口（072 结构性）**：决策平面自身**没有**速率或并发上限，唯一内部过载保护是熔断（事后），
-  唯一全局上限是 worker 的 `PI_MAX_ACTIVE_JOBS`；docs/26 §6 已据实修正原先"统一处理限流"的表述。
+  另：决策平面自带**并发准入控制**（`decision-engine/admission.ts`，`PI_DECISION_MAX_CONCURRENT`
+  默认 4，由 `registerDecisionRoutes` 恒定安装）：8 路并发 @ 上限 4 → 恰好 4 路进入 provider、
+  4 路返回 `rate_limited` 业务安全回退且**零外呼零审计行**，在飞峰值 4（`decision-admission.test.ts` +
+  perf 用例实测）。熔断仍是"失败后"的保护，两者互补。
 
 
 ## 9. Shadow 统计验收
