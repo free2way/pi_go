@@ -442,6 +442,8 @@ PI_JEV_ALLOW_SOURCE=false
 | Unit | `src/server/decision-engine/index.test.ts` | 引擎组装、模式门控、shadow 采样 |
 | Unit | `src/server/decision-engine/key-source.test.ts` | vault/env key 解析优先级 |
 | Unit | `src/server/decision-engine/review-triage.test.ts` | 状态投影、问题集、分批与批次隔离 |
+| Unit | `src/server/decision-engine/prompt-injection.test.ts` | AT-JEV-053：注入不改 schema、只作数据、未知返回整体拒绝、决策路径无 I/O |
+| Unit | `src/server/decision-engine/replay.test.ts`（fixture `fixtures/replay-review-triage.json`） | AT-JEV-065：脱敏 fixture 回放、出站载荷钉住、概率抖动与模型漂移不改 outcome |
 | Integration | `src/server/decision-engine/integration.test.ts` | 本地 HTTP server：重试、熔断、超时、取消、鉴权 |
 | Worker | `src/worker/decision-triage.test.ts` | worker 侧调用点、verdict→triage 顺序 |
 | Worker | `src/worker/decision-integration.test.ts` | worker 端到端接入（注入 transport，无网络） |
@@ -481,8 +483,8 @@ npm run report:at-coverage
 
 局限（诚实声明）：这是**引用级**检查，不是覆盖率证明。编号出现在测试标题或注释里只表示
 "有人声称该测试映射到这条用例"，**不等于**该用例描述的行为已被断言证明。`uncited` 是可靠信号
-（无人声称覆盖）；`cited` 仍需人工核对断言内容。截至本次更新：61 条用例中 47 条 cited、14 条 uncited
-（`uncited` = `025 / 030–035 / 053 / 065 / 082 / 083 / 090 / 091 / 093`）。
+（无人声称覆盖）；`cited` 仍需人工核对断言内容。截至本次更新：61 条用例中 49 条 cited、12 条 uncited
+（`uncited` = `025 / 030–035 / 082 / 083 / 090 / 091 / 093`）。
 
 已知缺口（无自动化证据，不得在阶段升级时当作已验收）：
 
@@ -494,10 +496,27 @@ npm run report:at-coverage
 - **AT-JEV-080（真实 API 最小调用）**：由在线 opt-in 套件引用（需 `PI_JEV_LIVE=1` + 真 key）。
 - **AT-JEV-090 / 091（配置回滚、引擎回滚）**：**有手工演练证据**（2026-10-06 demo 实测，步骤与结果记录在
   docs/25「决策平面回滚演练」），但未被任何测试引用，因此本脚本仍报 uncited——脚本只识别测试引用。
-- **AT-JEV-030～035（Planner 路由）、053（提示注入）、065（决策回放）、082/083（选项顺序敏感、模型弱项）、
+- **AT-JEV-030～035（Planner 路由）、082/083（选项顺序敏感、模型弱项）、
   093（Enforce 自动降级）**：无自动化引用，多为阶段 3/4 或校准类用例。
 
 已被证据补齐（本次更新移出缺口清单）：
+
+- **AT-JEV-053（提示注入）**：`src/server/decision-engine/prompt-injection.test.ts`（15 例）。四条断言分别覆盖
+  AT 的三项预期：①问题 id 由 finding 稳定 key 派生、内容等于静态模板（注入文本进不了 question/options/levels，
+  `questionSchemaHash` 对注入内容不变而 `stateHash` 变）；②注入只能作为数据落在 state 允许字段里（逐层键白名单，
+  不出现 `toolCall/command/deploy/merge/options` 等键；envelope 里的未知顶层字段被丢弃且不进结果）；
+  ③未知/注入形状的返回**整体拒绝**（未知问题 id、注入选项、概率越界、夹带命令字段、类型不符、score 越界、
+  分布不完整、缺答案共 8 种，且 detail 只含问题 id 不含凭据）；④决策路径无 I/O——`review-triage/policy/
+  response-schema/mock` 不导入任何 `child_process/node:fs|net|http|dns/pg/docker/git/deploy` 且无 `require(`，
+  run 对象深冻结后跑完整条链路不被改写，shadow 恒 `appliedOutcome: none`，确定性门失败只加违规不施加结果，
+  注入也无法把 `shadow` 抬成可施加模式。
+- **AT-JEV-065（决策回放）**：`src/server/decision-engine/replay.test.ts` + fixture
+  `fixtures/replay-review-triage.json`（5 例，合成且按构造脱敏：无仓库路径/diff 内容/密钥）。fixture 记录
+  真实线上契约形状的响应（`noul` / `choice`+distribution / `score`+`legend` 位置键），并把
+  `questionSchemaHash`、`stateHash` 与本地 policy 的答案取值一起钉住——投影或模板漂移即失败；重复回放逐字段
+  相同（含影子采样 `shouldSampleShadow` 稳定）；同一“桶”内的概率抖动与模型版本漂移（`jev-1.13.0`→`1.14.0`）
+  不改变 outcome，只有越过政策阈值（certainty 归零、分布变平）才记为 `uncertain`，此时 assist 也不施加结果
+  （`none`）；模型版本只被记录、不参与 outcome。
 
 - **AT-JEV-061（usage 独立归类）**：`src/server/decision-usage.ts` 读取时聚合（不落库、无迁移）+
   `GET /api/runs/:id` 接线；证据：`decision-usage.test.ts`、`decision-usage-route.test.ts`；

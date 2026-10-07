@@ -1,0 +1,167 @@
+{
+  "_readme": [
+    "AT-JEV-065 · 决策回放 fixture（docs/27 §7.7）。",
+    "合成数据，按构造即脱敏：不含仓库路径、diff 内容、客户数据或任何密钥材料。",
+    "providerResponse 使用线上 System One 契约的真实形状（noul / choice+distribution / score+legend 的位置键）。",
+    "expected.stateHash 与 expected.questionSchemaHash 把出站载荷钉住：投影或问题模板一旦变化，回放用例必须响亮地失败。",
+    "expected.selectedValues 记录本地 policy 会落库的答案取值——这是“同一 policy 产生同一 outcome”的可核对锚点。"
+  ],
+  "recordedAt": "2026-10-06",
+  "policyVersion": "review-triage-v1",
+  "provider": { "name": "typesafe", "requestedModel": "jev-latest" },
+  "note": "run 只是 baseRealRun 的覆盖字段（id/ownerId/state/时间戳/仓库路径由 baseRealRun 提供，且永不进入载荷）。",
+  "run": {
+    "title": "Replay fixture: reject oversized uploads",
+    "task": "Make the upload endpoint reject oversized payloads and cover the rejection with a test.",
+    "acceptanceCriteria": "- Oversized uploads are rejected with 413\n- A test covers the rejection path",
+    "checks": [{ "name": "npm test", "status": "failed", "command": "npm test", "exitCode": 1 }],
+    "findings": [
+      {
+        "id": "F-crit",
+        "fingerprint": "fp-replay-crit-1",
+        "severity": "critical",
+        "file": "/home/operator/private/proj/src/server/upload.ts",
+        "line": 42,
+        "title": "Upload handler accepts unbounded body size",
+        "evidence": "The handler streams req.body into memory before any size check.",
+        "requiredChange": "Reject bodies larger than the configured limit with 413.",
+        "resolved": false,
+        "consecutiveRounds": 3
+      },
+      {
+        "id": "F-med",
+        "fingerprint": "fp-replay-med-2",
+        "severity": "medium",
+        "file": "src/server/upload.ts",
+        "line": 88,
+        "title": "No test for the rejection path",
+        "evidence": "Coverage shows the 413 branch is never exercised.",
+        "requiredChange": "Add a test that posts an oversized body.",
+        "resolved": false,
+        "consecutiveRounds": 1
+      }
+    ]
+  },
+  "expected": {
+    "questionIds": [
+      "f_fdd4768e1da9_requirement_relevant",
+      "f_fdd4768e1da9_security_impact",
+      "f_fdd4768e1da9_human_urgency",
+      "f_fdd4768e1da9_retry_value",
+      "f_a4c689d1cb4f_requirement_relevant",
+      "f_a4c689d1cb4f_security_impact",
+      "f_a4c689d1cb4f_human_urgency",
+      "f_a4c689d1cb4f_retry_value"
+    ],
+    "questionSchemaHash": "e1c25d41d0a45f06c9ad1451e6464418cbb21e0d570feaf2cc5255a58a5cebc1",
+    "stateHash": "a93accb3201d9610c849515e8e5ba4fe610cc5b4d57ccf76de99d45968655536",
+    "selectedValues": {
+      "f_fdd4768e1da9_requirement_relevant": true,
+      "f_fdd4768e1da9_security_impact": "material",
+      "f_fdd4768e1da9_human_urgency": "immediate",
+      "f_fdd4768e1da9_retry_value": "high",
+      "f_a4c689d1cb4f_requirement_relevant": true,
+      "f_a4c689d1cb4f_security_impact": "none",
+      "f_a4c689d1cb4f_human_urgency": "soon",
+      "f_a4c689d1cb4f_retry_value": "medium"
+    },
+    "appliedOutcome": "none",
+    "assistAppliedOutcome": "assist_suggestion",
+    "uncertain": []
+  },
+  "providerResponse": {
+    "model": "jev-1.13.0",
+    "usage": { "input_tokens": 1180, "output_tokens": 420 },
+    "answers": {
+      "f_fdd4768e1da9_requirement_relevant": { "type": "noul", "noul": 0.91 },
+      "f_fdd4768e1da9_security_impact": {
+        "type": "choice",
+        "choice": "material",
+        "probabilities": { "none": 0.02, "possible": 0.18, "material": 0.8 },
+        "confidence": 0.88
+      },
+      "f_fdd4768e1da9_human_urgency": {
+        "type": "choice",
+        "choice": "immediate",
+        "probabilities": { "normal": 0.04, "soon": 0.16, "immediate": 0.8 },
+        "confidence": 0.86
+      },
+      "f_fdd4768e1da9_retry_value": {
+        "type": "score",
+        "weighted_score": 3,
+        "probabilities": { "0": 0.02, "1": 0.08, "2": 0.15, "3": 0.75 },
+        "legend": { "0": "none", "1": "low", "2": "medium", "3": "high" },
+        "confidence": 0.84
+      },
+      "f_a4c689d1cb4f_requirement_relevant": { "type": "noul", "noul": 0.78 },
+      "f_a4c689d1cb4f_security_impact": {
+        "type": "choice",
+        "choice": "none",
+        "probabilities": { "none": 0.82, "possible": 0.13, "material": 0.05 },
+        "confidence": 0.79
+      },
+      "f_a4c689d1cb4f_human_urgency": {
+        "type": "choice",
+        "choice": "soon",
+        "probabilities": { "normal": 0.14, "soon": 0.71, "immediate": 0.15 },
+        "confidence": 0.72
+      },
+      "f_a4c689d1cb4f_retry_value": {
+        "type": "score",
+        "weighted_score": 2,
+        "probabilities": { "0": 0.05, "1": 0.12, "2": 0.72, "3": 0.11 },
+        "legend": { "0": "none", "1": "low", "2": "medium", "3": "high" },
+        "confidence": 0.7
+      }
+    }
+  },
+  "jitter": [
+    {
+      "label": "同一桶内概率抖动（供应商换了模型版本，取值不变）",
+      "model": "jev-1.14.0",
+      "answers": {
+        "f_fdd4768e1da9_requirement_relevant": { "type": "noul", "noul": 0.84 },
+        "f_fdd4768e1da9_security_impact": {
+          "type": "choice",
+          "choice": "material",
+          "probabilities": { "none": 0.05, "possible": 0.21, "material": 0.74 },
+          "confidence": 0.81
+        },
+        "f_fdd4768e1da9_retry_value": {
+          "type": "score",
+          "weighted_score": 3,
+          "probabilities": { "0": 0.06, "1": 0.14, "2": 0.26, "3": 0.54 },
+          "confidence": 0.68
+        }
+      },
+      "expected": { "appliedOutcome": "none", "assistAppliedOutcome": "assist_suggestion", "uncertain": [] }
+    },
+    {
+      "label": "概率贴近 0.5（certainty 归零）越过阈值 → 该答案记为 uncertain，assist 下不施加结果",
+      "answers": {
+        "f_fdd4768e1da9_requirement_relevant": { "type": "noul", "noul": 0.5 }
+      },
+      "expected": {
+        "appliedOutcome": "none",
+        "assistAppliedOutcome": "none",
+        "uncertain": ["f_fdd4768e1da9_requirement_relevant"]
+      }
+    },
+    {
+      "label": "分布变平（spread 低于 0.1）→ uncertain",
+      "answers": {
+        "f_fdd4768e1da9_security_impact": {
+          "type": "choice",
+          "choice": "material",
+          "probabilities": { "none": 0.33, "possible": 0.34, "material": 0.33 },
+          "confidence": 0.9
+        }
+      },
+      "expected": {
+        "appliedOutcome": "none",
+        "assistAppliedOutcome": "none",
+        "uncertain": ["f_fdd4768e1da9_security_impact"]
+      }
+    }
+  ]
+}
