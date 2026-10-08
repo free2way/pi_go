@@ -14,6 +14,7 @@
     "start": "node dist/server/index.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:executor": "node --test deploy/executor/server.test.mjs",
     "test:decision": "vitest run src/server/decision-engine src/server/decision-routes.test.ts src/worker/decision-triage.test.ts src/worker/decision-integration.test.ts",
     "test:decision:e2e": "playwright test tests/e2e/decision-engine.spec.ts --project=chromium",
     "test:jev:live": "vitest run --config vitest.live.config.ts",

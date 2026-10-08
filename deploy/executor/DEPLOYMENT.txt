@@ -1,0 +1,253 @@
+PiGO Webhook Executor — deployment and operations guide
+========================================================
+
+Scope
+-----
+This service is intentionally separate from PiGO Web. It accepts only two
+signed PiGO events and never accepts a caller-supplied command:
+
+  run.release_requested  -> fixed apps/<app>/ops/deploy.sh, then ops/smoke.sh
+  release.published      -> register the latest successful deployment
+
+Only staging and production are valid environments. The repository must resolve
+under /workspace, must be clean, and its current HEAD must equal the requested
+full commit SHA. Production promotion additionally requires a successful staging
+deployment for the same canonical repository and commit, with the same Docker
+image digest.
+
+Application ops contract
+------------------------
+The reviewed repository must provide executable files at the configured app
+path:
+
+  ops/deploy.sh <staging|production> <full-commit-sha>
+  ops/smoke.sh
+
+Both run with the application directory as cwd and receive only a scrubbed PATH,
+HOME and these release variables:
+
+  APP_BASE_URL, ORDER_STATUS_PORT, COMPOSE_PROJECT_NAME,
+  PIGO_DEPLOY_ENVIRONMENT, PIGO_DEPLOY_IMAGE,
+  PIGO_DEPLOY_REPOSITORY, PIGO_DEPLOY_COMMIT
+
+Production also receives PIGO_DEPLOY_IMAGE_ID, the exact image id proven in
+staging. Production deploy.sh must run that existing image id and must never
+rebuild it. Staging deploy.sh must build/tag PIGO_DEPLOY_IMAGE, whose tag is the
+full commit SHA. The scripts must not use host source bind mounts; build contexts
+can be sent through Docker, but a /workspace path inside this container is not a
+valid bind source on the Docker host. smoke.sh must perform a real readiness and
+functional check against APP_BASE_URL and exit nonzero on failure.
+
+Trust boundary
+--------------
+The executor has Docker socket access. Docker socket access is effectively host
+root, even though the process runs as an unprivileged user with all Linux
+capabilities dropped. Keep the host dedicated, expose the service only on the
+existing private PiGO Docker network plus the host loopback health port, and
+permit changes to ops/deploy.sh and ops/smoke.sh only through the normal reviewed
+merge flow. Do not mount arbitrary directories.
+
+Protocol
+--------
+Endpoint: POST /hooks/pigo-release
+Required headers:
+  Content-Type: application/json
+  Authorization: Bearer <shared token>
+  X-PiGO-Delivery-Id: <delivery id copied from the JSON body>
+  X-PiGO-Signature: sha256=<HMAC-SHA256 of the exact raw body>
+
+The receiver returns HTTP 202 after atomically claiming a new delivery. A
+delivery id plus attempt is idempotent: identical retries never redeploy, while
+a different body is rejected with HTTP 409. If only the result callback failed,
+an identical retry retries the callback without rerunning deployment.
+
+Final result callbacks are POSTed to the request callback URL with the same
+Bearer token. The callback's public origin and /api/internal/ path are allowlisted
+before the URL is optionally rewritten to the internal PiGO origin. This avoids
+sending the callback through a Cloudflare Access email login page.
+
+Prerequisites
+-------------
+  - Linux Docker host with Docker Compose v2, curl, tar, gzip and openssl
+  - SSH public-key authentication for an unprivileged deployment account that
+    can use Docker and write only the selected install directory
+  - PiGO workspace root on the same host
+  - Application ops/deploy.sh and ops/smoke.sh are executable and tracked in Git
+  - The existing private PiGO Docker network
+
+Do not place credentials, real hostnames, private addresses, account names or
+tokens in this repository. The real .env must remain only on the deployment host
+with mode 0600.
+
+1. Prepare the protected environment file
+-----------------------------------------
+Copy executor.env.example to a temporary path outside the repository and fill:
+
+  PIGO_EXECUTOR_TOKEN
+    Generate with `openssl rand -hex 32`. Use this exact value in PiGO release
+    settings. Never print it in CI logs.
+
+  DOCKER_GID
+    May be any placeholder for first install; the remote installer replaces it
+    with the group id of /var/run/docker.sock.
+
+  PIGO_HOST_WORKSPACE_ROOT
+    Exact host path mounted by PiGO as its workspace root. The executor maps it
+    read-only to /workspace.
+
+  PIGO_EXECUTOR_APP_PATH
+    Fixed application path relative to each repository. It cannot be absolute or
+    contain `..`.
+
+  PIGO_EXECUTOR_CALLBACK_ORIGIN
+    PiGO's public HTTPS origin. It is used only to validate callback URLs.
+
+  PIGO_EXECUTOR_CALLBACK_INTERNAL_ORIGIN
+    Private Docker origin used for the actual callback, normally
+    http://web:3100. It must reach the same PiGO instance as the public origin.
+
+  PIGO_DOCKER_NETWORK
+    Existing private Docker network shared with PiGO Web. The default is
+    pi-agent-network.
+
+  PIGO_EXECUTOR_IMAGE_REPOSITORY
+    Fixed local image repository used by ops/deploy.sh.
+
+  PIGO_EXECUTOR_STAGING_URL / PIGO_EXECUTOR_PRODUCTION_URL
+    URLs used by smoke.sh and stored with the result.
+
+  PIGO_EXECUTOR_STAGING_PORT / PIGO_EXECUTOR_PRODUCTION_PORT
+    Distinct host ports passed to the fixed deployment script.
+
+Validate that the file is not inside the Git work tree and restrict it:
+
+  chmod 600 /secure/path/executor.env
+
+2. Install or upgrade
+---------------------
+The deployment script is key-only and deliberately refuses password automation.
+Set the target without committing it:
+
+  export PIGO_DEPLOY_TARGET='<ssh-user>@<executor-host>'
+  export PIGO_EXECUTOR_ENV_FILE='/secure/path/executor.env'   # first install
+  deploy/executor/deploy.sh
+
+On upgrades, omit PIGO_EXECUTOR_ENV_FILE; the remote .env is preserved. To
+rotate or intentionally replace configuration, set both variables below for one
+run, then unset them:
+
+  export PIGO_EXECUTOR_ENV_FILE='/secure/path/executor.env'
+  export PIGO_EXECUTOR_REPLACE_ENV=1
+
+The installer validates Compose, builds the image, starts the service, waits for
+/healthz, proves an unsigned request is rejected, and prints only non-sensitive
+status. It snapshots the previous source and tags the previous image for rollback.
+
+3. Connect PiGO and optionally Cloudflare Tunnel
+------------------------------------------------
+Recommended same-host configuration:
+  Configure PiGO through its protected deployment environment with:
+
+    PI_POST_MERGE_DEPLOY_HOOK=http://pigo-release-executor:3300/hooks/pigo-release
+    PI_POST_MERGE_DEPLOY_TOKEN=<same protected token>
+
+  Both services share the private PiGO Docker network. No request crosses
+  Cloudflare, no email-OTP page can intercept it, and port 3300 remains bound to
+  127.0.0.1 on the host. Recreate only the PiGO web container after changing its
+  protected environment.
+
+Cloudflare is optional and should be added only when a caller outside the Docker
+host must deliver a webhook. First determine how the existing tunnel is managed:
+
+  systemctl status cloudflared
+  docker ps --format '{{.Names}} {{.Image}}'
+  cloudflared tunnel list
+
+Locally managed tunnel:
+  Add one ingress rule for a dedicated executor hostname whose service is
+  http://127.0.0.1:3300, followed by the existing catch-all 404 rule. Validate
+  with `cloudflared tunnel ingress validate`, create the DNS route with
+  `cloudflared tunnel route dns`, then restart cloudflared.
+
+Remotely managed tunnel:
+  In Cloudflare Zero Trust, open Networks > Tunnels > the existing tunnel >
+  Public Hostnames. Add a dedicated hostname whose service is
+  http://127.0.0.1:3300. If cloudflared itself runs in a bridge container,
+  127.0.0.1 means that container; either run it with host networking or use a
+  host-gateway route that is not exposed on the LAN.
+
+Do not attach the email-OTP Access policy used by the PiGO user interface to an
+executor hostname: server-to-server webhook requests cannot complete that login.
+Protect the endpoint with its Bearer + HMAC checks, Cloudflare TLS, a narrow WAF
+path rule and rate limiting. If organizational policy requires Access, create a
+machine service-token policy and first add corresponding CF-Access headers to
+PiGO; the current webhook protocol does not send those headers.
+
+4. Configure PiGO through the UI (external HTTPS mode only)
+----------------------------------------------------------
+If an external Tunnel hostname was intentionally created, PiGO Release settings
+can instead save:
+
+  Webhook URL:  https://<executor-hostname>/hooks/pigo-release
+  Webhook token: the protected PIGO_EXECUTOR_TOKEN value
+  Public origin: PiGO's public HTTPS origin
+
+The stored configuration is encrypted by PiGO. Do not place the token in a URL,
+README, Compose file or shell history. For environment-based configuration, use
+PI_POST_MERGE_DEPLOY_HOOK, PI_POST_MERGE_DEPLOY_TOKEN and PI_PUBLIC_ORIGIN in the
+deployment secret store and recreate only the PiGO web container.
+
+5. Verification
+---------------
+Host-local checks:
+
+  curl --fail http://127.0.0.1:3300/healthz
+  test "$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+    http://127.0.0.1:3300/hooks/pigo-release \
+    -H 'Content-Type: application/json' -d '{}')" = 401
+  docker inspect pigo-release-executor --format '{{.Config.User}} {{.HostConfig.ReadonlyRootfs}} {{.HostConfig.NetworkMode}}'
+  docker inspect pigo-release-executor --format '{{json .HostConfig.CapDrop}} {{json .HostConfig.SecurityOpt}}'
+
+External checks:
+  - GET the dedicated hostname /healthz and expect status=ok.
+  - POST an unsigned empty JSON body and expect HTTP 401.
+  - Publish a reviewed commit to staging from PiGO and expect: HTTP 202, a final
+    successful callback, a passing smoke check, and a recorded image digest.
+  - Retry the identical delivery and prove the application is not redeployed.
+  - Promote that same commit to production and verify the digest is unchanged.
+  - Attempt production with a different or un-staged commit and expect failure.
+
+6. Operations
+-------------
+Status:
+  docker compose --env-file /app/pi-agent/services/pigo-release-executor/.env \
+    -f /app/pi-agent/services/pigo-release-executor/compose.yaml ps
+  curl --fail http://127.0.0.1:3300/healthz
+
+Logs (never enable shell tracing around secret files):
+  docker logs --since 30m pigo-release-executor
+
+Persistent state:
+  Named volume pigo-release-executor-data contains executions.json. Back it up
+  before host migration. The file is mode 0600. A restart converts interrupted
+  pending work to an explicit failure; the operator should submit a new attempt.
+
+Token rotation:
+  1. Pause new releases.
+  2. Generate a new 32-byte-or-longer token.
+  3. Update the protected executor .env and PiGO release settings in one window.
+  4. Recreate the executor and send the unsigned rejection check.
+  5. Resume releases after one signed staging request completes.
+
+Rollback:
+  The installer prints no secret and creates a rollback image tag plus a source
+  backup. Restore the matching source backup, retag the rollback image as
+  local/pigo-release-executor:0.2.0, and run `docker compose up -d executor`.
+  Never roll back executions.json independently of the deployed application;
+  doing so could forget a completed delivery and permit it to run again.
+
+Incident response:
+  Stop the executor, remove the Tunnel hostname, rotate the shared token, retain
+  executions.json and Docker logs, inspect reviewed ops script history, deployed
+  image digests and PiGO release audit events, then restore service only after
+  reconciling staging and production state.

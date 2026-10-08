@@ -5,11 +5,12 @@
  * Runs, in order:
  *   1. npm run typecheck
  *   2. npm test
- *   3. npm run lint
- *   4. npm run build
- *   5. npm run validate:compose
- *   6. npm run scan:secrets            (tracked-file secret scan)
- *   7. npm run test:pg:concurrency     (only when PI_DATABASE_URL / DATABASE_URL
+ *   3. npm run test:executor
+ *   4. npm run lint
+ *   5. npm run build
+ *   6. npm run validate:compose
+ *   7. npm run scan:secrets            (tracked-file secret scan)
+ *   8. npm run test:pg:concurrency     (only when PI_DATABASE_URL / DATABASE_URL
  *                                       is set; otherwise an explicit SKIP)
  *
  * The secret scan and the PostgreSQL check are the two pieces a bare "run the
