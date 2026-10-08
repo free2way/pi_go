@@ -5,7 +5,7 @@ import type { DecisionAuditProjection } from "../shared/decision-audit";
 import type { DecisionMetricsResponse } from "../shared/decision-metrics";
 export type { DecisionMetricsResponse } from "../shared/decision-metrics";
 import type { AgileProject, AgileRelease, AgileSprint, AgileStory, ReleaseDeployRecord, ModelTemplate, RunBudget, StoryDetail, StoryPriority, StoryStatus } from "../shared/agile";
-import type { ConfigStatus, CredentialStatus, CurrentUser, ModelCatalogResponse, ModelSelection, Run, RunArtifact, RunEvent, RunRoundsResponse, RunState, Workspace, AccountDetail, AccountSummary, AccountWorkspaceOption, WorkspacePermission } from "../shared/types";
+import type { ConfigStatus, CredentialStatus, CurrentUser, ModelCatalogResponse, ModelSelection, Run, RunArtifact, RunEvent, RunRoundsResponse, RunState, Workspace, AccountDetail, AccountSummary, AccountWorkspaceOption, WorkspacePermission, ReleaseWebhookSettingsStatus } from "../shared/types";
 import { LOCALE_TAGS, type Locale } from "../shared/i18n";
 
 /**
@@ -155,6 +155,10 @@ export const api = {
     request<CredentialStatus>("/api/credentials", { method: "PUT", body: JSON.stringify(body) }),
   deleteCredentials: (provider?: string) =>
     request<void>(`/api/credentials${provider ? `?provider=${encodeURIComponent(provider)}` : ""}`, { method: "DELETE" }),
+  releaseSettings: () => request<ReleaseWebhookSettingsStatus>("/api/admin/release-settings"),
+  saveReleaseSettings: (body: { webhookUrl: string; webhookToken?: string; publicOrigin: string }) =>
+    request<ReleaseWebhookSettingsStatus>("/api/admin/release-settings", { method: "PUT", body: JSON.stringify(body) }),
+  deleteReleaseSettings: () => request<ReleaseWebhookSettingsStatus>("/api/admin/release-settings", { method: "DELETE" }),
   workspaces: () => request<{ workspaces: Workspace[] }>("/api/workspaces"),
   registerWorkspace: (body: { relativePath: string }) =>
     request<Workspace>("/api/workspaces/register", { method: "POST", body: JSON.stringify(body) }),
@@ -287,7 +291,7 @@ export const api = {
    * dry-run preview (guards + blocked stories) for the confirmation dialog.
    * `retry: true` is required to start a new deploy attempt after a failed or
    * timed-out one. */
-  publishRelease: (id: string, body: { confirm?: boolean; note?: string; retry?: boolean } = {}) =>
+  publishRelease: (id: string, body: { confirm?: boolean; environment?: "staging" | "production"; note?: string; retry?: boolean } = {}) =>
     request<{
       published: boolean;
       release: AgileRelease;

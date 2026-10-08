@@ -14,6 +14,7 @@ import { AccountError, AccountService, accountAdminGate } from "./accounts.js";
 import { AlertManager, createAlertSink } from "./alerts.js";
 import { Authenticator } from "./auth.js";
 import { CredentialVault } from "./credential-vault.js";
+import { ReleaseSettingsStore, releaseSettingsStatus } from "./release-settings.js";
 import { createDb, createPool, newId, runMigrations } from "./db.js";
 import { baseDemoRun, runDemo } from "./demo-runner.js";
 import { IdentityService } from "./identity.js";
@@ -77,9 +78,9 @@ const demoMode = process.env.PI_DEMO_MODE !== "false";
 const realRunsEnabled = process.env.PI_REAL_RUNS_ENABLED === "true";
 const workerUrl = process.env.PI_WORKER_URL || "http://worker:3200";
 const internalToken = process.env.PI_INTERNAL_TOKEN || "";
-const releaseWebhookToken = process.env.PI_POST_MERGE_DEPLOY_TOKEN || "";
 const dataFile = process.env.PI_DATA_FILE || path.resolve("data/runs.json");
 const vaultFile = process.env.PI_VAULT_FILE || path.resolve("data/credentials.v1.json");
+const releaseSettingsFile = process.env.PI_RELEASE_SETTINGS_FILE || path.resolve("data/release-settings.v1.json");
 const publicOrigin = process.env.PI_PUBLIC_ORIGIN || "";
 const vaultSecret = process.env.PI_VAULT_SECRET;
 if (!vaultSecret) throw new Error("PI_VAULT_SECRET is required");
@@ -91,8 +92,9 @@ const vault = new CredentialVault(vaultFile, vaultSecret, {
   developer: modelDefaults.developer.provider,
   reviewer: modelDefaults.reviewer.provider,
 });
+const releaseSettings = new ReleaseSettingsStore(releaseSettingsFile, vaultSecret);
 const auth = new Authenticator();
-await vault.init();
+await Promise.all([vault.init(), releaseSettings.init()]);
 // AUD-08 / AT-MODEL-004: live provider probe used to verify credentials. It is
 // injectable and never throws; a failed probe simply leaves a key unverified.
 const providerProbe = createProviderProbe();
@@ -678,6 +680,15 @@ const accountGrantSchema = z.object({
   workspaceId: z.string().trim().min(1).max(120),
   permission: z.enum(["read", "write"]),
 }).strict();
+const secureUrlSchema = z.string().trim().url().max(2_048).refine((value) => {
+  const url = new URL(value);
+  return url.protocol === "https:" && !url.username && !url.password;
+}, "必须是未包含用户名或密码的 HTTPS URL");
+const releaseSettingsSchema = z.object({
+  webhookUrl: secureUrlSchema,
+  webhookToken: z.string().trim().min(12).max(1_024).optional(),
+  publicOrigin: secureUrlSchema,
+}).strict();
 
 /** Returns the calling admin, or sends 403 and returns undefined. */
 async function requireAccountAdmin(request: FastifyRequest, reply: FastifyReply) {
@@ -689,6 +700,71 @@ async function requireAccountAdmin(request: FastifyRequest, reply: FastifyReply)
   }
   return user;
 }
+
+function effectiveReleaseConfig() {
+  const saved = releaseSettings.get();
+  const webhookUrl = saved?.webhookUrl ?? process.env.PI_POST_MERGE_DEPLOY_HOOK;
+  return {
+    deployPlan: planPostMergeDeploy(webhookUrl),
+    webhookToken: saved?.webhookToken ?? process.env.PI_POST_MERGE_DEPLOY_TOKEN ?? "",
+    callbackOrigin: saved?.publicOrigin ?? publicOrigin,
+    source: saved ? "web" as const : webhookUrl ? "environment" as const : "none" as const,
+  };
+}
+
+function releaseSettingsProjection() {
+  const saved = releaseSettings.get();
+  const effective = effectiveReleaseConfig();
+  const environmentWebhook = effective.deployPlan.configured && effective.deployPlan.kind === "webhook"
+    ? effective.deployPlan
+    : undefined;
+  if (saved || environmentWebhook) {
+    return releaseSettingsStatus({
+      ...(saved ? { saved } : {}),
+      environment: {
+        webhookUrl: environmentWebhook?.url,
+        webhookToken: process.env.PI_POST_MERGE_DEPLOY_TOKEN,
+        publicOrigin,
+      },
+    });
+  }
+  return {
+    source: effective.source,
+    configured: effective.deployPlan.configured && effective.deployPlan.kind !== "unsupported",
+    webhookUrl: null,
+    tokenConfigured: false,
+    publicOrigin: null,
+    updatedAt: null,
+  };
+}
+
+app.get("/api/admin/release-settings", async (request, reply) => {
+  if (!(await requireAccountAdmin(request, reply))) return reply;
+  return releaseSettingsProjection();
+});
+
+app.put("/api/admin/release-settings", async (request, reply) => {
+  const actor = await requireAccountAdmin(request, reply);
+  if (!actor) return reply;
+  const limit = credentialWrites.check(`release-settings:${actor.id}`);
+  if (!limit.allowed) return tooManyRequests(reply, limit.retryAfterMs);
+  const parsed = releaseSettingsSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
+  if (!parsed.data.webhookToken && !releaseSettings.get()?.webhookToken) {
+    return reply.code(400).send({ error: "首次配置必须填写 Webhook Token", code: "RELEASE_TOKEN_REQUIRED" });
+  }
+  await releaseSettings.set(parsed.data);
+  return releaseSettingsProjection();
+});
+
+app.delete("/api/admin/release-settings", async (request, reply) => {
+  const actor = await requireAccountAdmin(request, reply);
+  if (!actor) return reply;
+  const limit = credentialWrites.check(`release-settings:${actor.id}`);
+  if (!limit.allowed) return tooManyRequests(reply, limit.retryAfterMs);
+  await releaseSettings.delete();
+  return releaseSettingsProjection();
+});
 
 function accountErrorReply(reply: FastifyReply, error: unknown) {
   if (error instanceof AccountError) return reply.code(error.status).send({ error: error.message, code: error.code });
@@ -824,7 +900,8 @@ app.get("/api/models", async (request): Promise<ModelCatalogResponse> => {
 app.get("/api/config/status", async (request): Promise<ConfigStatus & { decisionEngine: DecisionEngineStatus }> => {
   const credentials = vault.status(vaultKeyFor(request));
   const configured = new Set(credentials.providers.map((item) => item.provider));
-  const releasePlan = planPostMergeDeploy(process.env.PI_POST_MERGE_DEPLOY_HOOK);
+  const releaseRuntime = effectiveReleaseConfig();
+  const releasePlan = releaseRuntime.deployPlan;
   // AUD-09 / AT-MODEL-006/007: execution availability is decoupled from the
   // default provider/credential pairing. As long as at least one provider is
   // configured the user may enter the real-run form; the actual per-role model
@@ -850,7 +927,7 @@ app.get("/api/config/status", async (request): Promise<ConfigStatus & { decision
     mergeRequestConfigured: mergeRequestConfig.configured,
     releaseConfigured: releasePlan.configured
       && releasePlan.kind !== "unsupported"
-      && (releasePlan.kind !== "webhook" || Boolean(releaseWebhookToken && publicOrigin)),
+      && (releasePlan.kind !== "webhook" || Boolean(releaseRuntime.webhookToken && releaseRuntime.callbackOrigin)),
     decisionEngine: decisionEngineStatus(decisionLoaded, { vaultKey: decisionVaultKey }),
   };
 });
@@ -1486,7 +1563,7 @@ app.post<{ Params: { id: string } }>("/api/agile/releases/:id/publish", { bodyLi
 
     // A terminal release has nothing left to publish (failed/timed-out deploys are
     // deliberately not terminal: they must be explicitly retried).
-    if (isReleasePublishTerminal(release)) return reply.code(409).send({ error: "发布已发布，不可重复发布", code: "RELEASE_RELEASED" });
+    if (isReleasePublishTerminal(release, parsed.data.environment)) return reply.code(409).send({ error: "该环境已经发布，不可重复发布", code: "RELEASE_RELEASED" });
 
     // Full, ordered precondition set on the stories' latest runs. Evaluated once
     // for both the preview and the confirmed publish (same verdict, no side effect).
@@ -1518,15 +1595,16 @@ app.post<{ Params: { id: string } }>("/api/agile/releases/:id/publish", { bodyLi
     }
 
     const now = new Date().toISOString();
-    const deployPlan = planPostMergeDeploy(process.env.PI_POST_MERGE_DEPLOY_HOOK);
-    if (deployPlan.configured && deployPlan.kind === "webhook" && !releaseWebhookToken) {
-      return reply.code(409).send({ error: "Webhook 发布必须配置 PI_POST_MERGE_DEPLOY_TOKEN", code: "RELEASE_AUTH_NOT_CONFIGURED" });
+    const releaseRuntime = effectiveReleaseConfig();
+    const deployPlan = releaseRuntime.deployPlan;
+    if (deployPlan.configured && deployPlan.kind === "webhook" && !releaseRuntime.webhookToken) {
+      return reply.code(409).send({ error: "Webhook 发布必须在发布设置或环境变量中配置 Token", code: "RELEASE_AUTH_NOT_CONFIGURED" });
     }
-    if (deployPlan.configured && deployPlan.kind === "webhook" && !publicOrigin) {
-      return reply.code(409).send({ error: "Webhook 发布必须配置 PI_PUBLIC_ORIGIN 以接收异步结果回调", code: "RELEASE_CALLBACK_NOT_CONFIGURED" });
+    if (deployPlan.configured && deployPlan.kind === "webhook" && !releaseRuntime.callbackOrigin) {
+      return reply.code(409).send({ error: "Webhook 发布必须配置 PiGO 公网地址以接收异步结果回调", code: "RELEASE_CALLBACK_NOT_CONFIGURED" });
     }
-    const callbackUrl = publicOrigin
-      ? `${publicOrigin.replace(/\/$/, "")}/api/internal/agile/releases/${encodeURIComponent(release.id)}/release-result`
+    const callbackUrl = releaseRuntime.callbackOrigin
+      ? `${releaseRuntime.callbackOrigin.replace(/\/$/, "")}/api/internal/agile/releases/${encodeURIComponent(release.id)}/release-result`
       : undefined;
 
     // AUD-P1: ordering (timeout → claim → execute) is the correctness argument
@@ -1539,9 +1617,10 @@ app.post<{ Params: { id: string } }>("/api/agile/releases/:id/publish", { bodyLi
         retry: parsed.data.retry === true,
         now,
         releasedBy: user.id,
+        environment: parsed.data.environment!,
         note: parsed.data.note,
         callbackUrl,
-        webhookToken: releaseWebhookToken || undefined,
+        webhookToken: releaseRuntime.webhookToken || undefined,
       },
       {
         start: (input) => agile.startReleaseDeploy(input),
@@ -1576,7 +1655,7 @@ app.post<{ Params: { id: string } }>("/api/agile/releases/:id/publish", { bodyLi
  * the current attempt stays idempotent (`{ ok: true }`, no write).
  */
 app.post<{ Params: { id: string } }>("/api/internal/agile/releases/:id/release-result", async (request, reply) => {
-  const authorized = safeSecretMatch(request.headers.authorization, releaseWebhookToken) || safeTokenMatch(request.headers.authorization);
+  const authorized = safeSecretMatch(request.headers.authorization, effectiveReleaseConfig().webhookToken) || safeTokenMatch(request.headers.authorization);
   if (!authorized) return reply.code(401).send({ error: "Unauthorized" });
   const parsed = releaseDeployResultSchema.safeParse(request.body ?? {});
   if (!parsed.success) return reply.code(400).send({ error: "Invalid release result", details: parsed.error.issues });
@@ -2245,7 +2324,7 @@ async function acceptanceSnapshotFor(run: Run, input: {
 
 const completedMergeSchema = z.object({ confirm: z.literal(true), note: z.string().trim().max(2_000).optional() });
 const releaseSchema = z.object({
-  environment: z.string().trim().min(1).max(64).regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/),
+  environment: z.enum(["staging", "production"]),
   confirm: z.literal(true),
   retry: z.boolean().optional(),
 });
@@ -2465,14 +2544,15 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/publish", { bodyLimit: 1024 
   const user = auth.user(request);
   if (!(await identities.isAdmin(user.id))) return reply.code(403).send({ error: "仅管理员可以发布代码", code: "ADMIN_REQUIRED" });
 
-  const deployPlan = planPostMergeDeploy(process.env.PI_POST_MERGE_DEPLOY_HOOK);
+  const releaseRuntime = effectiveReleaseConfig();
+  const deployPlan = releaseRuntime.deployPlan;
   if (!deployPlan.configured) return reply.code(409).send({ error: deployPlan.reason, code: "RELEASE_NOT_CONFIGURED" });
   if (deployPlan.kind === "unsupported") return reply.code(409).send({ error: deployPlan.reason, code: "RELEASE_CONFIG_INVALID" });
-  if (deployPlan.kind === "webhook" && !releaseWebhookToken) {
-    return reply.code(409).send({ error: "Webhook 发布必须配置 PI_POST_MERGE_DEPLOY_TOKEN", code: "RELEASE_AUTH_NOT_CONFIGURED" });
+  if (deployPlan.kind === "webhook" && !releaseRuntime.webhookToken) {
+    return reply.code(409).send({ error: "Webhook 发布必须在发布设置或环境变量中配置 Token", code: "RELEASE_AUTH_NOT_CONFIGURED" });
   }
-  if (deployPlan.kind === "webhook" && !publicOrigin) {
-    return reply.code(409).send({ error: "Webhook 发布必须配置 PI_PUBLIC_ORIGIN 以接收异步结果回调", code: "RELEASE_CALLBACK_NOT_CONFIGURED" });
+  if (deployPlan.kind === "webhook" && !releaseRuntime.callbackOrigin) {
+    return reply.code(409).send({ error: "Webhook 发布必须配置 PiGO 公网地址以接收异步结果回调", code: "RELEASE_CALLBACK_NOT_CONFIGURED" });
   }
 
   const decision = planReleaseStart({
@@ -2511,13 +2591,13 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/publish", { bodyLimit: 1024 
     meta: { ...decision.release },
   }, { deliveryId: `release-start:${decision.release.deliveryId}:${decision.release.attempt}` }).catch(() => undefined);
 
-  const callbackUrl = publicOrigin
-    ? `${publicOrigin.replace(/\/$/, "")}/api/internal/runs/${encodeURIComponent(run.id)}/release-result`
+  const callbackUrl = releaseRuntime.callbackOrigin
+    ? `${releaseRuntime.callbackOrigin.replace(/\/$/, "")}/api/internal/runs/${encodeURIComponent(run.id)}/release-result`
     : undefined;
   const execution = await executeRelease(
     deployPlan,
     buildDeployHookPayload({ run, merge: run.merge!, release: decision.release, callbackUrl }),
-    { deliveryId: decision.release.deliveryId, webhookToken: releaseWebhookToken || undefined },
+    { deliveryId: decision.release.deliveryId, webhookToken: releaseRuntime.webhookToken || undefined },
   );
   const finishedAt = new Date().toISOString();
   const release: RunReleaseRecord = {
@@ -2558,7 +2638,7 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/publish", { bodyLimit: 1024 
 
 /** Authenticated final-status callback for asynchronous (HTTP 202) publishers. */
 app.post<{ Params: { id: string } }>("/api/internal/runs/:id/release-result", async (request, reply) => {
-  const authorized = safeSecretMatch(request.headers.authorization, releaseWebhookToken) || safeTokenMatch(request.headers.authorization);
+  const authorized = safeSecretMatch(request.headers.authorization, effectiveReleaseConfig().webhookToken) || safeTokenMatch(request.headers.authorization);
   if (!authorized) return reply.code(401).send({ error: "Unauthorized" });
   const parsed = releaseResultSchema.safeParse(request.body ?? {});
   if (!parsed.success) return reply.code(400).send({ error: "Invalid release result", details: parsed.error.issues });

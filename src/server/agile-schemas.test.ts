@@ -95,7 +95,8 @@ describe("agile schemas — blocked-management and release publish", () => {
 
   it("accepts an optional confirm/note and rejects unknown fields", () => {
     expect(releasePublishSchema.safeParse({}).success).toBe(true);
-    expect(releasePublishSchema.safeParse({ confirm: true, note: "首次发布" }).success).toBe(true);
+    expect(releasePublishSchema.safeParse({ confirm: true, environment: "staging", note: "首次发布" }).success).toBe(true);
+    expect(releasePublishSchema.safeParse({ confirm: true, note: "缺少环境" }).success).toBe(false);
     expect(releasePublishSchema.safeParse({ confirm: "yes" }).success).toBe(false);
     expect(releasePublishSchema.safeParse({ confirmed: true }).success).toBe(false);
   });

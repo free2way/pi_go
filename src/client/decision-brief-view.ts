@@ -73,6 +73,11 @@ export function decisionBriefExpanded(state: string, collapsed: boolean, termina
   return terminalStates.includes(state) && !collapsed;
 }
 
+/** Decision actions are valid only while the run is explicitly parked for an operator. */
+export function decisionBriefVisible(state: string): boolean {
+  return state === "needs_human";
+}
+
 export type DecisionRemainingGroupKind = "ac" | "unknown" | "unmapped";
 
 export interface DecisionRemainingGroup {

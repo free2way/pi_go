@@ -40,6 +40,14 @@ describe("releaseDeliveryId", () => {
 });
 
 describe("planReleaseStart", () => {
+  it("allows a successful staging deployment to promote the same commit to production", () => {
+    const staging = planReleaseStart({ run: run(), environment: "staging", requestedBy: "admin", now: NOW, kind: "webhook" });
+    expect(staging.kind).toBe("ready");
+    const succeeded = { ...(staging as Extract<typeof staging, { kind: "ready" }>).release, status: "succeeded" as const };
+    const promoted = planReleaseStart({ run: run({ release: succeeded }), environment: "production", requestedBy: "admin", now: "2026-10-05T03:10:00.000Z", kind: "webhook" });
+    expect(promoted).toMatchObject({ kind: "ready", release: { environment: "production", attempt: 1 } });
+    if (promoted.kind === "ready") expect(promoted.release.deliveryId).not.toBe(succeeded.deliveryId);
+  });
   it("requires a completed, merged run", () => {
     expect(planReleaseStart({ run: run({ state: "reviewing" }), environment: "production", requestedBy: "admin", now: NOW, kind: "webhook" })).toMatchObject({ kind: "conflict", code: "RUN_NOT_RELEASE_READY" });
     expect(planReleaseStart({ run: run({ merge: undefined }), environment: "production", requestedBy: "admin", now: NOW, kind: "webhook" })).toMatchObject({ kind: "conflict", code: "MERGE_REQUIRED" });

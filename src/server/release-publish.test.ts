@@ -190,6 +190,7 @@ describe("buildReleaseDeployPayload", () => {
       stories: [{ storyId: "s1", title: "故事一", status: "done" }],
       releasedAt: "2026-01-01T00:00:00.000Z",
       releasedBy: "user_a",
+      environment: "staging",
       deliveryId: "release-publish:rel_1",
       attempt: 2,
     });
@@ -205,6 +206,7 @@ describe("buildReleaseDeployPayload", () => {
       ],
       releasedAt: "2026-01-01T00:00:00.000Z",
       releasedBy: "user_a",
+      environment: "staging",
       note: "  首次发布  ",
     });
     expect(payload).toEqual({
@@ -215,6 +217,7 @@ describe("buildReleaseDeployPayload", () => {
       version: "v1.2.0",
       releasedAt: "2026-01-01T00:00:00.000Z",
       releasedBy: "user_a",
+      environment: "staging",
       note: "首次发布",
       stories: [
         { storyId: "s1", title: "故事一", status: "done" },
@@ -241,16 +244,16 @@ describe("planReleasePublishGate (release.requireAdmin)", () => {
 
 describe("planReleaseDeployAttempt", () => {
   it("starts the first attempt for an unpublished release", () => {
-    expect(planReleaseDeployAttempt({ release: release(), now: NOW })).toEqual({
+    expect(planReleaseDeployAttempt({ release: release(), environment: "staging", now: NOW })).toEqual({
       kind: "ready",
-      deliveryId: "release-publish:release_1",
+      deliveryId: "release-publish:release_1:staging",
       attempt: 1,
     });
   });
 
   it("is terminal for an ok / not-configured / no-deploy release", () => {
     for (const deploy of [null, { status: "ok", detail: "HTTP 200", at: NOW }, { status: "not_configured", detail: "未配置", at: NOW }]) {
-      const decision = planReleaseDeployAttempt({ release: release({ status: "released", deploy: deploy as never }), now: NOW });
+      const decision = planReleaseDeployAttempt({ release: release({ status: "released", deploy: deploy as never }), environment: "staging", now: NOW });
       expect(decision).toMatchObject({ kind: "conflict", status: 409, code: "RELEASE_RELEASED" });
     }
     expect(isReleasePublishTerminal(release({ status: "released", deploy: null }))).toBe(true);
@@ -259,14 +262,27 @@ describe("planReleaseDeployAttempt", () => {
 
   it("requires an explicit retry after a failed deploy", () => {
     const failed = release({ status: "released", deploy: { status: "failed", detail: "HTTP 503", at: NOW, deliveryId: "release-publish:release_1", attempt: 1 } });
-    expect(planReleaseDeployAttempt({ release: failed, now: NOW })).toMatchObject({ kind: "conflict", status: 409, code: "RELEASE_RETRY_REQUIRED" });
-    expect(planReleaseDeployAttempt({ release: failed, retry: true, now: NOW })).toEqual({ kind: "ready", deliveryId: "release-publish:release_1", attempt: 2 });
+    expect(planReleaseDeployAttempt({ release: failed, environment: "staging", now: NOW })).toMatchObject({ kind: "conflict", status: 409, code: "RELEASE_RETRY_REQUIRED" });
+    expect(planReleaseDeployAttempt({ release: failed, environment: "staging", retry: true, now: NOW })).toEqual({ kind: "ready", deliveryId: "release-publish:release_1", attempt: 2 });
+  });
+
+  it("allows a successful staging release to promote to production with a new delivery id", () => {
+    const staged = release({
+      status: "released",
+      deploy: { status: "ok", environment: "staging", detail: "HTTP 200", at: NOW, deliveryId: "release-publish:release_1:staging", attempt: 1 },
+    });
+    expect(isReleasePublishTerminal(staged, "production")).toBe(false);
+    expect(planReleaseDeployAttempt({ release: staged, environment: "production", now: NOW })).toEqual({
+      kind: "ready",
+      deliveryId: "release-publish:release_1:production",
+      attempt: 1,
+    });
   });
 
   it("keeps a fresh pending attempt pending and refuses a premature retry", () => {
     const pending = release({ status: "released", deploy: { status: "pending", detail: "HTTP 202", at: NOW, startedAt: NOW, attempt: 1 } });
-    expect(planReleaseDeployAttempt({ release: pending, now: NOW })).toMatchObject({ kind: "conflict", code: "RELEASE_AWAITING_RESULT" });
-    expect(planReleaseDeployAttempt({ release: pending, retry: true, now: NOW })).toMatchObject({ kind: "conflict", code: "RELEASE_IN_PROGRESS" });
+    expect(planReleaseDeployAttempt({ release: pending, environment: "staging", now: NOW })).toMatchObject({ kind: "conflict", code: "RELEASE_AWAITING_RESULT" });
+    expect(planReleaseDeployAttempt({ release: pending, environment: "staging", retry: true, now: NOW })).toMatchObject({ kind: "conflict", code: "RELEASE_IN_PROGRESS" });
   });
 
   it("times a pending attempt out (bounded verification) and reports it as expired for retry", () => {
@@ -276,8 +292,8 @@ describe("planReleaseDeployAttempt", () => {
       deploy: { status: "pending", detail: "HTTP 202", at: started, startedAt: started, deliveryId: "release-publish:release_1", attempt: 1 },
     });
     const later = new Date(Date.parse(started) + RELEASE_DEPLOY_STALE_MS + 1).toISOString();
-    expect(planReleaseDeployAttempt({ release: timedOut, now: later })).toMatchObject({ kind: "conflict", code: "RELEASE_DEPLOY_TIMEOUT" });
-    const decision = planReleaseDeployAttempt({ release: timedOut, retry: true, now: later });
+    expect(planReleaseDeployAttempt({ release: timedOut, environment: "staging", now: later })).toMatchObject({ kind: "conflict", code: "RELEASE_DEPLOY_TIMEOUT" });
+    const decision = planReleaseDeployAttempt({ release: timedOut, environment: "staging", retry: true, now: later });
     expect(decision.kind).toBe("ready");
     if (decision.kind !== "ready") throw new Error("expected ready");
     expect(decision.attempt).toBe(2);
@@ -288,8 +304,9 @@ describe("planReleaseDeployAttempt", () => {
 
 describe("releaseDeployDeliveryId", () => {
   it("is stable for a release so a retry can be de-duplicated by the receiver", () => {
-    expect(releaseDeployDeliveryId("release_1")).toBe("release-publish:release_1");
-    expect(releaseDeployDeliveryId("release_1")).toBe(releaseDeployDeliveryId("release_1"));
+    expect(releaseDeployDeliveryId("release_1", "staging")).toBe("release-publish:release_1:staging");
+    expect(releaseDeployDeliveryId("release_1", "staging")).toBe(releaseDeployDeliveryId("release_1", "staging"));
+    expect(releaseDeployDeliveryId("release_1", "staging")).not.toBe(releaseDeployDeliveryId("release_1", "production"));
   });
 });
 
@@ -336,4 +353,3 @@ describe("planReleaseDeployCallback (old-attempt isolation)", () => {
     expect(plan).toMatchObject({ kind: "reject", code: "RELEASE_ALREADY_FINAL", audit: false });
   });
 });
-

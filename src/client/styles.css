@@ -623,6 +623,29 @@ button { color: inherit; }
 .acceptance-grid strong { color: #dfe3e7; font-size: 12px; }
 .acceptance-grid small { color: #6b7680; font-size: 9px; }
 .release-panel { margin-top: 16px; border-color: rgba(116, 196, 255, .22); }
+.release-settings-page { max-width: 980px; }
+.release-settings-state { display: inline-flex; align-items: center; gap: 7px; padding: 8px 11px; border: 1px solid rgba(255, 180, 75, .25); border-radius: 999px; color: #d9a24d; font-size: 11px; }
+.release-settings-state.is-ready { border-color: rgba(77, 205, 150, .3); color: #62d6a3; }
+.release-settings-card { margin-top: 22px; }
+.release-settings-form { display: grid; gap: 18px; padding: 20px; }
+.release-settings-form label { display: grid; gap: 7px; }
+.release-settings-form label > span { color: #dce4ec; font-size: 12px; font-weight: 650; }
+.release-settings-form input { width: 100%; box-sizing: border-box; }
+.release-settings-form small, .release-settings-meta { color: #7f8a96; font-size: 10px; line-height: 1.6; }
+.release-settings-security { display: flex; align-items: flex-start; gap: 8px; padding: 12px; border: 1px solid rgba(88, 161, 255, .18); border-radius: 8px; background: rgba(88, 161, 255, .05); color: #9bbfe7; font-size: 11px; line-height: 1.55; }
+.release-settings-security svg { flex: none; margin-top: 1px; }
+.release-settings-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.form-success { color: #62d6a3; font-size: 11px; }
+.release-guide-card { margin-top: 18px; }
+.release-guide-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; padding: 18px 20px 8px; }
+.release-guide-grid article { display: flex; gap: 11px; padding: 13px; border: 1px solid rgba(255,255,255,.07); border-radius: 8px; background: rgba(255,255,255,.018); }
+.release-guide-grid article > em { color: #62d6a3; font: 600 11px/1.4 ui-monospace, monospace; }
+.release-guide-grid strong { display: block; color: #dce4ec; font-size: 11px; }
+.release-guide-grid p, .release-protocol p { margin: 5px 0 0; color: #84909c; font-size: 10px; line-height: 1.65; }
+.release-protocol { padding: 12px 20px 20px; }
+.release-protocol h4 { margin: 0 0 8px; color: #dce4ec; font-size: 12px; }
+.release-protocol pre { overflow: auto; margin: 8px 0 14px; padding: 12px; border: 1px solid rgba(255,255,255,.07); border-radius: 7px; background: #0c1117; color: #a9c7e5; font-size: 10px; line-height: 1.6; }
+@media (max-width: 720px) { .release-guide-grid { grid-template-columns: 1fr; } }
 .release-status { border: 1px solid var(--line-soft); border-radius: 999px; padding: 4px 8px; color: #8e99a3; font-size: 9px; }
 .release-succeeded { color: #bcd867; border-color: rgba(188, 216, 103, .3); background: rgba(188, 216, 103, .06); }
 .release-failed { color: #ff9f91; border-color: rgba(255, 112, 91, .3); background: rgba(255, 112, 91, .06); }
@@ -889,6 +912,7 @@ button.agile-metrics-row:hover strong { color: #c3d274; }
 .decision-reco p { display: flex; align-items: center; gap: 7px; margin: 0; color: var(--panel-text); font-size: var(--panel-fs); line-height: var(--panel-lh); }
 .decision-reco p svg { flex: 0 0 auto; color: var(--green); }
 .decision-actions { display: flex; gap: 8px; }
+.decision-advisory { padding: 5px 8px; border: 1px solid rgba(120, 150, 180, .2); border-radius: 999px; color: #8795a3; font-size: 9px; white-space: nowrap; }
 .finding-flagged { border-color: rgba(242,113,113,.55); box-shadow: 0 0 0 1px rgba(242,113,113,.25); }
 @media (max-width: 900px) {
   .decision-gates { grid-template-columns: repeat(2, minmax(0, 1fr)); }

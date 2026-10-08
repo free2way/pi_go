@@ -55,6 +55,7 @@ import {
   Square,
   Trash2,
   Users,
+  Webhook,
   X,
   XCircle,
   Zap,
@@ -72,12 +73,10 @@ import type { ChatMessage, ConfigStatus, CurrentUser, Finding, ModelCatalogRespo
 import type { ModelTemplate } from "../shared/agile";
 import { api } from "./api";
 import {
-  acceptConfirmMessage,
-  continueConfirmMessage,
-  decisionBriefActionRequest,
   decisionBriefExpanded,
   decisionBriefHeadingKey,
   decisionBriefTone,
+  decisionBriefVisible,
   decisionGateDetail,
   decisionRecommendationNote,
   decisionStopMessage,
@@ -102,6 +101,7 @@ import { isModelSelectableForRole } from "../shared/model-select";
 import { AccountsPage } from "./AccountsPage";
 import { SystemStatusPage } from "./SystemStatusPage";
 import { WorkspacesPage } from "./WorkspacesPage";
+import { ReleaseSettingsPage } from "./ReleaseSettingsPage";
 
 /**
  * 侧栏「最近任务」只列最近的 N 个（需求）：完整列表在「需求历史」页
@@ -865,7 +865,7 @@ function ReleasePanel({ run, user, configured, onUpdated }: {
   onUpdated: (run: Run) => void;
 }) {
   const { t, locale } = useT();
-  const [environment, setEnvironment] = useState("production");
+  const [environment, setEnvironment] = useState<"staging" | "production">("staging");
   const [busy, setBusy] = useState<"" | "merge" | "publish">("");
   const [error, setError] = useState("");
   const [, setReleaseClock] = useState(0);
@@ -879,6 +879,7 @@ function ReleasePanel({ run, user, configured, onUpdated }: {
   if (run.state !== "completed" || run.mode !== "real") return null;
 
   const release = run.release;
+  const canPromote = release?.status === "succeeded" && release.environment === "staging";
   const stalePublishing = (release?.status === "publishing" || release?.status === "triggered")
     && Date.now() - Date.parse(release.startedAt) >= 2 * 60_000;
   const canRetry = release?.status === "failed" || stalePublishing;
@@ -896,7 +897,7 @@ function ReleasePanel({ run, user, configured, onUpdated }: {
     }
   };
   const publish = async () => {
-    const target = release?.environment ?? environment.trim();
+    const target = canPromote ? "production" : release?.environment ?? environment;
     if (!target) return setError(t("release.environmentRequired"));
     if (!window.confirm(t("release.publishConfirm", { title: run.title, commit: run.merge?.commit.slice(0, 12) ?? "—", environment: target }))) return;
     setBusy("publish");
@@ -942,11 +943,16 @@ function ReleasePanel({ run, user, configured, onUpdated }: {
               {busy === "merge" ? <LoaderCircle className="spin" size={14} /> : <GitBranch size={14} />}{t("release.mergeAction")}
             </button>
           ) : null}
-          {run.merge && release?.status !== "succeeded" ? (
+          {run.merge && (release?.status !== "succeeded" || canPromote) ? (
             <>
-              {!release ? <input aria-label={t("release.environment")} value={environment} maxLength={64} onChange={(event) => setEnvironment(event.target.value)} disabled={Boolean(busy)} /> : null}
+              {!release ? (
+                <select aria-label={t("release.environment")} value={environment} onChange={(event) => setEnvironment(event.target.value === "production" ? "production" : "staging")} disabled={Boolean(busy)}>
+                  <option value="staging">{t("release.environment.staging")}</option>
+                  <option value="production">{t("release.environment.production")}</option>
+                </select>
+              ) : null}
               <button type="button" className="button primary" disabled={Boolean(busy) || inProgress || configured === false} onClick={() => void publish()}>
-                {busy === "publish" || inProgress ? <LoaderCircle className="spin" size={14} /> : <Rocket size={14} />}{t(canRetry ? "release.retry" : inProgress ? "release.inProgress" : "release.confirm")}
+                {busy === "publish" || inProgress ? <LoaderCircle className="spin" size={14} /> : <Rocket size={14} />}{t(canPromote ? "release.promoteProduction" : canRetry ? "release.retry" : inProgress ? "release.inProgress" : "release.confirm")}
               </button>
             </>
           ) : null}
@@ -1269,8 +1275,6 @@ function DecisionBriefCard({
   run,
   open,
   onToggle,
-  onContinue,
-  onAccept,
   onOpenFinding,
   onOpenTab,
 }: {
@@ -1278,8 +1282,6 @@ function DecisionBriefCard({
   run: Run;
   open: boolean;
   onToggle: () => void;
-  onContinue: (note: string) => void;
-  onAccept: () => void;
   onOpenFinding: (key: string) => void;
   onOpenTab: (tab: Tab) => void;
 }) {
@@ -1361,14 +1363,7 @@ function DecisionBriefCard({
           ) : null}
           <div className="decision-reco">
             <p><ShieldCheck size={14} />{recommendationNote}</p>
-            <div className="decision-actions">
-              <button type="button" className="button primary" onClick={() => onContinue(recommendationNote)}>
-                <Play size={15} />{t("decision.continue")}
-              </button>
-              <button type="button" className="button primary" onClick={onAccept}>
-                <CheckCircle2 size={15} />{t("decision.accept")}
-              </button>
-            </div>
+            <span className="decision-advisory">{t("decision.advisory")}</span>
           </div>
         </div>
       ) : null}
@@ -1376,7 +1371,7 @@ function DecisionBriefCard({
   );
 }
 
-function HumanInterventionPanel({ run, events, user, onUpdated, draftNote }: { run: Run; events: RunEvent[]; user?: CurrentUser; onUpdated: (run: Run) => void; draftNote?: string }) {
+function HumanInterventionPanel({ run, events, user, onUpdated }: { run: Run; events: RunEvent[]; user?: CurrentUser; onUpdated: (run: Run) => void }) {
   const { t, locale } = useT();
   const [instruction, setInstruction] = useState("");
   const [busy, setBusy] = useState<"" | "resume" | "review" | "terminate" | "continue" | "approve" | "reject">("");
@@ -1405,11 +1400,6 @@ function HumanInterventionPanel({ run, events, user, onUpdated, draftNote }: { r
   useEffect(() => {
     if (mergeOption.disabled) setMergeIntoWorkspace(false);
   }, [mergeOption.disabled]);
-
-  // 决策摘要: prefill the drafted note (one item naming the file|title fingerprint).
-  useEffect(() => {
-    if (draftNote) setInstruction(draftNote);
-  }, [draftNote]);
 
   const act = async (kind: "resume" | "review" | "terminate" | "continue" | "approve" | "reject") => {
     setError("");
@@ -1477,11 +1467,11 @@ function HumanInterventionPanel({ run, events, user, onUpdated, draftNote }: { r
       {restoreNotice && <div className={`merge-notice ${restoreFailed ? "merge-notice-warn" : ""}`}>{restoreNotice}</div>}
       {error && <div className="form-error">{error}</div>}
       <div className="human-actions">
-        <button type="button" className="button primary" disabled={Boolean(busy)} onClick={() => void act("continue")}>
-          {busy === "continue" ? <LoaderCircle className="spin" size={15} /> : <Play size={15} />}{t("decision.continue")}
-        </button>
         <button type="button" className="button primary" disabled={Boolean(busy)} onClick={() => void act("approve")}>
           {busy === "approve" ? <LoaderCircle className="spin" size={15} /> : <CheckCircle2 size={15} />}{t("decision.accept")}
+        </button>
+        <button type="button" className="button secondary" disabled={Boolean(busy)} onClick={() => void act("continue")}>
+          {busy === "continue" ? <LoaderCircle className="spin" size={15} /> : <Play size={15} />}{t("decision.rework")}
         </button>
         <button type="button" className="button secondary" disabled={Boolean(busy)} onClick={() => void act("resume")}>
           {busy === "resume" ? <LoaderCircle className="spin" size={15} /> : <RotateCcw size={15} />}{t("human.resume")}
@@ -1515,7 +1505,6 @@ export function App() {
   const [roundSummaries, setRoundSummaries] = useState<RoundSummary[] | undefined>(undefined);
   // 决策摘要: server-built Decision Brief; `undefined` means unavailable/loading.
   const [decisionBrief, setDecisionBrief] = useState<DecisionBrief>();
-  const [briefDraft, setBriefDraft] = useState("");
   const [briefCollapsed, setBriefCollapsed] = useState(false);
   const [highlightFinding, setHighlightFinding] = useState<string | null>(null);
   const [artifacts, setArtifacts] = useState<RunArtifact[]>([]);
@@ -1526,7 +1515,7 @@ export function App() {
   // Item-1: which rework branch's detail panel is open; Item-2: the chat round filter.
   const [reworkRound, setReworkRound] = useState<number | null>(null);
   const [chatRoundFilter, setChatRoundFilter] = useState<number | null>(null);
-  const [view, setView] = useState<"run" | "agile" | "workspaces" | "models" | "history" | "system" | "accounts">("run");
+  const [view, setView] = useState<"run" | "agile" | "workspaces" | "models" | "history" | "system" | "release-settings" | "accounts">("run");
   const [createOpen, setCreateOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -1637,7 +1626,10 @@ export function App() {
   // (docs/24-i18n.md §9); the card itself renders from the already-fetched
   // payload, so switching language does not need a refetch.
   useEffect(() => {
-    if (!selectedId) return;
+    if (!selectedId || !activeRun || !decisionBriefVisible(activeRun.state)) {
+      setDecisionBrief(undefined);
+      return;
+    }
     let active = true;
     void api.decisionBrief(selectedId, locale).then((next) => {
       if (active) setDecisionBrief(next);
@@ -1679,33 +1671,6 @@ export function App() {
     document.getElementById("chat-log")?.scrollIntoView({ behavior: "smooth", block: "start" });
   }, []);
 
-  // 决策摘要 actions reuse the existing approve endpoint (no new mutation API).
-  const applyAccept = useCallback((next: Run) => {
-    setRun(next);
-    setRuns((current) => current.map((item) => (item.id === next.id ? next : item)));
-  }, []);
-
-  const handleBriefContinue = useCallback(async (note: string) => {
-    if (!activeRun || !decisionBrief) return;
-    setBriefDraft(note);
-    if (!window.confirm(continueConfirmMessage(activeRun.title, note, locale))) return;
-    try {
-      applyAccept(await api.approveRun(activeRun.id, decisionBriefActionRequest(decisionBrief, "continue")));
-    } catch (cause) {
-      window.alert(t("alert.continueFailed", { message: localizeError(locale, cause as { code?: string; message?: string }) }));
-    }
-  }, [activeRun, decisionBrief, applyAccept, locale, t]);
-
-  const handleBriefAccept = useCallback(async () => {
-    if (!activeRun || !decisionBrief) return;
-    if (!window.confirm(acceptConfirmMessage(activeRun.title, decisionBrief.remaining.length, locale))) return;
-    try {
-      applyAccept(await api.approveRun(activeRun.id, decisionBriefActionRequest(decisionBrief, "accept")));
-    } catch (cause) {
-      window.alert(t("alert.acceptFailed", { message: localizeError(locale, cause as { code?: string; message?: string }) }));
-    }
-  }, [activeRun, decisionBrief, applyAccept, locale, t]);
-
   const openBriefTarget = useCallback((nextTab: Tab, key?: string) => {
     setTab(nextTab);
     setHighlightFinding(key ?? null);
@@ -1719,7 +1684,6 @@ export function App() {
     setArtifacts([]);
     setRoundSummaries(undefined);
     setDecisionBrief(undefined);
-    setBriefDraft("");
     setHighlightFinding(null);
     setReworkRound(null);
     setChatRoundFilter(null);
@@ -1823,6 +1787,7 @@ export function App() {
           <button type="button" className={view === "models" ? "active" : ""} onClick={() => setView("models")}><Cpu size={16} />{t("nav.models")}</button>
           {/* SYS-01: this used to be a dead `#system` anchor into the sidebar deployment card; it now opens the system status dashboard. */}
           <button type="button" className={view === "system" ? "active" : ""} onClick={() => setView("system")}><Activity size={16} />{t("nav.system")}</button>
+          {user?.isAdmin && <button type="button" className={view === "release-settings" ? "active" : ""} onClick={() => setView("release-settings")}><Webhook size={16} />{t("nav.releaseSettings")}</button>}
           {/* 账户管理: admin-only; non-admins never see the entry (direct navigation shows the explicit 仅管理员可见 state). */}
           {user?.isAdmin && <button type="button" className={view === "accounts" ? "active" : ""} onClick={() => setView("accounts")}><Users size={16} />{t("nav.accounts")}</button>}
           </nav>
@@ -1883,6 +1848,8 @@ export function App() {
                 ? <><span>MODELS</span><ChevronRight size={13} /><strong>{t("nav.models")}</strong></>
                 : view === "system"
                   ? <><span>SYSTEM</span><ChevronRight size={13} /><strong>{t("nav.system")}</strong></>
+                  : view === "release-settings"
+                    ? <><span>RELEASE</span><ChevronRight size={13} /><strong>{t("nav.releaseSettings")}</strong></>
                   : view === "history"
                     ? <><span>HISTORY</span><ChevronRight size={13} /><strong>{t("nav.history")}</strong></>
                     : view === "agile"
@@ -1909,6 +1876,8 @@ export function App() {
 
         {view === "system" ? (
           <SystemStatusPage isAdmin={Boolean(user?.isAdmin)} />
+        ) : view === "release-settings" ? (
+          <ReleaseSettingsPage onChanged={() => { void api.config().then(setConfig); }} />
         ) : view === "models" ? (
           <ModelsPage config={config} onChanged={() => { void api.config().then(setConfig); }} />
         ) : view === "workspaces" ? (
@@ -1954,14 +1923,12 @@ export function App() {
 
             <DeferredNonBlockingNotice events={events} />
 
-            {decisionBrief ? (
+            {decisionBrief && decisionBriefVisible(activeRun.state) ? (
               <DecisionBriefCard
                 brief={decisionBrief}
                 run={activeRun}
                 open={decisionBriefExpanded(activeRun.state, briefCollapsed, terminalStates)}
                 onToggle={() => setBriefCollapsed((collapsed) => !collapsed)}
-                onContinue={(note) => void handleBriefContinue(note)}
-                onAccept={() => void handleBriefAccept()}
                 onOpenFinding={(key) => openBriefTarget("review", key)}
                 onOpenTab={(target) => openBriefTarget(target)}
               />
@@ -1972,7 +1939,6 @@ export function App() {
                 run={activeRun}
                 events={events}
                 user={user}
-                draftNote={briefDraft}
                 onUpdated={(next) => {
                   setRun(next);
                   setRuns((current) => current.map((item) => (item.id === next.id ? next : item)));

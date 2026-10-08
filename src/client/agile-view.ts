@@ -144,11 +144,12 @@ export function deployStatusKey(status: ReleaseDeployRecord["status"]): MessageK
   return DEPLOY_STATUS_KEYS[status] ?? "common.unknown";
 }
 
-export type ReleaseDeployAction = "publish" | "retry" | "waiting" | "done";
+export type ReleaseDeployAction = "publish" | "promote" | "retry" | "waiting" | "done";
 
 /** Catalog keys for the deploy button (labels live in the catalog). */
 export const RELEASE_DEPLOY_ACTION_KEYS: Record<ReleaseDeployAction, MessageKey> = {
   publish: "agile.deployAction.publish",
+  promote: "agile.deployAction.promote",
   retry: "agile.deployAction.retry",
   waiting: "agile.deployAction.waiting",
   done: "agile.deployAction.done",
@@ -162,6 +163,7 @@ export const RELEASE_DEPLOY_ACTION_KEYS: Record<ReleaseDeployAction, MessageKey>
  */
 export function releaseDeployAction(deploy: ReleaseDeployRecord | null | undefined, now = Date.now()): ReleaseDeployAction {
   if (!deploy) return "publish";
+  if (deploy.status === "ok" && deploy.environment === "staging") return "promote";
   if (deploy.status === "failed") return "retry";
   if (deploy.status === "pending") {
     const startedAt = Date.parse(deploy.startedAt ?? deploy.at);

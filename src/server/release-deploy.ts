@@ -1,4 +1,4 @@
-import type { AgileRelease, ReleaseDeployRecord } from "../shared/agile.js";
+import type { AgileRelease, ReleaseDeployRecord, ReleaseEnvironment } from "../shared/agile.js";
 import type { PostMergeDeployPlan } from "./run-merge.js";
 import type { ReleaseExecutionOutcome } from "./release-execution.js";
 import {
@@ -65,6 +65,7 @@ export interface ReleaseDeployInput {
   retry: boolean;
   now: string;
   releasedBy: string;
+  environment: ReleaseEnvironment;
   note?: string;
   callbackUrl?: string;
   webhookToken?: string;
@@ -79,7 +80,7 @@ export async function runReleaseDeploy(input: ReleaseDeployInput, deps: ReleaseD
   const release = input.release;
 
   // 1. Bounded verification / retry decision from the observed state.
-  const decision = planReleaseDeployAttempt({ release, retry: input.retry, now });
+  const decision = planReleaseDeployAttempt({ release, environment: input.environment, retry: input.retry, now });
   if (decision.kind === "conflict") {
     return { kind: "conflict", status: decision.status, code: decision.code, message: decision.message };
   }
@@ -96,6 +97,7 @@ export async function runReleaseDeploy(input: ReleaseDeployInput, deps: ReleaseD
   const releasedAt = now;
   const hookExecutable = input.deployPlan.configured && input.deployPlan.kind !== "unsupported";
   const pendingDeploy: ReleaseDeployRecord = {
+    environment: input.environment,
     status: "pending",
     detail: "部署已触发，等待部署系统回调",
     at: now,
@@ -111,7 +113,7 @@ export async function runReleaseDeploy(input: ReleaseDeployInput, deps: ReleaseD
     releasedBy: input.releasedBy,
     releasedAt,
     note: input.note,
-    deploy: hookExecutable ? pendingDeploy : shapeReleaseDeployOutcome(input.deployPlan, undefined, now),
+    deploy: hookExecutable ? pendingDeploy : shapeReleaseDeployOutcome(input.deployPlan, undefined, now, { environment: input.environment }),
     stories: input.stories,
   });
   if (!started.claimed) {
@@ -134,13 +136,14 @@ export async function runReleaseDeploy(input: ReleaseDeployInput, deps: ReleaseD
       releasedAt,
       releasedBy: input.releasedBy,
       note: input.note,
+      environment: input.environment,
       callbackUrl: input.callbackUrl,
       deliveryId,
       attempt: decision.attempt,
     }),
     { deliveryId, ...(input.webhookToken ? { webhookToken: input.webhookToken } : {}) },
   );
-  const deploy = shapeReleaseDeployOutcome(input.deployPlan, execution, new Date().toISOString(), { deliveryId, attempt: decision.attempt });
+  const deploy = shapeReleaseDeployOutcome(input.deployPlan, execution, new Date().toISOString(), { deliveryId, attempt: decision.attempt, environment: input.environment });
   // A 202 stays pending; only a real result is settled (CAS-guarded).
   if (deploy.status === "pending") return { kind: "published", release: await deps.read(), deploy };
 

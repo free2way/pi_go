@@ -123,9 +123,14 @@ export const storyBlockSchema = z.object({
  * deploy attempt after a failed or timed-out one, so a retry is always explicit. */
 export const releasePublishSchema = z.object({
   confirm: z.boolean().optional(),
+  environment: z.enum(["staging", "production"]).optional(),
   note: text.optional(),
   retry: z.boolean().optional(),
-}).strict();
+}).strict().superRefine((value, context) => {
+  if (value.confirm === true && !value.environment) {
+    context.addIssue({ code: "custom", path: ["environment"], message: "确认发布时必须选择 staging 或 production" });
+  }
+});
 
 /** Sprint 4: saved model combination. `budget`/`maxParallel` are optional. */
 export const templateCreateSchema = z.object({

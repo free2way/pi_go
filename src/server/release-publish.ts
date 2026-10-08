@@ -1,4 +1,4 @@
-import { RELEASE_DEPLOY_STALE_MS, type AgileRelease, type ReleaseDeployRecord, type StoryStatus } from "../shared/agile.js";
+import { RELEASE_DEPLOY_STALE_MS, type AgileRelease, type ReleaseDeployRecord, type ReleaseEnvironment, type StoryStatus } from "../shared/agile.js";
 import { gateBlocking, type DecisionBriefFindingInput } from "../shared/decision-brief.js";
 import type { RunState } from "../shared/types.js";
 import type { ReleaseExecutionOutcome } from "./release-execution.js";
@@ -54,8 +54,8 @@ export function planReleasePublishGate(input: { isAdmin: boolean }): ReleasePubl
  * deployment unit, so its id is the `run` slot of the documented
  * `run+commit+environment` key).
  */
-export function releaseDeployDeliveryId(releaseId: string) {
-  return `release-publish:${releaseId}`;
+export function releaseDeployDeliveryId(releaseId: string, environment: ReleaseEnvironment) {
+  return `release-publish:${releaseId}:${environment}`;
 }
 
 /**
@@ -65,10 +65,11 @@ export function releaseDeployDeliveryId(releaseId: string) {
  * `failed`/timed-out deploy is deliberately *not* terminal — see
  * `planReleaseDeployAttempt`, which allows an explicit retry.
  */
-export function isReleasePublishTerminal(release: Pick<AgileRelease, "status" | "deploy">): boolean {
+export function isReleasePublishTerminal(release: Pick<AgileRelease, "status" | "deploy">, environment?: ReleaseEnvironment): boolean {
   const deploy = release.deploy ?? null;
   if (release.status !== "released") return false;
   if (!deploy) return true;
+  if (environment === "production" && deploy.environment === "staging" && deploy.status === "ok") return false;
   return deploy.status === "ok" || deploy.status === "not_configured" || deploy.status === "unsupported";
 }
 
@@ -90,19 +91,27 @@ export type ReleaseDeployDecision =
  */
 export function planReleaseDeployAttempt(input: {
   release: Pick<AgileRelease, "id" | "status" | "deploy">;
+  environment: ReleaseEnvironment;
   retry?: boolean;
   now: string;
   staleAfterMs?: number;
 }): ReleaseDeployDecision {
-  const deliveryId = releaseDeployDeliveryId(input.release.id);
   const deploy = input.release.deploy ?? null;
   const retry = input.retry === true;
+  const deliveryId = releaseDeployDeliveryId(input.release.id, input.environment);
   if (!deploy) {
     if (input.release.status === "released") {
       return { kind: "conflict", status: 409, code: "RELEASE_RELEASED", message: "发布已发布，不可重复发布" };
     }
     return { kind: "ready", deliveryId, attempt: 1 };
   }
+  const promotion = deploy.status === "ok" && deploy.environment === "staging" && input.environment === "production";
+  const targetChanged = Boolean(deploy.environment && deploy.environment !== input.environment);
+  if (targetChanged && !promotion) {
+    return { kind: "conflict", status: 409, code: "RELEASE_TARGET_CHANGED", message: "已有发布记录与当前环境不一致，仅允许 staging 成功后晋级到 production" };
+  }
+  if (promotion) return { kind: "ready", deliveryId, attempt: 1 };
+  const retryDeliveryId = deploy.deliveryId ?? deliveryId;
   const nextAttempt = (deploy.attempt ?? 1) + 1;
   if (deploy.status === "ok" || deploy.status === "not_configured" || deploy.status === "unsupported") {
     return { kind: "conflict", status: 409, code: "RELEASE_RELEASED", message: "发布已发布，不可重复发布" };
@@ -111,7 +120,7 @@ export function planReleaseDeployAttempt(input: {
     if (!retry) {
       return { kind: "conflict", status: 409, code: "RELEASE_RETRY_REQUIRED", message: "上次部署失败，请明确选择重试部署" };
     }
-    return { kind: "ready", deliveryId, attempt: nextAttempt };
+    return { kind: "ready", deliveryId: retryDeliveryId, attempt: nextAttempt };
   }
   // pending: bounded verification — only a timed-out attempt may be retried.
   const startedAt = deploy.startedAt ?? deploy.at;
@@ -133,7 +142,7 @@ export function planReleaseDeployAttempt(input: {
   if (!retry) {
     return { kind: "conflict", status: 409, code: "RELEASE_DEPLOY_TIMEOUT", message: `${expired.detail}，请显式重试部署` };
   }
-  return { kind: "ready", deliveryId, attempt: nextAttempt, expired };
+  return { kind: "ready", deliveryId: retryDeliveryId, attempt: nextAttempt, expired };
 }
 
 /** One release story, already reconciled to its derived status. */
@@ -448,11 +457,12 @@ export function shapeReleaseDeployOutcome(
   plan: PostMergeDeployPlan,
   execution: ReleaseExecutionOutcome | undefined,
   at: string,
-  identity: { deliveryId?: string; attempt?: number } = {},
+  identity: { deliveryId?: string; attempt?: number; environment?: ReleaseEnvironment } = {},
 ): ReleaseDeployRecord {
   const id = {
     ...(identity.deliveryId ? { deliveryId: identity.deliveryId } : {}),
     ...(identity.attempt === undefined ? {} : { attempt: identity.attempt }),
+    ...(identity.environment ? { environment: identity.environment } : {}),
   };
   if (!plan.configured) return { status: "not_configured", detail: plan.reason, at, ...id };
   if (plan.kind === "unsupported") return { status: "unsupported", detail: plan.reason, at, ...id };
@@ -468,6 +478,7 @@ export function buildReleaseDeployPayload(input: {
   stories: Array<Pick<ReleasePublishStory, "storyId" | "title" | "status">>;
   releasedAt: string;
   releasedBy: string;
+  environment: ReleaseEnvironment;
   note?: string;
   callbackUrl?: string;
   deliveryId?: string;
@@ -485,6 +496,7 @@ export function buildReleaseDeployPayload(input: {
     ...(input.attempt === undefined ? {} : { attempt: input.attempt }),
     releasedAt: input.releasedAt,
     releasedBy: input.releasedBy,
+    environment: input.environment,
     ...(input.note?.trim() ? { note: input.note.trim() } : {}),
     stories: input.stories.map((story) => ({ storyId: story.storyId, title: story.title, status: story.status })),
     ...(input.callbackUrl ? { callbackUrl: input.callbackUrl } : {}),

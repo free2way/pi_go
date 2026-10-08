@@ -84,6 +84,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
   const [publishBlocked, setPublishBlocked] = useState<Array<{ storyId: string; title: string; reason: string }>>([]);
   const [publishReady, setPublishReady] = useState(false);
   const [publishNote, setPublishNote] = useState("");
+  const [publishEnvironment, setPublishEnvironment] = useState<"staging" | "production">("staging");
   const [publishBusy, setPublishBusy] = useState(false);
   const [publishError, setPublishError] = useState("");
 
@@ -612,14 +613,16 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
 
   // ------------------------------------------------- publish action (Sprint 5)
   const openPublish = async (release: AgileRelease) => {
+    const targetEnvironment = release.deploy?.status === "ok" && release.deploy.environment === "staging" ? "production" : release.deploy?.environment === "production" ? "production" : "staging";
     setPublishTarget(release);
     setPublishBlocked([]);
     setPublishReady(false);
     setPublishNote("");
+    setPublishEnvironment(targetEnvironment);
     setPublishError("");
     setPublishBusy(true);
     try {
-      const preview = await api.publishRelease(release.id, {});
+      const preview = await api.publishRelease(release.id, { environment: targetEnvironment });
       setPublishTarget(preview.release);
       setPublishReady(true);
     } catch (cause) {
@@ -645,6 +648,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
     try {
       const result = await api.publishRelease(publishTarget.id, {
         confirm: true,
+        environment: publishEnvironment,
         // An existing deploy record means this confirm is a retry (failed or
         // timed-out attempt); the server still refuses a non-stale `pending` one.
         retry: publishTarget.deploy != null,
@@ -1401,11 +1405,17 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
           )}
           {publishBusy && <div className="ws-empty"><LoaderCircle className="spin" size={18} /><span>{t("agile.publish.validating")}</span></div>}
           {!publishBusy && publishReady && <div className="agile-hint">{t(publishTarget.deploy?.status === "failed" || releaseDeployAction(publishTarget.deploy) === "retry" ? "agile.publish.retryHint" : "agile.publish.readyHint")}</div>}
+          <label>{t("release.environment")}
+            <select value={publishEnvironment} onChange={(event) => setPublishEnvironment(event.target.value === "production" ? "production" : "staging")} disabled={publishBusy}>
+              <option value="staging" disabled={publishTarget.deploy?.status === "ok" && publishTarget.deploy.environment === "staging"}>{t("release.environment.staging")}</option>
+              <option value="production">{t("release.environment.production")}</option>
+            </select>
+          </label>
           <label>{t("agile.publish.note")}<textarea rows={2} value={publishNote} onChange={(event) => setPublishNote(event.target.value)} placeholder={t("agile.publish.notePlaceholder")} /></label>
           <div className="ws-form-actions">
             <button type="button" className="button secondary" onClick={closePublish}>{t("common.cancel")}</button>
             <button type="button" className="button primary" disabled={publishBusy || !publishReady} onClick={() => void confirmPublish()}>
-              {publishBusy ? <LoaderCircle className="spin" size={15} /> : <Rocket size={15} />}{t(releaseDeployAction(publishTarget.deploy) === "retry" ? "agile.publish.confirmRetry" : "agile.publish.confirm")}
+              {publishBusy ? <LoaderCircle className="spin" size={15} /> : <Rocket size={15} />}{t(releaseDeployAction(publishTarget.deploy) === "retry" ? "agile.publish.confirmRetry" : releaseDeployAction(publishTarget.deploy) === "promote" ? "agile.publish.confirmProduction" : "agile.publish.confirm")}
             </button>
           </div>
         </section>

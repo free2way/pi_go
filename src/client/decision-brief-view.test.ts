@@ -9,6 +9,7 @@ import {
   decisionBriefHeading,
   decisionBriefHeadingKey,
   decisionBriefTone,
+  decisionBriefVisible,
   decisionGateDetail,
   decisionGateKeys,
   decisionRecommendationNote,
@@ -45,16 +46,23 @@ describe("decision brief view · three-state rendering", () => {
 
   it("turns a red or unknown brief into a continue card", () => {
     expect(decisionBriefTone(red)).toBe("continue");
-    expect(decisionBriefHeading(red)).toContain("建议继续开发");
+    expect(decisionBriefHeading(red)).toContain("建议返修");
     expect(decisionBriefTone(unknown)).toBe("continue");
-    expect(decisionBriefHeading(unknown)).toContain("建议继续开发");
-    expect(decisionBriefHeading(unknown, "en")).toContain("continue development");
+    expect(decisionBriefHeading(unknown)).toContain("建议返修");
+    expect(decisionBriefHeading(unknown, "en")).toContain("rework suggested");
   });
 
   it("expands only for a terminal run and respects an explicit collapse", () => {
     expect(decisionBriefExpanded("needs_human", false, ["needs_human", "failed"])).toBe(true);
     expect(decisionBriefExpanded("needs_human", true, ["needs_human"])).toBe(false);
     expect(decisionBriefExpanded("developing", false, ["needs_human"])).toBe(false);
+  });
+
+  it("hides stale continue advice after acceptance, merge, or release", () => {
+    expect(decisionBriefVisible("needs_human")).toBe(true);
+    expect(decisionBriefVisible("completed")).toBe(false);
+    expect(decisionBriefVisible("failed")).toBe(false);
+    expect(decisionBriefVisible("cancelled")).toBe(false);
   });
 
   it("groups remaining findings by AC label and splits the unmapped bucket by relevance", () => {

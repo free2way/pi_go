@@ -42,10 +42,14 @@ export function planReleaseStart(input: {
 
   const existing = run.release;
   const sameTarget = existing?.commit === run.merge.commit && existing.environment === input.environment;
-  if (existing && !sameTarget) {
+  const stagingPromotion = existing?.status === "succeeded"
+    && existing.commit === run.merge.commit
+    && existing.environment === "staging"
+    && input.environment === "production";
+  if (existing && !sameTarget && !stagingPromotion) {
     return { kind: "conflict", status: 409, code: "RELEASE_TARGET_CHANGED", message: "已有发布记录与当前 commit 或环境不一致，请先完成或回滚该发布" };
   }
-  if (existing?.status === "succeeded") return { kind: "already-succeeded", release: existing };
+  if (existing?.status === "succeeded" && !stagingPromotion) return { kind: "already-succeeded", release: existing };
 
   if (existing?.status === "triggered" || existing?.status === "publishing") {
     const age = Date.parse(input.now) - Date.parse(existing.startedAt);
@@ -60,8 +64,8 @@ export function planReleaseStart(input: {
     return { kind: "conflict", status: 409, code: "RELEASE_RETRY_REQUIRED", message: "上次发布失败，请明确选择重试发布" };
   }
 
-  const requestedAt = existing?.requestedAt ?? input.now;
-  const deliveryId = existing?.deliveryId ?? releaseDeliveryId(run.id, run.merge.commit, input.environment);
+  const requestedAt = stagingPromotion ? input.now : existing?.requestedAt ?? input.now;
+  const deliveryId = stagingPromotion ? releaseDeliveryId(run.id, run.merge.commit, input.environment) : existing?.deliveryId ?? releaseDeliveryId(run.id, run.merge.commit, input.environment);
   return {
     kind: "ready",
     release: {
@@ -73,7 +77,7 @@ export function planReleaseStart(input: {
       requestedAt,
       requestedBy: input.requestedBy,
       startedAt: input.now,
-      attempt: (existing?.attempt ?? 0) + 1,
+      attempt: stagingPromotion ? 1 : (existing?.attempt ?? 0) + 1,
       kind: input.kind,
     },
   };

@@ -47,6 +47,7 @@ function input(release: AgileRelease, stories: Awaited<ReturnType<AgileService["
     retry: false,
     now: "2026-01-02T00:00:00.000Z",
     releasedBy: "admin_1",
+    environment: "staging" as const,
     callbackUrl: "https://pigo.example/api/internal/agile/releases/x/release-result",
     webhookToken: "token",
     ...overrides,
@@ -66,7 +67,7 @@ describe("runReleaseDeploy (audit P1)", () => {
     ]);
 
     expect(executions).toHaveLength(1);
-    expect(executions[0].deliveryId).toBe(`release-publish:${release.id}`);
+    expect(executions[0].deliveryId).toBe(`release-publish:${release.id}:staging`);
     const conflicts = [first, second].filter((run) => run.kind === "conflict");
     expect(conflicts).toHaveLength(1);
     expect(conflicts[0]).toMatchObject({ status: 409, code: "RELEASE_IN_PROGRESS" });
@@ -74,12 +75,12 @@ describe("runReleaseDeploy (audit P1)", () => {
     expect(published).toMatchObject({ kind: "published", deploy: { status: "pending" } });
 
     const stored = await service.getRelease([], release.id, true);
-    expect(stored.deploy).toMatchObject({ status: "pending", deliveryId: `release-publish:${release.id}`, attempt: 1 });
+    expect(stored.deploy).toMatchObject({ status: "pending", environment: "staging", deliveryId: `release-publish:${release.id}:staging`, attempt: 1 });
 
     // The single execution is backed by exactly one persisted claim record.
     const claims = await db.query("SELECT attempt, idempotency_key FROM agile_release_deploy_claims WHERE release_id = $1", [release.id]);
     expect(claims.rows).toHaveLength(1);
-    expect(claims.rows[0]).toMatchObject({ attempt: 1, idempotency_key: `release-publish:${release.id}#1` });
+    expect(claims.rows[0]).toMatchObject({ attempt: 1, idempotency_key: `release-publish:${release.id}:staging#1` });
   });
 
   it("records an HTTP 202 as pending, never as premature success, until the callback settles it", async () => {
@@ -97,7 +98,7 @@ describe("runReleaseDeploy (audit P1)", () => {
       action: "release.deploy_succeeded",
       actorId: "deploy-system",
       now: "2026-01-02T00:05:00.000Z",
-      deploy: { status: "ok", detail: "部署系统回调：成功", at: "2026-01-02T00:05:00.000Z", finishedAt: "2026-01-02T00:05:00.000Z", deliveryId: `release-publish:${release.id}`, attempt: 1 },
+      deploy: { status: "ok", detail: "部署系统回调：成功", at: "2026-01-02T00:05:00.000Z", finishedAt: "2026-01-02T00:05:00.000Z", environment: "staging", deliveryId: `release-publish:${release.id}:staging`, attempt: 1 },
     });
     expect(settled.applied).toBe(true);
     expect(settled.release.deploy).toMatchObject({ status: "ok" });
@@ -164,7 +165,7 @@ describe("runReleaseDeploy (audit P1)", () => {
   it("rejects a late callback for attempt 1 after attempt 2 started and leaves attempt 2 intact", async () => {
     const db = await createTestDb();
     const { service, release, stories } = await seed(db);
-    const deliveryId = `release-publish:${release.id}`;
+    const deliveryId = `release-publish:${release.id}:staging`;
     const t0 = "2026-01-02T00:00:00.000Z";
     await service.startReleaseDeploy({
       releaseId: release.id,
@@ -217,7 +218,7 @@ describe("runReleaseDeploy (audit P1)", () => {
   it("is idempotent for a duplicate callback on the current attempt", async () => {
     const db = await createTestDb();
     const { service, release, stories } = await seed(db);
-    const deliveryId = `release-publish:${release.id}`;
+    const deliveryId = `release-publish:${release.id}:staging`;
     const t0 = "2026-01-02T00:00:00.000Z";
     await service.startReleaseDeploy({
       releaseId: release.id,

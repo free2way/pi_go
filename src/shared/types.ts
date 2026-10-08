@@ -490,6 +490,16 @@ export interface ConfigStatus {
   releaseConfigured?: boolean;
 }
 
+/** Admin-only release Webhook settings. The secret itself is never returned. */
+export interface ReleaseWebhookSettingsStatus {
+  source: "web" | "environment" | "none";
+  configured: boolean;
+  webhookUrl: string | null;
+  tokenConfigured: boolean;
+  publicOrigin: string | null;
+  updatedAt: string | null;
+}
+
 export interface CurrentUser {
   id: string;
   email: string;

@@ -96,6 +96,7 @@ export type RunBudget = NonNullable<Run["budget"]>;
  * silently skipped.
  */
 export type ReleaseDeployStatus = "not_configured" | "unsupported" | "pending" | "ok" | "failed";
+export type ReleaseEnvironment = "staging" | "production";
 /**
  * A `pending` deploy older than this is considered timed out: the server
  * materializes it as `failed` (bounded verification, no callback ever arrived)
@@ -104,6 +105,7 @@ export type ReleaseDeployStatus = "not_configured" | "unsupported" | "pending" |
  */
 export const RELEASE_DEPLOY_STALE_MS = 2 * 60 * 1000;
 export interface ReleaseDeployRecord {
+  environment?: ReleaseEnvironment;
   status: ReleaseDeployStatus;
   detail: string;
   /** Last update time of this record. */

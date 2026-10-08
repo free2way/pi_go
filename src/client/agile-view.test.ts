@@ -158,6 +158,7 @@ describe("releaseDeployAction", () => {
   });
 
   it("is done for ok / not_configured / unsupported", () => {
+    expect(releaseDeployAction({ status: "ok", environment: "staging", detail: "HTTP 200", at: "2026-01-02T00:00:00.000Z" }, now)).toBe("promote");
     expect(releaseDeployAction({ status: "ok", detail: "HTTP 200", at: "2026-01-02T00:00:00.000Z" }, now)).toBe("done");
     expect(releaseDeployAction({ status: "not_configured", detail: "未配置", at: "2026-01-02T00:00:00.000Z" }, now)).toBe("done");
     expect(releaseDeployAction({ status: "unsupported", detail: "无效", at: "2026-01-02T00:00:00.000Z" }, now)).toBe("done");
