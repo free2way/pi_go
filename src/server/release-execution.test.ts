@@ -43,4 +43,23 @@ describe("executeRelease webhook", () => {
       { deliveryId: "release_1", fetchImpl: async () => { throw new Error("offline"); } },
     )).resolves.toMatchObject({ status: "failed", detail: "webhook request failed (Error)" });
   });
+
+  it("keeps a bounded JSON rejection reason so operators can diagnose 4xx responses", async () => {
+    const result = await executeRelease(
+      { configured: true, kind: "webhook", url: "https://deploy.example/hook" },
+      {},
+      {
+        deliveryId: "release_1",
+        fetchImpl: async () => new Response(JSON.stringify({ error: "repository must be a safe workspace path\n" }), {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        }),
+      },
+    );
+    expect(result).toMatchObject({
+      status: "failed",
+      httpStatus: 400,
+      detail: "HTTP 400: repository must be a safe workspace path",
+    });
+  });
 });

@@ -6,7 +6,7 @@ REMOTE_DIR="${1:-}"
 BUNDLE="${2:-}"
 INCOMING_ENV="${3:--}"
 REPLACE_ENV="${4:-0}"
-IMAGE="local/pigo-release-executor:0.2.0"
+IMAGE="local/pigo-release-executor:0.2.2"
 CONTAINER="pigo-release-executor"
 
 if [[ ! "$REMOTE_DIR" =~ ^/[A-Za-z0-9._/-]+$ || "$REMOTE_DIR" == "/" ]]; then

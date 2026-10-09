@@ -6,7 +6,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const SERVICE = "pigo-release-executor";
-const VERSION = "0.2.0";
+const VERSION = "0.2.2";
 const BODY_LIMIT = 128 * 1024;
 const LOG_LIMIT = 64 * 1024;
 const COMMAND_TIMEOUT_MS = 15 * 60_000;
@@ -46,7 +46,10 @@ export function validatePayload(value, expectedDeliveryId) {
   if (parsedCallback.protocol !== "https:") throw new Error("callbackUrl must use HTTPS");
   if (event === "run.release_requested") {
     const repository = requiredText(value.repository, "repository", 2_000);
-    if (!path.posix.isAbsolute(repository)) throw new Error("repository must be absolute");
+    if (repository.includes("\\") || (!path.posix.isAbsolute(repository)
+      && repository.split("/").some((segment) => !segment || segment === "." || segment === ".."))) {
+      throw new Error("repository must be an absolute workspace path or a safe relative workspace path");
+    }
     const commit = requiredText(value.commit, "commit", 64).toLowerCase();
     if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error("commit must be a full SHA-1");
     return { ...value, event, environment, deliveryId, attempt, callbackUrl, repository, commit };
@@ -247,7 +250,10 @@ async function imageDigest(image) {
 
 async function resolveRunTarget(config, payload) {
   const workspaceRoot = await realpath(config.workspaceRoot);
-  const repository = await realpath(payload.repository);
+  const requestedRepository = path.isAbsolute(payload.repository)
+    ? payload.repository
+    : path.join(workspaceRoot, payload.repository);
+  const repository = await realpath(requestedRepository);
   if (!pathWithin(workspaceRoot, repository)) throw new Error("repository is outside the workspace allowlist");
   const repositoryStats = await stat(repository);
   if (!repositoryStats.isDirectory()) throw new Error("repository is not a directory");
@@ -289,6 +295,9 @@ async function runDeploy(config, store, payload) {
   const env = {
     ...executorEnvironment(config, payload.environment),
     PIGO_DEPLOY_IMAGE: image,
+    // Compatibility alias for the currently reviewed order-status app contract.
+    // The value is still executor-owned; callers cannot select an image.
+    ORDER_STATUS_IMAGE: image,
     PIGO_DEPLOY_REPOSITORY: target.repository,
     PIGO_DEPLOY_COMMIT: payload.commit,
     ...(staging?.imageDigest ? { PIGO_DEPLOY_IMAGE_ID: staging.imageDigest } : {}),
@@ -461,6 +470,13 @@ export async function createExecutor(options = {}) {
         payload = validatePayload(decoded, deliveryId);
         callbackTarget(payload.callbackUrl, config.callbackPublicOrigin, config.callbackInternalOrigin);
       } catch (error) {
+        console.warn(JSON.stringify({
+          level: "warn",
+          event: "request.rejected",
+          status: 400,
+          deliveryId: deliveryId.slice(0, 200),
+          reason: (error instanceof Error ? error.message : "invalid request").slice(0, 500),
+        }));
         return json(reply, 400, { error: error.message });
       }
       const key = deliveryKey(payload);

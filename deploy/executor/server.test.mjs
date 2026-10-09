@@ -25,19 +25,21 @@ test("webhook authentication requires both bearer token and raw-body HMAC", () =
   assert.equal(authenticateWebhook({ authorization: `Bearer ${token}`, signature: `${signature}0`, rawBody, token }), false);
 });
 
-test("run payload requires fixed event, environment, delivery identity and full commit", () => {
+test("run payload accepts safe workspace-relative repositories and requires a full commit", () => {
   const payload = validatePayload({
     event: "run.release_requested",
     environment: "staging",
     deliveryId: "release:run_1:staging",
     attempt: 1,
     callbackUrl: "https://pigo.example.com/api/internal/runs/run_1/release-result",
-    repository: "/workspace/projects/order_check",
+    repository: "order_check",
     commit: "a".repeat(40),
   }, "release:run_1:staging");
   assert.equal(payload.commit, "a".repeat(40));
   assert.throws(() => validatePayload({ ...payload, environment: "qa" }, payload.deliveryId), /unsupported environment/);
   assert.throws(() => validatePayload({ ...payload, commit: "abc" }, payload.deliveryId), /full SHA-1/);
+  assert.throws(() => validatePayload({ ...payload, repository: "../outside" }, payload.deliveryId), /safe relative workspace path/);
+  assert.throws(() => validatePayload({ ...payload, repository: "nested\\outside" }, payload.deliveryId), /safe relative workspace path/);
   assert.throws(() => validatePayload(payload, "different"), /header\/body mismatch/);
 });
 

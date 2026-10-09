@@ -10,6 +10,21 @@ export interface ReleaseExecutionOutcome {
   httpStatus?: number;
 }
 
+async function webhookFailureDetail(response: Response) {
+  let reason = "";
+  try {
+    const text = (await response.text()).slice(0, 4_096);
+    if (text) {
+      const parsed = JSON.parse(text) as { error?: unknown };
+      if (typeof parsed.error === "string") reason = parsed.error;
+    }
+  } catch {
+    // The status remains authoritative when an upstream returns non-JSON text.
+  }
+  const safeReason = reason.replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 300);
+  return `HTTP ${response.status}${safeReason ? `: ${safeReason}` : ""}`;
+}
+
 /**
  * Invokes the operator-controlled publisher. HTTP delivery is authenticated and
  * idempotency-addressable; HTTP 202 is only "triggered", never final success.
@@ -42,9 +57,16 @@ export async function executeRelease(
       if (response.status === 202) {
         return { configured: true, kind: "webhook", status: "triggered", detail: "HTTP 202；等待部署系统回调", httpStatus: response.status };
       }
-      return response.ok
-        ? { configured: true, kind: "webhook", status: "succeeded", detail: `HTTP ${response.status}`, httpStatus: response.status }
-        : { configured: true, kind: "webhook", status: "failed", detail: `HTTP ${response.status}`, httpStatus: response.status };
+      if (response.ok) {
+        return { configured: true, kind: "webhook", status: "succeeded", detail: `HTTP ${response.status}`, httpStatus: response.status };
+      }
+      return {
+        configured: true,
+        kind: "webhook",
+        status: "failed",
+        detail: await webhookFailureDetail(response),
+        httpStatus: response.status,
+      };
     } catch (error) {
       return { configured: true, kind: "webhook", status: "failed", detail: `webhook request failed (${(error as Error).name || "Error"})` };
     }

@@ -4,7 +4,7 @@ services:
   executor:
     build:
       context: .
-    image: local/pigo-release-executor:0.2.0
+    image: local/pigo-release-executor:0.2.2
     container_name: pigo-release-executor
     restart: unless-stopped
     init: true

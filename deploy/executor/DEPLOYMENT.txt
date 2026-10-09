@@ -27,7 +27,7 @@ Both run with the application directory as cwd and receive only a scrubbed PATH,
 HOME and these release variables:
 
   APP_BASE_URL, ORDER_STATUS_PORT, COMPOSE_PROJECT_NAME,
-  PIGO_DEPLOY_ENVIRONMENT, PIGO_DEPLOY_IMAGE,
+  PIGO_DEPLOY_ENVIRONMENT, PIGO_DEPLOY_IMAGE, ORDER_STATUS_IMAGE,
   PIGO_DEPLOY_REPOSITORY, PIGO_DEPLOY_COMMIT
 
 Production also receives PIGO_DEPLOY_IMAGE_ID, the exact image id proven in
@@ -92,8 +92,9 @@ Copy executor.env.example to a temporary path outside the repository and fill:
     with the group id of /var/run/docker.sock.
 
   PIGO_HOST_WORKSPACE_ROOT
-    Exact host path mounted by PiGO as its workspace root. The executor maps it
-    read-only to /workspace.
+    Exact host directory that directly contains the registered repository root
+    paths used by PiGO. The executor maps it read-only to /workspace, so a PiGO
+    repository value such as project-a resolves only to /workspace/project-a.
 
   PIGO_EXECUTOR_APP_PATH
     Fixed application path relative to each repository. It cannot be absolute or
@@ -242,7 +243,7 @@ Token rotation:
 Rollback:
   The installer prints no secret and creates a rollback image tag plus a source
   backup. Restore the matching source backup, retag the rollback image as
-  local/pigo-release-executor:0.2.0, and run `docker compose up -d executor`.
+  local/pigo-release-executor:0.2.2, and run `docker compose up -d executor`.
   Never roll back executions.json independently of the deployed application;
   doing so could forget a completed delivery and permit it to run again.
 
