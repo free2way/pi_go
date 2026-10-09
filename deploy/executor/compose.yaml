@@ -4,7 +4,7 @@ services:
   executor:
     build:
       context: .
-    image: local/pigo-release-executor:0.2.3
+    image: local/pigo-release-executor:0.2.5
     container_name: pigo-release-executor
     restart: unless-stopped
     init: true
@@ -30,6 +30,8 @@ services:
       PIGO_EXECUTOR_TARGET_NETWORK: ${PIGO_EXECUTOR_TARGET_NETWORK:-pigo-release-targets}
       PIGO_EXECUTOR_STAGING_URL: ${PIGO_EXECUTOR_STAGING_URL:-http://127.0.0.1:18080}
       PIGO_EXECUTOR_PRODUCTION_URL: ${PIGO_EXECUTOR_PRODUCTION_URL:-http://127.0.0.1:18081}
+      PIGO_EXECUTOR_STAGING_PUBLIC_URL: ${PIGO_EXECUTOR_STAGING_PUBLIC_URL:-}
+      PIGO_EXECUTOR_PRODUCTION_PUBLIC_URL: ${PIGO_EXECUTOR_PRODUCTION_PUBLIC_URL:-}
       PIGO_EXECUTOR_STAGING_PORT: ${PIGO_EXECUTOR_STAGING_PORT:-18080}
       PIGO_EXECUTOR_PRODUCTION_PORT: ${PIGO_EXECUTOR_PRODUCTION_PORT:-18081}
     volumes:

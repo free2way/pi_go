@@ -660,6 +660,60 @@ button { color: inherit; }
 .release-detail { margin: 2px 17px 6px; color: #8e99a3; font-size: 10px; }
 .release-link { display: inline-flex; align-items: center; gap: 4px; margin: 2px 17px 6px; color: #8ccfff; font-size: 10px; text-decoration: none; }
 .release-config-hint { color: #808a94; font-size: 9px; }
+.release-head-actions { display: flex; align-items: center; gap: 8px; }
+.release-progress-open { display: inline-flex; align-items: center; gap: 5px; border: 0; background: transparent; color: #7e9fba; padding: 4px 2px; font: 500 9px var(--font-mono); cursor: pointer; }
+.release-progress-open:hover { color: #a8d8ff; }
+.release-progress-window { position: fixed; right: 22px; bottom: 22px; z-index: 140; width: min(560px, calc(100vw - 32px)); max-height: min(760px, calc(100vh - 44px)); overflow: hidden; border: 1px solid #303944; border-radius: 13px; background: #0c1116; color: #dfe5eb; box-shadow: 0 28px 80px rgba(0, 0, 0, .58), 0 0 0 1px rgba(116, 196, 255, .04) inset; animation: release-window-in 180ms ease-out both; }
+.release-progress-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 16px 17px 13px; border-bottom: 1px solid rgba(255,255,255,.07); background: #0f151b; }
+.release-progress-head h3 { margin: 4px 0 0; font-size: 15px; letter-spacing: -.02em; }
+.release-progress-head-actions { display: flex; align-items: center; gap: 8px; }
+.release-progress-status { display: inline-flex; align-items: center; gap: 6px; border: 1px solid #313a43; border-radius: 999px; padding: 4px 8px; color: #8a96a1; font: 500 9px var(--font-mono); white-space: nowrap; }
+.release-progress-status i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: release-status-pulse 1.4s ease-in-out infinite; }
+.release-progress-status.is-running { color: #8ccfff; border-color: rgba(116,196,255,.28); background: rgba(116,196,255,.06); }
+.release-progress-status.is-succeeded { color: #75d7a8; border-color: rgba(77,205,150,.28); background: rgba(77,205,150,.06); }
+.release-progress-status.is-failed { color: #ff9f91; border-color: rgba(255,112,91,.28); background: rgba(255,112,91,.06); }
+.release-progress-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-bottom: 1px solid rgba(255,255,255,.07); }
+.release-progress-summary > div { min-width: 0; padding: 11px 13px; border-right: 1px solid rgba(255,255,255,.06); }
+.release-progress-summary > div:last-child { border-right: 0; }
+.release-progress-summary span { display: block; margin-bottom: 4px; color: #687581; font-size: 8px; text-transform: uppercase; letter-spacing: .06em; }
+.release-progress-summary strong { display: block; overflow: hidden; color: #cbd4dc; font: 600 10px var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
+.release-progress-confirm { display: flex; align-items: flex-start; gap: 12px; margin: 18px 17px 4px; padding: 15px 0; color: #8ccfff; }
+.release-progress-confirm > div { min-width: 0; }
+.release-progress-confirm strong { display: block; color: #e1e7ed; font-size: 12px; }
+.release-progress-confirm p { margin: 6px 0 0; color: #7c8995; font-size: 10px; line-height: 1.6; }
+.release-progress-body { max-height: 470px; overflow-y: auto; padding: 15px 17px 5px; }
+.release-progress-timeline { list-style: none; margin: 0; padding: 0; }
+.release-progress-timeline li { position: relative; display: grid; grid-template-columns: 24px minmax(0, 1fr); gap: 9px; min-height: 47px; }
+.release-progress-timeline li:not(:last-child)::after { content: ""; position: absolute; left: 11px; top: 25px; bottom: 2px; width: 1px; background: #28313a; }
+.release-progress-timeline li > span { position: relative; z-index: 1; display: grid; place-items: center; width: 22px; height: 22px; border: 1px solid #313a43; border-radius: 50%; background: #0c1116; color: #58636d; }
+.release-progress-timeline li > div { padding: 2px 0 10px; min-width: 0; }
+.release-progress-timeline strong { display: block; color: #9da8b2; font-size: 10px; font-weight: 600; }
+.release-progress-timeline small { display: block; margin-top: 3px; overflow-wrap: anywhere; color: #5f6b76; font: 9px/1.5 var(--font-mono); }
+.release-progress-timeline li.is-active > span { color: #8ccfff; border-color: rgba(116,196,255,.5); box-shadow: 0 0 0 4px rgba(116,196,255,.06); }
+.release-progress-timeline li.is-active strong { color: #d9ecfb; }
+.release-progress-timeline li.is-done > span { color: #75d7a8; border-color: rgba(77,205,150,.4); }
+.release-progress-timeline li.is-done strong { color: #b9c6d0; }
+.release-progress-timeline li.is-failed > span { color: #ff9f91; border-color: rgba(255,112,91,.48); }
+.release-progress-timeline li.is-failed strong, .release-progress-timeline li.is-failed small { color: #f2a397; }
+.release-progress-log { margin-top: 4px; border-top: 1px solid rgba(255,255,255,.07); padding: 13px 0 5px; }
+.release-progress-log > div { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 7px; }
+.release-progress-log > div span { color: #aab5bf; font-size: 9px; font-weight: 650; }
+.release-progress-log > div small { color: #596570; font-size: 8px; }
+.release-progress-log p { display: grid; grid-template-columns: 62px minmax(0, 1fr); gap: 8px; margin: 0; padding: 4px 0; color: #84919c; font-size: 9px; line-height: 1.4; }
+.release-progress-log time { color: #52606b; font-family: var(--font-mono); }
+.release-progress-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 17px 14px; border-top: 1px solid rgba(255,255,255,.07); }
+.release-progress-actions a { text-decoration: none; }
+.release-progress-error { margin: 10px 17px 0; }
+.release-progress-footnote { margin: -7px 17px 13px; color: #57636e; font-size: 8px; text-align: right; }
+@keyframes release-window-in { from { opacity: 0; transform: translateY(10px) scale(.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
+@keyframes release-status-pulse { 0%, 100% { opacity: .45; box-shadow: 0 0 0 0 currentColor; } 50% { opacity: 1; box-shadow: 0 0 0 4px transparent; } }
+@media (max-width: 640px) {
+  .release-progress-window { right: 8px; bottom: 8px; width: calc(100vw - 16px); max-height: calc(100vh - 16px); }
+  .release-progress-summary { grid-template-columns: 1fr 1fr; }
+  .release-progress-summary > div:nth-child(2) { border-right: 0; }
+  .release-progress-summary > div:nth-child(-n+2) { border-bottom: 1px solid rgba(255,255,255,.06); }
+}
+@media (prefers-reduced-motion: reduce) { .release-progress-window, .release-progress-status i { animation: none; } }
 
 /* SYS-01: read-only system status dashboard. */
 .sys-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }

@@ -66,6 +66,12 @@ Bearer token. The callback's public origin and /api/internal/ path are allowlist
 before the URL is optionally rewritten to the internal PiGO origin. This avoids
 sending the callback through a Cloudflare Access email login page.
 
+For run deployments, the executor also sends best-effort, attempt-scoped
+progress callbacks for validating, deploying, networking, smoke and verifying.
+PiGO writes them to the existing run event stream so the release progress window
+updates live. A progress callback failure is logged but never changes the deploy
+result; only the terminal succeeded/failed callback settles the release.
+
 Prerequisites
 -------------
   - Linux Docker host with Docker Compose v2, curl, tar, gzip and openssl
@@ -120,10 +126,15 @@ Copy executor.env.example to a temporary path outside the repository and fill:
     pigo-release-targets. Do not reuse the PiGO application/database network.
 
   PIGO_EXECUTOR_STAGING_URL / PIGO_EXECUTOR_PRODUCTION_URL
-    Publicly meaningful URLs stored with the result. For host.docker.internal
-    URLs, the executor resolves the one container publishing the configured port,
+    Internal deployment and smoke-check URLs. For host.docker.internal URLs,
+    the executor resolves the one container publishing the configured port,
     attaches it to the dedicated internal network, and gives smoke.sh a private
     container address. Host ports can therefore remain bound to 127.0.0.1.
+
+  PIGO_EXECUTOR_STAGING_PUBLIC_URL / PIGO_EXECUTOR_PRODUCTION_PUBLIC_URL
+    Optional browser-facing HTTP(S) URLs returned to PiGO after success. Keep
+    these blank until the deployed application is exposed by an authenticated
+    reverse proxy or tunnel. Container-only and loopback hosts are rejected.
 
   PIGO_EXECUTOR_STAGING_PORT / PIGO_EXECUTOR_PRODUCTION_PORT
     Distinct host ports passed to the fixed deployment script.
@@ -251,7 +262,7 @@ Token rotation:
 Rollback:
   The installer prints no secret and creates a rollback image tag plus a source
   backup. Restore the matching source backup, retag the rollback image as
-  local/pigo-release-executor:0.2.3, and run `docker compose up -d executor`.
+  local/pigo-release-executor:0.2.5, and run `docker compose up -d executor`.
   Never roll back executions.json independently of the deployed application;
   doing so could forget a completed delivery and permit it to run again.
 

@@ -6,7 +6,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const SERVICE = "pigo-release-executor";
-const VERSION = "0.2.3";
+const VERSION = "0.2.5";
 const BODY_LIMIT = 128 * 1024;
 const LOG_LIMIT = 64 * 1024;
 const COMMAND_TIMEOUT_MS = 15 * 60_000;
@@ -343,7 +343,8 @@ async function resolveRunTarget(config, payload) {
   return { repository, appDirectory, deployScript, smokeScript };
 }
 
-async function runDeploy(config, store, payload) {
+async function runDeploy(config, store, payload, reportProgress = async () => undefined) {
+  await reportProgress("validating", "workspace and reviewed commit validation started");
   const target = await resolveRunTarget(config, payload);
   const image = `${config.imageRepository}:${payload.commit}`;
   let staging;
@@ -365,9 +366,13 @@ async function runDeploy(config, store, payload) {
     PIGO_DEPLOY_COMMIT: payload.commit,
     ...(staging?.imageDigest ? { PIGO_DEPLOY_IMAGE_ID: staging.imageDigest } : {}),
   };
+  await reportProgress("deploying", "fixed deployment script started");
   await command(target.deployScript, [payload.environment, payload.commit], { cwd: target.appDirectory, env });
+  await reportProgress("networking", "private smoke network is being prepared");
   const smokeUrl = await prepareSmokeUrl(config, payload.environment);
+  await reportProgress("smoke", "readiness and functional smoke checks started");
   await command(target.smokeScript, [], { cwd: target.appDirectory, env: { ...env, APP_BASE_URL: smokeUrl } });
+  await reportProgress("verifying", "immutable image digest verification started");
   const digest = await imageDigest(image);
   if (payload.environment === "production") {
     if (digest !== staging.imageDigest) throw new Error("production deployment changed the staging image digest");
@@ -375,7 +380,9 @@ async function runDeploy(config, store, payload) {
   return {
     detail: `${payload.environment} deploy and smoke checks passed`,
     deploymentId: `order-status-${payload.environment}-${payload.commit.slice(0, 12)}`,
-    url: payload.environment === "staging" ? config.stagingUrl : config.productionUrl,
+    ...(payload.environment === "staging"
+      ? config.stagingPublicUrl ? { url: config.stagingPublicUrl } : {}
+      : config.productionPublicUrl ? { url: config.productionPublicUrl } : {}),
     commit: payload.commit,
     image,
     imageDigest: digest,
@@ -430,6 +437,24 @@ async function postCallback(config, payload, outcome) {
   throw lastError;
 }
 
+export async function postProgress(config, payload, stage, detail) {
+  if (payload.event !== "run.release_requested") return;
+  const url = callbackTarget(payload.callbackUrl, config.callbackPublicOrigin, config.callbackInternalOrigin);
+  const response = await (config.fetchImpl ?? fetch)(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${config.token}` },
+    body: JSON.stringify({
+      deliveryId: payload.deliveryId,
+      attempt: payload.attempt,
+      status: "progress",
+      stage,
+      detail: detail.slice(0, 500),
+    }),
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (!response.ok) throw new Error(`progress callback returned HTTP ${response.status}`);
+}
+
 export function loadConfig(environment = process.env) {
   const token = environment.PIGO_EXECUTOR_TOKEN?.trim() ?? "";
   if (token.length < 32) throw new Error("PIGO_EXECUTOR_TOKEN must contain at least 32 characters");
@@ -452,6 +477,19 @@ export function loadConfig(environment = process.env) {
   if (!/^[a-z0-9][a-z0-9._/-]*$/i.test(imageRepository)) throw new Error("PIGO_EXECUTOR_IMAGE_REPOSITORY is invalid");
   const targetNetwork = environment.PIGO_EXECUTOR_TARGET_NETWORK || "pigo-release-targets";
   if (!/^[a-z0-9][a-z0-9_.-]*$/i.test(targetNetwork)) throw new Error("PIGO_EXECUTOR_TARGET_NETWORK is invalid");
+  const publicUrl = (name) => {
+    const raw = environment[name]?.trim() || "";
+    if (!raw) return "";
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") throw new Error(`${name} must use HTTP or HTTPS`);
+    if (parsed.username || parsed.password) throw new Error(`${name} must not contain credentials`);
+    const hostname = parsed.hostname.toLowerCase();
+    if (hostname === "host.docker.internal" || hostname === "localhost" || hostname === "0.0.0.0"
+      || hostname === "::1" || hostname.startsWith("127.")) {
+      throw new Error(`${name} must be reachable from a user's browser`);
+    }
+    return parsed.toString();
+  };
   return {
     token,
     host: environment.HOST || "127.0.0.1",
@@ -465,6 +503,8 @@ export function loadConfig(environment = process.env) {
     targetNetwork,
     stagingUrl: environment.PIGO_EXECUTOR_STAGING_URL || "http://127.0.0.1:18080",
     productionUrl: environment.PIGO_EXECUTOR_PRODUCTION_URL || "http://127.0.0.1:18081",
+    stagingPublicUrl: publicUrl("PIGO_EXECUTOR_STAGING_PUBLIC_URL"),
+    productionPublicUrl: publicUrl("PIGO_EXECUTOR_PRODUCTION_PUBLIC_URL"),
     stagingPort,
     productionPort,
   };
@@ -478,9 +518,16 @@ export async function createExecutor(options = {}) {
 
   async function processDelivery(payload, key) {
     let outcome;
+    const reportProgress = async (stage, detail) => {
+      try {
+        await postProgress(config, payload, stage, detail);
+      } catch (error) {
+        console.warn(JSON.stringify({ level: "warn", event: "progress.callback_failed", deliveryId: payload.deliveryId, attempt: payload.attempt, stage, message: error.message }));
+      }
+    };
     try {
       const result = payload.event === "run.release_requested"
-        ? await runDeploy(config, store, payload)
+        ? await runDeploy(config, store, payload, reportProgress)
         : await runReleaseRegistration(store, payload);
       outcome = { status: "succeeded", ...result };
     } catch (error) {

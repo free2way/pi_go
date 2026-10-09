@@ -12,6 +12,7 @@ import {
   createExecutor,
   loadConfig,
   pathWithin,
+  postProgress,
   prepareSmokeUrl,
   validatePayload,
 } from "./server.mjs";
@@ -84,10 +85,13 @@ test("configuration fails closed for missing origin, weak token and invalid port
   };
   assert.equal(loadConfig(valid).port, 3300);
   assert.equal(loadConfig(valid).targetNetwork, "pigo-release-targets");
+  assert.equal(loadConfig(valid).stagingPublicUrl, "");
+  assert.equal(loadConfig({ ...valid, PIGO_EXECUTOR_STAGING_PUBLIC_URL: "https://staging.example.com/app" }).stagingPublicUrl, "https://staging.example.com/app");
   assert.throws(() => loadConfig({ ...valid, PIGO_EXECUTOR_CALLBACK_ORIGIN: "" }), /CALLBACK_ORIGIN is required/);
   assert.throws(() => loadConfig({ ...valid, PIGO_EXECUTOR_TOKEN: "too-short" }), /at least 32/);
   assert.throws(() => loadConfig({ ...valid, PORT: "70000" }), /integer TCP port/);
   assert.throws(() => loadConfig({ ...valid, PIGO_EXECUTOR_TARGET_NETWORK: "unsafe/network" }), /TARGET_NETWORK is invalid/);
+  assert.throws(() => loadConfig({ ...valid, PIGO_EXECUTOR_STAGING_PUBLIC_URL: "http://host.docker.internal:18080" }), /user's browser/);
 });
 
 test("host-gateway smoke URL resolves through the dedicated target network", async () => {
@@ -129,6 +133,39 @@ test("non-host smoke URL passes through without Docker network mutation", async 
   }, "staging", async () => { called = true; });
   assert.equal(url, "https://staging.example.com");
   assert.equal(called, false);
+});
+
+test("run deployments emit authenticated, attempt-scoped progress callbacks", async () => {
+  let observed;
+  const config = {
+    token,
+    callbackPublicOrigin: "https://pigo.example.com",
+    callbackInternalOrigin: "http://web:3100",
+    fetchImpl: async (url, options) => {
+      observed = { url, options };
+      return { ok: true, status: 200 };
+    },
+  };
+  const payload = {
+    event: "run.release_requested",
+    deliveryId: "release:run_1:staging",
+    attempt: 3,
+    callbackUrl: "https://pigo.example.com/api/internal/runs/run_1/release-result",
+  };
+  await postProgress(config, payload, "smoke", "functional checks started");
+  assert.equal(observed.url, "http://web:3100/api/internal/runs/run_1/release-result");
+  assert.equal(observed.options.headers.Authorization, `Bearer ${token}`);
+  assert.deepEqual(JSON.parse(observed.options.body), {
+    deliveryId: payload.deliveryId,
+    attempt: 3,
+    status: "progress",
+    stage: "smoke",
+    detail: "functional checks started",
+  });
+
+  observed = undefined;
+  await postProgress(config, { ...payload, event: "release.published" }, "smoke", "ignored");
+  assert.equal(observed, undefined);
 });
 
 test("host-gateway smoke resolution fails closed when the published port is ambiguous", async () => {
