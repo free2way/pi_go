@@ -59,6 +59,8 @@ import { projectCreateSchema, projectPatchSchema, releaseCreateSchema, releasePa
 import { executeRelease } from "./release-execution.js";
 import { isReleasePublishTerminal, planReleaseDeployCallback, planReleasePublish, planReleasePublishGate, RELEASE_DEPLOY_STALE_MS, RELEASE_PUBLISH_POLICY } from "./release-publish.js";
 import { runReleaseDeploy } from "./release-deploy.js";
+import compress from "@fastify/compress";
+import { cacheControlFor, isBuildAssetRequest } from "./static-cache.js";
 import type { RunStoreLike } from "./store.js";
 import { WorkspaceError, WorkspaceService } from "./workspaces.js";
 
@@ -71,6 +73,11 @@ const app = Fastify({
   },
   bodyLimit: 64 * 1024,
 });
+
+// 响应压缩：JS/CSS/JSON 未压缩时要传 ~700 KB（实测首屏 702 KB JS），压缩后约 1/4。
+// 必须注册在任何路由之前才生效；`@fastify/compress` 的默认可压缩类型显式排除
+// `text/event-stream`，所以运行事件流（SSE）不会被压缩/缓冲。
+await app.register(compress, { global: true, encodings: ["br", "gzip", "deflate"], threshold: 1024 });
 const port = Number(process.env.PORT || 3100);
 const host = process.env.HOST || "localhost";
 const webVersion = process.env.PI_WEB_VERSION?.trim() || "0.27.5";
@@ -481,11 +488,13 @@ const runDirectoryCleaner: RunDirectoryCleaner = ({ runId, ownerId, dryRun }) =>
     body: JSON.stringify({ ownerId, dryRun }),
   });
 
-app.addHook("onSend", async (_request, reply, payload) => {
+app.addHook("onSend", async (request, reply, payload) => {
   reply.header("X-Content-Type-Options", "nosniff");
   reply.header("Referrer-Policy", "same-origin");
   reply.header("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
-  reply.header("Cache-Control", "no-store");
+  // 按路径区分：API 不缓存；带 hash 的构建产物长缓存 immutable；index.html/SPA 回退走
+  // no-cache（每次校验）。策略见 static-cache.ts，那里有单元测试。
+  reply.header("Cache-Control", cacheControlFor(request.url));
   return payload;
 });
 
@@ -2328,13 +2337,23 @@ const releaseSchema = z.object({
   confirm: z.literal(true),
   retry: z.boolean().optional(),
 });
-const releaseResultSchema = z.object({
-  deliveryId: z.string().trim().min(8).max(120),
-  status: z.enum(["succeeded", "failed"]),
-  detail: z.string().trim().max(500).optional(),
-  deploymentId: z.string().trim().max(200).optional(),
-  url: z.string().url().max(1_000).optional(),
-});
+const releaseResultSchema = z.discriminatedUnion("status", [
+  z.object({
+    deliveryId: z.string().trim().min(8).max(120),
+    attempt: z.number().int().min(1).optional(),
+    status: z.literal("progress"),
+    stage: z.enum(["validating", "deploying", "networking", "smoke", "verifying"]),
+    detail: z.string().trim().max(500).optional(),
+  }).strict(),
+  z.object({
+    deliveryId: z.string().trim().min(8).max(120),
+    attempt: z.number().int().min(1).optional(),
+    status: z.enum(["succeeded", "failed"]),
+    detail: z.string().trim().max(500).optional(),
+    deploymentId: z.string().trim().max(200).optional(),
+    url: z.string().url().max(1_000).optional(),
+  }).strict(),
+]);
 /** Final-status callback for an asynchronous agile release deploy. */
 const releaseDeployResultSchema = z.object({
   deliveryId: z.string().trim().min(8).max(120),
@@ -2647,6 +2666,37 @@ app.post<{ Params: { id: string } }>("/api/internal/runs/:id/release-result", as
   const current = run.release;
   if (!current || current.deliveryId !== parsed.data.deliveryId) {
     return reply.code(409).send({ error: "Release delivery id does not match", code: "RELEASE_DELIVERY_MISMATCH" });
+  }
+  if ((parsed.data.attempt !== undefined && parsed.data.attempt !== current.attempt)
+    || (parsed.data.attempt === undefined && current.attempt > 1)) {
+    return reply.code(409).send({ error: "Release callback attempt is stale", code: "RELEASE_ATTEMPT_STALE", attempt: current.attempt });
+  }
+  if (parsed.data.status === "progress") {
+    if (current.status !== "triggered" && current.status !== "publishing") {
+      return reply.code(409).send({ error: `Release is already ${current.status}`, code: "RELEASE_ALREADY_FINAL" });
+    }
+    const progressMessages: Record<typeof parsed.data.stage, string> = {
+      validating: "正在校验工作区与审核提交",
+      deploying: "正在执行受控部署脚本",
+      networking: "正在准备隔离的冒烟检查网络",
+      smoke: "正在执行健康检查与业务冒烟测试",
+      verifying: "正在校验不可变镜像摘要",
+    };
+    await store.appendEvent({
+      runId: run.id,
+      round: run.round,
+      source: "system",
+      type: "run.release_progress",
+      message: progressMessages[parsed.data.stage],
+      at: new Date().toISOString(),
+      meta: {
+        deliveryId: current.deliveryId,
+        attempt: current.attempt,
+        stage: parsed.data.stage,
+        ...(parsed.data.detail ? { detail: parsed.data.detail } : {}),
+      },
+    }, { deliveryId: `release-progress:${current.deliveryId}:${current.attempt}:${parsed.data.stage}` });
+    return { ok: true, release: current, progress: parsed.data.stage };
   }
   if (current.status === parsed.data.status) {
     await store.appendEvent({
@@ -3413,6 +3463,9 @@ if (existsSync(staticRoot)) {
   await app.register(fastifyStatic, { root: staticRoot, prefix: "/" });
   app.setNotFoundHandler((request, reply) => {
     if (request.url.startsWith("/api/")) return reply.code(404).send({ error: "Not found" });
+    // 构建产物缺失就是真的缺失：回退成 index.html 会让浏览器把 HTML 当 JS/CSS 解析
+    // （旧 hash 的请求在重新发布后就会这样），这里的 404 让它显式失败。
+    if (isBuildAssetRequest(request.url)) return reply.code(404).send({ error: "Not found" });
     return reply.sendFile("index.html");
   });
 }
