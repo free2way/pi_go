@@ -91,6 +91,10 @@ tests/e2e/      Playwright 端到端验收
 - Reviewer 通过后仍需 Human Gate；合并和发布均为显式操作，并留下审计记录。
 - 插件默认关闭，仅允许经审核、固定摘要的插件进入 Worker。
 
+## 许可证
+
+PiGO 采用 [GNU Affero General Public License v3.0](LICENSE)（仅限第 3 版，SPDX：`AGPL-3.0-only`）许可。
+
 ---
 
 PiGO 的目标很直接：让一个人能够像带领一支小型工程团队一样组织 AI——并行开发、独立审核、持续返修，最终交付可验收的代码。

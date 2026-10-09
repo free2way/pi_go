@@ -91,6 +91,10 @@ tests/e2e/      Playwright end-to-end acceptance
 - Reviewer approval still leads to a Human Gate. Merge and publishing are explicit, audited actions.
 - Plugins are disabled by default and only reviewed, digest-pinned plugins may enter the Worker.
 
+## License
+
+PiGO is licensed under the [GNU Affero General Public License v3.0](LICENSE) (version 3 only; SPDX: `AGPL-3.0-only`).
+
 ---
 
 PiGO has one clear goal: let one person lead AI like a small engineering team—develop in parallel, review independently, repair continuously, and ship code that can be accepted with evidence.
