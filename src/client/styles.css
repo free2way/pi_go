@@ -296,6 +296,8 @@ button { color: inherit; }
 .welcome-orbit > i:nth-of-type(3) { bottom: 8px; right: 28px; background: var(--green); }
 .modal-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 18px; background: rgba(3,5,7,.78); backdrop-filter: blur(7px); }
 .modal { width: min(540px, 100%); border: 1px solid #2b323a; background: #0e1216; border-radius: 13px; padding: 20px; box-shadow: 0 30px 80px rgba(0,0,0,.5); }
+.create-run-modal { max-height: calc(100dvh - 36px); overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.create-run-modal .modal-actions { position: sticky; bottom: -20px; z-index: 3; margin: 19px -20px -20px; padding: 12px 20px 20px; border-top: 1px solid #20262d; background: rgba(14,18,22,.98); backdrop-filter: blur(8px); }
 .modal-head { display: flex; justify-content: space-between; align-items: flex-start; }
 .modal h2 { margin: 5px 0 18px; font-size: 21px; letter-spacing: -.04em; }
 .mode-picker { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; margin: 0 0 10px; }
@@ -551,7 +553,11 @@ button { color: inherit; }
 .history-note-kind.kind-reject { color: #e08383; border-color: rgba(242,113,113,.22); }
 .history-note-list p { margin: 7px 0 0; color: #c3cad1; font-size: 10px; line-height: 1.7; white-space: pre-wrap; word-break: break-word; }
 
-.recent-requirements { margin-top: 10px; }
+.recent-requirements { margin-top: 12px; border-top: 1px solid #20262d; padding-top: 10px; }
+.recent-requirements summary { display: flex; align-items: center; width: max-content; max-width: 100%; cursor: pointer; color: #69737d; list-style: none; }
+.recent-requirements summary::-webkit-details-marker { display: none; }
+.recent-requirements summary::before { content: "+"; display: inline-grid; place-items: center; width: 16px; height: 16px; margin-right: 6px; border: 1px solid #2a3138; border-radius: 5px; color: #818b94; font: 11px "DM Mono", monospace; }
+.recent-requirements[open] summary::before { content: "−"; }
 .recent-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
 .recent-item { display: block; text-align: left; max-width: 240px; border: 1px solid #262d34; background: #101419; border-radius: 8px; padding: 7px 10px; cursor: pointer; }
 .recent-item:hover { border-color: #3b444d; background: #14181d; }

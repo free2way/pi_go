@@ -45,9 +45,9 @@ test.describe("run creation error paths", () => {
     const config = await configStatus(page.request);
     test.skip(!config.demoMode, "Demo mode is disabled (PI_DEMO_MODE=false); the dialog needs a runnable mode to submit.");
 
-    // The create dialog is tall; give it room so the error banner cannot push
-    // the submit button below the fold (the modal itself is not scrollable).
-    await page.setViewportSize({ width: 1280, height: 1080 });
+    // The create dialog owns its scroll area and keeps the action bar reachable
+    // even when an error banner adds content below the form fields.
+    await page.setViewportSize({ width: 1280, height: 720 });
 
     let message = "Invalid request";
     let status = 400;
@@ -61,6 +61,20 @@ test.describe("run creation error paths", () => {
     await page.goto("/");
     await page.getByRole("button", { name: /新建任务/ }).click();
     await expect(page.getByRole("heading", { name: "创建开发任务" })).toBeVisible();
+    await expect(page.locator(".create-run-modal")).toHaveCSS("overflow-y", "auto");
+    await expect(page.locator(".create-run-modal .modal-actions")).toBeVisible();
+
+    if (config.realRunsAvailable) {
+      await page.locator(".mode-picker button").nth(1).click();
+      const checkCommands = page.locator(".create-run-checks textarea");
+      await expect(checkCommands).toBeVisible();
+      await checkCommands.scrollIntoViewIfNeeded();
+      await expect(checkCommands).toBeInViewport();
+      const checksTop = await page.locator(".create-run-checks").evaluate((element) => element.getBoundingClientRect().top);
+      const historyTop = await page.locator(".recent-requirements").evaluate((element) => element.getBoundingClientRect().top);
+      expect(checksTop).toBeLessThan(historyTop);
+      await page.locator(".mode-picker button").first().click();
+    }
 
     await page.getByLabel("任务名称").fill(`E2E 400 ${Date.now()}`);
     await page.getByRole("button", { name: "运行演示" }).click();

@@ -564,7 +564,7 @@ function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, onGoWor
   };
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
-      <form className="modal" onSubmit={submit} onMouseDown={(event) => event.stopPropagation()}>
+      <form className="modal create-run-modal" onSubmit={submit} onMouseDown={(event) => event.stopPropagation()}>
         <div className="modal-head">
           <div><span className="eyebrow">NEW WORKFLOW</span><h2>{t("createRun.title")}</h2></div>
           <button className="icon-button" type="button" onClick={onClose}><X size={18} /></button>
@@ -643,9 +643,10 @@ function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, onGoWor
           )
         ) : <label>{t("createRun.repository")}<input value={repository} onChange={(event) => setRepository(event.target.value)} /></label>}
         <label>{t("createRun.task")}<textarea rows={5} value={task} onChange={(event) => setTask(event.target.value)} /></label>
+        {mode === "real" && <label className="create-run-checks">{t("createRun.checks")}<textarea rows={4} value={checks} onChange={(event) => setChecks(event.target.value)} placeholder="npm test" /></label>}
         {recentRuns.length > 0 && (
-          <div className="recent-requirements">
-            <span className="eyebrow">{t("createRun.recent")}</span>
+          <details className="recent-requirements">
+            <summary><span className="eyebrow">{t("createRun.recent")}</span></summary>
             <div className="recent-list">
               {recentRuns.slice(0, 5).map((item) => (
                 <button
@@ -660,9 +661,8 @@ function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, onGoWor
                 </button>
               ))}
             </div>
-          </div>
+          </details>
         )}
-        {mode === "real" && <label>{t("createRun.checks")}<textarea rows={3} value={checks} onChange={(event) => setChecks(event.target.value)} placeholder="npm test" /></label>}
         {error && <div className="form-error">{error}</div>}
         <div className="modal-actions">
           <button type="button" className="button secondary" onClick={onClose}>{t("common.cancel")}</button>
