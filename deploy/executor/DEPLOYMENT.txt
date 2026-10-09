@@ -114,8 +114,16 @@ Copy executor.env.example to a temporary path outside the repository and fill:
   PIGO_EXECUTOR_IMAGE_REPOSITORY
     Fixed local image repository used by ops/deploy.sh.
 
+  PIGO_EXECUTOR_TARGET_NETWORK
+    Dedicated internal Docker network used only between the executor and the
+    deployed application during smoke checks. The default is
+    pigo-release-targets. Do not reuse the PiGO application/database network.
+
   PIGO_EXECUTOR_STAGING_URL / PIGO_EXECUTOR_PRODUCTION_URL
-    URLs used by smoke.sh and stored with the result.
+    Publicly meaningful URLs stored with the result. For host.docker.internal
+    URLs, the executor resolves the one container publishing the configured port,
+    attaches it to the dedicated internal network, and gives smoke.sh a private
+    container address. Host ports can therefore remain bound to 127.0.0.1.
 
   PIGO_EXECUTOR_STAGING_PORT / PIGO_EXECUTOR_PRODUCTION_PORT
     Distinct host ports passed to the fixed deployment script.
@@ -243,7 +251,7 @@ Token rotation:
 Rollback:
   The installer prints no secret and creates a rollback image tag plus a source
   backup. Restore the matching source backup, retag the rollback image as
-  local/pigo-release-executor:0.2.2, and run `docker compose up -d executor`.
+  local/pigo-release-executor:0.2.3, and run `docker compose up -d executor`.
   Never roll back executions.json independently of the deployed application;
   doing so could forget a completed delivery and permit it to run again.
 

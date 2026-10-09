@@ -4,7 +4,7 @@ services:
   executor:
     build:
       context: .
-    image: local/pigo-release-executor:0.2.2
+    image: local/pigo-release-executor:0.2.3
     container_name: pigo-release-executor
     restart: unless-stopped
     init: true
@@ -14,6 +14,7 @@ services:
         host_ip: 127.0.0.1
     networks:
       - pigo-network
+      - release-targets
     extra_hosts:
       - host.docker.internal:host-gateway
     environment:
@@ -26,6 +27,7 @@ services:
       PIGO_EXECUTOR_CALLBACK_ORIGIN: ${PIGO_EXECUTOR_CALLBACK_ORIGIN:?Set the public PiGO origin}
       PIGO_EXECUTOR_CALLBACK_INTERNAL_ORIGIN: ${PIGO_EXECUTOR_CALLBACK_INTERNAL_ORIGIN:?Set the host-local PiGO origin}
       PIGO_EXECUTOR_IMAGE_REPOSITORY: ${PIGO_EXECUTOR_IMAGE_REPOSITORY:-local/order-status-app}
+      PIGO_EXECUTOR_TARGET_NETWORK: ${PIGO_EXECUTOR_TARGET_NETWORK:-pigo-release-targets}
       PIGO_EXECUTOR_STAGING_URL: ${PIGO_EXECUTOR_STAGING_URL:-http://127.0.0.1:18080}
       PIGO_EXECUTOR_PRODUCTION_URL: ${PIGO_EXECUTOR_PRODUCTION_URL:-http://127.0.0.1:18081}
       PIGO_EXECUTOR_STAGING_PORT: ${PIGO_EXECUTOR_STAGING_PORT:-18080}
@@ -61,3 +63,6 @@ networks:
   pigo-network:
     name: ${PIGO_DOCKER_NETWORK:-pi-agent-network}
     external: true
+  release-targets:
+    name: ${PIGO_EXECUTOR_TARGET_NETWORK:-pigo-release-targets}
+    internal: true

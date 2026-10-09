@@ -6,7 +6,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const SERVICE = "pigo-release-executor";
-const VERSION = "0.2.2";
+const VERSION = "0.2.3";
 const BODY_LIMIT = 128 * 1024;
 const LOG_LIMIT = 64 * 1024;
 const COMMAND_TIMEOUT_MS = 15 * 60_000;
@@ -240,6 +240,69 @@ function executorEnvironment(config, environment) {
   };
 }
 
+function parseDockerInspect(stdout, containerId) {
+  let parsed;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    throw new Error(`Docker returned invalid inspect data for ${containerId}`);
+  }
+  if (!Array.isArray(parsed) || parsed.length !== 1 || !parsed[0]?.NetworkSettings) {
+    throw new Error(`Docker returned incomplete inspect data for ${containerId}`);
+  }
+  return parsed[0];
+}
+
+/**
+ * Resolve a host-gateway URL to the one container that owns the configured
+ * published port. The published port intentionally remains loopback-only on
+ * the host; smoke traffic instead crosses a dedicated internal Docker network.
+ */
+export async function prepareSmokeUrl(config, environment, runCommand = command) {
+  const configuredUrl = environment === "staging" ? config.stagingUrl : config.productionUrl;
+  const configuredPort = environment === "staging" ? config.stagingPort : config.productionPort;
+  const target = new URL(configuredUrl);
+  if (target.hostname !== "host.docker.internal") return configuredUrl;
+  if (target.protocol !== "http:") throw new Error("host.docker.internal smoke URL must use HTTP");
+  const publishedPort = Number(target.port || 80);
+  if (publishedPort !== configuredPort) {
+    throw new Error(`smoke URL port ${publishedPort} does not match the configured deploy port ${configuredPort}`);
+  }
+
+  const dockerEnv = executorEnvironment(config, environment);
+  const listed = await runCommand("docker", [
+    "ps", "--filter", "status=running", "--filter", `publish=${publishedPort}`, "--format", "{{.ID}}",
+  ], { timeout: 30_000, env: dockerEnv });
+  const containerIds = listed.stdout.split(/\s+/).filter(Boolean);
+  if (containerIds.length !== 1 || !/^[0-9a-f]{12,64}$/i.test(containerIds[0])) {
+    throw new Error(`expected exactly one running container publishing TCP port ${publishedPort}; found ${containerIds.length}`);
+  }
+  const containerId = containerIds[0];
+  const inspect = async () => parseDockerInspect((await runCommand(
+    "docker", ["inspect", containerId], { timeout: 30_000, env: dockerEnv },
+  )).stdout, containerId);
+  let container = await inspect();
+  const matchingPorts = Object.entries(container.NetworkSettings.Ports ?? {})
+    .filter(([key, bindings]) => key.endsWith("/tcp") && Array.isArray(bindings)
+      && bindings.some((binding) => Number(binding?.HostPort) === publishedPort))
+    .map(([key]) => Number(key.split("/")[0]))
+    .filter((port) => Number.isInteger(port) && port > 0 && port <= 65_535);
+  if (matchingPorts.length !== 1) {
+    throw new Error(`could not resolve one container TCP port for published port ${publishedPort}`);
+  }
+
+  const targetNetwork = config.targetNetwork || "pigo-release-targets";
+  if (!container.NetworkSettings.Networks?.[targetNetwork]) {
+    await runCommand("docker", ["network", "connect", targetNetwork, containerId], { timeout: 30_000, env: dockerEnv });
+    container = await inspect();
+  }
+  const address = container.NetworkSettings.Networks?.[targetNetwork]?.IPAddress;
+  if (typeof address !== "string" || !/^\d{1,3}(?:\.\d{1,3}){3}$/.test(address)) {
+    throw new Error(`container did not receive an IPv4 address on ${targetNetwork}`);
+  }
+  return `http://${address}:${matchingPorts[0]}${target.pathname === "/" ? "" : target.pathname}${target.search}`;
+}
+
 async function imageDigest(image) {
   const result = await command("docker", ["image", "inspect", image, "--format", "{{.Id}}"], { timeout: 30_000, env: executorEnvironment({
     stagingUrl: "", productionUrl: "", stagingPort: 0, productionPort: 0,
@@ -303,7 +366,8 @@ async function runDeploy(config, store, payload) {
     ...(staging?.imageDigest ? { PIGO_DEPLOY_IMAGE_ID: staging.imageDigest } : {}),
   };
   await command(target.deployScript, [payload.environment, payload.commit], { cwd: target.appDirectory, env });
-  await command(target.smokeScript, [], { cwd: target.appDirectory, env });
+  const smokeUrl = await prepareSmokeUrl(config, payload.environment);
+  await command(target.smokeScript, [], { cwd: target.appDirectory, env: { ...env, APP_BASE_URL: smokeUrl } });
   const digest = await imageDigest(image);
   if (payload.environment === "production") {
     if (digest !== staging.imageDigest) throw new Error("production deployment changed the staging image digest");
@@ -386,6 +450,8 @@ export function loadConfig(environment = process.env) {
   if (!path.isAbsolute(workspaceRoot)) throw new Error("PIGO_EXECUTOR_WORKSPACE_ROOT must be absolute");
   const imageRepository = environment.PIGO_EXECUTOR_IMAGE_REPOSITORY || "local/order-status-app";
   if (!/^[a-z0-9][a-z0-9._/-]*$/i.test(imageRepository)) throw new Error("PIGO_EXECUTOR_IMAGE_REPOSITORY is invalid");
+  const targetNetwork = environment.PIGO_EXECUTOR_TARGET_NETWORK || "pigo-release-targets";
+  if (!/^[a-z0-9][a-z0-9_.-]*$/i.test(targetNetwork)) throw new Error("PIGO_EXECUTOR_TARGET_NETWORK is invalid");
   return {
     token,
     host: environment.HOST || "127.0.0.1",
@@ -396,6 +462,7 @@ export function loadConfig(environment = process.env) {
     callbackPublicOrigin,
     callbackInternalOrigin,
     imageRepository,
+    targetNetwork,
     stagingUrl: environment.PIGO_EXECUTOR_STAGING_URL || "http://127.0.0.1:18080",
     productionUrl: environment.PIGO_EXECUTOR_PRODUCTION_URL || "http://127.0.0.1:18081",
     stagingPort,
