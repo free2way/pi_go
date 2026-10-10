@@ -1,6 +1,7 @@
 import {
   AlertTriangle,
   Check,
+  ExternalLink,
   FolderGit2,
   FolderPlus,
   GitBranch,
@@ -9,10 +10,11 @@ import {
   RotateCcw,
   SlidersHorizontal,
   Trash2,
+  UploadCloud,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
-import type { ConfigStatus, Run, Workspace } from "../shared/types";
+import type { ConfigStatus, Run, ScmAuthMode, ScmProvider, Workspace, WorkspaceRemoteStatus, WorkspaceScmOverview } from "../shared/types";
 import { DEFAULT_LOCALE, intlLocale, t, type Locale } from "../shared/i18n";
 import { api } from "./api";
 import { useT } from "./i18n";
@@ -45,6 +47,8 @@ function describeError(cause: unknown, locale: Locale = DEFAULT_LOCALE): string 
       return t(locale, "workspace.error.WORKSPACES_DISABLED");
     case "WORKSPACE_READ_ONLY":
       return t(locale, "workspace.error.WORKSPACE_READ_ONLY");
+    case "SCM_OPERATION_TIMEOUT":
+      return t(locale, "workspace.error.SCM_OPERATION_TIMEOUT");
     default:
       return error.message || t(locale, "workspace.error.generic");
   }
@@ -61,10 +65,25 @@ const statusKeys = {
   unregistered: "workspace.status.unregistered",
 } as const satisfies Record<Workspace["status"], string>;
 
-export function WorkspacesPage({ config, runs, onOpenCredentials }: {
+function repositoryBrowseUrl(value?: string | null) {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+    url.username = "";
+    url.password = "";
+    url.pathname = url.pathname.replace(/\.git$/, "");
+    return url.toString();
+  } catch {
+    return undefined;
+  }
+}
+
+export function WorkspacesPage({ config, runs, onOpenCredentials, isAdmin }: {
   config?: ConfigStatus;
   runs: Run[];
   onOpenCredentials: () => void;
+  isAdmin: boolean;
 }) {
   const { t, locale } = useT();
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
@@ -82,6 +101,15 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
   const [editChecks, setEditChecks] = useState("");
   const [editBranch, setEditBranch] = useState("");
   const [savingEdit, setSavingEdit] = useState(false);
+  const [scmWorkspaceId, setScmWorkspaceId] = useState("");
+  const [scmOverview, setScmOverview] = useState<WorkspaceScmOverview>();
+  const [scmRemote, setScmRemote] = useState<WorkspaceRemoteStatus>();
+  const [scmProvider, setScmProvider] = useState<ScmProvider>("generic");
+  const [scmAuthMode, setScmAuthMode] = useState<ScmAuthMode>("server_ssh");
+  const [scmUsername, setScmUsername] = useState("");
+  const [scmToken, setScmToken] = useState("");
+  const [scmBusy, setScmBusy] = useState(false);
+  const [scmError, setScmError] = useState("");
 
   const load = useCallback(async () => {
     setLoadError("");
@@ -208,6 +236,119 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
     }
   };
 
+  const checkScm = async (workspace: Workspace) => {
+    setScmBusy(true);
+    setScmError("");
+    try {
+      const remote = await api.checkWorkspaceScm(workspace.id);
+      setScmRemote(remote);
+      if (!scmOverview?.settings.updatedAt) setScmProvider(remote.provider);
+      return remote;
+    } catch (cause) {
+      setScmRemote(undefined);
+      setScmError(describeError(cause, locale));
+      return undefined;
+    } finally {
+      setScmBusy(false);
+    }
+  };
+
+  const openScm = async (workspace: Workspace) => {
+    if (scmWorkspaceId === workspace.id) {
+      setScmWorkspaceId("");
+      return;
+    }
+    setScmWorkspaceId(workspace.id);
+    setScmOverview(undefined);
+    setScmRemote(undefined);
+    setScmError("");
+    setScmBusy(true);
+    try {
+      const overview = await api.workspaceScm(workspace.id);
+      setScmOverview(overview);
+      setScmProvider(overview.settings.provider);
+      setScmAuthMode(overview.settings.authMode);
+      setScmUsername(overview.settings.username ?? "");
+      setScmToken("");
+    } catch (cause) {
+      setScmError(describeError(cause, locale));
+      setScmBusy(false);
+      return;
+    }
+    setScmBusy(false);
+    await checkScm(workspace);
+  };
+
+  const saveScm = async (workspace: Workspace) => {
+    setScmBusy(true);
+    setScmError("");
+    try {
+      const settings = await api.saveWorkspaceScm(workspace.id, {
+        provider: scmProvider,
+        authMode: scmAuthMode,
+        ...(scmAuthMode === "https_token" ? { username: scmUsername.trim() || null, token: scmToken.trim() || null } : {}),
+      });
+      setScmOverview((current) => current ? { ...current, settings } : { settings, remote: null, attempts: [] });
+      setScmUsername(settings.username ?? "");
+      setScmToken("");
+    } catch (cause) {
+      setScmError(describeError(cause, locale));
+      setScmBusy(false);
+      return;
+    }
+    setScmBusy(false);
+    await checkScm(workspace);
+  };
+
+  const pushScm = async (workspace: Workspace) => {
+    if (!window.confirm(t("workspace.scmPushConfirm", { name: workspace.name }))) return;
+    setScmBusy(true);
+    setScmError("");
+    try {
+      const result = await api.pushWorkspace(workspace.id);
+      setScmRemote(result.after);
+      window.alert(t(result.pushed ? "workspace.scmPushDone" : "workspace.scmAlreadySynced"));
+      const overview = await api.workspaceScm(workspace.id);
+      setScmOverview(overview);
+    } catch (cause) {
+      setScmError(t("workspace.scmFailed", { message: describeError(cause, locale) }));
+    } finally {
+      setScmBusy(false);
+    }
+  };
+
+  const deleteScm = async (workspace: Workspace) => {
+    if (!window.confirm(t("workspace.scmDeleteConfirm", { name: workspace.name }))) return;
+    setScmBusy(true);
+    try {
+      const settings = await api.deleteWorkspaceScm(workspace.id);
+      setScmOverview((current) => current ? { ...current, settings } : { settings, remote: null, attempts: [] });
+      setScmProvider(settings.provider);
+      setScmAuthMode(settings.authMode);
+      setScmUsername("");
+      setScmToken("");
+    } catch (cause) {
+      setScmError(describeError(cause, locale));
+    } finally {
+      setScmBusy(false);
+    }
+  };
+
+  const scmRelationLabel = (remote?: WorkspaceRemoteStatus) => {
+    if (!remote) return t("workspace.scmUnchecked");
+    if (remote.relation === "synchronized") return t("workspace.scmSynchronized");
+    if (remote.relation === "ahead") return t("workspace.scmAhead", { count: remote.ahead });
+    if (remote.relation === "behind") return t("workspace.scmBehind", { count: remote.behind });
+    if (remote.relation === "diverged") return t("workspace.scmDiverged");
+    if (remote.relation === "remote_branch_missing") return t("workspace.scmRemoteBranchMissing");
+    return t("workspace.scmNoRemote");
+  };
+
+  const scmHttpsTokenRequired = (workspace: Workspace) => {
+    const remote = scmRemote?.remote ?? workspace.repositoryUrl ?? "";
+    return /^https?:\/\//i.test(remote) && !scmOverview?.settings.tokenConfigured;
+  };
+
   return (
     <div className="workspaces-page">
       <section className="ws-heading">
@@ -313,6 +454,7 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
         <div className="ws-grid">
           {workspaces.map((workspace) => {
             const readOnly = workspace.permission === "read";
+            const remoteBrowseUrl = repositoryBrowseUrl(scmRemote?.remote ?? workspace.repositoryUrl);
             return (
             <article className="ws-card" key={workspace.id}>
               <header className="ws-card-head">
@@ -360,7 +502,56 @@ export function WorkspacesPage({ config, runs, onOpenCredentials }: {
                 </div>
               )}
 
+              {scmWorkspaceId === workspace.id && (
+                <section className="ws-scm-panel">
+                  <div className="ws-scm-head">
+                    <div><strong>{t("workspace.scmTitle")}</strong><p>{t("workspace.scmHint")}</p></div>
+                    <span className={`ws-scm-relation relation-${scmRemote?.relation ?? "unchecked"}`}>{scmRelationLabel(scmRemote)}</span>
+                  </div>
+                  <div className="ws-scm-heads">
+                    <div><span>{t("workspace.scmLocal")}</span><code>{scmRemote?.localHead?.slice(0, 12) ?? workspace.git?.head?.slice(0, 12) ?? "—"}</code></div>
+                    <div><span>{t("workspace.scmRemote")}</span><code>{scmRemote?.remoteHead?.slice(0, 12) ?? "—"}</code></div>
+                  </div>
+                  {isAdmin ? (
+                    <div className="ws-scm-form">
+                      <label>{t("workspace.scmProvider")}
+                        <select value={scmProvider} onChange={(event) => setScmProvider(event.target.value as ScmProvider)}>
+                          <option value="github">GitHub</option><option value="gitlab">GitLab</option><option value="generic">Generic Git</option>
+                        </select>
+                      </label>
+                      <label>{t("workspace.scmAuthMode")}
+                        <select value={scmAuthMode} onChange={(event) => setScmAuthMode(event.target.value as ScmAuthMode)}>
+                          <option value="https_token">{t("workspace.scmHttps")}</option><option value="server_ssh">{t("workspace.scmSsh")}</option>
+                        </select>
+                      </label>
+                      {scmAuthMode === "https_token" && <>
+                        <label>{t("workspace.scmUsername")}<input value={scmUsername} onChange={(event) => setScmUsername(event.target.value)} placeholder={scmProvider === "github" ? "x-access-token" : scmProvider === "gitlab" ? "oauth2" : "git"} /></label>
+                        <label>{t("workspace.scmToken")}<input type="password" value={scmToken} onChange={(event) => setScmToken(event.target.value)} placeholder={scmOverview?.settings.tokenConfigured ? t("workspace.scmTokenKeep") : t("workspace.scmTokenNew")} autoComplete="new-password" /></label>
+                      </>}
+                    </div>
+                  ) : <p className="ws-form-help">{t("workspace.scmAdminOnly")}</p>}
+                  {scmError && <div className="form-error">{scmError}</div>}
+                  {isAdmin && scmHttpsTokenRequired(workspace) && (
+                    <p className="ws-form-help">{t("workspace.scmHttpsRequired")}</p>
+                  )}
+                  <div className="ws-scm-actions">
+                    <button type="button" disabled={scmBusy} onClick={() => void checkScm(workspace)}>{scmBusy ? <LoaderCircle className="spin" size={13} /> : <RotateCcw size={13} />}{t("workspace.scmCheck")}</button>
+                    {remoteBrowseUrl && <a href={remoteBrowseUrl} target="_blank" rel="noreferrer"><ExternalLink size={13} />{t("workspace.scmOpen")}</a>}
+                    {isAdmin && <button type="button" disabled={scmBusy} onClick={() => void saveScm(workspace)}><Check size={13} />{t("workspace.scmSave")}</button>}
+                    {isAdmin && <button type="button" className="primary" disabled={scmBusy || scmHttpsTokenRequired(workspace) || !scmRemote || scmRemote.relation === "behind" || scmRemote.relation === "diverged" || scmRemote.relation === "no_remote"} onClick={() => void pushScm(workspace)}><UploadCloud size={13} />{t("workspace.scmPush")}</button>}
+                    {isAdmin && scmOverview?.settings.updatedAt && <button type="button" className="danger" disabled={scmBusy} onClick={() => void deleteScm(workspace)}><Trash2 size={13} />{t("workspace.scmDelete")}</button>}
+                  </div>
+                  <div className="ws-scm-attempts">
+                    <strong>{t("workspace.scmAttempts")}</strong>
+                    {scmOverview?.attempts.length ? scmOverview.attempts.slice(0, 5).map((attempt) => (
+                      <div key={attempt.id}><span className={`attempt-${attempt.status}`}>{attempt.status}</span><code>{attempt.localHead?.slice(0, 8) ?? "—"}</code><time>{formatTime(attempt.createdAt, locale)}</time></div>
+                    )) : <em>{t("workspace.scmNoAttempts")}</em>}
+                  </div>
+                </section>
+              )}
+
               <footer className="ws-actions">
+                <button type="button" disabled={pendingId === workspace.id} onClick={() => void openScm(workspace)}><GitBranch size={13} />{t("workspace.scm")}</button>
                 <button type="button" disabled={readOnly || pendingId === workspace.id} title={readOnly ? t("workspace.roRefresh") : undefined} onClick={() => void refresh(workspace)}>
                   {pendingId === workspace.id ? <LoaderCircle className="spin" size={13} /> : <RotateCcw size={13} />}{t("workspace.refresh")}
                 </button>

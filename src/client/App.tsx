@@ -103,6 +103,8 @@ import { SystemStatusPage } from "./SystemStatusPage";
 import { WorkspacesPage } from "./WorkspacesPage";
 import { ReleaseSettingsPage } from "./ReleaseSettingsPage";
 import { browserDeploymentUrl, RELEASE_PROGRESS_STAGES, releaseProgressEventStage, releaseProgressStepState, type ReleaseProgressStage } from "./release-progress";
+import { RequirementAssistant } from "./RequirementAssistant";
+import { PiAssistant } from "./PiAssistant";
 
 /**
  * 侧栏「最近任务」只列最近的 N 个（需求）：完整列表在「需求历史」页
@@ -483,6 +485,7 @@ function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, onGoWor
   const [title, setTitle] = useState(() => t("createRun.demoTitle"));
   const [repository, setRepository] = useState("demo/auth-service");
   const [task, setTask] = useState(() => t("createRun.demoTask"));
+  const [acceptanceCriteria, setAcceptanceCriteria] = useState("");
   const [mode, setMode] = useState<RunMode>("demo");
   const [checks, setChecks] = useState("npm test");
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
@@ -544,6 +547,7 @@ function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, onGoWor
       const run = await api.createRun({
         title,
         task,
+        acceptanceCriteria: acceptanceCriteria.trim() || undefined,
         mode,
         ...(mode === "real"
           ? {
@@ -642,7 +646,23 @@ function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, onGoWor
             </>
           )
         ) : <label>{t("createRun.repository")}<input value={repository} onChange={(event) => setRepository(event.target.value)} /></label>}
-        <label>{t("createRun.task")}<textarea rows={5} value={task} onChange={(event) => setTask(event.target.value)} /></label>
+        <div className="field-block">
+          <div className="requirement-authoring-head">
+            <span>{t("createRun.task")}</span>
+            <RequirementAssistant
+              draft={task}
+              title={title}
+              models={models}
+              context={{ source: "run", workspaceName: selectedWorkspace?.name || repository }}
+              onApply={(refinement) => {
+                setTitle(refinement.spec.title);
+                setTask(refinement.task);
+                setAcceptanceCriteria(refinement.acceptanceCriteria);
+              }}
+            />
+          </div>
+          <textarea rows={5} value={task} onChange={(event) => { setTask(event.target.value); setAcceptanceCriteria(""); }} />
+        </div>
         {mode === "real" && <label className="create-run-checks">{t("createRun.checks")}<textarea rows={4} value={checks} onChange={(event) => setChecks(event.target.value)} placeholder="npm test" /></label>}
         {recentRuns.length > 0 && (
           <details className="recent-requirements">
@@ -654,7 +674,7 @@ function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, onGoWor
                   className="recent-item"
                   key={item.id}
                   title={requirementSummary(item.task, 300)}
-                  onClick={() => { setTitle(item.title); setTask(item.task); }}
+                  onClick={() => { setTitle(item.title); setTask(item.task); setAcceptanceCriteria(item.acceptanceCriteria ?? ""); }}
                 >
                   <strong>{item.title}</strong>
                   <small>{requirementSummary(item.task, 70)}</small>
@@ -2054,7 +2074,7 @@ export function App() {
         ) : view === "models" ? (
           <ModelsPage config={config} onChanged={() => { void api.config().then(setConfig); }} />
         ) : view === "workspaces" ? (
-          <WorkspacesPage config={config} runs={runs} onOpenCredentials={() => setView("models")} />
+          <WorkspacesPage config={config} runs={runs} isAdmin={Boolean(user?.isAdmin)} onOpenCredentials={() => setView("models")} />
         ) : view === "history" ? (
           <HistoryPage runs={runs} onOpenRun={(id) => { setSelectedId(id); setView("run"); setSidebarOpen(false); }} />
         ) : view === "agile" ? (
@@ -2198,6 +2218,7 @@ export function App() {
           </div>
         )}
       </main>
+      <PiAssistant page={view} run={view === "run" ? activeRun : undefined} />
       <CreateRunDialog open={createOpen} onClose={() => setCreateOpen(false)} onCreated={handleCreated} config={config} recentRuns={runs} onGoWorkspaces={() => { setCreateOpen(false); setView("workspaces"); }} />
     </div>
   );

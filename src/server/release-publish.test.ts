@@ -275,7 +275,19 @@ describe("planReleaseDeployAttempt", () => {
     expect(planReleaseDeployAttempt({ release: staged, environment: "production", now: NOW })).toEqual({
       kind: "ready",
       deliveryId: "release-publish:release_1:production",
-      attempt: 1,
+      attempt: 2,
+    });
+  });
+
+  it("continues the release-wide attempt sequence when staging was retried before promotion", () => {
+    const staged = release({
+      status: "released",
+      deploy: { status: "ok", environment: "staging", detail: "HTTP 200", at: NOW, deliveryId: "release-publish:release_1:staging", attempt: 3 },
+    });
+    expect(planReleaseDeployAttempt({ release: staged, environment: "production", now: NOW })).toMatchObject({
+      kind: "ready",
+      deliveryId: "release-publish:release_1:production",
+      attempt: 4,
     });
   });
 

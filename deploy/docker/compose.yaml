@@ -70,6 +70,7 @@ services:
       PORT: 3100
       PI_DATA_FILE: /app/data/runs.json
       PI_VAULT_FILE: /app/data/credentials.v1.json
+      PI_SCM_SETTINGS_FILE: /app/data/scm-settings.v1.json
       PI_VAULT_SECRET: ${PI_VAULT_SECRET:?Set PI_VAULT_SECRET in the deployment environment}
       PI_DATABASE_URL: postgresql://pigo:${PIGO_POSTGRES_PASSWORD:?Set PIGO_POSTGRES_PASSWORD in the deployment environment}@postgres:5432/pigo
       PI_AUTH_MODE: ${PI_AUTH_MODE:?Set PI_AUTH_MODE in the deployment environment}
@@ -119,6 +120,7 @@ services:
       PI_JOB_STALE_SECONDS: ${PI_JOB_STALE_SECONDS:-120}
       PI_PIPELINE_VERSION: ${PI_PIPELINE_VERSION:-pigo-pipeline-1}
       PI_WORKSPACES_ENABLED: ${PI_WORKSPACES_ENABLED:-true}
+      PI_SCM_WORKER_TIMEOUT_MS: ${PI_SCM_WORKER_TIMEOUT_MS:-300000}
       # Decision plane / Jev (docs/26). Opt-in: PI_DECISION_ENGINE defaults to
       # disabled and PI_JEV_MODE to off; every empty value below falls back to the
       # documented default, so existing deployments are unchanged. TYPESAFE_API_KEY

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { RELEASE_DEPLOY_STALE_MS } from "../shared/agile.js";
 import { deriveStoryStatus, type AgileProject, type AgileStory } from "../shared/agile";
 import type { ReleaseRetrospective, ReleaseSummary } from "../shared/agile-metrics";
-import { columnPoints, estimateKey, estimateLabel, groupStoriesByColumn, priorityKey, priorityLabel, releaseDeployAction, releaseExportFilename, releaseExportJson, splitLines, storyReference, boardColumnKey, RELEASE_DEPLOY_ACTION_KEYS , projectContentsLabel, projectDeletionWarning } from "./agile-view";
+import { agileReleaseProgressView, columnPoints, estimateKey, estimateLabel, groupStoriesByColumn, priorityKey, priorityLabel, releaseDeployAction, releaseExportFilename, releaseExportJson, splitLines, storyReference, boardColumnKey, RELEASE_DEPLOY_ACTION_KEYS , projectContentsLabel, projectDeletionWarning } from "./agile-view";
 import { t } from "../shared/i18n";
 
 function story(overrides: Partial<AgileStory>): AgileStory {
@@ -167,6 +167,29 @@ describe("releaseDeployAction", () => {
   it("exposes catalog keys for the publish button", () => {
     expect(t("zh", RELEASE_DEPLOY_ACTION_KEYS.retry)).toBe("重试部署");
     expect(t("en", RELEASE_DEPLOY_ACTION_KEYS.retry)).toBe("Retry deploy");
+  });
+});
+
+describe("agileReleaseProgressView", () => {
+  it("shows request, registration and final-result progress without inventing Run deploy stages", () => {
+    expect(agileReleaseProgressView(undefined)).toEqual({
+      status: "running",
+      request: "active",
+      registration: "waiting",
+      result: "waiting",
+    });
+    expect(agileReleaseProgressView({ status: "pending", detail: "HTTP 202", at: "2026-01-02T00:00:00.000Z" })).toEqual({
+      status: "running",
+      request: "done",
+      registration: "active",
+      result: "waiting",
+    });
+    expect(agileReleaseProgressView({ status: "ok", detail: "registered", at: "2026-01-02T00:00:00.000Z" }).status).toBe("succeeded");
+    expect(agileReleaseProgressView({ status: "failed", detail: "callback failed", at: "2026-01-02T00:00:00.000Z" })).toMatchObject({
+      status: "failed",
+      registration: "failed",
+      result: "failed",
+    });
   });
 });
 

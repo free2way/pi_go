@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { mkdtemp } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import type { WorkspaceVerifyResult } from "../shared/types.js";
-import { WorkspaceError, WorkspaceService, redactGitUrl, type WorkerCall } from "./workspaces.js";
+import { DEFAULT_SCM_WORKER_TIMEOUT_MS, scmWorkerTimeoutMs, WorkspaceError, WorkspaceService, redactGitUrl, type WorkerCall } from "./workspaces.js";
 import { createTestDb } from "./test-db.js";
+import { ScmSettingsStore } from "./scm-settings.js";
 
 async function createService(callWorker: (pathName: string, init?: RequestInit) => Promise<WorkspaceVerifyResult>) {
   const db = await createTestDb();
@@ -22,6 +26,14 @@ const verifyOk = (overrides: Partial<WorkspaceVerifyResult> = {}): WorkspaceVeri
 });
 
 describe("workspace service", () => {
+  it("uses a bounded SCM worker timeout instead of the 15-second control-plane default", () => {
+    expect(scmWorkerTimeoutMs()).toBe(DEFAULT_SCM_WORKER_TIMEOUT_MS);
+    expect(scmWorkerTimeoutMs("120000")).toBe(120_000);
+    expect(scmWorkerTimeoutMs("1")).toBe(30_000);
+    expect(scmWorkerTimeoutMs("9999999")).toBe(900_000);
+    expect(scmWorkerTimeoutMs("invalid")).toBe(DEFAULT_SCM_WORKER_TIMEOUT_MS);
+  });
+
   it("registers a workspace through the worker and lists it per owner", async () => {
     const { service } = await createService(async () => verifyOk());
     const workspace = await service.register("owner-a", "pi_go");
@@ -212,6 +224,72 @@ describe("workspace service", () => {
       const { service, workspace } = await sharedWorkspace("read");
       await expect(service.patch(["stranger"], workspace.id, { defaultChecks: ["x"] })).rejects.toMatchObject({ code: "WORKSPACE_NOT_FOUND", status: 404 });
     });
+  });
+
+  it("checks, pushes and audits a workspace remote without exposing its token", async () => {
+    const db = await createTestDb();
+    const directory = await mkdtemp(path.join(os.tmpdir(), "pigo-scm-workspaces-"));
+    const settings = new ScmSettingsStore(path.join(directory, "scm.json"), Buffer.alloc(32, 3).toString("base64"));
+    await settings.init();
+    let pushed = false;
+    let receivedToken = "";
+    const callWorker = (async (pathName: string, init?: RequestInit) => {
+      if (pathName === "/workspaces/verify") return verifyOk();
+      const body = JSON.parse(String(init?.body ?? "{}")) as { credential?: { token?: string } };
+      receivedToken = body.credential?.token ?? "";
+      if (pathName === "/workspaces/remote-status") return {
+        provider: "github", remote: "https://github.com/org/repo.git", branch: "main",
+        localHead: "abc", remoteHead: "def", relation: "ahead", ahead: 1, behind: 0, checkedAt: "now",
+      };
+      if (pathName === "/workspaces/push") {
+        pushed = true;
+        return {
+          pushed: true,
+          before: { provider: "github", remote: "https://github.com/org/repo.git", branch: "main", localHead: "abc", remoteHead: "def", relation: "ahead", ahead: 1, behind: 0, checkedAt: "now" },
+          after: { provider: "github", remote: "https://github.com/org/repo.git", branch: "main", localHead: "abc", remoteHead: "abc", relation: "synchronized", ahead: 0, behind: 0, checkedAt: "later" },
+        };
+      }
+      throw new Error(`unexpected ${pathName}`);
+    }) as WorkerCall;
+    const service = new WorkspaceService(db, callWorker, settings);
+    const workspace = await service.register("owner", "pi_go");
+    await service.saveScmSettings(["owner"], workspace.id, { provider: "github", authMode: "https_token", token: "github-secret" });
+    expect(await service.remoteStatus(["owner"], workspace.id)).toMatchObject({ relation: "ahead" });
+    expect(receivedToken).toBe("github-secret");
+    expect(await service.push(["owner"], workspace.id, "owner")).toMatchObject({ pushed: true });
+    expect(pushed).toBe(true);
+    const overview = await service.scmOverview(["owner"], workspace.id);
+    expect(overview.settings).toMatchObject({ provider: "github", tokenConfigured: true });
+    expect(overview.attempts[0]).toMatchObject({ status: "succeeded", localHead: "abc", remoteHead: "abc" });
+    expect(JSON.stringify(overview)).not.toContain("github-secret");
+  });
+
+  it("defaults an HTTPS GitHub workspace to token authentication", async () => {
+    const db = await createTestDb();
+    const service = new WorkspaceService(db, (async (pathName: string) => {
+      if (pathName === "/workspaces/clone") return verifyOk({ relativePath: "repo", name: "repo" });
+      throw new Error(`unexpected ${pathName}`);
+    }) as WorkerCall);
+    const workspace = await service.clone("owner", "https://github.com/org/repo.git", "repo");
+    await expect(service.scmOverview(["owner"], workspace.id)).resolves.toMatchObject({
+      settings: { provider: "github", authMode: "https_token", tokenConfigured: false },
+    });
+  });
+
+  it("returns an actionable SCM timeout and records the failed attempt", async () => {
+    const db = await createTestDb();
+    const service = new WorkspaceService(db, (async (pathName: string) => {
+      if (pathName === "/workspaces/verify") return verifyOk();
+      throw Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" });
+    }) as WorkerCall);
+    const workspace = await service.register("owner", "pi_go");
+    await expect(service.push(["owner"], workspace.id, "owner")).rejects.toMatchObject({
+      code: "SCM_OPERATION_TIMEOUT",
+      status: 504,
+    });
+    const overview = await service.scmOverview(["owner"], workspace.id);
+    expect(overview.attempts[0]).toMatchObject({ status: "failed" });
+    expect(overview.attempts[0]?.detail).toContain("configured server timeout");
   });
 
 });

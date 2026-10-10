@@ -99,6 +99,11 @@ import {
 } from "./review-performance.js";
 import { createReviewTriageTrigger, jevReviewTriageEnabled, recordVerdictThenReviewTriage } from "./decision-triage.js";
 import { createAuditRetentionTrigger } from "./audit-retention.js";
+import { parseRequirementSpec, renderAcceptanceCriteria, renderRequirementTask, REQUIREMENT_PROMPT_VERSION } from "../shared/requirement-assistant.js";
+import { buildRequirementPrompt } from "./requirement-assistant.js";
+import { parsePiAssistantOutput, PI_ASSISTANT_PROMPT_VERSION } from "../shared/pi-assistant.js";
+import { buildPiAssistantPrompt, sanitizePiAssistantPayload } from "./pi-assistant.js";
+import { inspectWorkspaceRemote, pushWorkspaceBranch, WorkspaceScmError, type WorkspaceScmCredentialInput } from "./workspace-scm.js";
 
 const port = Number(process.env.PORT || 3200);
 const host = process.env.HOST || "localhost";
@@ -113,6 +118,16 @@ const maxSubagents = Number.isInteger(configuredMaxSubagents) ? Math.min(4, Math
 const configuredMaxActiveJobs = Number(process.env.PI_MAX_ACTIVE_JOBS || 1);
 const maxActiveJobs = Number.isInteger(configuredMaxActiveJobs) ? Math.min(4, Math.max(1, configuredMaxActiveJobs)) : 1;
 const active = new Map<string, AbortController>();
+const configuredMaxRequirementAssistants = Number(process.env.PI_REQUIREMENT_ASSISTANT_CONCURRENCY || 2);
+const maxRequirementAssistants = Number.isInteger(configuredMaxRequirementAssistants)
+  ? Math.min(4, Math.max(1, configuredMaxRequirementAssistants))
+  : 2;
+let activeRequirementAssistants = 0;
+const configuredMaxPiAssistants = Number(process.env.PI_ASSISTANT_CONCURRENCY || 2);
+const maxPiAssistants = Number.isInteger(configuredMaxPiAssistants)
+  ? Math.min(4, Math.max(1, configuredMaxPiAssistants))
+  : 2;
+let activePiAssistants = 0;
 // P1: set by the SIGTERM/SIGINT handler so a shutting-down worker never claims
 // (or starts) another job while it reclaims its sandbox containers.
 let shuttingDown = false;
@@ -934,6 +949,50 @@ async function verifyWorkspace(relativePath: string): Promise<WorkspaceVerifyRes
   };
 }
 
+async function workspaceScmGit(relativePath: string) {
+  const directory = await resolveInsideRoot(projectsRoot, relativePath);
+  const isGit = await git(directory, ["rev-parse", "--is-inside-work-tree"]).then((value) => value === "true").catch(() => false);
+  if (!isGit) throw new WorkspaceScmError("WORKSPACE_INVALID", "Not a Git repository");
+  return {
+    directory,
+    exec: (args: string[], env?: Record<string, string>) => runHardenedGit({
+      cwd: directory,
+      args,
+      env,
+      timeoutMs: 120_000,
+      maxOutput,
+    }),
+  };
+}
+
+async function workspaceRemoteStatus(input: {
+  relativePath: string;
+  branch: string;
+  requiredCommit?: string;
+  credential?: WorkspaceScmCredentialInput;
+}) {
+  const target = await workspaceScmGit(input.relativePath);
+  return inspectWorkspaceRemote({
+    branch: input.branch,
+    requiredCommit: input.requiredCommit,
+    credential: input.credential,
+    git: target.exec,
+  });
+}
+
+async function pushWorkspace(input: {
+  relativePath: string;
+  branch: string;
+  credential?: WorkspaceScmCredentialInput;
+}) {
+  const target = await workspaceScmGit(input.relativePath);
+  return serializeWorktreeMutation(async () => {
+    const dirty = await git(target.directory, ["status", "--porcelain"]);
+    if (dirty) throw new WorkspaceScmError("WORKSPACE_DIRTY", "Workspace has uncommitted changes; push is blocked");
+    return pushWorkspaceBranch({ branch: input.branch, credential: input.credential, git: target.exec });
+  });
+}
+
 async function cloneWorkspace(url: string, name: string): Promise<WorkspaceVerifyResult> {
   const urlError = validateCloneUrl(url);
   if (urlError) return { ok: false, code: "WORKSPACE_INVALID", error: urlError };
@@ -1003,6 +1062,12 @@ async function runPi(input: {
   onActivity: (message: string) => Promise<void>;
   /** COST/GAP-02: the calling role gates which allowlisted plugins are enabled. */
   role?: RunRoleUsage["role"];
+  /** Requirement refinement is deliberately plugin-free even when global plugins exist. */
+  allowPlugins?: boolean;
+  /** Interactive helpers use a much smaller deadline than a development run. */
+  timeoutMs?: number;
+  /** Empty string disables every Pi tool for pure structured generation. */
+  tools?: string;
 }) {
   const args = [
     "--mode", "json",
@@ -1013,7 +1078,7 @@ async function runPi(input: {
     "--provider", input.provider,
     "--model", input.model,
     "--thinking", input.thinking === "low" || input.thinking === "medium" ? input.thinking : "high",
-    "--tools", input.readOnly ? "read,grep,find,ls" : "read,bash,edit,write,grep,find,ls",
+    "--tools", input.tools ?? (input.readOnly ? "read,grep,find,ls" : "read,bash,edit,write,grep,find,ls"),
   ];
   // P1 (fail-closed): never fall through to an in-process Pi call when the
   // container sandbox is unavailable.
@@ -1021,7 +1086,9 @@ async function runPi(input: {
   // GAP-02: re-enable only allowlisted resources. The `--no-*` flags above
   // disable discovery (including project `.pi/extensions`); explicit paths still
   // load, so the allowlist is the single source of truth.
-  const selected = selectPlugins(pluginPolicy, input.role ?? "developer");
+  const selected = input.allowPlugins === false
+    ? { enabled: [], denials: [] }
+    : selectPlugins(pluginPolicy, input.role ?? "developer");
   // AT-PI-007 / AT-SEC-014: re-verify pinned content immediately before every Pi
   // invocation. A mismatch (or a missing pin when required) denies that plugin;
   // it is never passed to Pi and the denial is reported as a `plugin.denied` event.
@@ -1043,7 +1110,7 @@ async function runPi(input: {
   // the worker's own tokens and the other role's key are stripped.
   const childEnvironment = scrubEnvironment(process.env, [input.apiKeyEnvironmentName]);
   childEnvironment[input.apiKeyEnvironmentName] = input.apiKey;
-  const runTimeoutMs = Number(process.env.PI_RUN_TIMEOUT_SECONDS || 1800) * 1000;
+  const runTimeoutMs = input.timeoutMs ?? Number(process.env.PI_RUN_TIMEOUT_SECONDS || 1800) * 1000;
   const onStdoutLine = (line: string) => {
       const event = parsePiLine(line);
       if (!event) return;
@@ -2835,6 +2902,171 @@ const server = createServer(async (request, response) => {
     if (request.method === "POST" && url.pathname === "/workspaces/create") {
       const body = await readJson(request) as { name?: unknown };
       return json(response, 200, await createWorkspace(String(body.name ?? "")));
+    }
+    if (request.method === "POST" && url.pathname === "/workspaces/remote-status") {
+      const body = await readJson(request) as { relativePath?: unknown; branch?: unknown; requiredCommit?: unknown; credential?: WorkspaceScmCredentialInput };
+      const relativePath = sanitizeRelativePath(String(body.relativePath ?? ""));
+      if (!relativePath) return json(response, 422, { error: "Invalid workspace path", code: "WORKSPACE_INVALID" });
+      try {
+        return json(response, 200, await workspaceRemoteStatus({
+          relativePath,
+          branch: String(body.branch ?? ""),
+          ...(typeof body.requiredCommit === "string" && body.requiredCommit ? { requiredCommit: body.requiredCommit } : {}),
+          ...(body.credential ? { credential: body.credential } : {}),
+        }));
+      } catch (error) {
+        if (error instanceof WorkspaceScmError) return json(response, 409, { error: error.message, code: error.code });
+        throw error;
+      }
+    }
+    if (request.method === "POST" && url.pathname === "/workspaces/push") {
+      const body = await readJson(request) as { relativePath?: unknown; branch?: unknown; credential?: WorkspaceScmCredentialInput };
+      const relativePath = sanitizeRelativePath(String(body.relativePath ?? ""));
+      if (!relativePath) return json(response, 422, { error: "Invalid workspace path", code: "WORKSPACE_INVALID" });
+      try {
+        return json(response, 200, await pushWorkspace({
+          relativePath,
+          branch: String(body.branch ?? ""),
+          ...(body.credential ? { credential: body.credential } : {}),
+        }));
+      } catch (error) {
+        if (error instanceof WorkspaceScmError) return json(response, 409, { error: error.message, code: error.code });
+        throw error;
+      }
+    }
+    if (request.method === "POST" && url.pathname === "/requirements/refine") {
+      if (activeRequirementAssistants >= maxRequirementAssistants) {
+        return json(response, 429, { error: "Requirement assistant capacity reached", code: "REQUIREMENT_ASSISTANT_BUSY" });
+      }
+      const body = await readJson(request) as {
+        draft?: unknown;
+        title?: unknown;
+        locale?: unknown;
+        provider?: unknown;
+        model?: unknown;
+        apiKey?: unknown;
+        context?: unknown;
+      };
+      const draft = typeof body.draft === "string" ? body.draft.trim() : "";
+      const title = typeof body.title === "string" ? body.title.trim().slice(0, 200) : "";
+      const provider = typeof body.provider === "string" ? body.provider.trim() : "";
+      const model = typeof body.model === "string" ? body.model.trim() : "";
+      const apiKey = typeof body.apiKey === "string" ? body.apiKey : "";
+      const rawContext = body.context && typeof body.context === "object" && !Array.isArray(body.context)
+        ? body.context as Record<string, unknown>
+        : {};
+      const source = rawContext.source === "story" ? "story" : "run";
+      const context = {
+        source,
+        ...(typeof rawContext.projectName === "string" ? { projectName: rawContext.projectName.trim().slice(0, 120) } : {}),
+        ...(typeof rawContext.workspaceName === "string" ? { workspaceName: rawContext.workspaceName.trim().slice(0, 120) } : {}),
+      } as const;
+      if (draft.length < 10 || draft.length > 10_000 || !provider || !model || !apiKey) {
+        return json(response, 400, { error: "Invalid requirement refinement input", code: "REQUIREMENT_INPUT_INVALID" });
+      }
+      activeRequirementAssistants += 1;
+      const startedAt = Date.now();
+      try {
+        const scratch = path.join(runsRoot, "_requirement-assistant");
+        await mkdir(scratch, { recursive: true });
+        const locale = body.locale === "en" ? "en" : "zh";
+        const result = await runPi({
+          cwd: scratch,
+          provider,
+          model,
+          prompt: buildRequirementPrompt({ draft, title, context }, locale),
+          readOnly: true,
+          thinking: "low",
+          apiKey,
+          apiKeyEnvironmentName: apiKeyEnvName(provider),
+          signal: AbortSignal.timeout(Math.max(5_000, Number(process.env.PI_REQUIREMENT_ASSISTANT_TIMEOUT_MS || 25_000))),
+          onActivity: async () => undefined,
+          role: "planner",
+          allowPlugins: false,
+          tools: "",
+          timeoutMs: Math.max(5_000, Number(process.env.PI_REQUIREMENT_ASSISTANT_TIMEOUT_MS || 25_000)),
+        });
+        const spec = parseRequirementSpec(result.text);
+        return json(response, 200, {
+          spec,
+          task: renderRequirementTask(spec, locale),
+          acceptanceCriteria: renderAcceptanceCriteria(spec),
+          model: { provider, model },
+          durationMs: Date.now() - startedAt,
+          usage: {
+            inputTokens: Math.round(result.usage.input),
+            outputTokens: Math.round(result.usage.output),
+            totalTokens: Math.round(result.usage.totalTokens || result.usage.input + result.usage.output),
+            estimatedCost: result.usage.cost,
+          },
+          promptVersion: REQUIREMENT_PROMPT_VERSION,
+        });
+      } catch (error) {
+        const safe = String((error as Error).message || "Requirement assistant failed")
+          .replaceAll(apiKey, "[redacted]")
+          .slice(0, 500);
+        return json(response, 502, { error: safe, code: "REQUIREMENT_ASSISTANT_FAILED" });
+      } finally {
+        body.apiKey = "";
+        activeRequirementAssistants -= 1;
+      }
+    }
+    if (request.method === "POST" && url.pathname === "/assistant/ask") {
+      if (activePiAssistants >= maxPiAssistants) {
+        return json(response, 429, { error: "Pi assistant capacity reached", code: "PI_ASSISTANT_BUSY" });
+      }
+      const body = await readJson(request) as Record<string, unknown>;
+      const input = sanitizePiAssistantPayload(body);
+      const provider = typeof body.provider === "string" ? body.provider.trim() : "";
+      const model = typeof body.model === "string" ? body.model.trim() : "";
+      const apiKey = typeof body.apiKey === "string" ? body.apiKey : "";
+      if (!input.message || !provider || !model || !apiKey) {
+        return json(response, 400, { error: "Invalid Pi assistant input", code: "PI_ASSISTANT_INPUT_INVALID" });
+      }
+      activePiAssistants += 1;
+      const startedAt = Date.now();
+      try {
+        const scratch = path.join(runsRoot, "_pi-assistant");
+        await mkdir(scratch, { recursive: true });
+        const locale = body.locale === "en" ? "en" : "zh";
+        const result = await runPi({
+          cwd: scratch,
+          provider,
+          model,
+          prompt: buildPiAssistantPrompt(input, locale),
+          readOnly: true,
+          thinking: "low",
+          apiKey,
+          apiKeyEnvironmentName: apiKeyEnvName(provider),
+          signal: AbortSignal.timeout(Math.max(5_000, Number(process.env.PI_ASSISTANT_TIMEOUT_MS || 30_000))),
+          onActivity: async () => undefined,
+          role: "planner",
+          allowPlugins: false,
+          tools: "",
+          timeoutMs: Math.max(5_000, Number(process.env.PI_ASSISTANT_TIMEOUT_MS || 30_000)),
+        });
+        const answer = parsePiAssistantOutput(result.text);
+        return json(response, 200, {
+          ...answer,
+          model: { provider, model },
+          durationMs: Date.now() - startedAt,
+          usage: {
+            inputTokens: Math.round(result.usage.input),
+            outputTokens: Math.round(result.usage.output),
+            totalTokens: Math.round(result.usage.totalTokens || result.usage.input + result.usage.output),
+            estimatedCost: result.usage.cost,
+          },
+          promptVersion: PI_ASSISTANT_PROMPT_VERSION,
+        });
+      } catch (error) {
+        const safe = String((error as Error).message || "Pi assistant failed")
+          .replaceAll(apiKey, "[redacted]")
+          .slice(0, 500);
+        return json(response, 502, { error: safe, code: "PI_ASSISTANT_FAILED" });
+      } finally {
+        body.apiKey = "";
+        activePiAssistants -= 1;
+      }
     }
     if (request.method === "POST" && url.pathname === "/jobs") {
       // P1: a shutting-down worker stops claiming new jobs so it can reclaim its

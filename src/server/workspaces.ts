@@ -1,7 +1,32 @@
-import type { Workspace, WorkspacePermission, WorkspaceStatus, WorkspaceVerifyResult } from "../shared/types.js";
+import type {
+  ScmAuthMode,
+  ScmProvider,
+  Workspace,
+  WorkspacePermission,
+  WorkspacePushResult,
+  WorkspaceRemoteStatus,
+  WorkspaceScmAttempt,
+  WorkspaceScmOverview,
+  WorkspaceStatus,
+  WorkspaceVerifyResult,
+} from "../shared/types.js";
 import { newId, type Db } from "./db.js";
+import { ScmSettingsStore, scmSettingsStatus } from "./scm-settings.js";
 
 export type WorkerCall = <T>(pathName: string, init?: RequestInit) => Promise<T>;
+
+export const DEFAULT_SCM_WORKER_TIMEOUT_MS = 300_000;
+
+/**
+ * SCM push includes remote discovery, fetch, export-policy scanning and push.
+ * It must not inherit the control plane's 15-second health-call timeout. Keep
+ * the operator value bounded so a typo cannot create an unbounded HTTP request.
+ */
+export function scmWorkerTimeoutMs(value?: string): number {
+  const parsed = Number(value ?? DEFAULT_SCM_WORKER_TIMEOUT_MS);
+  if (!Number.isFinite(parsed)) return DEFAULT_SCM_WORKER_TIMEOUT_MS;
+  return Math.min(900_000, Math.max(30_000, Math.floor(parsed)));
+}
 
 /**
  * B4: extra context for access decisions. `isAdmin` lets an admin act on a
@@ -19,6 +44,18 @@ export class WorkspaceError extends Error {
   ) {
     super(message);
   }
+}
+
+function workspaceWorkerFailure(error: unknown, fallbackCode: string, fallbackStatus: number): WorkspaceError {
+  const typed = error as Error & { code?: string; status?: number };
+  if (typed.name === "TimeoutError" || /aborted due to timeout/i.test(typed.message ?? "")) {
+    return new WorkspaceError(
+      "SCM_OPERATION_TIMEOUT",
+      "Repository synchronization exceeded the configured server timeout; retry after checking Git remote connectivity",
+      504,
+    );
+  }
+  return new WorkspaceError(typed.code ?? fallbackCode, typed.message, typed.status ?? fallbackStatus);
 }
 
 type WorkspaceRow = {
@@ -86,6 +123,7 @@ export class WorkspaceService {
   constructor(
     private readonly db: Db,
     private readonly callWorker: WorkerCall,
+    private readonly scmSettings?: ScmSettingsStore,
   ) {}
 
   async list(ownerKeys: string[]): Promise<Workspace[]> {
@@ -215,6 +253,122 @@ export class WorkspaceService {
     await this.db.query("UPDATE workspaces SET status = 'unregistered', updated_at = $1 WHERE id = $2", [new Date().toISOString(), access.row.id]);
   }
 
+  async scmOverview(ownerKeys: string[], id: string, options: WorkspaceAccessOptions = {}): Promise<WorkspaceScmOverview> {
+    const access = await this.resolveAccess(ownerKeys, id, options.isAdmin ?? false);
+    if (!access) throw new WorkspaceError("WORKSPACE_NOT_FOUND", "Workspace not found", 404);
+    const saved = this.scmSettings?.get(id);
+    const inferredProvider = inferScmProvider(access.row.repository_url);
+    return {
+      settings: saved ? scmSettingsStatus(saved) : {
+        ...scmSettingsStatus(),
+        provider: inferredProvider,
+        authMode: inferScmAuthMode(access.row.repository_url),
+      },
+      remote: null,
+      attempts: await this.listScmAttempts(id),
+    };
+  }
+
+  async saveScmSettings(ownerKeys: string[], id: string, input: {
+    provider: ScmProvider;
+    authMode: ScmAuthMode;
+    username?: string | null;
+    token?: string | null;
+  }, options: WorkspaceAccessOptions = {}) {
+    await this.requirePermission(ownerKeys, id, options);
+    if (!this.scmSettings) throw new WorkspaceError("SCM_SETTINGS_UNAVAILABLE", "SCM settings store is unavailable", 503);
+    try {
+      return scmSettingsStatus(await this.scmSettings.set(id, input));
+    } catch (error) {
+      throw new WorkspaceError("SCM_SETTINGS_INVALID", (error as Error).message, 422);
+    }
+  }
+
+  async deleteScmSettings(ownerKeys: string[], id: string, options: WorkspaceAccessOptions = {}) {
+    await this.requirePermission(ownerKeys, id, options);
+    await this.scmSettings?.delete(id);
+    const repositoryUrl = (await this.findRow(ownerKeys, id, options.isAdmin ?? false))?.repository_url ?? null;
+    return {
+      ...scmSettingsStatus(),
+      provider: inferScmProvider(repositoryUrl),
+      authMode: inferScmAuthMode(repositoryUrl),
+    };
+  }
+
+  async remoteStatus(ownerKeys: string[], id: string, options: WorkspaceAccessOptions & { requiredCommit?: string } = {}): Promise<WorkspaceRemoteStatus> {
+    const access = await this.resolveAccess(ownerKeys, id, options.isAdmin ?? false);
+    if (!access) throw new WorkspaceError("WORKSPACE_NOT_FOUND", "Workspace not found", 404);
+    const branch = access.row.default_branch ?? access.row.git_branch;
+    if (!branch) throw new WorkspaceError("SCM_BRANCH_MISSING", "Workspace default branch is not configured", 409);
+    const credential = this.scmSettings?.get(id);
+    try {
+      return await this.callWorker<WorkspaceRemoteStatus>("/workspaces/remote-status", {
+        method: "POST",
+        body: JSON.stringify({
+          relativePath: access.row.root_path,
+          branch,
+          ...(options.requiredCommit ? { requiredCommit: options.requiredCommit } : {}),
+          ...(credential ? { credential } : {}),
+        }),
+      });
+    } catch (error) {
+      throw workspaceWorkerFailure(error, "SCM_REMOTE_FAILED", 503);
+    }
+  }
+
+  async push(ownerKeys: string[], id: string, actorId: string, options: WorkspaceAccessOptions = {}): Promise<WorkspacePushResult> {
+    const access = await this.requirePermission(ownerKeys, id, options);
+    const branch = access.row.default_branch ?? access.row.git_branch;
+    if (!branch) throw new WorkspaceError("SCM_BRANCH_MISSING", "Workspace default branch is not configured", 409);
+    const credential = this.scmSettings?.get(id);
+    const createdAt = new Date().toISOString();
+    try {
+      const result = await this.callWorker<WorkspacePushResult>("/workspaces/push", {
+        method: "POST",
+        body: JSON.stringify({ relativePath: access.row.root_path, branch, ...(credential ? { credential } : {}) }),
+      });
+      await this.recordScmAttempt({
+        id: newId("scm"), workspaceId: id, actorId, operation: "push",
+        status: result.pushed ? "succeeded" : "noop",
+        localHead: result.after.localHead, remoteHead: result.after.remoteHead,
+        detail: result.pushed ? `Pushed ${result.after.localHead.slice(0, 12)} to origin/${branch}` : "Local and remote branches were already synchronized",
+        createdAt,
+      });
+      return result;
+    } catch (error) {
+      const failure = workspaceWorkerFailure(error, "SCM_PUSH_FAILED", 503);
+      await this.recordScmAttempt({
+        id: newId("scm"), workspaceId: id, actorId, operation: "push", status: "failed",
+        localHead: access.row.git_head, remoteHead: null, detail: failure.message.slice(0, 800), createdAt,
+      }).catch(() => undefined);
+      throw failure;
+    }
+  }
+
+  private async listScmAttempts(workspaceId: string): Promise<WorkspaceScmAttempt[]> {
+    const rows = (await this.db.query(
+      "SELECT * FROM workspace_scm_sync_attempts WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT 10",
+      [workspaceId],
+    )).rows as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      id: String(row.id), operation: "push", status: String(row.status) as WorkspaceScmAttempt["status"],
+      actorId: String(row.actor_id), localHead: row.local_head ? String(row.local_head) : null,
+      remoteHead: row.remote_head ? String(row.remote_head) : null, detail: row.detail ? String(row.detail) : null,
+      createdAt: String(row.created_at),
+    }));
+  }
+
+  private async recordScmAttempt(input: {
+    id: string; workspaceId: string; actorId: string; operation: "push"; status: WorkspaceScmAttempt["status"];
+    localHead: string | null; remoteHead: string | null; detail: string | null; createdAt: string;
+  }) {
+    await this.db.query(
+      `INSERT INTO workspace_scm_sync_attempts (id, workspace_id, actor_id, operation, status, local_head, remote_head, detail, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [input.id, input.workspaceId, input.actorId, input.operation, input.status, input.localHead, input.remoteHead, input.detail, input.createdAt],
+    );
+  }
+
   private async verifyOnWorker(relativePath: string): Promise<WorkspaceVerifyResult> {
     const result = await this.callWorker<WorkspaceVerifyResult>("/workspaces/verify", {
       method: "POST",
@@ -314,5 +468,21 @@ export class WorkspaceService {
       throw new WorkspaceError("WORKSPACE_READ_ONLY", "只读授权：仅工作区所有者、管理员或拥有写权限的成员可以修改该工作区", 403);
     }
     return access;
+  }
+}
+
+function inferScmProvider(repositoryUrl: string | null): ScmProvider {
+  const lower = (repositoryUrl ?? "").toLowerCase();
+  if (lower.includes("github.com")) return "github";
+  if (lower.includes("gitlab")) return "gitlab";
+  return "generic";
+}
+
+function inferScmAuthMode(repositoryUrl: string | null): ScmAuthMode {
+  try {
+    const protocol = new URL(repositoryUrl ?? "").protocol;
+    return protocol === "http:" || protocol === "https:" ? "https_token" : "server_ssh";
+  } catch {
+    return "server_ssh";
   }
 }

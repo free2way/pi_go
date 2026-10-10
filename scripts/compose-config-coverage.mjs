@@ -61,6 +61,7 @@ export const CRITICAL_ENV = {
     "PI_ALERT_COOLDOWN_SECONDS",
     "PI_PIPELINE_VERSION",
     "PI_WORKSPACES_ENABLED",
+    "PI_SCM_WORKER_TIMEOUT_MS",
     // decision plane / Jev (docs/26). Engine defaults to disabled and every
     // empty value falls back to the documented default; TYPESAFE_API_KEY is the
     // secret read by `PI_DECISION_ENGINE=jev` and stays empty by default.

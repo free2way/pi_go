@@ -5,8 +5,10 @@ import type { DecisionAuditProjection } from "../shared/decision-audit";
 import type { DecisionMetricsResponse } from "../shared/decision-metrics";
 export type { DecisionMetricsResponse } from "../shared/decision-metrics";
 import type { AgileProject, AgileRelease, AgileSprint, AgileStory, ReleaseDeployRecord, ModelTemplate, RunBudget, StoryDetail, StoryPriority, StoryStatus } from "../shared/agile";
-import type { ConfigStatus, CredentialStatus, CurrentUser, ModelCatalogResponse, ModelSelection, Run, RunArtifact, RunEvent, RunRoundsResponse, RunState, Workspace, AccountDetail, AccountSummary, AccountWorkspaceOption, WorkspacePermission, ReleaseWebhookSettingsStatus } from "../shared/types";
+import type { ConfigStatus, CredentialStatus, CurrentUser, ModelCatalogResponse, ModelSelection, Run, RunArtifact, RunEvent, RunRoundsResponse, RunState, Workspace, AccountDetail, AccountSummary, AccountWorkspaceOption, WorkspacePermission, ReleaseWebhookSettingsStatus, ScmAuthMode, ScmProvider, WorkspacePushResult, WorkspaceRemoteStatus, WorkspaceScmOverview, WorkspaceScmSettingsStatus } from "../shared/types";
 import { LOCALE_TAGS, type Locale } from "../shared/i18n";
+import type { RequirementRefineInput, RequirementRefinement } from "../shared/requirement-assistant";
+import type { PiAssistantAnswer, PiAssistantAskInput } from "../shared/pi-assistant";
 
 /**
  * AUD-09 / docs/26 §11: `/api/config/status` augments the shared `ConfigStatus`
@@ -151,6 +153,10 @@ export const api = {
   me: () => request<CurrentUser>("/api/me"),
   credentialStatus: () => request<CredentialStatus>("/api/credentials/status"),
   models: () => request<ModelCatalogResponse>("/api/models"),
+  refineRequirement: (body: RequirementRefineInput, locale?: Locale) =>
+    request<RequirementRefinement>("/api/requirements/refine", { method: "POST", body: JSON.stringify(body), headers: localeHeaders(locale) }),
+  askAssistant: (body: PiAssistantAskInput, locale?: Locale) =>
+    request<PiAssistantAnswer>("/api/assistant/ask", { method: "POST", body: JSON.stringify(body), headers: localeHeaders(locale) }),
   saveCredentials: (body: { provider: string; apiKey: string } | { developerApiKey?: string; reviewerApiKey?: string }) =>
     request<CredentialStatus>("/api/credentials", { method: "PUT", body: JSON.stringify(body) }),
   deleteCredentials: (provider?: string) =>
@@ -170,6 +176,12 @@ export const api = {
   patchWorkspace: (id: string, body: { defaultChecks?: string[]; defaultBranch?: string }) =>
     request<Workspace>(`/api/workspaces/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   unregisterWorkspace: (id: string) => request<void>(`/api/workspaces/${id}`, { method: "DELETE" }),
+  workspaceScm: (id: string) => request<WorkspaceScmOverview>(`/api/workspaces/${id}/scm`),
+  checkWorkspaceScm: (id: string) => request<WorkspaceRemoteStatus>(`/api/workspaces/${id}/scm/check`, { method: "POST" }),
+  saveWorkspaceScm: (id: string, body: { provider: ScmProvider; authMode: ScmAuthMode; username?: string | null; token?: string | null }) =>
+    request<WorkspaceScmSettingsStatus>(`/api/workspaces/${id}/scm`, { method: "PUT", body: JSON.stringify(body) }),
+  deleteWorkspaceScm: (id: string) => request<WorkspaceScmSettingsStatus>(`/api/workspaces/${id}/scm`, { method: "DELETE" }),
+  pushWorkspace: (id: string) => request<WorkspacePushResult>(`/api/workspaces/${id}/scm/push`, { method: "POST", body: JSON.stringify({ confirm: true }) }),
   runs: (params: { query?: string; state?: RunState } = {}) => {
     const search = new URLSearchParams();
     if (params.query?.trim()) search.set("query", params.query.trim());
@@ -210,7 +222,7 @@ export const api = {
     request<Run>(`/api/runs/${id}/reopen`, { method: "POST", body: JSON.stringify(body) }),
   batchRuns: (body: { action: "continue" | "accept" | "cleanup"; runIds: string[]; note?: string; acknowledgeOpenFindings?: boolean; deleteRunDirectory?: boolean }) =>
     request<BatchSummary>("/api/runs/batch", { method: "POST", body: JSON.stringify(body) }),
-  createRun: (body: { title: string; task: string; repository?: string; workspaceId?: string; mode: "demo" | "real"; checks?: string[]; developerModel?: ModelSelection; reviewerModel?: ModelSelection }, options: { locale?: Locale } = {}) =>
+  createRun: (body: { title: string; task: string; repository?: string; workspaceId?: string; mode: "demo" | "real"; checks?: string[]; acceptanceCriteria?: string; developerModel?: ModelSelection; reviewerModel?: ModelSelection }, options: { locale?: Locale } = {}) =>
     request<Run>("/api/runs", { method: "POST", body: JSON.stringify(body), headers: localeHeaders(options.locale) }),
   cancelRun: (id: string) => request<Run>(`/api/runs/${id}/cancel`, { method: "POST" }),
   approveRun: (id: string, body: { mode?: "continue" | "accept"; note?: string; acknowledgeOpenFindings?: boolean; mergeIntoWorkspace?: boolean; reviewScope?: "all" | "blocking" } = {}) =>

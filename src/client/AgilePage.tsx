@@ -1,4 +1,4 @@
-import { FolderCog, BarChart3, ClipboardList, Copy, Download, LayoutTemplate, ListChecks, LoaderCircle, Pencil, Plus, Rocket, RotateCcw, Save, Trash2, X } from "lucide-react";
+import { Activity, ArrowUpRight, Check, CircleDot, FolderCog, BarChart3, ClipboardList, Copy, Download, LayoutTemplate, ListChecks, LoaderCircle, Pencil, Plus, Rocket, RotateCcw, Save, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { DEFAULT_LOCALE, intlLocale, localizeError, t, type Locale, type MessageKey } from "../shared/i18n";
 import { useT } from "./i18n";
@@ -6,9 +6,12 @@ import { runStateKey } from "./requirement-history";
 import { applyModelTemplate, RELEASE_STATUSES, SPRINT_STATUSES, STORY_PRIORITIES, STORY_STATUSES, type AgileProject, type AgileRelease, type AgileSprint, type AgileStory, type ModelTemplate, type ReleaseDeployRecord, type ReleaseStatus, type SprintStatus, type StoryDetail, type StoryPriority, type StoryStatus } from "../shared/agile";
 import type { AgileMetricsResponse, ReleaseRetrospective, ReleaseSummary } from "../shared/agile-metrics";
 import type { ConfigStatus, ModelCatalogResponse, Workspace } from "../shared/types";
+import { renderAcceptanceCriteria, renderRequirementStoryDescription } from "../shared/requirement-assistant";
 import { api } from "./api";
 import { agileFormErrorMessage, buildReleaseInput, buildSprintInput, buildStoryInput, buildTemplateInput, sprintToFormValues, storyToFormValues, STORY_ESTIMATES } from "./agile-forms";
-import { boardColumnKey, columnPoints, estimateLabel, groupStoriesByColumn, priorityKey, priorityLabel, RELEASE_DEPLOY_ACTION_KEYS, releaseDeployAction, releaseExportFilename, releaseExportJson, storyReference, storyStatusKey , projectContentsLabel, projectDeletionWarning } from "./agile-view";
+import { agileReleaseProgressView, boardColumnKey, columnPoints, estimateLabel, groupStoriesByColumn, priorityKey, priorityLabel, RELEASE_DEPLOY_ACTION_KEYS, releaseDeployAction, releaseExportFilename, releaseExportJson, storyReference, storyStatusKey , projectContentsLabel, projectDeletionWarning, type AgileReleaseProgressState } from "./agile-view";
+import { browserDeploymentUrl } from "./release-progress";
+import { RequirementAssistant } from "./RequirementAssistant";
 
 /** Catalog key for the sprint/release/deploy badges (labels live in the catalog). */
 const sprintStatusKey = (status: AgileSprint["status"]): MessageKey => `agile.sprintStatus.${status}` as MessageKey;
@@ -25,6 +28,91 @@ function formatDuration(seconds: number, locale: Locale = DEFAULT_LOCALE): strin
   if (seconds >= 3_600) return t(locale, "agile.duration.hours", { value: (seconds / 3_600).toFixed(1) });
   if (seconds >= 60) return t(locale, "agile.duration.minutes", { value: Math.round(seconds / 60) });
   return t(locale, "agile.duration.seconds", { value: Math.round(seconds) });
+}
+
+function AgileReleaseProgressDialog({ open, release, error, onClose }: {
+  open: boolean;
+  release?: AgileRelease;
+  error: string;
+  onClose: () => void;
+}) {
+  const { t, locale } = useT();
+  const [, setClock] = useState(0);
+  const deploy = release?.deploy;
+  const view = agileReleaseProgressView(deploy);
+  const startedAt = deploy?.startedAt ?? deploy?.at;
+  const elapsedMs = startedAt
+    ? Math.max(0, (deploy?.finishedAt ? Date.parse(deploy.finishedAt) : Date.now()) - Date.parse(startedAt))
+    : 0;
+  const deploymentUrl = browserDeploymentUrl(deploy?.url);
+
+  useEffect(() => {
+    if (!open || view.status !== "running") return;
+    const timer = window.setInterval(() => setClock((value) => value + 1), 1_000);
+    return () => window.clearInterval(timer);
+  }, [open, view.status]);
+  useEffect(() => {
+    if (!open) return;
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [open, onClose]);
+
+  if (!open || !release) return null;
+  const stepIcon = (state: AgileReleaseProgressState) => state === "done"
+    ? <Check size={12} />
+    : state === "failed"
+      ? <X size={12} />
+      : state === "active"
+        ? <LoaderCircle className="spin" size={12} />
+        : <CircleDot size={11} />;
+  const stepLabel = (state: AgileReleaseProgressState) => t(state === "active"
+    ? "release.progress.running"
+    : state === "done"
+      ? "release.progress.done"
+      : state === "failed"
+        ? "release.progress.failed"
+        : "release.progress.waiting");
+
+  return (
+    <aside className="release-progress-window" role="dialog" aria-modal="false" aria-labelledby="agile-release-progress-title">
+      <div className="release-progress-head">
+        <div>
+          <span className="eyebrow">AGILE RELEASE</span>
+          <h3 id="agile-release-progress-title">{t("agile.publish.title", { version: release.version, name: release.name })}</h3>
+        </div>
+        <div className="release-progress-head-actions">
+          <span className={`release-progress-status is-${view.status}`}>{view.status === "running" && <i />}{t(`release.progress.status.${view.status}`)}</span>
+          <button type="button" className="icon-button" onClick={onClose} aria-label={t("release.progress.close")} title={t("release.progress.close")}><X size={16} /></button>
+        </div>
+      </div>
+      <div className="release-progress-summary">
+        <div><span>{t("agile.releaseManage.version")}</span><strong>{release.version}</strong></div>
+        <div><span>{t("release.environment")}</span><strong>{deploy?.environment ?? "—"}</strong></div>
+        <div><span>attempt</span><strong>{deploy?.attempt ?? "—"}</strong></div>
+        <div><span>{t("release.progress.elapsed")}</span><strong>{startedAt ? formatDuration(elapsedMs / 1_000, locale) : "—"}</strong></div>
+      </div>
+      <div className="release-progress-body">
+        <ol className="release-progress-timeline">
+          <li className={`is-${view.request}`}><span>{stepIcon(view.request)}</span><div><strong>{t("release.progress.request")}</strong><small>{deploy?.deliveryId ?? t("release.progress.requesting")}</small></div></li>
+          <li className={`is-${view.registration}`}><span>{stepIcon(view.registration)}</span><div><strong>{t("agile.publish.progress.registration")}</strong><small>{view.registration === "active" ? t("agile.publish.progress.registrationHelp") : stepLabel(view.registration)}</small></div></li>
+          <li className={`is-${view.result}`}><span>{stepIcon(view.result)}</span><div><strong>{t("release.progress.result")}</strong><small>{deploy?.detail ?? t(view.status === "running" ? "release.progress.awaitingResult" : "release.progress.waiting")}</small></div></li>
+        </ol>
+        {deploy && (
+          <div className="release-progress-log">
+            <div><span>{t("release.progress.events")}</span><small>{t(deploy.status === "pending" ? "release.progress.awaitingResult" : `release.progress.status.${view.status}`)}</small></div>
+            <p><time>{formatTime(deploy.at, locale)}</time><span>{deploy.detail}</span></p>
+          </div>
+        )}
+      </div>
+      {error ? <div className="form-error release-progress-error">{error}</div> : null}
+      <div className="release-progress-actions">
+        <button type="button" className="button secondary" onClick={onClose}>{t("release.progress.close")}</button>
+        {deploymentUrl && <a className="button secondary" href={deploymentUrl} target="_blank" rel="noreferrer">{t("release.viewDeploy")}<ArrowUpRight size={13} /></a>}
+      </div>
+      <p className="release-progress-footnote">{t("release.progress.closeHint")}</p>
+    </aside>
+  );
 }
 
 /** Sprint 3 batch 1: project/story planning on top of the existing run engine. */
@@ -87,6 +175,9 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
   const [publishEnvironment, setPublishEnvironment] = useState<"staging" | "production">("staging");
   const [publishBusy, setPublishBusy] = useState(false);
   const [publishError, setPublishError] = useState("");
+  const [releaseProgressId, setReleaseProgressId] = useState("");
+  const [releaseProgressOpen, setReleaseProgressOpen] = useState(false);
+  const [releaseProgressError, setReleaseProgressError] = useState("");
 
   // new-project form
   const [projectName, setProjectName] = useState("");
@@ -120,6 +211,13 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
   const [budgetSeconds, setBudgetSeconds] = useState("");
 
   const selectedProject = projects.find((project) => project.id === projectId);
+  const progressRelease = releases.find((release) => release.id === releaseProgressId);
+  const selectedStoryWorkspace = workspaces.find((workspace) => workspace.id === storyWorkspace);
+  const storyRequirementDraft = [
+    storyDescription.trim(),
+    storyCriteria.trim() ? `${locale === "en" ? "Current acceptance criteria" : "当前验收条件"}:\n${storyCriteria.trim()}` : "",
+    storyDod.trim() ? `${locale === "en" ? "Current definition of done" : "当前完成定义"}:\n${storyDod.trim()}` : "",
+  ].filter(Boolean).join("\n\n");
 
   const loadProjects = useCallback(async () => {
     setError("");
@@ -168,9 +266,34 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
     setPublishBlocked([]);
     setPublishReady(false);
     setPublishError("");
+    setReleaseProgressId("");
+    setReleaseProgressOpen(false);
+    setReleaseProgressError("");
     if (projectId) void loadProjectData(projectId);
     else { setStories([]); setSprints([]); setReleases([]); }
   }, [projectId, loadProjectData]);
+
+  const refreshReleases = useCallback(async () => {
+    if (!projectId) return;
+    const result = await api.releases(projectId);
+    setReleases(result.releases);
+  }, [projectId]);
+
+  useEffect(() => {
+    if (!releaseProgressOpen || !releaseProgressId || progressRelease?.deploy?.status !== "pending") return;
+    let stopped = false;
+    const refresh = async () => {
+      try {
+        await refreshReleases();
+        if (!stopped) setReleaseProgressError("");
+      } catch (cause) {
+        if (!stopped) setReleaseProgressError(localizeError(locale, cause as { code?: string; message?: string }, t("agile.error.loadStories")));
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 1_500);
+    return () => { stopped = true; window.clearInterval(timer); };
+  }, [releaseProgressOpen, releaseProgressId, progressRelease?.deploy?.status, refreshReleases, locale, t]);
 
   useEffect(() => {
     if (!selectedId) { setDetail(undefined); return; }
@@ -641,6 +764,15 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
     setPublishError("");
   };
 
+  const openReleaseProgress = (release: AgileRelease) => {
+    setReleaseProgressId(release.id);
+    setReleaseProgressError("");
+    setReleaseProgressOpen(true);
+    void refreshReleases().catch((cause) => {
+      setReleaseProgressError(localizeError(locale, cause as { code?: string; message?: string }, t("agile.error.loadStories")));
+    });
+  };
+
   const confirmPublish = async () => {
     if (!publishTarget) return;
     setPublishBusy(true);
@@ -655,6 +787,9 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
         ...(publishNote.trim() ? { note: publishNote.trim() } : {}),
       });
       setReleases((current) => current.map((item) => (item.id === result.release.id ? result.release : item)));
+      setReleaseProgressId(result.release.id);
+      setReleaseProgressError("");
+      setReleaseProgressOpen(true);
       closePublish();
     } catch (cause) {
       const error = cause as { message?: string; body?: { blocked?: Array<{ storyId: string; title: string; reason: string }> } };
@@ -817,7 +952,24 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
           <form className="ws-form" onSubmit={saveStory}>
             <div className="ws-form-head"><div><span className="eyebrow">{storyManageId ? "EDIT STORY" : "NEW STORY"}</span><h3>{t(storyManageId ? "agile.storyForm.edit" : "agile.storyForm.title")}</h3></div><button className="icon-button" type="button" onClick={closeStoryForm}><X size={16} /></button></div>
             <label>{t("agile.storyForm.titleField")}<input value={storyTitle} onChange={(event) => setStoryTitle(event.target.value)} placeholder={t("agile.storyForm.titlePlaceholder")} autoFocus /></label>
-            <label>{t("agile.storyForm.description")}<textarea rows={3} value={storyDescription} onChange={(event) => setStoryDescription(event.target.value)} placeholder={t("agile.storyForm.descriptionPlaceholder")} /></label>
+            <div className="field-block">
+              <div className="requirement-authoring-head">
+                <span>{t("agile.storyForm.description")}</span>
+                <RequirementAssistant
+                  draft={storyRequirementDraft}
+                  title={storyTitle}
+                  models={models}
+                  context={{ source: "story", projectName: selectedProject?.name, workspaceName: selectedStoryWorkspace?.name }}
+                  onApply={(refinement) => {
+                    setStoryTitle(refinement.spec.title);
+                    setStoryDescription(renderRequirementStoryDescription(refinement.spec, locale));
+                    setStoryCriteria(renderAcceptanceCriteria(refinement.spec));
+                    setStoryDod(refinement.spec.definitionOfDone.join("\n"));
+                  }}
+                />
+              </div>
+              <textarea rows={3} value={storyDescription} onChange={(event) => setStoryDescription(event.target.value)} placeholder={t("agile.storyForm.descriptionPlaceholder")} />
+            </div>
             <label>{t("agile.storyForm.criteria")}<textarea rows={3} value={storyCriteria} onChange={(event) => setStoryCriteria(event.target.value)} placeholder={t("agile.storyForm.criteriaPlaceholder")} /></label>
             <label>{t("agile.storyForm.dod")}<textarea rows={2} value={storyDod} onChange={(event) => setStoryDod(event.target.value)} placeholder={t("agile.storyForm.dodPlaceholder")} /></label>
             <div className="agile-form-row">
@@ -1377,6 +1529,7 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
                   <code>{release.version}</code>
                   <span>{release.name}</span>
                   <small>{release.deploy ? t("agile.releaseManage.rowMetaDeploy", { status: t(releaseStatusKey(release.status)), count: release.storyIds.length, deploy: t(deployStatusKey(release.deploy.status)) }) : t("agile.releaseManage.rowMeta", { status: t(releaseStatusKey(release.status)), count: release.storyIds.length })}</small>
+                  {release.deploy && <button type="button" onClick={() => openReleaseProgress(release)}><Activity size={12} />{t("release.progress.open")}</button>}
                   <button type="button" disabled={deployAction === "done" || deployAction === "waiting"} onClick={() => void openPublish(release)}><Rocket size={12} />{t(RELEASE_DEPLOY_ACTION_KEYS[deployAction])}</button>
                   <button type="button" disabled={release.status === "released"} onClick={() => editRelease(release)}><Pencil size={12} />{t("common.edit")}</button>
                   <button type="button" className="danger" disabled={busy === `delete-release:${release.id}`} onClick={() => void removeRelease(release)}><Trash2 size={12} />{t("common.delete")}</button>
@@ -1420,6 +1573,13 @@ export function AgilePage({ config, onOpenRun }: { config?: ConfigStatus; onOpen
           </div>
         </section>
       )}
+
+      <AgileReleaseProgressDialog
+        open={releaseProgressOpen}
+        release={progressRelease}
+        error={releaseProgressError}
+        onClose={() => setReleaseProgressOpen(false)}
+      />
 
       {detail && (
         <section className="panel agile-detail">

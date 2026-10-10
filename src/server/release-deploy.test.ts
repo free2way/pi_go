@@ -104,6 +104,33 @@ describe("runReleaseDeploy (audit P1)", () => {
     expect(settled.release.deploy).toMatchObject({ status: "ok" });
   });
 
+  it("promotes staging to production with the next release-wide attempt", async () => {
+    const db = await createTestDb();
+    const { service, release, stories } = await seed(db);
+    const executions: Array<{ deliveryId: string }> = [];
+    const d = deps(service, release.id, executions, { configured: true, kind: "webhook", status: "succeeded", detail: "registered", httpStatus: 200 });
+
+    const staged = await runReleaseDeploy(input(release, stories), d);
+    expect(staged).toMatchObject({ kind: "published", deploy: { status: "ok", environment: "staging", attempt: 1 } });
+
+    const promoted = await runReleaseDeploy(input(
+      await service.getRelease([], release.id, true),
+      stories,
+      { environment: "production", now: "2026-01-02T00:01:00.000Z" },
+    ), d);
+    expect(promoted).toMatchObject({ kind: "published", deploy: { status: "ok", environment: "production", attempt: 2 } });
+    expect(executions.map((entry) => entry.deliveryId)).toEqual([
+      `release-publish:${release.id}:staging`,
+      `release-publish:${release.id}:production`,
+    ]);
+
+    const claims = await db.query("SELECT attempt, delivery_id FROM agile_release_deploy_claims WHERE release_id = $1 ORDER BY attempt", [release.id]);
+    expect(claims.rows.map((row) => ({ attempt: Number(row.attempt), deliveryId: row.delivery_id }))).toEqual([
+      { attempt: 1, deliveryId: `release-publish:${release.id}:staging` },
+      { attempt: 2, deliveryId: `release-publish:${release.id}:production` },
+    ]);
+  });
+
   it("records a failed deploy and retries it as a new attempt with the same delivery id", async () => {
     const db = await createTestDb();
     const { service, release, stories } = await seed(db);

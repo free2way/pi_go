@@ -101,6 +101,7 @@ services:
       # The mounted host credential file — deliberately NOT /tmp. The stack uses
       # one shared vault; /tmp would silently create an empty throwaway vault.
       PI_VAULT_FILE: /app/data/credentials.v1.json
+      PI_SCM_SETTINGS_FILE: /app/data/scm-settings.v1.json
       PI_VAULT_SECRET: ${PI_VAULT_SECRET:?Set PI_VAULT_SECRET in deploy/docker/demo.env}
       # HARD-WIRED demo database. scripts/demo-env.sh up refuses to start if the
       # resolved URL does not end in /pigo_demo.
@@ -114,6 +115,7 @@ services:
       PI_WEB_VERSION: ${PIGO_DEMO_VERSION:?Set PIGO_DEMO_VERSION in deploy/docker/demo.env}
       PI_WORKER_VERSION: ${PIGO_DEMO_VERSION:?Set PIGO_DEMO_VERSION in deploy/docker/demo.env}
       PI_WORKSPACES_ENABLED: "true"
+      PI_SCM_WORKER_TIMEOUT_MS: ${PI_SCM_WORKER_TIMEOUT_MS:-300000}
       PI_DEVELOPER_MODEL: ${PI_DEVELOPER_MODEL:-deepseek-flash}
       PI_REVIEWER_PROVIDER: ${PI_REVIEWER_PROVIDER:-openai-proxy}
       PI_REVIEWER_MODEL: ${PI_REVIEWER_MODEL:-gpt-5.6-sol}

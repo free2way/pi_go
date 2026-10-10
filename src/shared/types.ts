@@ -707,6 +707,57 @@ export interface WorkspaceVerifyResult {
   dirtyFiles?: string[];
 }
 
+export type ScmProvider = "github" | "gitlab" | "generic";
+export type ScmAuthMode = "https_token" | "server_ssh";
+export type WorkspaceRemoteRelation = "synchronized" | "ahead" | "behind" | "diverged" | "no_remote" | "remote_branch_missing";
+
+/** Public projection of one workspace's encrypted SCM configuration. */
+export interface WorkspaceScmSettingsStatus {
+  provider: ScmProvider;
+  authMode: ScmAuthMode;
+  username: string | null;
+  tokenConfigured: boolean;
+  updatedAt: string | null;
+}
+
+/** Live comparison between the canonical workspace branch and origin. */
+export interface WorkspaceRemoteStatus {
+  provider: ScmProvider;
+  remote: string;
+  branch: string;
+  localHead: string;
+  remoteHead: string | null;
+  relation: WorkspaceRemoteRelation;
+  ahead: number;
+  behind: number;
+  checkedAt: string;
+  requiredCommit?: string | null;
+  requiredCommitPresent?: boolean;
+}
+
+export interface WorkspaceScmAttempt {
+  id: string;
+  operation: "push";
+  status: "succeeded" | "failed" | "noop";
+  actorId: string;
+  localHead: string | null;
+  remoteHead: string | null;
+  detail: string | null;
+  createdAt: string;
+}
+
+export interface WorkspaceScmOverview {
+  settings: WorkspaceScmSettingsStatus;
+  remote: WorkspaceRemoteStatus | null;
+  attempts: WorkspaceScmAttempt[];
+}
+
+export interface WorkspacePushResult {
+  pushed: boolean;
+  before: WorkspaceRemoteStatus;
+  after: WorkspaceRemoteStatus;
+}
+
 /** 账户管理: the two internal roles. `admin` may manage accounts and merge/publish. */
 export type AccountRole = "admin" | "user";
 /** 账户管理: soft account state; `disabled` blocks new logins but keeps history. */

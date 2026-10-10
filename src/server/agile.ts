@@ -857,6 +857,7 @@ export class AgileService {
         storyId: story.id,
         title: story.title,
         status: story.status,
+        workspaceId: run?.workspaceId ?? story.workspaceId,
         ...(story.status === "blocked" && story.blockedReason ? { reason: story.blockedReason } : {}),
         runState: run?.state ?? null,
         runId: run?.id ?? null,

@@ -146,6 +146,35 @@ export function deployStatusKey(status: ReleaseDeployRecord["status"]): MessageK
 
 export type ReleaseDeployAction = "publish" | "promote" | "retry" | "waiting" | "done";
 
+export type AgileReleaseProgressState = "waiting" | "active" | "done" | "failed";
+
+export interface AgileReleaseProgressView {
+  status: "running" | "succeeded" | "failed";
+  request: AgileReleaseProgressState;
+  registration: AgileReleaseProgressState;
+  result: AgileReleaseProgressState;
+}
+
+/**
+ * The version-level webhook registers an already deployed Run artifact; it does
+ * not expose the Run deployer's build/smoke stages. Keep its progress model
+ * honest: request accepted -> executor registration -> final callback/result.
+ */
+export function agileReleaseProgressView(deploy: ReleaseDeployRecord | null | undefined): AgileReleaseProgressView {
+  if (!deploy || deploy.status === "pending") {
+    return {
+      status: "running",
+      request: deploy ? "done" : "active",
+      registration: deploy ? "active" : "waiting",
+      result: "waiting",
+    };
+  }
+  if (deploy.status === "ok") {
+    return { status: "succeeded", request: "done", registration: "done", result: "done" };
+  }
+  return { status: "failed", request: "done", registration: "failed", result: "failed" };
+}
+
 /** Catalog keys for the deploy button (labels live in the catalog). */
 export const RELEASE_DEPLOY_ACTION_KEYS: Record<ReleaseDeployAction, MessageKey> = {
   publish: "agile.deployAction.publish",

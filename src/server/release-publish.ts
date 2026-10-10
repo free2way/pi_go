@@ -84,6 +84,8 @@ export type ReleaseDeployDecision =
  * the same attempt and therefore the same DB idempotency key — exactly one wins.
  *
  * - first publish (or a publish that never recorded a deploy) → attempt 1;
+ * - staging → production promotion → the next release-wide attempt, with a
+ *   new environment-scoped delivery id;
  * - already succeeded / nothing to wait for → `RELEASE_RELEASED` (409);
  * - `failed` → only with an explicit `retry` (`RELEASE_RETRY_REQUIRED`);
  * - `pending` → refused until the bounded timeout, then only with `retry`; a
@@ -110,9 +112,12 @@ export function planReleaseDeployAttempt(input: {
   if (targetChanged && !promotion) {
     return { kind: "conflict", status: 409, code: "RELEASE_TARGET_CHANGED", message: "已有发布记录与当前环境不一致，仅允许 staging 成功后晋级到 production" };
   }
-  if (promotion) return { kind: "ready", deliveryId, attempt: 1 };
   const retryDeliveryId = deploy.deliveryId ?? deliveryId;
   const nextAttempt = (deploy.attempt ?? 1) + 1;
+  // `agile_release_deploy_claims` enforces UNIQUE(release_id, attempt), so the
+  // sequence is release-wide rather than per environment. Reusing attempt 1
+  // for production after a successful staging claim would violate that key.
+  if (promotion) return { kind: "ready", deliveryId, attempt: nextAttempt };
   if (deploy.status === "ok" || deploy.status === "not_configured" || deploy.status === "unsupported") {
     return { kind: "conflict", status: 409, code: "RELEASE_RELEASED", message: "发布已发布，不可重复发布" };
   }
@@ -150,6 +155,8 @@ export interface ReleasePublishStory {
   storyId: string;
   title: string;
   status: StoryStatus;
+  /** Canonical source workspace used by the story's latest run. */
+  workspaceId?: string | null;
   /** Derived reason; present only when `status` is `blocked`. */
   reason?: string;
   /** Latest linked run state, echoed to the UI when the story is blocked. */

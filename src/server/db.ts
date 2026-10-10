@@ -542,6 +542,24 @@ export const databaseMigrations: Migration[] = [
       CREATE UNIQUE INDEX idx_decision_evaluations_idempotency ON decision_evaluations(idempotency_key);
     `,
   },
+  {
+    id: 16,
+    name: "workspace-scm-sync-attempts",
+    sql: `
+      CREATE TABLE workspace_scm_sync_attempts (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+        actor_id TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        status TEXT NOT NULL,
+        local_head TEXT,
+        remote_head TEXT,
+        detail TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX idx_workspace_scm_attempts_workspace ON workspace_scm_sync_attempts(workspace_id, created_at);
+    `,
+  },
 ];
 
 export async function runMigrations(db: Db) {

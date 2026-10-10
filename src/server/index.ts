@@ -15,10 +15,11 @@ import { AlertManager, createAlertSink } from "./alerts.js";
 import { Authenticator } from "./auth.js";
 import { CredentialVault } from "./credential-vault.js";
 import { ReleaseSettingsStore, releaseSettingsStatus } from "./release-settings.js";
+import { ScmSettingsStore } from "./scm-settings.js";
 import { createDb, createPool, newId, runMigrations } from "./db.js";
 import { baseDemoRun, runDemo } from "./demo-runner.js";
 import { IdentityService } from "./identity.js";
-import { availableModels, defaultSelections, loadModelCatalog, preflightRunModels } from "./model-catalog.js";
+import { availableModels, defaultSelections, loadModelCatalog, preflightRunModels, validateModelSelection } from "./model-catalog.js";
 import { RunEventStream } from "./event-stream.js";
 import { cleanupRunDirectory, keptRunStorageOutcome, type RunDirectoryCleaner } from "./run-cleanup.js";
 import { baseRealRun } from "./real-run.js";
@@ -62,12 +63,15 @@ import { runReleaseDeploy } from "./release-deploy.js";
 import compress from "@fastify/compress";
 import { cacheControlFor, isBuildAssetRequest } from "./static-cache.js";
 import type { RunStoreLike } from "./store.js";
-import { WorkspaceError, WorkspaceService } from "./workspaces.js";
+import { scmWorkerTimeoutMs, WorkspaceError, WorkspaceService } from "./workspaces.js";
+import { planRemoteSyncGate, type RemoteCommitEvidence } from "./scm-release-gate.js";
+import type { RequirementRefinement } from "../shared/requirement-assistant.js";
+import type { PiAssistantAnswer } from "../shared/pi-assistant.js";
 
 const app = Fastify({
   logger: {
     redact: {
-      paths: ["req.headers.authorization", "req.headers.cf-access-jwt-assertion", "developerApiKey", "reviewerApiKey", "credentials"],
+      paths: ["req.headers.authorization", "req.headers.cf-access-jwt-assertion", "req.body.token", "developerApiKey", "reviewerApiKey", "credentials", "token"],
       censor: "[redacted]",
     },
   },
@@ -88,6 +92,7 @@ const internalToken = process.env.PI_INTERNAL_TOKEN || "";
 const dataFile = process.env.PI_DATA_FILE || path.resolve("data/runs.json");
 const vaultFile = process.env.PI_VAULT_FILE || path.resolve("data/credentials.v1.json");
 const releaseSettingsFile = process.env.PI_RELEASE_SETTINGS_FILE || path.resolve("data/release-settings.v1.json");
+const scmSettingsFile = process.env.PI_SCM_SETTINGS_FILE || path.resolve("data/scm-settings.v1.json");
 const publicOrigin = process.env.PI_PUBLIC_ORIGIN || "";
 const vaultSecret = process.env.PI_VAULT_SECRET;
 if (!vaultSecret) throw new Error("PI_VAULT_SECRET is required");
@@ -100,8 +105,9 @@ const vault = new CredentialVault(vaultFile, vaultSecret, {
   reviewer: modelDefaults.reviewer.provider,
 });
 const releaseSettings = new ReleaseSettingsStore(releaseSettingsFile, vaultSecret);
+const scmSettings = new ScmSettingsStore(scmSettingsFile, vaultSecret);
 const auth = new Authenticator();
-await Promise.all([vault.init(), releaseSettings.init()]);
+await Promise.all([vault.init(), releaseSettings.init(), scmSettings.init()]);
 // AUD-08 / AT-MODEL-004: live provider probe used to verify credentials. It is
 // injectable and never throws; a failed probe simply leaves a key unverified.
 const providerProbe = createProviderProbe();
@@ -181,7 +187,12 @@ const workspacesEnabled = process.env.PI_WORKSPACES_ENABLED !== "false";
 // A1: merge-request creation is opt-in via PI_MERGE_REQUEST_*; when unset the
 // route refuses clearly (409 MERGE_REQUEST_NOT_CONFIGURED) instead of guessing.
 const mergeRequestConfig = resolveMergeRequestConfig(process.env);
-const workspaces = new WorkspaceService(db, workerRequest);
+const scmRequestTimeoutMs = scmWorkerTimeoutMs(process.env.PI_SCM_WORKER_TIMEOUT_MS);
+const workspaces = new WorkspaceService(
+  db,
+  (pathName, init) => workerRequest(pathName, init, scmRequestTimeoutMs),
+  scmSettings,
+);
 const agile = new AgileService(db);
 const userCache = new Map<string, CurrentUser>();
 
@@ -205,6 +216,20 @@ const createRunSchema = z.object({
   }
 });
 
+const requirementRefineSchema = z.object({
+  draft: z.string().trim().min(10).max(10_000),
+  title: z.string().trim().max(200).optional(),
+  context: z.object({
+    source: z.enum(["run", "story"]).optional(),
+    projectName: z.string().trim().max(120).optional(),
+    workspaceName: z.string().trim().max(120).optional(),
+  }).strict().optional(),
+  model: z.object({
+    provider: z.string().trim().min(1).max(80),
+    model: z.string().trim().min(1).max(120),
+  }).strict().optional(),
+}).strict();
+
 const credentialSchema = z.object({
   provider: z.string().trim().min(1).max(80).optional(),
   apiKey: z.string().trim().min(12).max(512).optional(),
@@ -214,6 +239,46 @@ const credentialSchema = z.object({
   .refine((value) => !value.provider || Boolean(value.apiKey), "apiKey is required when provider is set");
 
 const runStateSchema = z.enum(["queued", "preparing", "developing", "checking", "reviewing", "completed", "needs_human", "failed", "cancelled"]);
+const piAssistantAskSchema = z.object({
+  message: z.string().trim().min(1).max(2_000),
+  context: z.object({
+    page: z.enum(["run", "agile", "workspaces", "models", "history", "system", "release-settings", "accounts"]),
+    run: z.object({
+      id: z.string().trim().min(1).max(80),
+      title: z.string().trim().max(200),
+      state: runStateSchema,
+      round: z.number().int().min(0).max(1_000),
+      maxRounds: z.number().int().min(1).max(1_000),
+      repository: z.string().trim().max(240),
+      summary: z.string().trim().max(1_000),
+      developer: z.object({ provider: z.string().trim().max(80), model: z.string().trim().max(120) }).strict(),
+      reviewer: z.object({ provider: z.string().trim().max(80), model: z.string().trim().max(120) }).strict(),
+      checks: z.array(z.object({
+        name: z.string().trim().max(160),
+        status: z.enum(["pending", "running", "passed", "failed"]),
+        exitCode: z.number().int().optional(),
+      }).strict()).max(8),
+      findings: z.array(z.object({
+        severity: z.enum(["critical", "high", "medium", "low"]),
+        title: z.string().trim().max(240),
+        resolved: z.boolean(),
+      }).strict()).max(12),
+      mergeStatus: z.enum(["not_merged", "pending", "merged"]),
+      release: z.object({
+        status: z.string().trim().max(60),
+        environment: z.string().trim().max(60).optional(),
+      }).strict().optional(),
+    }).strict().optional(),
+  }).strict(),
+  history: z.array(z.object({
+    role: z.enum(["user", "assistant"]),
+    content: z.string().trim().min(1).max(4_000),
+  }).strict()).max(8).optional(),
+  model: z.object({
+    provider: z.string().trim().min(1).max(80),
+    model: z.string().trim().min(1).max(120),
+  }).strict().optional(),
+}).strict();
 const checkpointSchema = z.object({
   stageKey: z.string().trim().min(1).max(120),
   status: z.enum(["running", "completed", "failed"]),
@@ -353,6 +418,8 @@ const INTERNAL_ARTIFACT_BODY_LIMIT = 8 * 1024 * 1024;
 const credentialWrites = new RateLimiter(10);
 const runCreations = new RateLimiter(Number(process.env.PI_RUN_CREATE_PER_MINUTE || 20));
 const runActions = new RateLimiter(Number(process.env.PI_RUN_ACTIONS_PER_MINUTE || 30));
+const requirementRefinements = new RateLimiter(Number(process.env.PI_REQUIREMENT_ASSISTANT_PER_MINUTE || 12));
+const piAssistantQuestions = new RateLimiter(Number(process.env.PI_ASSISTANT_PER_MINUTE || 20));
 
 /** GAP-01: the budget that applied when the run was created (also shown in the UI). */
 function readRunBudget() {
@@ -471,8 +538,13 @@ async function workerRequest<T>(pathName: string, init?: RequestInit, timeoutMs 
     headers: { Authorization: `Bearer ${internalToken}`, "Content-Type": "application/json", ...init?.headers },
     signal: AbortSignal.timeout(timeoutMs),
   });
-  const body = await response.json().catch(() => ({})) as { error?: string };
-  if (!response.ok) throw new Error(body.error || `Worker request failed: ${response.status}`);
+  const body = await response.json().catch(() => ({})) as { error?: string; code?: string };
+  if (!response.ok) {
+    const failure = new Error(body.error || `Worker request failed: ${response.status}`) as Error & { code?: string; status?: number };
+    failure.code = body.code;
+    failure.status = response.status;
+    throw failure;
+  }
   return body as T;
 }
 
@@ -906,6 +978,105 @@ app.get("/api/models", async (request): Promise<ModelCatalogResponse> => {
   };
 });
 
+/**
+ * Interactive, non-mutating requirement refinement. It deliberately does not
+ * create a run or a story: the browser previews the structured result and the
+ * human explicitly applies it to the form before the normal submit path.
+ */
+app.post("/api/requirements/refine", async (request, reply) => {
+  const user = auth.user(request);
+  const limit = requirementRefinements.check(user.id);
+  if (!limit.allowed) return tooManyRequests(reply, limit.retryAfterMs);
+  const parsed = requirementRefineSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid requirement", code: "REQUIREMENT_INPUT_INVALID", details: parsed.error.issues });
+
+  const selection = parsed.data.model ?? modelDefaults.developer;
+  const validation = validateModelSelection(modelCatalog, "developer", selection, vault.providerAvailability(vaultKeyFor(request)));
+  if (!validation.ok) {
+    return reply.code(422).send({ error: validation.message, code: validation.code, role: "requirement" });
+  }
+  let apiKey = vault.get(vaultKeyFor(request), validation.entry.provider) ?? "";
+  if (!apiKey) {
+    return reply.code(403).send({ error: "所选需求模型缺少可用凭据", code: "PERSONAL_CREDENTIALS_REQUIRED" });
+  }
+  try {
+    const result = await workerRequest<RequirementRefinement>("/requirements/refine", {
+      method: "POST",
+      body: JSON.stringify({
+        ...parsed.data,
+        locale: requestLocale(request),
+        provider: validation.entry.provider,
+        model: validation.entry.model,
+        apiKey,
+      }),
+    }, Math.max(8_000, Number(process.env.PI_REQUIREMENT_ASSISTANT_HTTP_TIMEOUT_MS || 30_000)));
+    return result;
+  } catch (error) {
+    const failure = error as Error & { code?: string };
+    app.log.warn({
+      provider: validation.entry.provider,
+      model: validation.entry.model,
+      error: String(failure.message).replaceAll(apiKey, "[redacted]").slice(0, 300),
+    }, "requirement assistant failed");
+    if (failure.code === "REQUIREMENT_ASSISTANT_BUSY") {
+      return reply.code(429).send({ error: "需求助手当前繁忙，请稍后重试", code: failure.code });
+    }
+    return reply.code(502).send({ error: "需求助手暂时不可用，请稍后重试；原始内容仍保留在表单中", code: "REQUIREMENT_ASSISTANT_FAILED" });
+  } finally {
+    apiKey = "";
+  }
+});
+
+/**
+ * Global, non-mutating Pi Assistant. The browser sends only the current page and
+ * a small run projection; the worker receives no repository mount, tools or
+ * plugins. Operational mutations remain behind their existing confirmation
+ * routes and cannot be reached from this endpoint.
+ */
+app.post("/api/assistant/ask", async (request, reply) => {
+  const user = auth.user(request);
+  const limit = piAssistantQuestions.check(user.id);
+  if (!limit.allowed) return tooManyRequests(reply, limit.retryAfterMs);
+  const parsed = piAssistantAskSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid assistant question", code: "PI_ASSISTANT_INPUT_INVALID", details: parsed.error.issues });
+
+  const selection = parsed.data.model ?? modelDefaults.developer;
+  const validation = validateModelSelection(modelCatalog, "developer", selection, vault.providerAvailability(vaultKeyFor(request)));
+  if (!validation.ok) {
+    return reply.code(422).send({ error: validation.message, code: validation.code, role: "assistant" });
+  }
+  let apiKey = vault.get(vaultKeyFor(request), validation.entry.provider) ?? "";
+  if (!apiKey) {
+    return reply.code(403).send({ error: "所选助手模型缺少可用凭据", code: "PERSONAL_CREDENTIALS_REQUIRED" });
+  }
+  try {
+    return await workerRequest<PiAssistantAnswer>("/assistant/ask", {
+      method: "POST",
+      body: JSON.stringify({
+        ...parsed.data,
+        locale: requestLocale(request),
+        provider: validation.entry.provider,
+        model: validation.entry.model,
+        apiKey,
+      }),
+    }, Math.max(8_000, Number(process.env.PI_ASSISTANT_HTTP_TIMEOUT_MS || 35_000)));
+  } catch (error) {
+    const failure = error as Error & { code?: string };
+    app.log.warn({
+      provider: validation.entry.provider,
+      model: validation.entry.model,
+      page: parsed.data.context.page,
+      error: String(failure.message).replaceAll(apiKey, "[redacted]").slice(0, 300),
+    }, "pi assistant failed");
+    if (failure.code === "PI_ASSISTANT_BUSY") {
+      return reply.code(429).send({ error: "Pi Assistant 当前繁忙，请稍后重试", code: failure.code });
+    }
+    return reply.code(502).send({ error: "Pi Assistant 暂时不可用，请稍后重试", code: "PI_ASSISTANT_FAILED" });
+  } finally {
+    apiKey = "";
+  }
+});
+
 app.get("/api/config/status", async (request): Promise<ConfigStatus & { decisionEngine: DecisionEngineStatus }> => {
   const credentials = vault.status(vaultKeyFor(request));
   const configured = new Set(credentials.providers.map((item) => item.provider));
@@ -1090,6 +1261,13 @@ const workspacePatchSchema = z.object({
   defaultChecks: z.array(z.string().trim().min(1).max(500)).max(8).optional(),
   defaultBranch: z.string().trim().min(1).max(200).optional(),
 }).strict();
+const workspaceScmSettingsSchema = z.object({
+  provider: z.enum(["github", "gitlab", "generic"]),
+  authMode: z.enum(["https_token", "server_ssh"]),
+  username: z.string().trim().min(1).max(120).nullable().optional(),
+  token: z.string().trim().min(8).max(2_000).nullable().optional(),
+}).strict();
+const workspacePushSchema = z.object({ confirm: z.literal(true) }).strict();
 
 function workspacesDisabled(reply: FastifyReply) {
   return reply.code(503).send({ error: "Workspaces are disabled", code: "WORKSPACES_DISABLED" });
@@ -1116,6 +1294,29 @@ function classifyWorkspaceError(error: unknown): { status: number; body: Record<
 function workspaceErrorReply(reply: FastifyReply, error: unknown) {
   const { status, body } = classifyWorkspaceError(error);
   return reply.code(status).send(body);
+}
+
+async function productionRemoteGate(
+  request: FastifyRequest,
+  targets: Array<{ workspaceId?: string | null; commit?: string | null }>,
+  isAdmin: boolean,
+) {
+  const evidence: RemoteCommitEvidence[] = [];
+  for (const target of targets) {
+    const workspaceId = target.workspaceId ?? "";
+    const commit = target.commit ?? "";
+    if (!workspaceId || !commit) {
+      evidence.push({ workspaceId, commit, error: "缺少工作区或合并提交" });
+      continue;
+    }
+    try {
+      const status = await workspaces.remoteStatus(ownerKeysFor(request), workspaceId, { isAdmin, requiredCommit: commit });
+      evidence.push({ workspaceId, commit, status });
+    } catch (error) {
+      evidence.push({ workspaceId, commit, error: (error as Error).message.slice(0, 300) });
+    }
+  }
+  return planRemoteSyncGate(evidence);
 }
 
 app.get("/api/workspaces", async (request, reply) => {
@@ -1174,6 +1375,63 @@ app.post<{ Params: { id: string } }>("/api/workspaces/:id/refresh", async (reque
   try {
     // B4: refreshing git metadata mutates stored state, so a read grant is refused.
     return await workspaces.refresh(ownerKeysFor(request), request.params.id, { isAdmin: await identities.isAdmin(auth.user(request).id) });
+  } catch (error) {
+    return workspaceErrorReply(reply, error);
+  }
+});
+
+app.get<{ Params: { id: string } }>("/api/workspaces/:id/scm", async (request, reply) => {
+  if (!workspacesEnabled) return workspacesDisabled(reply);
+  try {
+    return await workspaces.scmOverview(ownerKeysFor(request), request.params.id, { isAdmin: await identities.isAdmin(auth.user(request).id) });
+  } catch (error) {
+    return workspaceErrorReply(reply, error);
+  }
+});
+
+app.post<{ Params: { id: string } }>("/api/workspaces/:id/scm/check", async (request, reply) => {
+  if (!workspacesEnabled) return workspacesDisabled(reply);
+  try {
+    return await workspaces.remoteStatus(ownerKeysFor(request), request.params.id, { isAdmin: await identities.isAdmin(auth.user(request).id) });
+  } catch (error) {
+    return workspaceErrorReply(reply, error);
+  }
+});
+
+app.put<{ Params: { id: string } }>("/api/workspaces/:id/scm", async (request, reply) => {
+  if (!workspacesEnabled) return workspacesDisabled(reply);
+  const user = auth.user(request);
+  if (!(await identities.isAdmin(user.id))) return reply.code(403).send({ error: "仅管理员可以配置代码仓库凭据", code: "ADMIN_REQUIRED" });
+  const parsed = workspaceScmSettingsSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
+  try {
+    return await workspaces.saveScmSettings(ownerKeysFor(request), request.params.id, parsed.data, { isAdmin: true });
+  } catch (error) {
+    return workspaceErrorReply(reply, error);
+  }
+});
+
+app.delete<{ Params: { id: string } }>("/api/workspaces/:id/scm", async (request, reply) => {
+  if (!workspacesEnabled) return workspacesDisabled(reply);
+  const user = auth.user(request);
+  if (!(await identities.isAdmin(user.id))) return reply.code(403).send({ error: "仅管理员可以删除代码仓库凭据", code: "ADMIN_REQUIRED" });
+  try {
+    return await workspaces.deleteScmSettings(ownerKeysFor(request), request.params.id, { isAdmin: true });
+  } catch (error) {
+    return workspaceErrorReply(reply, error);
+  }
+});
+
+app.post<{ Params: { id: string } }>("/api/workspaces/:id/scm/push", async (request, reply) => {
+  if (!workspacesEnabled) return workspacesDisabled(reply);
+  const actionLimit = runActions.check(auth.user(request).id);
+  if (!actionLimit.allowed) return tooManyRequests(reply, actionLimit.retryAfterMs);
+  const parsed = workspacePushSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "推送需要 confirm=true", code: "SCM_PUSH_CONFIRM_REQUIRED", details: parsed.error.issues });
+  const user = auth.user(request);
+  if (!(await identities.isAdmin(user.id))) return reply.code(403).send({ error: "仅管理员可以推送代码到远程仓库", code: "ADMIN_REQUIRED" });
+  try {
+    return await workspaces.push(ownerKeysFor(request), request.params.id, user.id, { isAdmin: true });
   } catch (error) {
     return workspaceErrorReply(reply, error);
   }
@@ -1587,6 +1845,17 @@ app.post<{ Params: { id: string } }>("/api/agile/releases/:id/publish", { bodyLi
         ...(plan.kind === "checks_failed" ? { stories: plan.stories } : {}),
         ...(plan.kind === "not_merged" ? { stories: plan.stories } : {}),
       });
+    }
+
+    if (parsed.data.environment === "production") {
+      const remoteGate = await productionRemoteGate(
+        request,
+        stories.map((story) => ({ workspaceId: story.workspaceId, commit: story.mergedCommit })),
+        isAdmin,
+      );
+      if (remoteGate.kind === "blocked") {
+        return reply.code(409).send({ error: remoteGate.message, code: remoteGate.code, blocked: remoteGate.blocked });
+      }
     }
 
     // Explicit confirmation (`release.requireExplicitConfirmation`): a request
@@ -2561,7 +2830,15 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/publish", { bodyLimit: 1024 
   const run = store.getRun(request.params.id, ownerKeysFor(request));
   if (!run) return reply.code(404).send({ error: "Run not found" });
   const user = auth.user(request);
-  if (!(await identities.isAdmin(user.id))) return reply.code(403).send({ error: "仅管理员可以发布代码", code: "ADMIN_REQUIRED" });
+  const isAdmin = await identities.isAdmin(user.id);
+  if (!isAdmin) return reply.code(403).send({ error: "仅管理员可以发布代码", code: "ADMIN_REQUIRED" });
+
+  if (parsed.data.environment === "production") {
+    const remoteGate = await productionRemoteGate(request, [{ workspaceId: run.workspaceId, commit: run.merge?.commit }], isAdmin);
+    if (remoteGate.kind === "blocked") {
+      return reply.code(409).send({ error: remoteGate.message, code: remoteGate.code, blocked: remoteGate.blocked });
+    }
+  }
 
   const releaseRuntime = effectiveReleaseConfig();
   const deployPlan = releaseRuntime.deployPlan;
