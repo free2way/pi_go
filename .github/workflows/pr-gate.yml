@@ -99,3 +99,84 @@ jobs:
         env:
           PI_DATABASE_URL: postgresql://pigo_ci:ci-local-only@127.0.0.1:5432/pigo_ci
         run: npm run test:pg:concurrency
+
+  browser-smoke:
+    name: Browser smoke evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: pigo_browser
+          POSTGRES_PASSWORD: ci-local-only
+          POSTGRES_DB: pigo_browser
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pigo_browser -d pigo_browser"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Configure Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22.19.0
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Build application
+        run: npm run build
+
+      - name: Install Chromium runtime
+        run: npx playwright install --with-deps chromium
+
+      - name: Start isolated PiGO server
+        env:
+          PORT: "3100"
+          PI_AUTH_MODE: development
+          PI_DATABASE_URL: postgresql://pigo_browser:ci-local-only@127.0.0.1:5432/pigo_browser
+          PI_VAULT_SECRET: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+          PI_DATA_FILE: /tmp/pigo-ci-runs.json
+          PI_VAULT_FILE: /tmp/pigo-ci-vault.json
+          PI_RELEASE_SETTINGS_FILE: /tmp/pigo-ci-release.json
+          PI_SCM_SETTINGS_FILE: /tmp/pigo-ci-scm.json
+          PI_STARTUP_CREDENTIAL_PROBE_BUDGET_MS: "1"
+        run: |
+          nohup npm start >/tmp/pigo-ci-server.log 2>&1 &
+          echo "$!" >/tmp/pigo-ci-server.pid
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:3100/api/health >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          tail -200 /tmp/pigo-ci-server.log
+          exit 1
+
+      - name: Execute and grade browser smoke suite
+        env:
+          PI_E2E_BASE_URL: http://127.0.0.1:3100
+          PI_E2E_DEV_EMAIL: e2e@localhost
+          PLAYWRIGHT_JSON_OUTPUT_NAME: /tmp/pigo-browser-report.json
+        run: |
+          playwright_status=0
+          npx playwright test tests/e2e/auth.spec.ts tests/e2e/i18n.spec.ts --project=chromium --reporter=list --reporter=json || playwright_status=$?
+          node scripts/browser-smoke-verdict.mjs /tmp/pigo-browser-report.json "$playwright_status"
+
+      - name: Print server diagnostics on failure
+        if: failure()
+        run: tail -200 /tmp/pigo-ci-server.log || true
+
+      - name: Stop isolated PiGO server
+        if: always()
+        run: |
+          if [ -f /tmp/pigo-ci-server.pid ]; then
+            kill "$(cat /tmp/pigo-ci-server.pid)" 2>/dev/null || true
+          fi

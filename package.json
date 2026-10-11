@@ -30,6 +30,7 @@
     "e2e:browser": "playwright test",
     "gate:release": "node scripts/release-gate.mjs",
     "gate:acceptance": "node scripts/acceptance-gate.mjs",
+    "gate:browser-report": "node scripts/browser-smoke-verdict.mjs",
     "scan:secrets": "bash scripts/secret-scan.sh",
     "scan:repository-policy": "node scripts/repository-policy-scan.mjs",
     "drill:providers": "node scripts/provider-drill.mjs",
