@@ -60,40 +60,26 @@ try {
   console.log("[pg-concurrency-check] target database: (unparseable connection string)");
 }
 
-// The store is imported from the BUILT output, exactly as the deployed server
-// loads it. `npm run build` must have run in this checkout first.
+// The store and migration runner are imported from the BUILT output, exactly as
+// the deployed server loads them. `npm run build` must have run first. Running
+// the real production migrations here is important: CI starts with a clean
+// PostgreSQL database, while deployed databases already have these tables.
 const storeModuleUrl = new URL("../dist/server/run-store-pg.js", import.meta.url);
+const dbModuleUrl = new URL("../dist/server/db.js", import.meta.url);
 let PostgresRunStore;
+let createDb;
+let runMigrations;
 try {
   ({ PostgresRunStore } = await import(storeModuleUrl.href));
+  ({ createDb, runMigrations } = await import(dbModuleUrl.href));
 } catch (error) {
-  console.error("[pg-concurrency-check] Could not load the built store from dist/server/run-store-pg.js.");
+  console.error("[pg-concurrency-check] Could not load the built store and migration runner from dist/server.");
   console.error("  Run `npm run build` first so dist/ is up to date.");
   console.error(`  ${error instanceof Error ? error.message : String(error)}`);
   process.exit(1);
 }
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-/** Minimal `Db` adapter mirroring src/server/db.ts (kept local so only run-store-pg.js must be built). */
-function createDb(pool) {
-  const withTransaction = async (fn) => {
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-      const tx = { query: (text, params) => client.query(text, params), withTransaction: (nested) => nested(tx) };
-      const result = await fn(tx);
-      await client.query("COMMIT");
-      return result;
-    } catch (error) {
-      await client.query("ROLLBACK").catch(() => undefined);
-      throw error;
-    } finally {
-      client.release();
-    }
-  };
-  return { query: (text, params) => pool.query(text, params), withTransaction };
-}
 
 const pool = new Pool({ connectionString: databaseUrl, max: 10, connectionTimeoutMillis: 10_000 });
 const db = createDb(pool);
@@ -193,6 +179,8 @@ let holder;
 let exitCode = 1;
 try {
   // ---------------------------------------------------------------- setup
+  await runMigrations(db);
+  console.log("[pg-concurrency-check] production schema ready");
   const storeA = new PostgresRunStore(db);
   const storeB = new PostgresRunStore(db);
 
