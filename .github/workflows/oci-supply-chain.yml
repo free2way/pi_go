@@ -181,6 +181,8 @@ jobs:
           upload-release-assets: false
 
       - name: Scan runtime for fixable critical vulnerabilities
+        id: scan_runtime
+        continue-on-error: true
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
         with:
           sbom: supply-chain/sbom/runtime.spdx.json
@@ -191,6 +193,8 @@ jobs:
           output-file: supply-chain/vulnerability/runtime.json
 
       - name: Scan web for fixable critical vulnerabilities
+        id: scan_web
+        continue-on-error: true
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
         with:
           sbom: supply-chain/sbom/web.spdx.json
@@ -201,6 +205,8 @@ jobs:
           output-file: supply-chain/vulnerability/web.json
 
       - name: Scan worker for fixable critical vulnerabilities
+        id: scan_worker
+        continue-on-error: true
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
         with:
           sbom: supply-chain/sbom/worker.spdx.json
@@ -211,6 +217,8 @@ jobs:
           output-file: supply-chain/vulnerability/worker.json
 
       - name: Scan sandbox for fixable critical vulnerabilities
+        id: scan_sandbox
+        continue-on-error: true
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
         with:
           sbom: supply-chain/sbom/sandbox.spdx.json
@@ -221,6 +229,8 @@ jobs:
           output-file: supply-chain/vulnerability/sandbox.json
 
       - name: Scan executor for fixable critical vulnerabilities
+        id: scan_executor
+        continue-on-error: true
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
         with:
           sbom: supply-chain/sbom/executor.spdx.json
@@ -229,6 +239,21 @@ jobs:
           only-fixed: true
           output-format: json
           output-file: supply-chain/vulnerability/executor.json
+
+      - name: Upload supply-chain evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: oci-supply-chain-${{ github.sha }}
+          path: supply-chain/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Enforce vulnerability gate
+        if: ${{ steps.scan_runtime.outcome != 'success' || steps.scan_web.outcome != 'success' || steps.scan_worker.outcome != 'success' || steps.scan_sandbox.outcome != 'success' || steps.scan_executor.outcome != 'success' }}
+        run: |
+          echo "One or more image scans found a fixable critical vulnerability. Inspect the uploaded JSON evidence."
+          exit 1
 
       - name: Attest runtime provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
@@ -269,11 +294,3 @@ jobs:
           subject-digest: ${{ steps.manifest.outputs.executor_digest }}
           push-to-registry: true
           create-storage-record: false
-
-      - name: Upload supply-chain evidence
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: oci-supply-chain-${{ github.sha }}
-          path: supply-chain/
-          if-no-files-found: error
-          retention-days: 90
