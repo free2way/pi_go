@@ -330,6 +330,11 @@ export interface RunReleaseRecord {
   httpStatus?: number;
   deploymentId?: string;
   url?: string;
+  /** Immutable image reference and digest reported by the executor. */
+  image?: string;
+  imageDigest?: string;
+  /** Staging digest that a production attempt is required to reuse. */
+  expectedImageDigest?: string;
 }
 
 /** B1: lifecycle of the durable merge marker between the two phases. */

@@ -13,6 +13,11 @@ import {
   type ReleasePublishStory,
 } from "./release-publish.js";
 
+const NOW = "2026-01-01T00:00:00.000Z";
+const DIGEST = `sha256:${"d".repeat(64)}`;
+const COMMIT = "a".repeat(40);
+const SUCCESS_EVIDENCE = { commit: COMMIT, image: "local/app:immutable", imageDigest: DIGEST };
+
 function story(overrides: Partial<ReleasePublishStory> = {}): ReleasePublishStory {
   return {
     storyId: "story_1",
@@ -25,7 +30,7 @@ function story(overrides: Partial<ReleasePublishStory> = {}): ReleasePublishStor
     findings: [],
     criteria: ["结账成功"],
     diffFiles: ["src/pay.ts"],
-    mergedCommit: "abc1234",
+    mergedCommit: COMMIT,
     ...overrides,
   };
 }
@@ -46,8 +51,6 @@ function release(overrides: Partial<AgileRelease> = {}): AgileRelease {
     ...overrides,
   };
 }
-
-const NOW = "2026-01-01T00:00:00.000Z";
 
 describe("planReleasePublish", () => {
   it("reports RELEASE_EMPTY when the release has no stories", () => {
@@ -187,7 +190,7 @@ describe("buildReleaseDeployPayload", () => {
   it("carries the exact delivery id + attempt so the callback can be matched", () => {
     const payload = buildReleaseDeployPayload({
       release: { id: "rel_1", projectId: "proj_1", name: "结账", version: "v1.2.0" },
-      stories: [{ storyId: "s1", title: "故事一", status: "done" }],
+      stories: [{ storyId: "s1", title: "故事一", status: "done", mergedCommit: COMMIT }],
       releasedAt: "2026-01-01T00:00:00.000Z",
       releasedBy: "user_a",
       environment: "staging",
@@ -201,8 +204,8 @@ describe("buildReleaseDeployPayload", () => {
     const payload = buildReleaseDeployPayload({
       release: { id: "rel_1", projectId: "proj_1", name: "结账", version: "v1.2.0" },
       stories: [
-        { storyId: "s1", title: "故事一", status: "done" },
-        { storyId: "s2", title: "故事二", status: "awaiting_acceptance" },
+        { storyId: "s1", title: "故事一", status: "done", mergedCommit: COMMIT },
+        { storyId: "s2", title: "故事二", status: "awaiting_acceptance", mergedCommit: COMMIT },
       ],
       releasedAt: "2026-01-01T00:00:00.000Z",
       releasedBy: "user_a",
@@ -219,6 +222,7 @@ describe("buildReleaseDeployPayload", () => {
       releasedBy: "user_a",
       environment: "staging",
       note: "首次发布",
+      commits: [COMMIT],
       stories: [
         { storyId: "s1", title: "故事一", status: "done" },
         { storyId: "s2", title: "故事二", status: "awaiting_acceptance" },
@@ -269,20 +273,21 @@ describe("planReleaseDeployAttempt", () => {
   it("allows a successful staging release to promote to production with a new delivery id", () => {
     const staged = release({
       status: "released",
-      deploy: { status: "ok", environment: "staging", detail: "HTTP 200", at: NOW, deliveryId: "release-publish:release_1:staging", attempt: 1 },
+      deploy: { status: "ok", environment: "staging", detail: "HTTP 200", at: NOW, deliveryId: "release-publish:release_1:staging", attempt: 1, imageDigest: DIGEST },
     });
     expect(isReleasePublishTerminal(staged, "production")).toBe(false);
     expect(planReleaseDeployAttempt({ release: staged, environment: "production", now: NOW })).toEqual({
       kind: "ready",
       deliveryId: "release-publish:release_1:production",
       attempt: 2,
+      expectedImageDigest: DIGEST,
     });
   });
 
   it("continues the release-wide attempt sequence when staging was retried before promotion", () => {
     const staged = release({
       status: "released",
-      deploy: { status: "ok", environment: "staging", detail: "HTTP 200", at: NOW, deliveryId: "release-publish:release_1:staging", attempt: 3 },
+      deploy: { status: "ok", environment: "staging", detail: "HTTP 200", at: NOW, deliveryId: "release-publish:release_1:staging", attempt: 3, imageDigest: DIGEST },
     });
     expect(planReleaseDeployAttempt({ release: staged, environment: "production", now: NOW })).toMatchObject({
       kind: "ready",
@@ -329,19 +334,19 @@ describe("planReleaseDeployCallback (old-attempt isolation)", () => {
   }
 
   it("rejects a callback for a previous attempt with RELEASE_ATTEMPT_STALE and audits it", () => {
-    const plan = planReleaseDeployCallback({ current: pending(), deliveryId, attempt: 1, status: "succeeded", now: NOW });
+    const plan = planReleaseDeployCallback({ current: pending(), deliveryId, attempt: 1, status: "succeeded", now: NOW, ...SUCCESS_EVIDENCE });
     expect(plan).toMatchObject({ kind: "reject", status: 409, code: "RELEASE_ATTEMPT_STALE", audit: true, attempt: 2 });
   });
 
   it("rejects a callback that omits the attempt (cannot prove it is for the current one)", () => {
-    const plan = planReleaseDeployCallback({ current: pending(), deliveryId, attempt: undefined, status: "succeeded", now: NOW });
+    const plan = planReleaseDeployCallback({ current: pending(), deliveryId, attempt: undefined, status: "succeeded", now: NOW, ...SUCCESS_EVIDENCE });
     expect(plan).toMatchObject({ kind: "reject", code: "RELEASE_ATTEMPT_STALE", audit: true });
   });
 
   it("rejects a foreign delivery id with RELEASE_DELIVERY_MISMATCH and no audit", () => {
-    const plan = planReleaseDeployCallback({ current: pending(), deliveryId, attempt: 2, status: "succeeded", now: NOW });
+    const plan = planReleaseDeployCallback({ current: pending(), deliveryId, attempt: 2, status: "succeeded", now: NOW, ...SUCCESS_EVIDENCE });
     expect(plan.kind).toBe("settle");
-    const mismatch = planReleaseDeployCallback({ current: pending(), deliveryId: "release-publish:other", attempt: 2, status: "succeeded", now: NOW });
+    const mismatch = planReleaseDeployCallback({ current: pending(), deliveryId: "release-publish:other", attempt: 2, status: "succeeded", now: NOW, ...SUCCESS_EVIDENCE });
     expect(mismatch).toMatchObject({ kind: "reject", code: "RELEASE_DELIVERY_MISMATCH", audit: false });
   });
 
@@ -354,9 +359,23 @@ describe("planReleaseDeployCallback (old-attempt isolation)", () => {
     });
   });
 
+  it("rejects production success when the reported digest differs from staging", () => {
+    const plan = planReleaseDeployCallback({
+      current: pending({ environment: "production", expectedImageDigest: DIGEST }),
+      deliveryId,
+      attempt: 2,
+      status: "succeeded",
+      now: NOW,
+      commit: COMMIT,
+      image: SUCCESS_EVIDENCE.image,
+      imageDigest: `sha256:${"e".repeat(64)}`,
+    });
+    expect(plan).toMatchObject({ kind: "reject", code: "RELEASE_DIGEST_MISMATCH", audit: true });
+  });
+
   it("stays idempotent for a duplicate callback on the current attempt", () => {
     const settled = pending({ status: "ok", finishedAt: NOW });
-    const plan = planReleaseDeployCallback({ current: settled, deliveryId, attempt: 2, status: "succeeded", now: NOW });
+    const plan = planReleaseDeployCallback({ current: settled, deliveryId, attempt: 2, status: "succeeded", now: NOW, ...SUCCESS_EVIDENCE });
     expect(plan).toEqual({ kind: "duplicate", deploy: settled });
   });
 

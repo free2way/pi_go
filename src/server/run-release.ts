@@ -3,6 +3,7 @@ import type { Run, RunReleaseRecord } from "../shared/types.js";
 
 /** A crashed synchronous publisher may be retried with the same delivery id. */
 export const RELEASE_STALE_MS = 2 * 60_000;
+const IMAGE_DIGEST = /^sha256:[a-f0-9]{64}$/;
 
 export function isActiveRelease(run: Pick<Run, "release">) {
   return run.release?.status === "publishing" || run.release?.status === "triggered";
@@ -46,11 +47,22 @@ export function planReleaseStart(input: {
     && existing.commit === run.merge.commit
     && existing.environment === "staging"
     && input.environment === "production";
+  if (existing?.status === "succeeded" && sameTarget && !stagingPromotion) {
+    return { kind: "already-succeeded", release: existing };
+  }
+  if (input.environment === "production" && !existing) {
+    return { kind: "conflict", status: 409, code: "RELEASE_STAGING_REQUIRED", message: "production 发布前必须先完成同一 commit 的 staging 发布" };
+  }
+  if (stagingPromotion && !IMAGE_DIGEST.test(existing.imageDigest ?? "")) {
+    return { kind: "conflict", status: 409, code: "RELEASE_PROMOTION_EVIDENCE_REQUIRED", message: "staging 发布缺少不可变镜像摘要，请重新发布 staging 后再晋级" };
+  }
+  if (input.environment === "production" && existing?.environment === "production"
+    && !IMAGE_DIGEST.test(existing.expectedImageDigest ?? "")) {
+    return { kind: "conflict", status: 409, code: "RELEASE_PROMOTION_EVIDENCE_REQUIRED", message: "production 发布缺少 staging 镜像摘要证据，请重新从 staging 晋级" };
+  }
   if (existing && !sameTarget && !stagingPromotion) {
     return { kind: "conflict", status: 409, code: "RELEASE_TARGET_CHANGED", message: "已有发布记录与当前 commit 或环境不一致，请先完成或回滚该发布" };
   }
-  if (existing?.status === "succeeded" && !stagingPromotion) return { kind: "already-succeeded", release: existing };
-
   if (existing?.status === "triggered" || existing?.status === "publishing") {
     const age = Date.parse(input.now) - Date.parse(existing.startedAt);
     const staleAfterMs = input.staleAfterMs ?? RELEASE_STALE_MS;
@@ -79,6 +91,9 @@ export function planReleaseStart(input: {
       startedAt: input.now,
       attempt: stagingPromotion ? 1 : (existing?.attempt ?? 0) + 1,
       kind: input.kind,
+      ...(input.environment === "production"
+        ? { expectedImageDigest: stagingPromotion ? existing!.imageDigest : existing!.expectedImageDigest }
+        : {}),
     },
   };
 }

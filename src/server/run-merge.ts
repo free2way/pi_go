@@ -70,7 +70,7 @@ export function planPostMergeDeploy(hook: string | undefined | null): PostMergeD
 export function buildDeployHookPayload(input: {
   run: Pick<Run, "id" | "title" | "repository" | "branch" | "baseSha">;
   merge: MergeRecord;
-  release?: Pick<RunReleaseRecord, "deliveryId" | "environment" | "attempt" | "requestedBy">;
+  release?: Pick<RunReleaseRecord, "deliveryId" | "environment" | "attempt" | "requestedBy" | "expectedImageDigest">;
   callbackUrl?: string;
 }) {
   return {
@@ -90,6 +90,7 @@ export function buildDeployHookPayload(input: {
           environment: input.release.environment,
           attempt: input.release.attempt,
           requestedBy: input.release.requestedBy,
+          ...(input.release.expectedImageDigest ? { expectedImageDigest: input.release.expectedImageDigest } : {}),
         }
       : {}),
     ...(input.callbackUrl ? { callbackUrl: input.callbackUrl } : {}),

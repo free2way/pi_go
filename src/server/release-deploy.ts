@@ -104,6 +104,7 @@ export async function runReleaseDeploy(input: ReleaseDeployInput, deps: ReleaseD
     startedAt: now,
     deliveryId,
     attempt: decision.attempt,
+    ...(decision.expectedImageDigest ? { expectedImageDigest: decision.expectedImageDigest } : {}),
   };
   // 2. Claim + record the in-flight attempt in one atomic write, BEFORE the hook.
   const started = await deps.start({
@@ -140,10 +141,16 @@ export async function runReleaseDeploy(input: ReleaseDeployInput, deps: ReleaseD
       callbackUrl: input.callbackUrl,
       deliveryId,
       attempt: decision.attempt,
+      ...(decision.expectedImageDigest ? { expectedImageDigest: decision.expectedImageDigest } : {}),
     }),
     { deliveryId, ...(input.webhookToken ? { webhookToken: input.webhookToken } : {}) },
   );
-  const deploy = shapeReleaseDeployOutcome(input.deployPlan, execution, new Date().toISOString(), { deliveryId, attempt: decision.attempt, environment: input.environment });
+  const deploy = shapeReleaseDeployOutcome(input.deployPlan, execution, new Date().toISOString(), {
+    deliveryId,
+    attempt: decision.attempt,
+    environment: input.environment,
+    ...(decision.expectedImageDigest ? { expectedImageDigest: decision.expectedImageDigest } : {}),
+  });
   // A 202 stays pending; only a real result is settled (CAS-guarded).
   if (deploy.status === "pending") return { kind: "published", release: await deps.read(), deploy };
 

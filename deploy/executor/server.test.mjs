@@ -12,12 +12,14 @@ import {
   createExecutor,
   loadConfig,
   pathWithin,
+  postCallback,
   postProgress,
   prepareSmokeUrl,
   validatePayload,
 } from "./server.mjs";
 
 const token = "0123456789abcdef0123456789abcdef";
+const digest = `sha256:${"d".repeat(64)}`;
 
 test("webhook authentication requires both bearer token and raw-body HMAC", () => {
   const rawBody = Buffer.from('{"event":"run.release_requested"}');
@@ -54,9 +56,13 @@ test("release payload keeps environment-scoped idempotency identity", () => {
     callbackUrl: "https://pigo.example.com/api/internal/agile/releases/rel_1/release-result",
     releaseId: "rel_1",
     version: "v1.0.0",
+    commits: ["a".repeat(40)],
+    expectedImageDigest: digest,
   }, "release-publish:rel_1:production");
   assert.equal(payload.environment, "production");
   assert.equal(payload.releaseId, "rel_1");
+  assert.equal(payload.expectedImageDigest, digest);
+  assert.throws(() => validatePayload({ ...payload, expectedImageDigest: undefined }, payload.deliveryId), /requires expectedImageDigest/);
 });
 
 test("callback target allowlists origin and internal API path before rewriting", () => {
@@ -168,6 +174,40 @@ test("run deployments emit authenticated, attempt-scoped progress callbacks", as
   assert.equal(observed, undefined);
 });
 
+test("successful callbacks carry immutable deployment evidence", async () => {
+  let body;
+  await postCallback({
+    token,
+    callbackPublicOrigin: "https://pigo.example.com",
+    callbackInternalOrigin: "http://web:3100",
+    fetchImpl: async (_url, options) => {
+      body = JSON.parse(options.body);
+      return { ok: true, status: 200 };
+    },
+  }, {
+    deliveryId: "release:run_1:staging",
+    attempt: 1,
+    callbackUrl: "https://pigo.example.com/api/internal/runs/run_1/release-result",
+  }, {
+    status: "succeeded",
+    detail: "staging verified",
+    deploymentId: "deploy_1",
+    commit: "a".repeat(40),
+    image: "local/app:immutable",
+    imageDigest: digest,
+  });
+  assert.deepEqual(body, {
+    deliveryId: "release:run_1:staging",
+    attempt: 1,
+    status: "succeeded",
+    detail: "staging verified",
+    deploymentId: "deploy_1",
+    commit: "a".repeat(40),
+    image: "local/app:immutable",
+    imageDigest: digest,
+  });
+});
+
 test("host-gateway smoke resolution fails closed when the published port is ambiguous", async () => {
   await assert.rejects(() => prepareSmokeUrl({
     stagingUrl: "http://host.docker.internal:18080",
@@ -203,6 +243,8 @@ test("state recovery fails interrupted work and promotion lookup is repository/c
     assert.match(store.getDelivery("pending").detail, /restarted/);
     assert.equal(store.successfulDeployment("staging", "/workspace/project-a", "a".repeat(40))?.status, "succeeded");
     assert.equal(store.successfulDeployment("staging", "/workspace/project-b", "a".repeat(40)), undefined);
+    assert.equal(store.successfulDeploymentForCommits("staging", ["a".repeat(40)])?.repository, "/workspace/project-a");
+    assert.equal(store.successfulDeploymentForCommits("staging", ["c".repeat(40)]), undefined);
     assert.equal(JSON.parse(await readFile(file, "utf8")).deliveries.pending.status, "failed");
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -245,6 +287,7 @@ test("HTTP delivery is signed, asynchronous and idempotent", async () => {
     callbackUrl: "https://pigo.example.com/api/internal/agile/releases/rel_1/release-result",
     releaseId: "rel_1",
     version: "v1.0.0",
+    commits: ["a".repeat(40)],
   };
   const deliver = async (nextPayload, authorization = `Bearer ${token}`) => {
     const body = JSON.stringify(nextPayload);

@@ -16,6 +16,7 @@ import type { PostMergeDeployPlan } from "./run-merge.js";
  */
 
 const WEBHOOK: PostMergeDeployPlan = { configured: true, kind: "webhook", url: "https://deploy.example/hook" };
+const DIGEST = `sha256:${"d".repeat(64)}`;
 
 async function seed(db: Db) {
   const service = new AgileService(db);
@@ -108,17 +109,33 @@ describe("runReleaseDeploy (audit P1)", () => {
     const db = await createTestDb();
     const { service, release, stories } = await seed(db);
     const executions: Array<{ deliveryId: string }> = [];
-    const d = deps(service, release.id, executions, { configured: true, kind: "webhook", status: "succeeded", detail: "registered", httpStatus: 200 });
+    const d = deps(service, release.id, executions, { configured: true, kind: "webhook", status: "triggered", detail: "HTTP 202", httpStatus: 202 });
 
     const staged = await runReleaseDeploy(input(release, stories), d);
-    expect(staged).toMatchObject({ kind: "published", deploy: { status: "ok", environment: "staging", attempt: 1 } });
+    expect(staged).toMatchObject({ kind: "published", deploy: { status: "pending", environment: "staging", attempt: 1 } });
+    await service.settleReleaseDeployResult({
+      releaseId: release.id,
+      action: "release.deploy_succeeded",
+      actorId: "deploy-system",
+      now: "2026-01-02T00:00:30.000Z",
+      deploy: {
+        ...(staged.kind === "published" ? staged.deploy : {}),
+        status: "ok",
+        detail: "staging verified",
+        at: "2026-01-02T00:00:30.000Z",
+        finishedAt: "2026-01-02T00:00:30.000Z",
+        commit: "a".repeat(40),
+        image: "local/app:immutable",
+        imageDigest: DIGEST,
+      },
+    });
 
     const promoted = await runReleaseDeploy(input(
       await service.getRelease([], release.id, true),
       stories,
       { environment: "production", now: "2026-01-02T00:01:00.000Z" },
     ), d);
-    expect(promoted).toMatchObject({ kind: "published", deploy: { status: "ok", environment: "production", attempt: 2 } });
+    expect(promoted).toMatchObject({ kind: "published", deploy: { status: "pending", environment: "production", attempt: 2, expectedImageDigest: DIGEST } });
     expect(executions.map((entry) => entry.deliveryId)).toEqual([
       `release-publish:${release.id}:staging`,
       `release-publish:${release.id}:production`,
