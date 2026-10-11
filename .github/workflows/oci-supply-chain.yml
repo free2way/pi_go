@@ -1,0 +1,279 @@
+name: OCI Supply Chain
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: oci-supply-chain-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OCI_IMAGE_PREFIX: ghcr.io/${{ github.repository }}
+
+jobs:
+  validate-images:
+    name: OCI reproducible image builds
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Build Pi runtime foundation
+        run: docker build --pull --file deploy/docker/Dockerfile --tag local/pi-coding-agent:1.0.0 .
+
+      - name: Build web image
+        run: docker build --file deploy/docker/Dockerfile.web --tag local/pigo-web:ci .
+
+      - name: Build worker image
+        run: docker build --file deploy/docker/Dockerfile.worker --tag local/pigo-worker:ci .
+
+      - name: Build sandbox image
+        run: docker build --file deploy/docker/Dockerfile.sandbox --tag local/pigo-sandbox:ci .
+
+      - name: Build executor image
+        run: docker build --file deploy/executor/Dockerfile --tag local/pigo-executor:ci deploy/executor
+
+  publish-images:
+    name: Publish immutable OCI evidence
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: validate-images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Configure Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Authenticate to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare evidence directory
+        run: mkdir -p supply-chain/metadata supply-chain/sbom supply-chain/vulnerability
+
+      - name: Publish Pi runtime foundation
+        run: |
+          docker buildx build --pull --platform linux/amd64 --push \
+            --provenance=mode=max --sbom=true \
+            --label org.opencontainers.image.revision=${GITHUB_SHA} \
+            --label org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY} \
+            --metadata-file supply-chain/metadata/runtime.json \
+            --file deploy/docker/Dockerfile \
+            --tag ${OCI_IMAGE_PREFIX}-runtime:${GITHUB_SHA} .
+
+      - name: Resolve immutable runtime base
+        run: |
+          RUNTIME_DIGEST=$(node -e "const m=require('./supply-chain/metadata/runtime.json'); const d=m['containerimage.digest']; if(!/^sha256:[a-f0-9]{64}$/.test(d)) process.exit(1); process.stdout.write(d)")
+          echo "PI_AGENT_IMAGE=${OCI_IMAGE_PREFIX}-runtime@${RUNTIME_DIGEST}" >> "${GITHUB_ENV}"
+
+      - name: Publish web image
+        run: |
+          docker buildx build --pull --platform linux/amd64 --push \
+            --provenance=mode=max --sbom=true \
+            --label org.opencontainers.image.revision=${GITHUB_SHA} \
+            --label org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY} \
+            --metadata-file supply-chain/metadata/web.json \
+            --file deploy/docker/Dockerfile.web \
+            --tag ${OCI_IMAGE_PREFIX}-web:${GITHUB_SHA} .
+
+      - name: Publish worker image from immutable runtime
+        run: |
+          docker buildx build --pull --platform linux/amd64 --push \
+            --provenance=mode=max --sbom=true \
+            --build-arg PI_AGENT_IMAGE=${PI_AGENT_IMAGE} \
+            --label org.opencontainers.image.revision=${GITHUB_SHA} \
+            --label org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY} \
+            --metadata-file supply-chain/metadata/worker.json \
+            --file deploy/docker/Dockerfile.worker \
+            --tag ${OCI_IMAGE_PREFIX}-worker:${GITHUB_SHA} .
+
+      - name: Publish sandbox image from immutable runtime
+        run: |
+          docker buildx build --pull --platform linux/amd64 --push \
+            --provenance=mode=max --sbom=true \
+            --build-arg PI_AGENT_IMAGE=${PI_AGENT_IMAGE} \
+            --label org.opencontainers.image.revision=${GITHUB_SHA} \
+            --label org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY} \
+            --metadata-file supply-chain/metadata/sandbox.json \
+            --file deploy/docker/Dockerfile.sandbox \
+            --tag ${OCI_IMAGE_PREFIX}-sandbox:${GITHUB_SHA} .
+
+      - name: Publish executor image
+        run: |
+          docker buildx build --pull --platform linux/amd64 --push \
+            --provenance=mode=max --sbom=true \
+            --label org.opencontainers.image.revision=${GITHUB_SHA} \
+            --label org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY} \
+            --metadata-file supply-chain/metadata/executor.json \
+            --file deploy/executor/Dockerfile \
+            --tag ${OCI_IMAGE_PREFIX}-executor:${GITHUB_SHA} deploy/executor
+
+      - name: Create immutable deployment manifest
+        id: manifest
+        run: |
+          node scripts/oci-manifest.mjs \
+            --commit "${GITHUB_SHA}" \
+            --repository-prefix "${OCI_IMAGE_PREFIX}" \
+            --metadata-dir supply-chain/metadata \
+            --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --output supply-chain/manifest.json \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Generate runtime SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          image: ${{ steps.manifest.outputs.runtime_repository }}@${{ steps.manifest.outputs.runtime_digest }}
+          format: spdx-json
+          output-file: supply-chain/sbom/runtime.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Generate web SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          image: ${{ steps.manifest.outputs.web_repository }}@${{ steps.manifest.outputs.web_digest }}
+          format: spdx-json
+          output-file: supply-chain/sbom/web.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Generate worker SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          image: ${{ steps.manifest.outputs.worker_repository }}@${{ steps.manifest.outputs.worker_digest }}
+          format: spdx-json
+          output-file: supply-chain/sbom/worker.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Generate sandbox SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          image: ${{ steps.manifest.outputs.sandbox_repository }}@${{ steps.manifest.outputs.sandbox_digest }}
+          format: spdx-json
+          output-file: supply-chain/sbom/sandbox.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Generate executor SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          image: ${{ steps.manifest.outputs.executor_repository }}@${{ steps.manifest.outputs.executor_digest }}
+          format: spdx-json
+          output-file: supply-chain/sbom/executor.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Scan runtime for fixable critical vulnerabilities
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
+        with:
+          sbom: supply-chain/sbom/runtime.spdx.json
+          fail-build: true
+          severity-cutoff: critical
+          only-fixed: true
+          output-format: json
+          output-file: supply-chain/vulnerability/runtime.json
+
+      - name: Scan web for fixable critical vulnerabilities
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
+        with:
+          sbom: supply-chain/sbom/web.spdx.json
+          fail-build: true
+          severity-cutoff: critical
+          only-fixed: true
+          output-format: json
+          output-file: supply-chain/vulnerability/web.json
+
+      - name: Scan worker for fixable critical vulnerabilities
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
+        with:
+          sbom: supply-chain/sbom/worker.spdx.json
+          fail-build: true
+          severity-cutoff: critical
+          only-fixed: true
+          output-format: json
+          output-file: supply-chain/vulnerability/worker.json
+
+      - name: Scan sandbox for fixable critical vulnerabilities
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
+        with:
+          sbom: supply-chain/sbom/sandbox.spdx.json
+          fail-build: true
+          severity-cutoff: critical
+          only-fixed: true
+          output-format: json
+          output-file: supply-chain/vulnerability/sandbox.json
+
+      - name: Scan executor for fixable critical vulnerabilities
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
+        with:
+          sbom: supply-chain/sbom/executor.spdx.json
+          fail-build: true
+          severity-cutoff: critical
+          only-fixed: true
+          output-format: json
+          output-file: supply-chain/vulnerability/executor.json
+
+      - name: Attest runtime provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ steps.manifest.outputs.runtime_repository }}
+          subject-digest: ${{ steps.manifest.outputs.runtime_digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Attest web provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ steps.manifest.outputs.web_repository }}
+          subject-digest: ${{ steps.manifest.outputs.web_digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Attest worker provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ steps.manifest.outputs.worker_repository }}
+          subject-digest: ${{ steps.manifest.outputs.worker_digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Attest sandbox provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ steps.manifest.outputs.sandbox_repository }}
+          subject-digest: ${{ steps.manifest.outputs.sandbox_digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Attest executor provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ steps.manifest.outputs.executor_repository }}
+          subject-digest: ${{ steps.manifest.outputs.executor_digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Upload supply-chain evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: oci-supply-chain-${{ github.sha }}
+          path: supply-chain/
+          if-no-files-found: error
+          retention-days: 90

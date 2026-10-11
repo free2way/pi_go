@@ -5,7 +5,8 @@
 # toolchain are available, but no entrypoint is declared: the worker supplies the
 # exact argv and mounts only the run worktree, its repository git metadata, the
 # read-only model definition and a per-run state directory.
-FROM local/pi-coding-agent:1.0.0
+ARG PI_AGENT_IMAGE=local/pi-coding-agent:1.0.0
+FROM ${PI_AGENT_IMAGE}
 
 USER root
 RUN mkdir -p /home/node/.pi/agent && chown -R node:node /home/node
