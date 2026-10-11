@@ -39,6 +39,11 @@ jobs:
       - name: Build executor image
         run: docker build --file deploy/executor/Dockerfile --tag local/pigo-executor:ci deploy/executor
 
+      - name: Verify executor release toolchain
+        run: |
+          docker run --rm --entrypoint docker local/pigo-executor:ci --version
+          docker run --rm --entrypoint docker local/pigo-executor:ci compose version
+
   publish-images:
     name: Publish immutable OCI evidence
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
