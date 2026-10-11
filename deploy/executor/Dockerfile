@@ -14,12 +14,14 @@ RUN CGO_ENABLED=0 TARGET=/out VERSION=29.9.0 ./scripts/build/binary
 FROM golang:${GO_VERSION}-alpine3.23 AS docker-compose-build
 
 ARG DOCKER_COMPOSE_COMMIT=42f48072bbf92ee9b0e43f9fdf2008d03546e7ca
+ARG X_NET_VERSION=v0.60.0
 RUN apk add --no-cache git
 WORKDIR /go/src/github.com/docker/compose
 RUN git init \
   && git remote add origin https://github.com/docker/compose.git \
   && git fetch --depth 1 origin "${DOCKER_COMPOSE_COMMIT}" \
   && git checkout --detach FETCH_HEAD
+RUN go get "golang.org/x/net@${X_NET_VERSION}"
 RUN CGO_ENABLED=0 GO111MODULE=on go build \
   -trimpath \
   -tags e2e \
