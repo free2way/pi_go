@@ -74,8 +74,10 @@ export function isReleasePublishTerminal(release: Pick<AgileRelease, "status" | 
 }
 
 export type ReleaseDeployDecision =
-  | { kind: "ready"; deliveryId: string; attempt: number; expired?: ReleaseDeployRecord }
+  | { kind: "ready"; deliveryId: string; attempt: number; expectedImageDigest?: string; expired?: ReleaseDeployRecord }
   | { kind: "conflict"; status: 409; code: string; message: string };
+
+const IMAGE_DIGEST = /^sha256:[a-f0-9]{64}$/;
 
 /**
  * Decides whether a confirmed publish may start a new deploy attempt, and which
@@ -102,12 +104,18 @@ export function planReleaseDeployAttempt(input: {
   const retry = input.retry === true;
   const deliveryId = releaseDeployDeliveryId(input.release.id, input.environment);
   if (!deploy) {
+    if (input.environment === "production") {
+      return { kind: "conflict", status: 409, code: "RELEASE_STAGING_REQUIRED", message: "production 发布前必须先完成 staging 发布" };
+    }
     if (input.release.status === "released") {
       return { kind: "conflict", status: 409, code: "RELEASE_RELEASED", message: "发布已发布，不可重复发布" };
     }
     return { kind: "ready", deliveryId, attempt: 1 };
   }
   const promotion = deploy.status === "ok" && deploy.environment === "staging" && input.environment === "production";
+  if (promotion && !IMAGE_DIGEST.test(deploy.imageDigest ?? "")) {
+    return { kind: "conflict", status: 409, code: "RELEASE_PROMOTION_EVIDENCE_REQUIRED", message: "staging 发布缺少不可变镜像摘要，请重新发布 staging 后再晋级" };
+  }
   const targetChanged = Boolean(deploy.environment && deploy.environment !== input.environment);
   if (targetChanged && !promotion) {
     return { kind: "conflict", status: 409, code: "RELEASE_TARGET_CHANGED", message: "已有发布记录与当前环境不一致，仅允许 staging 成功后晋级到 production" };
@@ -117,15 +125,24 @@ export function planReleaseDeployAttempt(input: {
   // `agile_release_deploy_claims` enforces UNIQUE(release_id, attempt), so the
   // sequence is release-wide rather than per environment. Reusing attempt 1
   // for production after a successful staging claim would violate that key.
-  if (promotion) return { kind: "ready", deliveryId, attempt: nextAttempt };
+  if (promotion) return { kind: "ready", deliveryId, attempt: nextAttempt, expectedImageDigest: deploy.imageDigest! };
   if (deploy.status === "ok" || deploy.status === "not_configured" || deploy.status === "unsupported") {
     return { kind: "conflict", status: 409, code: "RELEASE_RELEASED", message: "发布已发布，不可重复发布" };
+  }
+  if (input.environment === "production" && deploy.environment === "production"
+    && !IMAGE_DIGEST.test(deploy.expectedImageDigest ?? "")) {
+    return { kind: "conflict", status: 409, code: "RELEASE_PROMOTION_EVIDENCE_REQUIRED", message: "production 发布缺少 staging 镜像摘要证据，请重新从 staging 晋级" };
   }
   if (deploy.status === "failed") {
     if (!retry) {
       return { kind: "conflict", status: 409, code: "RELEASE_RETRY_REQUIRED", message: "上次部署失败，请明确选择重试部署" };
     }
-    return { kind: "ready", deliveryId: retryDeliveryId, attempt: nextAttempt };
+    return {
+      kind: "ready",
+      deliveryId: retryDeliveryId,
+      attempt: nextAttempt,
+      ...(input.environment === "production" ? { expectedImageDigest: deploy.expectedImageDigest! } : {}),
+    };
   }
   // pending: bounded verification — only a timed-out attempt may be retried.
   const startedAt = deploy.startedAt ?? deploy.at;
@@ -147,7 +164,13 @@ export function planReleaseDeployAttempt(input: {
   if (!retry) {
     return { kind: "conflict", status: 409, code: "RELEASE_DEPLOY_TIMEOUT", message: `${expired.detail}，请显式重试部署` };
   }
-  return { kind: "ready", deliveryId: retryDeliveryId, attempt: nextAttempt, expired };
+  return {
+    kind: "ready",
+    deliveryId: retryDeliveryId,
+    attempt: nextAttempt,
+    expired,
+    ...(input.environment === "production" ? { expectedImageDigest: deploy.expectedImageDigest! } : {}),
+  };
 }
 
 /** One release story, already reconciled to its derived status. */
@@ -367,7 +390,7 @@ export function planReleasePublish(input: {
   const requireMergedCommit = input.requireMergedCommit ?? RELEASE_PUBLISH_POLICY.requireMergedCommit;
   if (requireMergedCommit) {
     const notMerged: ReleasePublishNotMergedStory[] = input.stories
-      .filter((story) => !story.mergedCommit?.trim())
+      .filter((story) => !/^[0-9a-f]{40}$/i.test(story.mergedCommit?.trim() ?? ""))
       .map((story) => ({ storyId: story.storyId, title: story.title, runId: story.runId ?? null }));
     if (notMerged.length > 0) {
       return {
@@ -404,7 +427,7 @@ export type ReleaseDeployCallbackPlan =
   | {
       kind: "reject";
       status: 409;
-      code: "RELEASE_DELIVERY_MISMATCH" | "RELEASE_ATTEMPT_STALE" | "RELEASE_ALREADY_FINAL";
+      code: "RELEASE_DELIVERY_MISMATCH" | "RELEASE_ATTEMPT_STALE" | "RELEASE_ALREADY_FINAL" | "RELEASE_DIGEST_MISMATCH";
       message: string;
       /** Whether the caller must append an audit row for this rejection. */
       audit: boolean;
@@ -419,6 +442,9 @@ export function planReleaseDeployCallback(input: {
   detail?: string;
   deploymentId?: string;
   url?: string;
+  commit?: string;
+  image?: string;
+  imageDigest?: string;
   now: string;
 }): ReleaseDeployCallbackPlan {
   const current = input.current;
@@ -436,8 +462,15 @@ export function planReleaseDeployCallback(input: {
     };
   }
   const deployStatus: ReleaseDeployCallbackStatus = input.status === "succeeded" ? "ok" : "failed";
-  // A duplicate callback for the *current* attempt is idempotent.
+  // A duplicate callback for the current attempt never mutates evidence.
   if (current.status === deployStatus) return { kind: "duplicate", deploy: current };
+  if (input.status === "succeeded" && !IMAGE_DIGEST.test(input.imageDigest ?? "")) {
+    return { kind: "reject", status: 409, code: "RELEASE_DIGEST_MISMATCH", message: "Successful release callback is missing an immutable image digest", audit: true };
+  }
+  if (input.status === "succeeded" && current.expectedImageDigest
+    && input.imageDigest !== current.expectedImageDigest) {
+    return { kind: "reject", status: 409, code: "RELEASE_DIGEST_MISMATCH", message: "Production image digest does not match the staged digest", audit: true };
+  }
   if (current.status !== "pending") {
     return { kind: "reject", status: 409, code: "RELEASE_ALREADY_FINAL", message: `Release deploy is already ${current.status}`, audit: false };
   }
@@ -449,6 +482,9 @@ export function planReleaseDeployCallback(input: {
     finishedAt: input.now,
     ...(input.deploymentId ? { deploymentId: input.deploymentId } : {}),
     ...(input.url ? { url: input.url } : {}),
+    ...(input.commit ? { commit: input.commit } : {}),
+    ...(input.image ? { image: input.image } : {}),
+    ...(input.imageDigest ? { imageDigest: input.imageDigest } : {}),
   };
   return { kind: "settle", deploy, action: deployStatus === "ok" ? "release.deploy_succeeded" : "release.deploy_failed" };
 }
@@ -464,12 +500,13 @@ export function shapeReleaseDeployOutcome(
   plan: PostMergeDeployPlan,
   execution: ReleaseExecutionOutcome | undefined,
   at: string,
-  identity: { deliveryId?: string; attempt?: number; environment?: ReleaseEnvironment } = {},
+  identity: { deliveryId?: string; attempt?: number; environment?: ReleaseEnvironment; expectedImageDigest?: string } = {},
 ): ReleaseDeployRecord {
   const id = {
     ...(identity.deliveryId ? { deliveryId: identity.deliveryId } : {}),
     ...(identity.attempt === undefined ? {} : { attempt: identity.attempt }),
     ...(identity.environment ? { environment: identity.environment } : {}),
+    ...(identity.expectedImageDigest ? { expectedImageDigest: identity.expectedImageDigest } : {}),
   };
   if (!plan.configured) return { status: "not_configured", detail: plan.reason, at, ...id };
   if (plan.kind === "unsupported") return { status: "unsupported", detail: plan.reason, at, ...id };
@@ -482,7 +519,7 @@ export function shapeReleaseDeployOutcome(
 /** Payload sent to the deploy hook for a release publish (reuses `executeRelease`). */
 export function buildReleaseDeployPayload(input: {
   release: Pick<AgileRelease, "id" | "projectId" | "name" | "version">;
-  stories: Array<Pick<ReleasePublishStory, "storyId" | "title" | "status">>;
+  stories: Array<Pick<ReleasePublishStory, "storyId" | "title" | "status" | "mergedCommit">>;
   releasedAt: string;
   releasedBy: string;
   environment: ReleaseEnvironment;
@@ -490,7 +527,10 @@ export function buildReleaseDeployPayload(input: {
   callbackUrl?: string;
   deliveryId?: string;
   attempt?: number;
+  expectedImageDigest?: string;
 }) {
+  const commits = [...new Set(input.stories.map((story) => story.mergedCommit?.trim().toLowerCase() ?? "")
+    .filter((commit) => /^[0-9a-f]{40}$/.test(commit)))];
   return {
     event: "release.published",
     releaseId: input.release.id,
@@ -504,7 +544,9 @@ export function buildReleaseDeployPayload(input: {
     releasedAt: input.releasedAt,
     releasedBy: input.releasedBy,
     environment: input.environment,
+    ...(input.expectedImageDigest ? { expectedImageDigest: input.expectedImageDigest } : {}),
     ...(input.note?.trim() ? { note: input.note.trim() } : {}),
+    commits,
     stories: input.stories.map((story) => ({ storyId: story.storyId, title: story.title, status: story.status })),
     ...(input.callbackUrl ? { callbackUrl: input.callbackUrl } : {}),
   };

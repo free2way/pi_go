@@ -121,6 +121,12 @@ export interface ReleaseDeployRecord {
   /** Deployment URL / id reported by the deploy system or its callback. */
   url?: string;
   deploymentId?: string;
+  /** Deployment evidence returned by the executor. */
+  commit?: string;
+  image?: string;
+  imageDigest?: string;
+  /** Staging digest that a production attempt is required to reuse. */
+  expectedImageDigest?: string;
 }
 
 /**

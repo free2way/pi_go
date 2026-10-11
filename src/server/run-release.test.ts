@@ -3,6 +3,7 @@ import type { Run } from "../shared/types.js";
 import { isActiveRelease, planReleaseStart, releaseDeliveryId, sameReleaseAttempt } from "./run-release.js";
 
 const NOW = "2026-10-05T03:00:00.000Z";
+const DIGEST = `sha256:${"d".repeat(64)}`;
 
 function run(overrides: Partial<Run> = {}): Run {
   return {
@@ -43,9 +44,14 @@ describe("planReleaseStart", () => {
   it("allows a successful staging deployment to promote the same commit to production", () => {
     const staging = planReleaseStart({ run: run(), environment: "staging", requestedBy: "admin", now: NOW, kind: "webhook" });
     expect(staging.kind).toBe("ready");
-    const succeeded = { ...(staging as Extract<typeof staging, { kind: "ready" }>).release, status: "succeeded" as const };
+    const succeeded = {
+      ...(staging as Extract<typeof staging, { kind: "ready" }>).release,
+      status: "succeeded" as const,
+      image: "local/app:abc123",
+      imageDigest: DIGEST,
+    };
     const promoted = planReleaseStart({ run: run({ release: succeeded }), environment: "production", requestedBy: "admin", now: "2026-10-05T03:10:00.000Z", kind: "webhook" });
-    expect(promoted).toMatchObject({ kind: "ready", release: { environment: "production", attempt: 1 } });
+    expect(promoted).toMatchObject({ kind: "ready", release: { environment: "production", attempt: 1, expectedImageDigest: DIGEST } });
     if (promoted.kind === "ready") expect(promoted.release.deliveryId).not.toBe(succeeded.deliveryId);
   });
   it("requires a completed, merged run", () => {
@@ -53,9 +59,11 @@ describe("planReleaseStart", () => {
     expect(planReleaseStart({ run: run({ merge: undefined }), environment: "production", requestedBy: "admin", now: NOW, kind: "webhook" })).toMatchObject({ kind: "conflict", code: "MERGE_REQUIRED" });
   });
 
-  it("creates a durable first attempt", () => {
-    const decision = planReleaseStart({ run: run(), environment: "production", requestedBy: "admin", now: NOW, kind: "webhook" });
-    expect(decision).toMatchObject({ kind: "ready", release: { status: "publishing", environment: "production", commit: "abc123", attempt: 1 } });
+  it("creates a durable staging first attempt and blocks direct production", () => {
+    expect(planReleaseStart({ run: run(), environment: "production", requestedBy: "admin", now: NOW, kind: "webhook" }))
+      .toMatchObject({ kind: "conflict", code: "RELEASE_STAGING_REQUIRED" });
+    const decision = planReleaseStart({ run: run(), environment: "staging", requestedBy: "admin", now: NOW, kind: "webhook" });
+    expect(decision).toMatchObject({ kind: "ready", release: { status: "publishing", environment: "staging", commit: "abc123", attempt: 1 } });
   });
 
   it("returns a successful identical release idempotently", () => {
@@ -71,6 +79,7 @@ describe("planReleaseStart", () => {
       finishedAt: NOW,
       attempt: 1,
       kind: "webhook" as const,
+      expectedImageDigest: DIGEST,
     };
     expect(planReleaseStart({ run: run({ release }), environment: "production", requestedBy: "admin", now: NOW, kind: "webhook" })).toEqual({ kind: "already-succeeded", release });
   });
@@ -88,6 +97,7 @@ describe("planReleaseStart", () => {
       finishedAt: NOW,
       attempt: 1,
       kind: "webhook" as const,
+      expectedImageDigest: DIGEST,
     };
     expect(planReleaseStart({ run: run({ release }), environment: "production", requestedBy: "admin", now: NOW, kind: "webhook" })).toMatchObject({ kind: "conflict", code: "RELEASE_RETRY_REQUIRED" });
     expect(planReleaseStart({ run: run({ release }), environment: "production", requestedBy: "admin", now: "2026-10-05T03:01:00.000Z", kind: "webhook", retry: true })).toMatchObject({
@@ -97,17 +107,17 @@ describe("planReleaseStart", () => {
   });
 
   it("only retries a publishing attempt after it is stale", () => {
-    const first = planReleaseStart({ run: run(), environment: "production", requestedBy: "admin", now: NOW, kind: "webhook" });
+    const first = planReleaseStart({ run: run(), environment: "staging", requestedBy: "admin", now: NOW, kind: "webhook" });
     if (first.kind !== "ready") throw new Error("expected ready");
-    expect(planReleaseStart({ run: run({ release: first.release }), environment: "production", requestedBy: "admin", now: "2026-10-05T03:01:00.000Z", kind: "webhook", retry: true })).toMatchObject({ kind: "conflict", code: "RELEASE_IN_PROGRESS" });
-    expect(planReleaseStart({ run: run({ release: first.release }), environment: "production", requestedBy: "admin", now: "2026-10-05T03:03:00.000Z", kind: "webhook", retry: true })).toMatchObject({ kind: "ready", release: { attempt: 2, deliveryId: first.release.deliveryId } });
+    expect(planReleaseStart({ run: run({ release: first.release }), environment: "staging", requestedBy: "admin", now: "2026-10-05T03:01:00.000Z", kind: "webhook", retry: true })).toMatchObject({ kind: "conflict", code: "RELEASE_IN_PROGRESS" });
+    expect(planReleaseStart({ run: run({ release: first.release }), environment: "staging", requestedBy: "admin", now: "2026-10-05T03:03:00.000Z", kind: "webhook", retry: true })).toMatchObject({ kind: "ready", release: { attempt: 2, deliveryId: first.release.deliveryId } });
   });
 
   it("can recover a lost asynchronous callback with the same delivery id", () => {
     const triggered = {
       deliveryId: "release_async",
       status: "triggered" as const,
-      environment: "production",
+      environment: "staging",
       commit: "abc123",
       targetBranch: "main",
       requestedAt: NOW,
@@ -116,14 +126,14 @@ describe("planReleaseStart", () => {
       attempt: 1,
       kind: "webhook" as const,
     };
-    expect(planReleaseStart({ run: run({ release: triggered }), environment: "production", requestedBy: "admin", now: "2026-10-05T03:01:00.000Z", kind: "webhook", retry: true })).toMatchObject({ kind: "conflict", code: "RELEASE_AWAITING_RESULT" });
-    expect(planReleaseStart({ run: run({ release: triggered }), environment: "production", requestedBy: "admin", now: "2026-10-05T03:03:00.000Z", kind: "webhook", retry: true })).toMatchObject({ kind: "ready", release: { deliveryId: "release_async", attempt: 2 } });
+    expect(planReleaseStart({ run: run({ release: triggered }), environment: "staging", requestedBy: "admin", now: "2026-10-05T03:01:00.000Z", kind: "webhook", retry: true })).toMatchObject({ kind: "conflict", code: "RELEASE_AWAITING_RESULT" });
+    expect(planReleaseStart({ run: run({ release: triggered }), environment: "staging", requestedBy: "admin", now: "2026-10-05T03:03:00.000Z", kind: "webhook", retry: true })).toMatchObject({ kind: "ready", release: { deliveryId: "release_async", attempt: 2 } });
   });
 });
 
 describe("sameReleaseAttempt", () => {
   it("matches only the publishing attempt that owns the result", () => {
-    const planned = planReleaseStart({ run: run(), environment: "production", requestedBy: "admin", now: NOW, kind: "webhook" });
+    const planned = planReleaseStart({ run: run(), environment: "staging", requestedBy: "admin", now: NOW, kind: "webhook" });
     if (planned.kind !== "ready") throw new Error("expected ready");
     expect(sameReleaseAttempt(run({ release: planned.release }), planned.release)).toBe(true);
     expect(sameReleaseAttempt(run({ release: { ...planned.release, attempt: 2 } }), planned.release)).toBe(false);
@@ -133,7 +143,7 @@ describe("sameReleaseAttempt", () => {
 
 describe("isActiveRelease", () => {
   it("protects publishing/triggered runs from reopen or cleanup", () => {
-    const planned = planReleaseStart({ run: run(), environment: "production", requestedBy: "admin", now: NOW, kind: "webhook" });
+    const planned = planReleaseStart({ run: run(), environment: "staging", requestedBy: "admin", now: NOW, kind: "webhook" });
     if (planned.kind !== "ready") throw new Error("expected ready");
     expect(isActiveRelease(run({ release: planned.release }))).toBe(true);
     expect(isActiveRelease(run({ release: { ...planned.release, status: "triggered" } }))).toBe(true);

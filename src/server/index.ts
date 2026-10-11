@@ -1949,6 +1949,9 @@ app.post<{ Params: { id: string } }>("/api/internal/agile/releases/:id/release-r
       detail: parsed.data.detail,
       deploymentId: parsed.data.deploymentId,
       url: parsed.data.url,
+      ...(parsed.data.status === "succeeded"
+        ? { commit: parsed.data.commit, image: parsed.data.image, imageDigest: parsed.data.imageDigest }
+        : {}),
       now: new Date().toISOString(),
     });
     if (plan.kind === "reject") {
@@ -2617,21 +2620,45 @@ const releaseResultSchema = z.discriminatedUnion("status", [
   z.object({
     deliveryId: z.string().trim().min(8).max(120),
     attempt: z.number().int().min(1).optional(),
-    status: z.enum(["succeeded", "failed"]),
+    status: z.literal("succeeded"),
+    detail: z.string().trim().max(500).optional(),
+    deploymentId: z.string().trim().max(200).optional(),
+    url: z.string().url().max(1_000).optional(),
+    commit: z.string().regex(/^[0-9a-f]{40}$/),
+    image: z.string().trim().min(1).max(500),
+    imageDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+  }).strict(),
+  z.object({
+    deliveryId: z.string().trim().min(8).max(120),
+    attempt: z.number().int().min(1).optional(),
+    status: z.literal("failed"),
     detail: z.string().trim().max(500).optional(),
     deploymentId: z.string().trim().max(200).optional(),
     url: z.string().url().max(1_000).optional(),
   }).strict(),
 ]);
 /** Final-status callback for an asynchronous agile release deploy. */
-const releaseDeployResultSchema = z.object({
-  deliveryId: z.string().trim().min(8).max(120),
-  attempt: z.number().int().min(1).optional(),
-  status: z.enum(["succeeded", "failed"]),
-  detail: z.string().trim().max(500).optional(),
-  deploymentId: z.string().trim().max(200).optional(),
-  url: z.string().url().max(1_000).optional(),
-}).strict();
+const releaseDeployResultSchema = z.discriminatedUnion("status", [
+  z.object({
+    deliveryId: z.string().trim().min(8).max(120),
+    attempt: z.number().int().min(1).optional(),
+    status: z.literal("succeeded"),
+    detail: z.string().trim().max(500).optional(),
+    deploymentId: z.string().trim().max(200).optional(),
+    url: z.string().url().max(1_000).optional(),
+    commit: z.string().regex(/^[0-9a-f]{40}$/),
+    image: z.string().trim().min(1).max(500),
+    imageDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+  }).strict(),
+  z.object({
+    deliveryId: z.string().trim().min(8).max(120),
+    attempt: z.number().int().min(1).optional(),
+    status: z.literal("failed"),
+    detail: z.string().trim().max(500).optional(),
+    deploymentId: z.string().trim().max(200).optional(),
+    url: z.string().url().max(1_000).optional(),
+  }).strict(),
+]);
 
 async function mergeCompletedRun(request: FastifyRequest, run: Run, userId: string, note?: string) {
   const now = new Date().toISOString();
@@ -2948,6 +2975,13 @@ app.post<{ Params: { id: string } }>("/api/internal/runs/:id/release-result", as
     || (parsed.data.attempt === undefined && current.attempt > 1)) {
     return reply.code(409).send({ error: "Release callback attempt is stale", code: "RELEASE_ATTEMPT_STALE", attempt: current.attempt });
   }
+  if (parsed.data.status === "succeeded" && parsed.data.commit !== current.commit) {
+    return reply.code(409).send({ error: "Release callback commit does not match the requested commit", code: "RELEASE_COMMIT_MISMATCH" });
+  }
+  if (parsed.data.status === "succeeded" && current.environment === "production"
+    && (!current.expectedImageDigest || parsed.data.imageDigest !== current.expectedImageDigest)) {
+    return reply.code(409).send({ error: "Production image digest does not match the staged digest", code: "RELEASE_DIGEST_MISMATCH" });
+  }
   if (parsed.data.status === "progress") {
     if (current.status !== "triggered" && current.status !== "publishing") {
       return reply.code(409).send({ error: `Release is already ${current.status}`, code: "RELEASE_ALREADY_FINAL" });
@@ -2997,6 +3031,9 @@ app.post<{ Params: { id: string } }>("/api/internal/runs/:id/release-result", as
     detail: parsed.data.detail,
     ...(parsed.data.deploymentId ? { deploymentId: parsed.data.deploymentId } : {}),
     ...(parsed.data.url ? { url: parsed.data.url } : {}),
+    ...(parsed.data.status === "succeeded"
+      ? { image: parsed.data.image, imageDigest: parsed.data.imageDigest }
+      : {}),
   };
   const result = await store.updateRunGuarded(run.id, (latest) => latest.release?.deliveryId === current.deliveryId
     && (latest.release.status === "triggered" || latest.release.status === "publishing")

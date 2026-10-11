@@ -6,7 +6,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const SERVICE = "pigo-release-executor";
-const VERSION = "0.2.5";
+const VERSION = "0.3.0";
 const BODY_LIMIT = 128 * 1024;
 const LOG_LIMIT = 64 * 1024;
 const COMMAND_TIMEOUT_MS = 15 * 60_000;
@@ -44,6 +44,10 @@ export function validatePayload(value, expectedDeliveryId) {
   const callbackUrl = requiredText(value.callbackUrl, "callbackUrl", 2_000);
   const parsedCallback = new URL(callbackUrl);
   if (parsedCallback.protocol !== "https:") throw new Error("callbackUrl must use HTTPS");
+  const expectedImageDigest = typeof value.expectedImageDigest === "string" ? value.expectedImageDigest.trim().toLowerCase() : "";
+  if (environment === "production" && !/^sha256:[a-f0-9]{64}$/.test(expectedImageDigest)) {
+    throw new Error("production requires expectedImageDigest from staging");
+  }
   if (event === "run.release_requested") {
     const repository = requiredText(value.repository, "repository", 2_000);
     if (repository.includes("\\") || (!path.posix.isAbsolute(repository)
@@ -52,8 +56,23 @@ export function validatePayload(value, expectedDeliveryId) {
     }
     const commit = requiredText(value.commit, "commit", 64).toLowerCase();
     if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error("commit must be a full SHA-1");
-    return { ...value, event, environment, deliveryId, attempt, callbackUrl, repository, commit };
+    return {
+      ...value,
+      event,
+      environment,
+      deliveryId,
+      attempt,
+      callbackUrl,
+      repository,
+      commit,
+      ...(expectedImageDigest ? { expectedImageDigest } : {}),
+    };
   }
+  if (!Array.isArray(value.commits) || value.commits.length < 1 || value.commits.length > 200) {
+    throw new Error("release commits must contain 1 to 200 reviewed commit SHAs");
+  }
+  const commits = [...new Set(value.commits.map((commit) => requiredText(commit, "commit", 40).toLowerCase()))];
+  if (commits.some((commit) => !/^[0-9a-f]{40}$/.test(commit))) throw new Error("release commits must be full SHA-1 values");
   return {
     ...value,
     event,
@@ -63,6 +82,8 @@ export function validatePayload(value, expectedDeliveryId) {
     callbackUrl,
     releaseId: requiredText(value.releaseId, "releaseId", 200),
     version: requiredText(value.version, "version", 200),
+    commits,
+    ...(expectedImageDigest ? { expectedImageDigest } : {}),
   };
 }
 
@@ -212,6 +233,17 @@ export class JsonStateStore {
       .sort((left, right) => String(right.finishedAt).localeCompare(String(left.finishedAt)))[0];
   }
 
+  successfulDeploymentForCommits(environment, commits) {
+    const allowed = new Set(commits);
+    return Object.values(this.value.deliveries)
+      .filter((item) => item.event === "run.release_requested"
+        && item.environment === environment
+        && item.status === "succeeded"
+        && allowed.has(item.commit)
+        && item.imageDigest)
+      .sort((left, right) => String(right.finishedAt).localeCompare(String(left.finishedAt)))[0];
+  }
+
   summary() {
     const deliveries = Object.values(this.value.deliveries);
     return {
@@ -353,6 +385,9 @@ async function runDeploy(config, store, payload, reportProgress = async () => un
     if (!staging) {
       throw new Error("production promotion requires a successful staging deployment of the same commit");
     }
+    if (payload.expectedImageDigest !== staging.imageDigest) {
+      throw new Error("requested production digest does not match the successful staging deployment");
+    }
     const before = await imageDigest(image);
     if (before !== staging.imageDigest) throw new Error("staging image digest no longer matches the local immutable image");
   }
@@ -375,7 +410,9 @@ async function runDeploy(config, store, payload, reportProgress = async () => un
   await reportProgress("verifying", "immutable image digest verification started");
   const digest = await imageDigest(image);
   if (payload.environment === "production") {
-    if (digest !== staging.imageDigest) throw new Error("production deployment changed the staging image digest");
+    if (digest !== staging.imageDigest || digest !== payload.expectedImageDigest) {
+      throw new Error("production deployment changed the staged image digest");
+    }
   }
   return {
     detail: `${payload.environment} deploy and smoke checks passed`,
@@ -391,8 +428,11 @@ async function runDeploy(config, store, payload, reportProgress = async () => un
 }
 
 async function runReleaseRegistration(store, payload) {
-  const deployed = store.latest(payload.environment);
-  if (!deployed || deployed.status !== "succeeded") throw new Error(`no successful ${payload.environment} run deployment is available`);
+  const deployed = store.successfulDeploymentForCommits(payload.environment, payload.commits);
+  if (!deployed) throw new Error(`no successful ${payload.environment} deployment matches the reviewed release commits`);
+  if (payload.environment === "production" && deployed.imageDigest !== payload.expectedImageDigest) {
+    throw new Error("production release does not match the staged image digest");
+  }
   return {
     detail: `${payload.version} registered against the existing ${payload.environment} deployment`,
     deploymentId: deployed.deploymentId,
@@ -403,7 +443,7 @@ async function runReleaseRegistration(store, payload) {
   };
 }
 
-async function postCallback(config, payload, outcome) {
+export async function postCallback(config, payload, outcome) {
   const url = callbackTarget(payload.callbackUrl, config.callbackPublicOrigin, config.callbackInternalOrigin);
   const body = {
     deliveryId: payload.deliveryId,
@@ -412,6 +452,9 @@ async function postCallback(config, payload, outcome) {
     detail: outcome.detail.slice(0, 500),
     ...(outcome.deploymentId ? { deploymentId: outcome.deploymentId } : {}),
     ...(outcome.url ? { url: outcome.url } : {}),
+    ...(outcome.commit ? { commit: outcome.commit } : {}),
+    ...(outcome.image ? { image: outcome.image } : {}),
+    ...(outcome.imageDigest ? { imageDigest: outcome.imageDigest } : {}),
   };
   let lastError;
   for (const delayMs of [0, 1_000, 2_000, 4_000, 8_000, 16_000]) {
