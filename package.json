@@ -62,7 +62,7 @@
     "globals": "^17.13.0",
     "pg-mem": "^3.0.14",
     "tsup": "8.5.0",
-    "tsx": "4.20.6",
+    "tsx": "4.23.15",
     "typescript": "5.9.3",
     "typescript-eslint": "^8.71.0",
     "vite": "^7.3.6",
