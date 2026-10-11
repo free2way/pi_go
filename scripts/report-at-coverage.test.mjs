@@ -11,8 +11,9 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
 import {
   collectAtCoverage,
@@ -22,7 +23,6 @@ import {
   runAtCoverageReport,
 } from "./report-at-coverage.mjs";
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 /** Build an AT id without emitting a literal the scanner would match. */
 const at = (digits) => `AT-JEV-${digits}`;
 
@@ -52,11 +52,20 @@ test("parseAcceptanceCases reads ###/#### headings and ignores prose ranges", ()
   assert.equal(cases[2].title, "配置回滚");
 });
 
-test("the shipped docs/27 defines all 61 cases", () => {
-  const { markdown } = readRepoInputs(ROOT);
-  const cases = parseAcceptanceCases(markdown);
-  assert.equal(cases.length, 61);
-  assert.ok(cases.every((entry) => entry.id.startsWith(at("")) && entry.title.length > 0));
+test("readRepoInputs loads the configured acceptance document and citation files", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "pigo-at-coverage-"));
+  try {
+    mkdirSync(path.join(root, "docs"));
+    mkdirSync(path.join(root, "src"));
+    writeFileSync(path.join(root, "docs", "27-jev-decision-engine-acceptance.md"), MARKDOWN);
+    writeFileSync(path.join(root, "src", "feature.test.ts"), FILES["src/server/x.test.ts"]);
+
+    const input = readRepoInputs(root);
+    assert.equal(input.markdown, MARKDOWN);
+    assert.equal(input.files["src/feature.test.ts"], FILES["src/server/x.test.ts"]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("collectAtCoverage classifies cited / uncited / unknown", () => {

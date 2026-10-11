@@ -99,7 +99,7 @@ export class Authenticator {
   private fromDevelopment(request: FastifyRequest): RequestIdentity {
     const emailHeader = request.headers["x-pigo-dev-email"];
     // 缺省身份：development 模式专用。demo 部署把浏览器会话固定成管理员身份
-    // （PIGO_DEMO_DEV_EMAIL=bobo.2000@gmail.com），否则在浏览器里打开控制台永远是
+    // （例如 PIGO_DEMO_DEV_EMAIL=admin@example.com），否则在浏览器里打开控制台永远是
     // developer@localhost 这个非管理员身份，管理员操作（额度录入、合并、发布）没有入口。
     // 该分支只在 PI_AUTH_MODE=development 时可达，而 production + development 会被
     // 构造函数直接拒绝，所以它不可能影响生产。

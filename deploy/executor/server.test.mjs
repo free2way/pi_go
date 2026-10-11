@@ -106,7 +106,7 @@ test("host-gateway smoke URL resolves through the dedicated target network", asy
       stdout: JSON.stringify([{
         NetworkSettings: {
           Ports: { "8080/tcp": [{ HostIp: "127.0.0.1", HostPort: "18080" }] },
-          Networks: inspections === 1 ? {} : { "pigo-release-targets": { IPAddress: "172.30.0.4" } },
+          Networks: inspections === 1 ? {} : { "pigo-release-targets": { IPAddress: "203.0.113.4" } },
         },
       }]),
       stderr: "",
@@ -119,7 +119,7 @@ test("host-gateway smoke URL resolves through the dedicated target network", asy
     productionPort: 18081,
     targetNetwork: "pigo-release-targets",
   }, "staging", run);
-  assert.equal(url, "http://172.30.0.4:8080");
+  assert.equal(url, "http://203.0.113.4:8080");
   assert.deepEqual(calls[2], ["docker", "network", "connect", "pigo-release-targets", "0123456789ab"]);
 });
 

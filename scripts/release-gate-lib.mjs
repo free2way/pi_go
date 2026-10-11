@@ -24,6 +24,7 @@ export const SKIP = "SKIP";
 /** The real-PostgreSQL step is the only gate entry that can touch an external system. */
 export const DB_STEP_ID = "pg-concurrency";
 export const SECRET_SCAN_STEP_ID = "scan-secrets";
+export const REPOSITORY_POLICY_STEP_ID = "scan-repository-policy";
 
 /**
  * Build the ordered gate plan. Command steps are executed in array order.
@@ -41,10 +42,17 @@ export function planGateSteps(env = process.env) {
     { id: "typecheck", label: "npm run typecheck", kind: "command", command: "npm", args: ["run", "typecheck"] },
     { id: "test", label: "npm test", kind: "command", command: "npm", args: ["test"] },
     { id: "test-executor", label: "npm run test:executor", kind: "command", command: "npm", args: ["run", "test:executor"] },
-    { id: "lint", label: "npm run lint", kind: "command", command: "npm", args: ["run", "lint"] },
+    { id: "lint", label: "npm run lint -- --max-warnings=0", kind: "command", command: "npm", args: ["run", "lint", "--", "--max-warnings=0"] },
     { id: "build", label: "npm run build", kind: "command", command: "npm", args: ["run", "build"] },
     { id: "validate-compose", label: "npm run validate:compose", kind: "command", command: "npm", args: ["run", "validate:compose"] },
     { id: SECRET_SCAN_STEP_ID, label: "npm run scan:secrets", kind: "command", command: "npm", args: ["run", "scan:secrets"] },
+    {
+      id: REPOSITORY_POLICY_STEP_ID,
+      label: "npm run scan:repository-policy",
+      kind: "command",
+      command: "npm",
+      args: ["run", "scan:repository-policy"],
+    },
   ];
 
   const databaseUrl = env.PI_DATABASE_URL || env.DATABASE_URL;

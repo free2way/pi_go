@@ -19,6 +19,7 @@ export default tseslint.config(
       "deploy/docker/workspace/**",
       "playwright-report/**",
       "test-results/**",
+      ".codex-artifacts/**",
       "**/*.d.ts",
     ],
   },

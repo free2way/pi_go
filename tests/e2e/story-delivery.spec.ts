@@ -565,7 +565,7 @@ test.describe("Story 全链路：从创建任务到部署交付（opt-in 手动�
       const me = (await meResponse.json()) as { id: string; email: string; isAdmin?: boolean };
       test.skip(
         !me.isAdmin,
-        `Step 0: 本用例需要**管理员**身份执行人工合并与显式发布：当前身份 ${me.email} 不是管理员（POST /api/runs/:id/merge 与 /publish 会返回 403 ADMIN_REQUIRED）。请用管理员账号运行（demo 部署为 bobo.2000@gmail.com；通过 PI_E2E_DEV_EMAIL 指定）。`,
+        `Step 0: 本用例需要**管理员**身份执行人工合并与显式发布：当前身份 ${me.email} 不是管理员（POST /api/runs/:id/merge 与 /publish 会返回 403 ADMIN_REQUIRED）。请通过 PI_E2E_DEV_EMAIL 指定部署中已授权的管理员身份。`,
       );
 
       const configResponse = await request.get("/api/config/status");

@@ -20,11 +20,12 @@
 #   单行 `expect { -re ... }` 会被 Tcl 当成"一个 pattern"整块匹配、永远匹配不上（第一次跑生产
 #   脚本时踩到）：块内必须换行写，照 deploy-demo.sh 的形状。
 #
-# 环境变量（都有默认值）：PIGO_DEPLOY_HOST、PIGO_PROD_DIR、PIGO_PROD_PROJECT、
-# PIGO_PROD_COMPOSE、PIGO_PROD_ENV_FILE、PIGO_PROD_VOLUME、PIGO_PROD_VERSION_KEY。
+# 环境变量：PIGO_DEPLOY_HOST 必填；其余变量提供可覆盖的安全默认值：PIGO_PROD_DIR、
+# PIGO_PROD_PROJECT、PIGO_PROD_COMPOSE、PIGO_PROD_ENV_FILE、PIGO_PROD_VOLUME、
+# PIGO_PROD_VERSION_KEY。
 set -uo pipefail
 
-HOST="${PIGO_DEPLOY_HOST:-free2way@192.168.2.235}"
+HOST="${PIGO_DEPLOY_HOST:-}"
 PROD_DIR="${PIGO_PROD_DIR:-/app/pi-agent}"
 PROJECT="${PIGO_PROD_PROJECT:-pi-agent}"
 COMPOSE="${PIGO_PROD_COMPOSE:-compose.yaml}"
@@ -34,6 +35,7 @@ VERSION_KEY="${PIGO_PROD_VERSION_KEY:-PI_WEB_VERSION}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 [ -n "${PIGO_SSH_PW:-}" ] || { echo "PIGO_SSH_PW not set"; exit 2; }
+[ -n "$HOST" ] || { echo "PIGO_DEPLOY_HOST not set (example: deploy-user@deployment-host)"; exit 2; }
 command -v expect >/dev/null || { echo "expect is required (password auth, never written to disk)"; exit 2; }
 
 TARBALL="$(mktemp -t pigo-prod-src).tar.gz"

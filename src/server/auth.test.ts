@@ -70,10 +70,10 @@ describe("development 缺省身份", () => {
   });
 
   it("PI_DEV_DEFAULT_EMAIL 生效（小写化），且显式头优先", async () => {
-    const fallback = await authenticate({ mode: "development", fallback: "Bobo.2000@Gmail.com" });
-    expect(fallback.auth.identity(fallback.req).email).toBe("bobo.2000@gmail.com");
+    const fallback = await authenticate({ mode: "development", fallback: "Admin@Example.com" });
+    expect(fallback.auth.identity(fallback.req).email).toBe("admin@example.com");
 
-    const withHeader = await authenticate({ mode: "development", fallback: "bobo.2000@gmail.com" }, { "x-pigo-dev-email": "e2e-alt@localhost" });
+    const withHeader = await authenticate({ mode: "development", fallback: "admin@example.com" }, { "x-pigo-dev-email": "e2e-alt@localhost" });
     expect(withHeader.auth.identity(withHeader.req).email).toBe("e2e-alt@localhost");
   });
 
@@ -88,7 +88,7 @@ describe("development 缺省身份", () => {
     process.env.PI_CF_ACCESS_TEAM_DOMAIN = "https://team.cloudflareaccess.com";
     process.env.PI_CF_ACCESS_AUDIENCE = "aud-test";
     try {
-      const { auth, req, rep } = await authenticate({ mode: "cloudflare", fallback: "bobo.2000@gmail.com" });
+      const { auth, req, rep } = await authenticate({ mode: "cloudflare", fallback: "admin@example.com" });
       expect((rep as unknown as { sent: { status: number } }).sent.status).toBe(401);
       // 身份上下文没有被写入：dev 缺省身份不能泄漏到 cloudflare 模式
       expect(() => auth.identity(req)).toThrow(/identity context is missing/);
@@ -102,7 +102,7 @@ describe("development 缺省身份", () => {
   });
 
   it("production + development 组合被构造函数拒绝（该变量不可能出现在生产）", () => {
-    setEnv({ mode: "development", nodeEnv: "production", fallback: "bobo.2000@gmail.com" });
+    setEnv({ mode: "development", nodeEnv: "production", fallback: "admin@example.com" });
     expect(() => new Authenticator()).toThrow(/not allowed when NODE_ENV=production/);
   });
 });

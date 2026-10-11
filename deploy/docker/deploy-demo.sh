@@ -29,16 +29,18 @@
 # （路径在输出里），需要回滚时解开它并重跑本脚本即可。
 set -uo pipefail
 
-HOST="${PIGO_DEPLOY_HOST:-free2way@192.168.2.235}"
+HOST="${PIGO_DEPLOY_HOST:-}"
 SOURCE_DIR="${PIGO_DEMO_SOURCE_DIR:-/app/pi-agent/source}"
 COMPOSE_REL="${PIGO_DEMO_COMPOSE_REL:-deploy/docker/compose.demo.yaml}"
 ENV_FILE="${PIGO_DEMO_ENV_FILE:-/app/pi-agent/demo.env}"
 WEB_SERVICE="${PIGO_DEMO_WEB_SERVICE:-demo-web}"
 WORKER_SERVICE="${PIGO_DEMO_WORKER_SERVICE:-demo-worker}"
-HEALTH_URL="${PIGO_DEMO_HEALTH_URL:-http://192.168.2.235:3101/api/health}"
+HEALTH_URL="${PIGO_DEMO_HEALTH_URL:-}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 [ -n "${PIGO_SSH_PW:-}" ] || { echo "PIGO_SSH_PW not set"; exit 2; }
+[ -n "$HOST" ] || { echo "PIGO_DEPLOY_HOST not set (example: deploy-user@deployment-host)"; exit 2; }
+[ -n "$HEALTH_URL" ] || { echo "PIGO_DEMO_HEALTH_URL not set (must be browser-reachable)"; exit 2; }
 command -v expect >/dev/null || { echo "expect is required (password auth, never written to disk)"; exit 2; }
 
 TARBALL="$(mktemp -t pigo-src).tar.gz"

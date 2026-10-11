@@ -63,9 +63,9 @@ describe("redactText — secrets", () => {
   });
 
   it("[AT-JEV-051] redacts URLs with embedded credentials", () => {
-    const redacted = redactText("postgres://admin:hunter2@db.internal:5432/pigo");
+    const redacted = redactText("postgres://admin:hunter2@db.example.com:5432/pigo");
     expect(redacted).not.toContain("hunter2");
-    expect(redacted).toContain(`postgres://${REDACTED}@db.internal:5432/pigo`.replace("[redacted]@", "[redacted]@"));
+    expect(redacted).toContain(`postgres://${REDACTED}@db.example.com:5432/pigo`.replace("[redacted]@", "[redacted]@"));
   });
 
   it("redacts emails (PII)", () => {

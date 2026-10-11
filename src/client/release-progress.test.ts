@@ -16,7 +16,7 @@ const event = (stage: unknown): RunEvent => ({
 describe("release progress view", () => {
   it("shows only browser-reachable deployment URLs", () => {
     expect(browserDeploymentUrl("https://staging.example.com/build/1")).toBe("https://staging.example.com/build/1");
-    expect(browserDeploymentUrl("http://192.168.2.20:18080")).toBe("http://192.168.2.20:18080/");
+    expect(browserDeploymentUrl("http://203.0.113.20:18080")).toBe("http://203.0.113.20:18080/");
     expect(browserDeploymentUrl("http://host.docker.internal:18080")).toBeUndefined();
     expect(browserDeploymentUrl("http://127.0.0.1:18080")).toBeUndefined();
     expect(browserDeploymentUrl("not a url")).toBeUndefined();
