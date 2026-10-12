@@ -38,6 +38,8 @@
     "drill:rollback": "bash scripts/rollback-drill.sh"
   },
   "dependencies": {
+    "@clerk/fastify": "3.1.20",
+    "@clerk/react": "6.17.8",
     "@fastify/compress": "^9.2.1",
     "@fastify/static": "^10.1.5",
     "@xyflow/react": "^12.12.0",
@@ -45,8 +47,8 @@
     "jose": "^6.1.0",
     "lucide-react": "0.545.0",
     "pg": "^8.23.1",
-    "react": "19.2.0",
-    "react-dom": "19.2.0",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
     "zod": "4.1.12"
   },
   "devDependencies": {
@@ -54,10 +56,10 @@
     "@playwright/test": "^1.63.0",
     "@types/node": "24.9.1",
     "@types/pg": "^8.23.1",
-    "@types/react": "19.2.2",
-    "@types/react-dom": "19.2.2",
+    "@types/react": "19.2.7",
+    "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "5.1.0",
-    "concurrently": "^9.2.4",
+    "concurrently": "^10.0.6",
     "eslint": "^10.12.0",
     "globals": "^17.13.0",
     "pg-mem": "^3.0.14",

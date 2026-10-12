@@ -100,9 +100,43 @@ button { color: inherit; }
 .account-footer > div { min-width: 0; display: grid; grid-template-columns: 7px 1fr; column-gap: 5px; align-items: center; }
 .account-footer strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #77818b; font: 500 8px "DM Mono", monospace; }
 .account-footer small { grid-column: 2; color: #48515a; font: 8px "DM Mono", monospace; margin-top: 2px; }
-.account-footer a { margin-left: auto; color: #58626c; padding: 5px; }
-.account-footer a:hover { color: #dde1e4; }
+.account-footer a, .account-footer > button { margin-left: auto; color: #58626c; padding: 5px; }
+.account-footer > button { border: 0; background: transparent; cursor: pointer; }
+.account-footer a:hover, .account-footer > button:hover { color: #dde1e4; }
 .system-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--green); }
+
+/* Clerk entry point: same visual language as the product shell, without making
+   the identity provider look like a detached third-party page. */
+.auth-state { min-height: 100vh; display: grid; place-content: center; justify-items: center; gap: 12px; background: var(--bg); color: var(--muted); font-size: 12px; }
+.auth-state-error strong { color: var(--text); font-size: 17px; }
+.auth-state-error button { height: 36px; margin-top: 8px; padding: 0 14px; display: inline-flex; align-items: center; gap: 7px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); color: var(--text); cursor: pointer; }
+.auth-page { min-height: 100vh; overflow: auto; display: grid; grid-template-columns: minmax(360px, 1.08fr) minmax(420px, .92fr); background: radial-gradient(circle at 14% 12%, rgba(223,248,84,.07), transparent 30%), var(--bg); }
+.auth-story { min-height: 100vh; padding: clamp(42px, 7vw, 100px); display: flex; flex-direction: column; justify-content: center; border-right: 1px solid var(--line-soft); }
+.auth-brand { position: absolute; top: 42px; display: flex; align-items: center; gap: 10px; }
+.auth-brand span { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 9px; background: var(--accent); color: #111408; }
+.auth-brand strong { font-size: 16px; letter-spacing: -.03em; }
+.auth-kicker { margin: 0 0 22px; color: #8c9860; font: 500 10px "DM Mono", monospace; letter-spacing: .16em; }
+.auth-story h1 { max-width: 760px; margin: 0; color: var(--text); font-size: clamp(38px, 5vw, 70px); line-height: 1.04; letter-spacing: -.055em; }
+.auth-lead { max-width: 610px; margin: 28px 0 0; color: #8d97a1; font-size: clamp(14px, 1.25vw, 18px); line-height: 1.8; }
+.auth-trust { margin-top: 36px; display: inline-flex; align-items: center; gap: 9px; color: #727c86; font-size: 11px; }
+.auth-trust svg { color: var(--green); }
+.auth-panel { min-height: 100vh; padding: 42px clamp(28px, 6vw, 88px); display: flex; flex-direction: column; align-items: center; justify-content: center; }
+.auth-tabs { width: min(100%, 400px); display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 4px; border: 1px solid var(--line); border-radius: 10px; background: #0d1115; }
+.auth-tabs button { height: 36px; border: 0; border-radius: 7px; background: transparent; color: var(--muted); cursor: pointer; font-size: 12px; }
+.auth-tabs button.active { background: var(--surface-3); color: var(--text); box-shadow: inset 0 0 0 1px #2c333b; }
+.auth-clerk-slot { width: min(100%, 400px); margin-top: 16px; display: grid; justify-items: center; }
+.auth-clerk-slot .cl-rootBox, .auth-clerk-slot .cl-cardBox { width: 100%; }
+.auth-clerk-slot .cl-cardBox { box-shadow: none; }
+
+@media (max-width: 860px) {
+  .auth-page { grid-template-columns: 1fr; }
+  .auth-story { min-height: auto; padding: 88px 28px 36px; border-right: 0; border-bottom: 1px solid var(--line-soft); }
+  .auth-brand { top: 25px; }
+  .auth-story h1 { font-size: clamp(30px, 9vw, 48px); }
+  .auth-lead { margin-top: 18px; }
+  .auth-trust { margin-top: 22px; }
+  .auth-panel { min-height: auto; padding: 32px 20px 60px; justify-content: start; }
+}
 
 .main-content { min-width: 0; height: 100vh; overflow: auto; background: radial-gradient(circle at 45% -20%, rgba(94,109,126,.08), transparent 35%), var(--bg); }
 .topbar { position: sticky; top: 0; z-index: 15; height: 57px; background: rgba(8,10,13,.88); backdrop-filter: blur(14px); border-bottom: 1px solid var(--line-soft); display: flex; align-items: center; padding: 0 22px; }

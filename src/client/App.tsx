@@ -1740,7 +1740,7 @@ const formatClock = (date: string, locale: Locale = DEFAULT_LOCALE) => new Intl.
 const formatDuration = (ms: number) => ms ? `${Math.floor(ms / 60_000)}m ${Math.floor((ms % 60_000) / 1000)}s` : "—";
 const compactNumber = (value: number) => value > 999 ? `${(value / 1000).toFixed(1)}k` : String(value);
 
-export function App() {
+export function App({ onSignOut }: { onSignOut?: () => void } = {}) {
   const { t, locale, setLocale, locales, localeLabels } = useT();
   const [runs, setRuns] = useState<Run[]>([]);
   const [selectedId, setSelectedId] = useState<string>();
@@ -2081,7 +2081,7 @@ export function App() {
           {!runs.length && !loading && <div className="sidebar-empty">{t("nav.empty")}</div>}
         </div>
         </section>
-        <div className="account-footer"><div><span className="system-dot" /><strong>{user?.email || t("account.verifying")}</strong><small>Pi {config?.piVersion || "—"}</small></div><a href="/cdn-cgi/access/logout" title={t("account.logout")}><LogOut size={15} /></a></div>
+        <div className="account-footer"><div><span className="system-dot" /><strong>{user?.email || t("account.verifying")}</strong><small>Pi {config?.piVersion || "—"}</small></div>{onSignOut ? <button type="button" onClick={onSignOut} title={t("account.logout")} aria-label={t("account.logout")}><LogOut size={15} /></button> : <a href="/cdn-cgi/access/logout" title={t("account.logout")}><LogOut size={15} /></a>}</div>
       </aside>
 
       <main className="main-content">

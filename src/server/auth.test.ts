@@ -15,6 +15,8 @@ const originals = {
   mode: process.env.PI_AUTH_MODE,
   nodeEnv: process.env.NODE_ENV,
   fallback: process.env.PI_DEV_DEFAULT_EMAIL,
+  clerkPublishableKey: process.env.CLERK_PUBLISHABLE_KEY,
+  clerkSecretKey: process.env.CLERK_SECRET_KEY,
 };
 
 afterEach(() => {
@@ -22,19 +24,25 @@ afterEach(() => {
     ["PI_AUTH_MODE", originals.mode],
     ["NODE_ENV", originals.nodeEnv],
     ["PI_DEV_DEFAULT_EMAIL", originals.fallback],
+    ["CLERK_PUBLISHABLE_KEY", originals.clerkPublishableKey],
+    ["CLERK_SECRET_KEY", originals.clerkSecretKey],
   ] as const) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
 });
 
-function setEnv(input: { mode?: string; nodeEnv?: string; fallback?: string }) {
+function setEnv(input: { mode?: string; nodeEnv?: string; fallback?: string; clerkPublishableKey?: string; clerkSecretKey?: string }) {
   if (input.mode === undefined) delete process.env.PI_AUTH_MODE;
   else process.env.PI_AUTH_MODE = input.mode;
   if (input.nodeEnv === undefined) delete process.env.NODE_ENV;
   else process.env.NODE_ENV = input.nodeEnv;
   if (input.fallback === undefined) delete process.env.PI_DEV_DEFAULT_EMAIL;
   else process.env.PI_DEV_DEFAULT_EMAIL = input.fallback;
+  if (input.clerkPublishableKey === undefined) delete process.env.CLERK_PUBLISHABLE_KEY;
+  else process.env.CLERK_PUBLISHABLE_KEY = input.clerkPublishableKey;
+  if (input.clerkSecretKey === undefined) delete process.env.CLERK_SECRET_KEY;
+  else process.env.CLERK_SECRET_KEY = input.clerkSecretKey;
 }
 
 const request = (headers: Record<string, string> = {}) => ({ headers } as unknown as FastifyRequest);
@@ -104,5 +112,74 @@ describe("development 缺省身份", () => {
   it("production + development 组合被构造函数拒绝（该变量不可能出现在生产）", () => {
     setEnv({ mode: "development", nodeEnv: "production", fallback: "admin@example.com" });
     expect(() => new Authenticator()).toThrow(/not allowed when NODE_ENV=production/);
+  });
+});
+
+describe("Clerk 邮箱身份", () => {
+  const clerkEnv = {
+    mode: "clerk",
+    clerkPublishableKey: "pk_test_example",
+    clerkSecretKey: "sk_test_example",
+  };
+
+  it("拒绝缺少密钥的 Clerk 配置", () => {
+    setEnv({ mode: "clerk" });
+    expect(() => new Authenticator()).toThrow(/requires CLERK_PUBLISHABLE_KEY and CLERK_SECRET_KEY/);
+  });
+
+  it("把已验证主邮箱映射为稳定身份，并缓存用户查询", async () => {
+    setEnv(clerkEnv);
+    let lookups = 0;
+    const auth = new Authenticator({
+      clerkAuth: () => ({ isAuthenticated: true, userId: "user_123", sessionClaims: { iss: "https://clerk.example" } }),
+      clerkUser: async () => {
+        lookups += 1;
+        return {
+          primaryEmailAddressId: "email_1",
+          emailAddresses: [{ id: "email_1", emailAddress: "Owner@Example.com", verification: { status: "verified" } }],
+        };
+      },
+    });
+    const firstRequest = request();
+    const secondRequest = request();
+    await Promise.all([
+      auth.authenticate(firstRequest, reply()),
+      auth.authenticate(secondRequest, reply()),
+    ]);
+
+    expect(auth.identity(firstRequest)).toMatchObject({
+      email: "owner@example.com",
+      issuer: "https://clerk.example",
+      subject: "user_123",
+      identityProvider: "clerk",
+    });
+    expect(auth.identity(secondRequest).legacyOwnerId).toBe(auth.identity(firstRequest).legacyOwnerId);
+    expect(lookups).toBe(1);
+    expect(auth.publicConfig()).toEqual({
+      mode: "clerk",
+      clerk: { publishableKey: "pk_test_example", proxyUrl: "/__clerk" },
+    });
+  });
+
+  it("拒绝未登录会话和未验证邮箱", async () => {
+    setEnv(clerkEnv);
+    const signedOut = new Authenticator({
+      clerkAuth: () => ({ isAuthenticated: false, userId: null }),
+      clerkUser: async () => ({ primaryEmailAddressId: null, emailAddresses: [] }),
+    });
+    const signedOutReply = reply();
+    await signedOut.authenticate(request(), signedOutReply);
+    expect(signedOutReply.sent.status).toBe(401);
+
+    const unverified = new Authenticator({
+      clerkAuth: () => ({ isAuthenticated: true, userId: "user_unverified", sessionClaims: { iss: "https://clerk.example" } }),
+      clerkUser: async () => ({
+        primaryEmailAddressId: "email_2",
+        emailAddresses: [{ id: "email_2", emailAddress: "pending@example.com", verification: { status: "unverified" } }],
+      }),
+    });
+    const unverifiedReply = reply();
+    await unverified.authenticate(request(), unverifiedReply);
+    expect(unverifiedReply.sent.status).toBe(401);
   });
 });

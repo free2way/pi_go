@@ -1,4 +1,5 @@
 import fastifyStatic from "@fastify/static";
+import { clerkPlugin } from "@clerk/fastify";
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -72,7 +73,7 @@ import type { PiAssistantAnswer } from "../shared/pi-assistant.js";
 const app = Fastify({
   logger: {
     redact: {
-      paths: ["req.headers.authorization", "req.headers.cf-access-jwt-assertion", "req.body.token", "developerApiKey", "reviewerApiKey", "credentials", "token"],
+      paths: ["req.headers.authorization", "req.headers.cookie", "req.headers.cf-access-jwt-assertion", "req.body.token", "developerApiKey", "reviewerApiKey", "credentials", "token"],
       censor: "[redacted]",
     },
   },
@@ -95,9 +96,12 @@ const vaultFile = process.env.PI_VAULT_FILE || path.resolve("data/credentials.v1
 const releaseSettingsFile = process.env.PI_RELEASE_SETTINGS_FILE || path.resolve("data/release-settings.v1.json");
 const scmSettingsFile = process.env.PI_SCM_SETTINGS_FILE || path.resolve("data/scm-settings.v1.json");
 const publicOrigin = process.env.PI_PUBLIC_ORIGIN || "";
+const authMode = process.env.PI_AUTH_MODE || "development";
 const vaultSecret = process.env.PI_VAULT_SECRET;
 if (!vaultSecret) throw new Error("PI_VAULT_SECRET is required");
-if (process.env.PI_AUTH_MODE === "cloudflare" && !publicOrigin) throw new Error("PI_PUBLIC_ORIGIN is required with Cloudflare authentication");
+if ((authMode === "cloudflare" || authMode === "clerk") && !publicOrigin) {
+  throw new Error("PI_PUBLIC_ORIGIN is required with external authentication");
+}
 
 const modelCatalog = loadModelCatalog();
 const modelDefaults = defaultSelections();
@@ -108,6 +112,17 @@ const vault = new CredentialVault(vaultFile, vaultSecret, {
 const releaseSettings = new ReleaseSettingsStore(releaseSettingsFile, vaultSecret);
 const scmSettings = new ScmSettingsStore(scmSettingsFile, vaultSecret);
 const auth = new Authenticator();
+if (auth.authMode === "clerk") {
+  // Use Clerk's same-origin Frontend API proxy. Besides improving resilience to
+  // privacy/ad-blocking rules, this keeps the __session cookie first-party so
+  // native EventSource connections authenticate without putting JWTs in URLs.
+  await app.register(clerkPlugin, {
+    publishableKey: process.env.CLERK_PUBLISHABLE_KEY!,
+    secretKey: process.env.CLERK_SECRET_KEY!,
+    hookName: "onRequest",
+    frontendApiProxy: { enabled: true, path: "/__clerk" },
+  });
+}
 await Promise.all([vault.init(), releaseSettings.init(), scmSettings.init()]);
 // AUD-08 / AT-MODEL-004: live provider probe used to verify credentials. It is
 // injectable and never throws; a failed probe simply leaves a key unverified.
@@ -572,7 +587,7 @@ app.addHook("onSend", async (request, reply, payload) => {
 });
 
 app.addHook("preHandler", async (request, reply) => {
-  if (!request.url.startsWith("/api/") || request.url === "/api/health" || request.url.startsWith("/api/internal/")) return;
+  if (!request.url.startsWith("/api/") || request.url === "/api/health" || request.url === "/api/auth/config" || request.url.startsWith("/api/internal/")) return;
   if (["POST", "PUT", "PATCH", "DELETE"].includes(request.method) && publicOrigin) {
     const origin = request.headers.origin;
     if (origin && origin !== publicOrigin) return reply.code(403).send({ error: "Origin not allowed" });
@@ -744,6 +759,9 @@ app.get("/api/me", async (request): Promise<CurrentUser> => {
   const user = auth.user(request);
   return { ...user, isAdmin: await identities.isAdmin(user.id) };
 });
+
+/** Public bootstrap data only; Clerk's publishable key is intentionally client-safe. */
+app.get("/api/auth/config", async () => auth.publicConfig());
 
 // ---------------------------------------------------------------------------
 // 账户管理 (account management) — admin only.
