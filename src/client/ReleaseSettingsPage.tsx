@@ -137,7 +137,7 @@ export function ReleaseSettingsPage({ onChanged }: { onChanged: () => void }) {
           <p>{t("releaseSettings.protocolRequest")}</p>
           <pre>{`Authorization: Bearer <Webhook Token>\nX-PiGO-Delivery-Id: <deliveryId>\nX-PiGO-Signature: sha256=<HMAC-SHA256>`}</pre>
           <p>{t("releaseSettings.protocolPayload")}</p>
-          <pre>{`{\n  "event": "run.release_requested | release.published",\n  "environment": "staging | production",\n  "deliveryId": "...",\n  "attempt": 1,\n  "callbackUrl": "https://pigo.example.com/api/internal/.../release-result"\n}`}</pre>
+          <pre>{`{\n  "event": "run.release_requested | run.rollback_requested | release.published",\n  "environment": "staging | production",\n  "deliveryId": "...",\n  "attempt": 1,\n  "callbackUrl": "https://pigo.example.com/api/internal/.../<operation>-result"\n}`}</pre>
           <p>{t("releaseSettings.protocolResponse")}</p>
           <p>{t("releaseSettings.protocolCallback")}</p>
           <pre>{`{ "deliveryId": "...", "attempt": 1, "status": "succeeded | failed", "detail": "...", "url": "https://..." }`}</pre>

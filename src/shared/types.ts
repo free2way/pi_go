@@ -282,6 +282,8 @@ export interface Run {
    * reviewed commit is still waiting to be merged or published.
    */
   release?: RunReleaseRecord;
+  /** Most recent audited production rollback targeting this run's release. */
+  rollback?: RunRollbackRecord;
   /**
    * Per-run review scope chosen by the operator when continuing a run. Additive
    * and backward compatible: runs written before this field exist are treated as
@@ -335,6 +337,34 @@ export interface RunReleaseRecord {
   imageDigest?: string;
   /** Staging digest that a production attempt is required to reuse. */
   expectedImageDigest?: string;
+}
+
+export type RunRollbackStatus = "publishing" | "triggered" | "succeeded" | "failed";
+
+/**
+ * Durable audit record for restoring one previously verified production image.
+ * The target is copied from a successful production release; callers never
+ * provide a free-form image name or command.
+ */
+export interface RunRollbackRecord {
+  deliveryId: string;
+  status: RunRollbackStatus;
+  environment: "production";
+  commit: string;
+  image: string;
+  imageDigest: string;
+  requestedAt: string;
+  requestedBy: string;
+  startedAt: string;
+  finishedAt?: string;
+  attempt: number;
+  reason: string;
+  detail?: string;
+  httpStatus?: number;
+  deploymentId?: string;
+  url?: string;
+  rolledBackFromCommit?: string;
+  rolledBackFromDigest?: string;
 }
 
 /** B1: lifecycle of the durable merge marker between the two phases. */

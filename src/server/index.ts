@@ -9,7 +9,7 @@ import { z } from "zod";
 import { internalUpdateRejection, releasesStoryBlocks, storyBlockReleaseNote } from "../shared/run-state.js";
 import { buildStoryRunInput, STORY_STATUS_LABELS, type RunBudget, type StoryDetail } from "../shared/agile.js";
 import { resolveRequestLocale, type Locale } from "../shared/i18n.js";
-import type { ConfigStatus, CurrentUser, ModelCatalogResponse, ReviewScope, Run, RunEvent, RunReleaseRecord, Workspace } from "../shared/types.js";
+import type { ConfigStatus, CurrentUser, ModelCatalogResponse, ReviewScope, Run, RunEvent, RunReleaseRecord, RunRollbackRecord, Workspace } from "../shared/types.js";
 import { AccountError, AccountService, accountAdminGate } from "./accounts.js";
 import { AlertManager, createAlertSink } from "./alerts.js";
 import { Authenticator } from "./auth.js";
@@ -54,6 +54,7 @@ import { coordinateApprovedMerge, replayPendingMerge } from "./merge-approval.js
 import { buildMergeRequestPayload, mergeRequestUnavailable, patchFileName, resolveMergeRequestConfig, selectPatch, type PatchSelection } from "./run-patch.js";
 import { planReopen, reopenEventMeta } from "./run-reopen.js";
 import { isActiveRelease, planReleaseStart, sameReleaseAttempt } from "./run-release.js";
+import { buildRollbackPayload, planRollbackStart, sameRollbackAttempt } from "./run-rollback.js";
 import { AgileError, AgileService } from "./agile.js";
 import { readAgileMetrics, readReleaseRetrospective, readReleaseSummary } from "./agile-metrics.js";
 import { projectCreateSchema, projectPatchSchema, releaseCreateSchema, releasePatchSchema, releasePublishSchema, sprintCreateSchema, sprintPatchSchema, storyBlockSchema, storyCreateSchema, storyPatchSchema, storySubmitSchema, templateCreateSchema } from "./agile-schemas.js";
@@ -2609,6 +2610,11 @@ const releaseSchema = z.object({
   confirm: z.literal(true),
   retry: z.boolean().optional(),
 });
+const rollbackSchema = z.object({
+  confirm: z.literal(true),
+  reason: z.string().trim().min(3).max(2_000),
+  retry: z.boolean().optional(),
+}).strict();
 const releaseResultSchema = z.discriminatedUnion("status", [
   z.object({
     deliveryId: z.string().trim().min(8).max(120),
@@ -2635,6 +2641,34 @@ const releaseResultSchema = z.discriminatedUnion("status", [
     detail: z.string().trim().max(500).optional(),
     deploymentId: z.string().trim().max(200).optional(),
     url: z.string().url().max(1_000).optional(),
+  }).strict(),
+]);
+const rollbackResultSchema = z.discriminatedUnion("status", [
+  z.object({
+    deliveryId: z.string().trim().min(8).max(120),
+    attempt: z.number().int().min(1),
+    status: z.literal("progress"),
+    stage: z.enum(["validating", "deploying", "networking", "smoke", "verifying"]),
+    detail: z.string().trim().max(500).optional(),
+  }).strict(),
+  z.object({
+    deliveryId: z.string().trim().min(8).max(120),
+    attempt: z.number().int().min(1),
+    status: z.literal("succeeded"),
+    detail: z.string().trim().max(500).optional(),
+    deploymentId: z.string().trim().max(200).optional(),
+    url: z.string().url().max(1_000).optional(),
+    commit: z.string().regex(/^[0-9a-f]{40}$/),
+    image: z.string().trim().min(1).max(500),
+    imageDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+    rolledBackFromCommit: z.string().regex(/^[0-9a-f]{40}$/).optional(),
+    rolledBackFromDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/).optional(),
+  }).strict(),
+  z.object({
+    deliveryId: z.string().trim().min(8).max(120),
+    attempt: z.number().int().min(1),
+    status: z.literal("failed"),
+    detail: z.string().trim().max(500).optional(),
   }).strict(),
 ]);
 /** Final-status callback for an asynchronous agile release deploy. */
@@ -2957,6 +2991,171 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/publish", { bodyLimit: 1024 
     meta: { ...release },
   }, { deliveryId: `release-result:${release.deliveryId}:${release.attempt}` }).catch(() => undefined);
   return finalized.run;
+});
+
+/**
+ * DEVOPS-ROLLBACK: restore a previously verified production artifact. The
+ * request names only the run; commit/image/digest are copied from that run's
+ * successful production release and revalidated by the executor.
+ */
+app.post<{ Params: { id: string } }>("/api/runs/:id/rollback", { bodyLimit: 1024 * 1024 }, async (request, reply) => {
+  const actionLimit = runActions.check(auth.user(request).id);
+  if (!actionLimit.allowed) return tooManyRequests(reply, actionLimit.retryAfterMs);
+  const parsed = rollbackSchema.safeParse(request.body ?? {});
+  if (!parsed.success) return reply.code(400).send({ error: "回滚需要原因和 confirm=true", code: "ROLLBACK_CONFIRM_REQUIRED", details: parsed.error.issues });
+  const run = store.getRun(request.params.id, ownerKeysFor(request));
+  if (!run) return reply.code(404).send({ error: "Run not found" });
+  const user = auth.user(request);
+  if (!(await identities.isAdmin(user.id))) return reply.code(403).send({ error: "仅管理员可以回滚 production", code: "ADMIN_REQUIRED" });
+
+  const releaseRuntime = effectiveReleaseConfig();
+  const deployPlan = releaseRuntime.deployPlan;
+  if (!deployPlan.configured) return reply.code(409).send({ error: deployPlan.reason, code: "RELEASE_NOT_CONFIGURED" });
+  if (deployPlan.kind !== "webhook") return reply.code(409).send({ error: "受控回滚只支持 Webhook Executor", code: "ROLLBACK_EXECUTOR_REQUIRED" });
+  if (!releaseRuntime.webhookToken || !releaseRuntime.callbackOrigin) {
+    return reply.code(409).send({ error: "回滚需要配置 Webhook Token 和 PiGO 回调地址", code: "RELEASE_AUTH_NOT_CONFIGURED" });
+  }
+
+  const decision = planRollbackStart({
+    run,
+    requestedBy: user.id,
+    reason: parsed.data.reason,
+    now: new Date().toISOString(),
+    retry: parsed.data.retry,
+  });
+  if (decision.kind === "conflict") return reply.code(decision.status).send({ error: decision.message, code: decision.code });
+
+  const previous = run.rollback;
+  const claim = await store.updateRunGuarded(run.id, (current) => {
+    if (current.release?.status !== "succeeded"
+      || current.release.environment !== "production"
+      || current.release.commit !== decision.rollback.commit
+      || current.release.imageDigest !== decision.rollback.imageDigest) {
+      return { allow: false as const, code: "ROLLBACK_TARGET_CHANGED", message: "目标 production 发布证据已变化，请刷新后重试" };
+    }
+    if (!previous && current.rollback) return { allow: false as const, code: "ROLLBACK_IN_PROGRESS", message: "已有其他回滚请求" };
+    if (previous && (current.rollback?.deliveryId !== previous.deliveryId
+      || current.rollback?.attempt !== previous.attempt
+      || current.rollback?.status !== previous.status)) {
+      return { allow: false as const, code: "ROLLBACK_IN_PROGRESS", message: "回滚状态已由其他请求更新" };
+    }
+    return { allow: true as const };
+  }, { rollback: decision.rollback });
+  if (!claim.ok) return reply.code(409).send({ error: claim.message, code: claim.code });
+
+  await store.appendEvent({
+    runId: run.id,
+    round: run.round,
+    source: "system",
+    type: "run.rollback_started",
+    message: `开始回滚 production 到 ${decision.rollback.commit.slice(0, 10)}`,
+    at: decision.rollback.startedAt,
+    meta: { ...decision.rollback },
+  }, { deliveryId: `rollback-start:${decision.rollback.deliveryId}:${decision.rollback.attempt}` }).catch(() => undefined);
+
+  const callbackUrl = `${releaseRuntime.callbackOrigin.replace(/\/$/, "")}/api/internal/runs/${encodeURIComponent(run.id)}/rollback-result`;
+  const execution = await executeRelease(
+    deployPlan,
+    buildRollbackPayload({ run, rollback: decision.rollback, callbackUrl }),
+    { deliveryId: decision.rollback.deliveryId, webhookToken: releaseRuntime.webhookToken },
+  );
+  const finishedAt = new Date().toISOString();
+  const rollback: RunRollbackRecord = {
+    ...decision.rollback,
+    status: execution.status === "succeeded" ? "succeeded" : execution.status === "triggered" ? "triggered" : "failed",
+    detail: execution.detail,
+    ...(execution.httpStatus === undefined ? {} : { httpStatus: execution.httpStatus }),
+    ...(execution.status === "triggered" ? {} : { finishedAt }),
+  };
+  const finalized = await store.updateRunGuarded(run.id, (current) => sameRollbackAttempt(current, decision.rollback)
+    ? { allow: true as const }
+    : { allow: false as const, code: "ROLLBACK_STATE_CHANGED", message: "回滚执行完成，但记录已被其他请求更新" }, { rollback });
+  if (!finalized.ok) {
+    const latest = store.getRun(run.id);
+    if (latest?.rollback?.deliveryId === rollback.deliveryId
+      && (latest.rollback.status === "succeeded" || latest.rollback.status === "failed")) return latest;
+    return reply.code(503).send({ error: finalized.message, code: finalized.code, deliveryId: rollback.deliveryId });
+  }
+  await store.appendEvent({
+    runId: run.id,
+    round: run.round,
+    source: "system",
+    type: rollback.status === "failed" ? "run.rollback_failed" : rollback.status === "triggered" ? "run.rollback_triggered" : "run.rollback_succeeded",
+    message: rollback.status === "failed" ? `回滚失败：${rollback.detail ?? "未知原因"}` : rollback.status === "triggered" ? "执行器已接收回滚请求" : "production 回滚完成",
+    at: finishedAt,
+    meta: { ...rollback },
+  }, { deliveryId: `rollback-result:${rollback.deliveryId}:${rollback.attempt}` }).catch(() => undefined);
+  return finalized.run;
+});
+
+/** Authenticated progress/final callback for production rollback attempts. */
+app.post<{ Params: { id: string } }>("/api/internal/runs/:id/rollback-result", async (request, reply) => {
+  const authorized = safeSecretMatch(request.headers.authorization, effectiveReleaseConfig().webhookToken) || safeTokenMatch(request.headers.authorization);
+  if (!authorized) return reply.code(401).send({ error: "Unauthorized" });
+  const parsed = rollbackResultSchema.safeParse(request.body ?? {});
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid rollback result", details: parsed.error.issues });
+  const run = store.getRun(request.params.id);
+  if (!run) return reply.code(404).send({ error: "Run not found" });
+  const current = run.rollback;
+  if (!current || current.deliveryId !== parsed.data.deliveryId) {
+    return reply.code(409).send({ error: "Rollback delivery id does not match", code: "ROLLBACK_DELIVERY_MISMATCH" });
+  }
+  if (current.attempt !== parsed.data.attempt) {
+    return reply.code(409).send({ error: "Rollback callback attempt is stale", code: "ROLLBACK_ATTEMPT_STALE", attempt: current.attempt });
+  }
+  if (parsed.data.status === "progress") {
+    if (current.status !== "triggered" && current.status !== "publishing") {
+      return reply.code(409).send({ error: `Rollback is already ${current.status}`, code: "ROLLBACK_ALREADY_FINAL" });
+    }
+    await store.appendEvent({
+      runId: run.id,
+      round: run.round,
+      source: "system",
+      type: "run.rollback_progress",
+      message: parsed.data.detail ?? parsed.data.stage,
+      at: new Date().toISOString(),
+      meta: { deliveryId: current.deliveryId, attempt: current.attempt, stage: parsed.data.stage },
+    }, { deliveryId: `rollback-progress:${current.deliveryId}:${current.attempt}:${parsed.data.stage}` });
+    return { ok: true, rollback: current, progress: parsed.data.stage };
+  }
+  if (current.status === parsed.data.status) return { ok: true, rollback: current };
+  if (current.status !== "triggered" && current.status !== "publishing") {
+    return reply.code(409).send({ error: `Rollback is already ${current.status}`, code: "ROLLBACK_ALREADY_FINAL" });
+  }
+  if (parsed.data.status === "succeeded"
+    && (parsed.data.commit !== current.commit || parsed.data.imageDigest !== current.imageDigest)) {
+    return reply.code(409).send({ error: "Rollback result does not match the immutable target", code: "ROLLBACK_DIGEST_MISMATCH" });
+  }
+  const rollback: RunRollbackRecord = {
+    ...current,
+    status: parsed.data.status,
+    finishedAt: new Date().toISOString(),
+    detail: parsed.data.detail,
+    ...(parsed.data.status === "succeeded" ? {
+      deploymentId: parsed.data.deploymentId,
+      url: parsed.data.url,
+      image: parsed.data.image,
+      imageDigest: parsed.data.imageDigest,
+      rolledBackFromCommit: parsed.data.rolledBackFromCommit,
+      rolledBackFromDigest: parsed.data.rolledBackFromDigest,
+    } : {}),
+  };
+  const result = await store.updateRunGuarded(run.id, (latest) => latest.rollback?.deliveryId === current.deliveryId
+    && latest.rollback.attempt === current.attempt
+    && (latest.rollback.status === "triggered" || latest.rollback.status === "publishing")
+    ? { allow: true as const }
+    : { allow: false as const, code: "ROLLBACK_STATE_CHANGED", message: "回滚状态已变化" }, { rollback });
+  if (!result.ok) return reply.code(409).send({ error: result.message, code: result.code });
+  await store.appendEvent({
+    runId: run.id,
+    round: run.round,
+    source: "system",
+    type: rollback.status === "succeeded" ? "run.rollback_succeeded" : "run.rollback_failed",
+    message: rollback.status === "succeeded" ? "production 回滚完成" : `回滚失败：${rollback.detail ?? "未知原因"}`,
+    at: rollback.finishedAt!,
+    meta: { ...rollback },
+  }, { deliveryId: `rollback-callback:${rollback.deliveryId}:${rollback.attempt}` });
+  return { ok: true, rollback };
 });
 
 /** Authenticated final-status callback for asynchronous (HTTP 202) publishers. */

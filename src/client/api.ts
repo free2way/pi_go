@@ -231,6 +231,8 @@ export const api = {
     request<Run>(`/api/runs/${id}/merge`, { method: "POST", body: JSON.stringify(body) }),
   publishRun: (id: string, body: { environment: string; confirm: true; retry?: boolean }) =>
     request<Run>(`/api/runs/${id}/publish`, { method: "POST", body: JSON.stringify(body) }),
+  rollbackRun: (id: string, body: { confirm: true; reason: string; retry?: boolean }) =>
+    request<Run>(`/api/runs/${id}/rollback`, { method: "POST", body: JSON.stringify(body) }),
   rejectRun: (id: string, body: { reason?: string } = {}) =>
     request<Run>(`/api/runs/${id}/reject`, { method: "POST", body: JSON.stringify(body) }),
   cleanupRuns: (body: { runIds?: string[]; states?: Run["state"][]; olderThanDays?: number; scope?: "own" | "all"; dryRun?: boolean; deleteRunDirectory?: boolean } = {}) =>

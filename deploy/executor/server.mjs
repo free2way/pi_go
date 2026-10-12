@@ -6,7 +6,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const SERVICE = "pigo-release-executor";
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const BODY_LIMIT = 128 * 1024;
 const LOG_LIMIT = 64 * 1024;
 const COMMAND_TIMEOUT_MS = 15 * 60_000;
@@ -33,7 +33,7 @@ function requiredText(value, name, max = 1_000) {
 export function validatePayload(value, expectedDeliveryId) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("JSON object required");
   const event = value.event;
-  if (event !== "run.release_requested" && event !== "release.published") throw new Error("unsupported event");
+  if (event !== "run.release_requested" && event !== "run.rollback_requested" && event !== "release.published") throw new Error("unsupported event");
   const environment = value.environment;
   if (environment !== "staging" && environment !== "production") throw new Error("unsupported environment");
   const deliveryId = requiredText(value.deliveryId, "deliveryId", 200);
@@ -48,7 +48,7 @@ export function validatePayload(value, expectedDeliveryId) {
   if (environment === "production" && !/^sha256:[a-f0-9]{64}$/.test(expectedImageDigest)) {
     throw new Error("production requires expectedImageDigest from staging");
   }
-  if (event === "run.release_requested") {
+  if (event === "run.release_requested" || event === "run.rollback_requested") {
     const repository = requiredText(value.repository, "repository", 2_000);
     if (repository.includes("\\") || (!path.posix.isAbsolute(repository)
       && repository.split("/").some((segment) => !segment || segment === "." || segment === ".."))) {
@@ -56,6 +56,8 @@ export function validatePayload(value, expectedDeliveryId) {
     }
     const commit = requiredText(value.commit, "commit", 64).toLowerCase();
     if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error("commit must be a full SHA-1");
+    const reason = event === "run.rollback_requested" ? requiredText(value.reason, "reason", 2_000) : "";
+    if (event === "run.rollback_requested" && environment !== "production") throw new Error("rollback is production-only");
     return {
       ...value,
       event,
@@ -65,6 +67,7 @@ export function validatePayload(value, expectedDeliveryId) {
       callbackUrl,
       repository,
       commit,
+      ...(reason ? { reason } : {}),
       ...(expectedImageDigest ? { expectedImageDigest } : {}),
     };
   }
@@ -343,7 +346,7 @@ async function imageDigest(image) {
   return result.stdout;
 }
 
-async function resolveRunTarget(config, payload) {
+async function resolveRunTarget(config, payload, options = {}) {
   const workspaceRoot = await realpath(config.workspaceRoot);
   const requestedRepository = path.isAbsolute(payload.repository)
     ? payload.repository
@@ -358,7 +361,8 @@ async function resolveRunTarget(config, payload) {
   });
   const resolvedCommit = (await git(["rev-parse", `${payload.commit}^{commit}`])).stdout.toLowerCase();
   const head = (await git(["rev-parse", "HEAD"])).stdout.toLowerCase();
-  if (resolvedCommit !== payload.commit || head !== payload.commit) throw new Error("workspace HEAD does not match the reviewed merge commit");
+  if (resolvedCommit !== payload.commit) throw new Error("target commit is not available in the workspace repository");
+  if (options.requireHead !== false && head !== payload.commit) throw new Error("workspace HEAD does not match the reviewed merge commit");
   if ((await git(["status", "--porcelain"])).stdout) throw new Error("workspace is dirty; deployment refused");
   const appDirectory = await realpath(path.join(repository, config.appPath));
   if (!pathWithin(repository, appDirectory)) throw new Error("application path escapes the repository");
@@ -427,6 +431,55 @@ async function runDeploy(config, store, payload, reportProgress = async () => un
   };
 }
 
+export async function runRollback(config, store, payload, reportProgress = async () => undefined) {
+  await reportProgress("validating", "immutable rollback target validation started");
+  const target = await resolveRunTarget(config, payload, { requireHead: false });
+  const previous = store.latest("production");
+  if (!previous || previous.status !== "succeeded" || !previous.imageDigest || !previous.commit) {
+    throw new Error("current production deployment evidence is unavailable");
+  }
+  if (previous.repository !== target.repository) throw new Error("current production deployment belongs to a different repository");
+  const historical = store.successfulDeployment("production", target.repository, payload.commit);
+  if (!historical || historical.imageDigest !== payload.expectedImageDigest) {
+    throw new Error("rollback target is not a successful historical production deployment");
+  }
+  if (previous.imageDigest === historical.imageDigest) throw new Error("rollback target is already active in production");
+
+  const image = `${config.imageRepository}:${payload.commit}`;
+  const before = await imageDigest(image);
+  if (before !== historical.imageDigest) throw new Error("rollback image digest no longer matches historical production evidence");
+  const env = {
+    ...executorEnvironment(config, "production"),
+    PIGO_DEPLOY_IMAGE: image,
+    ORDER_STATUS_IMAGE: image,
+    PIGO_DEPLOY_REPOSITORY: target.repository,
+    PIGO_DEPLOY_COMMIT: payload.commit,
+    PIGO_DEPLOY_IMAGE_ID: historical.imageDigest,
+  };
+  await reportProgress("deploying", "fixed deployment script started for historical image");
+  await command(target.deployScript, ["production", payload.commit], { cwd: target.appDirectory, env });
+  await reportProgress("networking", "private smoke network is being prepared");
+  const smokeUrl = await prepareSmokeUrl(config, "production");
+  await reportProgress("smoke", "post-rollback smoke checks started");
+  await command(target.smokeScript, [], { cwd: target.appDirectory, env: { ...env, APP_BASE_URL: smokeUrl } });
+  await reportProgress("verifying", "rollback image digest verification started");
+  const digest = await imageDigest(image);
+  if (digest !== historical.imageDigest || digest !== payload.expectedImageDigest) {
+    throw new Error("rollback changed the historical image digest");
+  }
+  return {
+    detail: "production rollback and smoke checks passed",
+    deploymentId: `order-status-production-rollback-${payload.commit.slice(0, 12)}`,
+    ...(config.productionPublicUrl ? { url: config.productionPublicUrl } : {}),
+    commit: payload.commit,
+    image,
+    imageDigest: digest,
+    repository: target.repository,
+    rolledBackFromCommit: previous.commit,
+    rolledBackFromDigest: previous.imageDigest,
+  };
+}
+
 async function runReleaseRegistration(store, payload) {
   const deployed = store.successfulDeploymentForCommits(payload.environment, payload.commits);
   if (!deployed) throw new Error(`no successful ${payload.environment} deployment matches the reviewed release commits`);
@@ -455,6 +508,8 @@ export async function postCallback(config, payload, outcome) {
     ...(outcome.commit ? { commit: outcome.commit } : {}),
     ...(outcome.image ? { image: outcome.image } : {}),
     ...(outcome.imageDigest ? { imageDigest: outcome.imageDigest } : {}),
+    ...(outcome.rolledBackFromCommit ? { rolledBackFromCommit: outcome.rolledBackFromCommit } : {}),
+    ...(outcome.rolledBackFromDigest ? { rolledBackFromDigest: outcome.rolledBackFromDigest } : {}),
   };
   let lastError;
   for (const delayMs of [0, 1_000, 2_000, 4_000, 8_000, 16_000]) {
@@ -481,7 +536,7 @@ export async function postCallback(config, payload, outcome) {
 }
 
 export async function postProgress(config, payload, stage, detail) {
-  if (payload.event !== "run.release_requested") return;
+  if (payload.event !== "run.release_requested" && payload.event !== "run.rollback_requested") return;
   const url = callbackTarget(payload.callbackUrl, config.callbackPublicOrigin, config.callbackInternalOrigin);
   const response = await (config.fetchImpl ?? fetch)(url, {
     method: "POST",
@@ -571,14 +626,16 @@ export async function createExecutor(options = {}) {
     try {
       const result = payload.event === "run.release_requested"
         ? await runDeploy(config, store, payload, reportProgress)
-        : await runReleaseRegistration(store, payload);
+        : payload.event === "run.rollback_requested"
+          ? await runRollback(config, store, payload, reportProgress)
+          : await runReleaseRegistration(store, payload);
       outcome = { status: "succeeded", ...result };
     } catch (error) {
       outcome = { status: "failed", detail: (error instanceof Error ? error.message : "deployment failed").slice(0, 500) };
     }
     await store.mutate((state) => {
       state.deliveries[key] = { ...state.deliveries[key], ...outcome, finishedAt: new Date().toISOString() };
-      if (outcome.status === "succeeded" && payload.event === "run.release_requested") state.latestByEnvironment[payload.environment] = key;
+      if (outcome.status === "succeeded" && (payload.event === "run.release_requested" || payload.event === "run.rollback_requested")) state.latestByEnvironment[payload.environment] = key;
     });
     try {
       await postCallback(config, payload, outcome);
@@ -658,6 +715,7 @@ export async function createExecutor(options = {}) {
           callbackStatus: "pending",
           startedAt: new Date().toISOString(),
           ...(payload.commit ? { commit: payload.commit } : {}),
+          ...(payload.reason ? { reason: payload.reason } : {}),
         };
         return { kind: "claimed" };
       });

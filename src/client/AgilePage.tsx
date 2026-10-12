@@ -12,6 +12,7 @@ import { agileFormErrorMessage, buildReleaseInput, buildSprintInput, buildStoryI
 import { agileReleaseProgressView, boardColumnKey, columnPoints, estimateLabel, groupStoriesByColumn, priorityKey, priorityLabel, RELEASE_DEPLOY_ACTION_KEYS, releaseDeployAction, releaseExportFilename, releaseExportJson, storyReference, storyStatusKey , projectContentsLabel, projectDeletionWarning, type AgileReleaseProgressState } from "./agile-view";
 import { browserDeploymentUrl } from "./release-progress";
 import { RequirementAssistant } from "./RequirementAssistant";
+import { ReleaseEvidence } from "./ReleaseEvidence";
 
 /** Catalog key for the sprint/release/deploy badges (labels live in the catalog). */
 const sprintStatusKey = (status: AgileSprint["status"]): MessageKey => `agile.sprintStatus.${status}` as MessageKey;
@@ -104,6 +105,7 @@ function AgileReleaseProgressDialog({ open, release, error, onClose }: {
             <p><time>{formatTime(deploy.at, locale)}</time><span>{deploy.detail}</span></p>
           </div>
         )}
+        {deploy?.status === "ok" && <ReleaseEvidence value={deploy} />}
       </div>
       {error ? <div className="form-error release-progress-error">{error}</div> : null}
       <div className="release-progress-actions">
