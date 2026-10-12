@@ -103,6 +103,7 @@ import { SystemStatusPage } from "./SystemStatusPage";
 import { WorkspacesPage } from "./WorkspacesPage";
 import { ReleaseSettingsPage } from "./ReleaseSettingsPage";
 import { browserDeploymentUrl, RELEASE_PROGRESS_STAGES, releaseProgressEventStage, releaseProgressStepState, type ReleaseProgressStage } from "./release-progress";
+import { ReleaseEvidence } from "./ReleaseEvidence";
 import { RequirementAssistant } from "./RequirementAssistant";
 import { PiAssistant } from "./PiAssistant";
 
@@ -998,6 +999,7 @@ function ReleaseProgressDialog({
               ))}
             </div>
           )}
+          {release?.status === "succeeded" && <ReleaseEvidence value={release} />}
         </div>
       )}
       {error ? <div className="form-error release-progress-error">{error}</div> : null}
@@ -1021,8 +1023,10 @@ function ReleasePanel({ run, events, user, configured, onUpdated }: {
 }) {
   const { t, locale } = useT();
   const [environment, setEnvironment] = useState<"staging" | "production">("staging");
-  const [busy, setBusy] = useState<"" | "merge" | "publish">("");
+  const [busy, setBusy] = useState<"" | "merge" | "publish" | "rollback">("");
   const [error, setError] = useState("");
+  const [rollbackOpen, setRollbackOpen] = useState(false);
+  const [rollbackReason, setRollbackReason] = useState("");
   const [progressOpen, setProgressOpen] = useState(false);
   const [progressStarted, setProgressStarted] = useState(false);
   const [progressEnvironment, setProgressEnvironment] = useState<"staging" | "production">("staging");
@@ -1044,6 +1048,11 @@ function ReleasePanel({ run, events, user, configured, onUpdated }: {
     && Date.now() - Date.parse(release.startedAt) >= 2 * 60_000;
   const canRetry = release?.status === "failed" || stalePublishing;
   const inProgress = (release?.status === "publishing" || release?.status === "triggered") && !stalePublishing;
+  const rollback = run.rollback;
+  const staleRollback = (rollback?.status === "publishing" || rollback?.status === "triggered")
+    && Date.now() - Date.parse(rollback.startedAt) >= 2 * 60_000;
+  const rollbackInProgress = (rollback?.status === "publishing" || rollback?.status === "triggered") && !staleRollback;
+  const rollbackRetry = rollback?.status === "failed" || staleRollback;
   const merge = async () => {
     if (!window.confirm(t("release.mergeConfirm", { title: run.title }))) return;
     setBusy("merge");
@@ -1087,6 +1096,24 @@ function ReleasePanel({ run, events, user, configured, onUpdated }: {
       setBusy("");
     }
   };
+  const submitRollback = async () => {
+    const reason = rollbackReason.trim();
+    if (reason.length < 3) {
+      setError(t("release.rollback.reasonRequired"));
+      return;
+    }
+    setBusy("rollback");
+    setError("");
+    try {
+      onUpdated(await api.rollbackRun(run.id, { confirm: true, reason, ...(rollbackRetry ? { retry: true } : {}) }));
+      setRollbackOpen(false);
+      setRollbackReason("");
+    } catch (cause) {
+      setError(localizeError(locale, cause as { code?: string; message?: string }));
+    } finally {
+      setBusy("");
+    }
+  };
 
   const statusLabel = !release
     ? run.merge ? t("release.statusMergedAwaiting") : t("release.statusAwaitingMerge")
@@ -1116,6 +1143,13 @@ function ReleasePanel({ run, events, user, configured, onUpdated }: {
       {release?.detail ? <p className="release-detail">{release.detail}</p> : null}
       {deploymentUrl ? <a className="release-link" href={deploymentUrl} target="_blank" rel="noreferrer">{t("release.viewDeploy")} <ArrowUpRight size={13} /></a> : null}
       {release?.status === "succeeded" && !deploymentUrl ? <small className="release-config-hint">{t("release.publicUrlUnavailable")}</small> : null}
+      {release?.status === "succeeded" ? <ReleaseEvidence value={release} /> : null}
+      {rollback ? (
+        <div className={`release-rollback-status is-${rollback.status}`}>
+          <RotateCcw size={13} />
+          <div><strong>{t(`release.rollback.status.${rollback.status}`)}</strong><small>{rollback.detail ?? rollback.reason}</small></div>
+        </div>
+      ) : null}
       {error ? <div className="form-error">{error}</div> : null}
       {user?.isAdmin ? (
         <div className="release-actions">
@@ -1136,6 +1170,25 @@ function ReleasePanel({ run, events, user, configured, onUpdated }: {
                 {busy === "publish" || inProgress ? <LoaderCircle className="spin" size={14} /> : <Rocket size={14} />}{t(canPromote ? "release.promoteProduction" : canRetry ? "release.retry" : inProgress ? "release.inProgress" : "release.confirm")}
               </button>
             </>
+          ) : null}
+          {release?.status === "succeeded" && release.environment === "production" && !rollbackOpen ? (
+            <button type="button" className="button secondary" disabled={Boolean(busy) || rollbackInProgress || configured === false} onClick={() => { setError(""); setRollbackOpen(true); }}>
+              {busy === "rollback" || rollbackInProgress ? <LoaderCircle className="spin" size={14} /> : <RotateCcw size={14} />}
+              {t(rollbackRetry ? "release.rollback.retry" : rollbackInProgress ? "release.rollback.inProgress" : "release.rollback.open")}
+            </button>
+          ) : null}
+          {rollbackOpen ? (
+            <div className="release-rollback-form">
+              <label htmlFor={`rollback-reason-${run.id}`}>{t("release.rollback.reason")}</label>
+              <textarea id={`rollback-reason-${run.id}`} value={rollbackReason} maxLength={2_000} autoFocus placeholder={t("release.rollback.reasonPlaceholder")} onChange={(event) => setRollbackReason(event.target.value)} disabled={Boolean(busy)} />
+              <small>{t("release.rollback.help", { commit: release?.commit.slice(0, 12) ?? "—" })}</small>
+              <div>
+                <button type="button" className="button secondary" disabled={Boolean(busy)} onClick={() => { setRollbackOpen(false); setRollbackReason(""); }}>{t("common.cancel")}</button>
+                <button type="button" className="button primary" disabled={Boolean(busy) || rollbackReason.trim().length < 3} onClick={() => void submitRollback()}>
+                  {busy === "rollback" ? <LoaderCircle className="spin" size={14} /> : <RotateCcw size={14} />}{t("release.rollback.confirm")}
+                </button>
+              </div>
+            </div>
           ) : null}
           {configured === false ? <small className="release-config-hint">{t("release.notConfigured")}</small> : null}
         </div>

@@ -65,6 +65,25 @@ test("release payload keeps environment-scoped idempotency identity", () => {
   assert.throws(() => validatePayload({ ...payload, expectedImageDigest: undefined }, payload.deliveryId), /requires expectedImageDigest/);
 });
 
+test("rollback payload is production-only and requires a reason plus immutable digest", () => {
+  const payload = validatePayload({
+    event: "run.rollback_requested",
+    environment: "production",
+    deliveryId: "rollback:run_1:production",
+    attempt: 1,
+    callbackUrl: "https://pigo.example.com/api/internal/runs/run_1/rollback-result",
+    repository: "order_check",
+    commit: "a".repeat(40),
+    expectedImageDigest: digest,
+    reason: "incident 42",
+  }, "rollback:run_1:production");
+  assert.equal(payload.reason, "incident 42");
+  assert.equal(payload.expectedImageDigest, digest);
+  assert.throws(() => validatePayload({ ...payload, environment: "staging" }, payload.deliveryId), /production-only/);
+  assert.throws(() => validatePayload({ ...payload, reason: undefined }, payload.deliveryId), /reason is required/);
+  assert.throws(() => validatePayload({ ...payload, expectedImageDigest: undefined }, payload.deliveryId), /requires expectedImageDigest/);
+});
+
 test("callback target allowlists origin and internal API path before rewriting", () => {
   assert.equal(
     callbackTarget(
@@ -208,6 +227,34 @@ test("successful callbacks carry immutable deployment evidence", async () => {
   });
 });
 
+test("rollback callbacks carry the previous and restored digests", async () => {
+  let body;
+  await postCallback({
+    token,
+    callbackPublicOrigin: "https://pigo.example.com",
+    callbackInternalOrigin: "http://web:3100",
+    fetchImpl: async (_url, options) => {
+      body = JSON.parse(options.body);
+      return { ok: true, status: 200 };
+    },
+  }, {
+    deliveryId: "rollback:run_1:production",
+    attempt: 1,
+    callbackUrl: "https://pigo.example.com/api/internal/runs/run_1/rollback-result",
+  }, {
+    status: "succeeded",
+    detail: "rollback verified",
+    commit: "a".repeat(40),
+    image: "local/app:immutable",
+    imageDigest: digest,
+    rolledBackFromCommit: "b".repeat(40),
+    rolledBackFromDigest: `sha256:${"e".repeat(64)}`,
+  });
+  assert.equal(body.imageDigest, digest);
+  assert.equal(body.rolledBackFromCommit, "b".repeat(40));
+  assert.equal(body.rolledBackFromDigest, `sha256:${"e".repeat(64)}`);
+});
+
 test("host-gateway smoke resolution fails closed when the published port is ambiguous", async () => {
   await assert.rejects(() => prepareSmokeUrl({
     stagingUrl: "http://host.docker.internal:18080",
@@ -233,8 +280,26 @@ test("state recovery fails interrupted work and promotion lookup is repository/c
         imageDigest: `sha256:${"b".repeat(64)}`,
         finishedAt: "2026-10-08T00:00:00.000Z",
       },
+      productionOld: {
+        event: "run.release_requested",
+        environment: "production",
+        status: "succeeded",
+        repository: "/workspace/project-a",
+        commit: "d".repeat(40),
+        imageDigest: `sha256:${"d".repeat(64)}`,
+        finishedAt: "2026-10-07T00:00:00.000Z",
+      },
+      productionNew: {
+        event: "run.release_requested",
+        environment: "production",
+        status: "succeeded",
+        repository: "/workspace/project-a",
+        commit: "e".repeat(40),
+        imageDigest: `sha256:${"e".repeat(64)}`,
+        finishedAt: "2026-10-08T00:00:00.000Z",
+      },
     },
-    latestByEnvironment: { staging: "good" },
+    latestByEnvironment: { staging: "good", production: "productionNew" },
   }));
   try {
     const store = new JsonStateStore(file);
@@ -245,6 +310,8 @@ test("state recovery fails interrupted work and promotion lookup is repository/c
     assert.equal(store.successfulDeployment("staging", "/workspace/project-b", "a".repeat(40)), undefined);
     assert.equal(store.successfulDeploymentForCommits("staging", ["a".repeat(40)])?.repository, "/workspace/project-a");
     assert.equal(store.successfulDeploymentForCommits("staging", ["c".repeat(40)]), undefined);
+    assert.equal(store.latest("production")?.commit, "e".repeat(40));
+    assert.equal(store.successfulDeployment("production", "/workspace/project-a", "d".repeat(40))?.imageDigest, `sha256:${"d".repeat(64)}`);
     assert.equal(JSON.parse(await readFile(file, "utf8")).deliveries.pending.status, "failed");
   } finally {
     await rm(directory, { recursive: true, force: true });

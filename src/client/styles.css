@@ -735,6 +735,32 @@ button { color: inherit; }
 .release-progress-log > div small { color: #596570; font-size: 8px; }
 .release-progress-log p { display: grid; grid-template-columns: 62px minmax(0, 1fr); gap: 8px; margin: 0; padding: 4px 0; color: #84919c; font-size: 9px; line-height: 1.4; }
 .release-progress-log time { color: #52606b; font-family: var(--font-mono); }
+.release-evidence { margin: 11px 0 8px; border: 1px solid rgba(117,215,168,.16); border-radius: 8px; background: rgba(117,215,168,.025); overflow: hidden; }
+.release-evidence-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 10px; border-bottom: 1px solid rgba(255,255,255,.06); }
+.release-evidence-head > div, .release-evidence-head > span { display: inline-flex; align-items: center; gap: 6px; }
+.release-evidence-head > div { color: #b9c6d0; font-size: 9px; }
+.release-evidence-head > span { border: 1px solid #39434c; border-radius: 999px; padding: 3px 7px; color: #8a96a1; font: 500 8px var(--font-mono); }
+.release-evidence-head > span.is-verified { color: #75d7a8; border-color: rgba(77,205,150,.3); background: rgba(77,205,150,.06); }
+.release-evidence-head > span.is-mismatch { color: #ff9f91; border-color: rgba(255,112,91,.35); background: rgba(255,112,91,.06); }
+.release-evidence dl { margin: 0; }
+.release-evidence dl > div { display: grid; grid-template-columns: 116px minmax(0, 1fr) 25px; align-items: center; min-height: 32px; padding: 0 7px 0 10px; border-bottom: 1px solid rgba(255,255,255,.045); }
+.release-evidence dl > div:last-child { border-bottom: 0; }
+.release-evidence dt { color: #687581; font-size: 8px; }
+.release-evidence dd { min-width: 0; margin: 0; overflow: hidden; color: #9facb7; font: 8px var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
+.release-evidence button { display: grid; place-items: center; width: 24px; height: 24px; border: 0; border-radius: 5px; background: transparent; color: #687581; cursor: pointer; }
+.release-evidence button:hover { color: #b8dfff; background: rgba(116,196,255,.07); }
+.release-panel > .release-evidence { margin: 12px 0; }
+.release-rollback-status { display: flex; align-items: flex-start; gap: 9px; margin: 10px 0; padding: 10px 11px; border: 1px solid rgba(255,255,255,.07); border-radius: 8px; color: #8ccfff; background: rgba(116,196,255,.035); }
+.release-rollback-status > div { min-width: 0; }
+.release-rollback-status strong { display: block; color: #b9c6d0; font-size: 9px; }
+.release-rollback-status small { display: block; margin-top: 3px; overflow-wrap: anywhere; color: #687581; font: 8px/1.45 var(--font-mono); }
+.release-rollback-status.is-succeeded { color: #75d7a8; border-color: rgba(77,205,150,.2); background: rgba(77,205,150,.035); }
+.release-rollback-status.is-failed { color: #ff9f91; border-color: rgba(255,112,91,.22); background: rgba(255,112,91,.035); }
+.release-rollback-form { flex: 1 1 100%; display: grid; gap: 7px; min-width: min(100%, 420px); padding: 11px; border: 1px solid rgba(255,159,145,.18); border-radius: 8px; background: rgba(255,112,91,.025); }
+.release-rollback-form label { color: #b9c6d0; font-size: 9px; font-weight: 650; }
+.release-rollback-form textarea { min-height: 64px; resize: vertical; }
+.release-rollback-form > small { color: #687581; font-size: 8px; line-height: 1.5; }
+.release-rollback-form > div { display: flex; justify-content: flex-end; gap: 7px; }
 .release-progress-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 17px 14px; border-top: 1px solid rgba(255,255,255,.07); }
 .release-progress-actions a { text-decoration: none; }
 .release-progress-error { margin: 10px 17px 0; }
