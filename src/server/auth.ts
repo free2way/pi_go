@@ -40,9 +40,11 @@ export type AuthenticatorOptions = {
   clerkAuth?: (request: FastifyRequest) => ClerkAuthState;
   clerkUser?: (userId: string) => Promise<ClerkUserProfile>;
   now?: () => number;
+  clerkEmailCacheMaxEntries?: number;
 };
 
 const CLERK_EMAIL_CACHE_MS = 5 * 60_000;
+const DEFAULT_CLERK_EMAIL_CACHE_MAX_ENTRIES = 1_000;
 
 function legacyOwnerIdFor(issuer: string, subject: string) {
   return createHash("sha256").update(`${issuer}|${subject}`).digest("hex");
@@ -51,6 +53,23 @@ function legacyOwnerIdFor(issuer: string, subject: string) {
 function normalizeTeamDomain(value: string) {
   const url = new URL(value.startsWith("https://") ? value : `https://${value}`);
   if (url.protocol !== "https:") throw new Error("PI_CF_ACCESS_TEAM_DOMAIN must use HTTPS");
+  return url.origin;
+}
+
+export function normalizePublicOrigin(value: string, options: { production: boolean }) {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("PI_PUBLIC_ORIGIN must be a valid URL origin");
+  }
+  const localhost = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+  if (url.protocol !== "https:" && !(!options.production && localhost && url.protocol === "http:")) {
+    throw new Error("PI_PUBLIC_ORIGIN must use HTTPS outside local development");
+  }
+  if (url.username || url.password || url.search || url.hash || (url.pathname && url.pathname !== "/")) {
+    throw new Error("PI_PUBLIC_ORIGIN must contain only scheme and host");
+  }
   return url.origin;
 }
 
@@ -63,6 +82,7 @@ export class Authenticator {
   private readonly clerkAuth: (request: FastifyRequest) => ClerkAuthState;
   private readonly clerkUser: (userId: string) => Promise<ClerkUserProfile>;
   private readonly now: () => number;
+  private readonly clerkEmailCacheMaxEntries: number;
   private readonly clerkEmails = new Map<string, { email: string; expiresAt: number }>();
   private readonly clerkEmailRequests = new Map<string, Promise<string>>();
 
@@ -75,6 +95,9 @@ export class Authenticator {
     this.clerkAuth = options.clerkAuth ?? ((request) => getAuth(request) as ClerkAuthState);
     this.clerkUser = options.clerkUser ?? ((userId) => clerkClient.users.getUser(userId));
     this.now = options.now ?? Date.now;
+    const cacheMaxEntries = options.clerkEmailCacheMaxEntries ?? DEFAULT_CLERK_EMAIL_CACHE_MAX_ENTRIES;
+    if (!Number.isInteger(cacheMaxEntries) || cacheMaxEntries < 1) throw new Error("clerkEmailCacheMaxEntries must be a positive integer");
+    this.clerkEmailCacheMaxEntries = cacheMaxEntries;
     if (this.mode === "development" && process.env.NODE_ENV === "production") {
       throw new Error("PI_AUTH_MODE=development is not allowed when NODE_ENV=production");
     }
@@ -182,7 +205,11 @@ export class Authenticator {
    */
   private async clerkEmail(userId: string): Promise<string> {
     const cached = this.clerkEmails.get(userId);
-    if (cached && cached.expiresAt > this.now()) return cached.email;
+    if (cached && cached.expiresAt > this.now()) {
+      this.clerkEmails.delete(userId);
+      this.clerkEmails.set(userId, cached);
+      return cached.email;
+    }
     const pending = this.clerkEmailRequests.get(userId);
     if (pending) return pending;
     const lookup = this.clerkUser(userId).then((user) => {
@@ -192,6 +219,17 @@ export class Authenticator {
       }
       const email = primary.emailAddress.trim().toLowerCase();
       if (!email) throw new Error("Clerk user email is empty");
+      for (const [cachedUserId, entry] of this.clerkEmails) {
+        if (entry.expiresAt <= this.now()) this.clerkEmails.delete(cachedUserId);
+      }
+      // Map preserves insertion order. Refreshing an existing entry and evicting
+      // the oldest one gives us a compact LRU-like bound without a second index.
+      this.clerkEmails.delete(userId);
+      while (this.clerkEmails.size >= this.clerkEmailCacheMaxEntries) {
+        const oldest = this.clerkEmails.keys().next().value as string | undefined;
+        if (!oldest) break;
+        this.clerkEmails.delete(oldest);
+      }
       this.clerkEmails.set(userId, { email, expiresAt: this.now() + CLERK_EMAIL_CACHE_MS });
       return email;
     }).finally(() => this.clerkEmailRequests.delete(userId));

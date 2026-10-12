@@ -1,6 +1,6 @@
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { afterEach, describe, expect, it } from "vitest";
-import { Authenticator } from "./auth.js";
+import { Authenticator, normalizePublicOrigin } from "./auth.js";
 
 /**
  * development 模式的缺省身份（`PI_DEV_DEFAULT_EMAIL`）。
@@ -181,5 +181,48 @@ describe("Clerk 邮箱身份", () => {
     const unverifiedReply = reply();
     await unverified.authenticate(request(), unverifiedReply);
     expect(unverifiedReply.sent.status).toBe(401);
+  });
+
+  it("限制邮箱缓存大小并淘汰最旧身份", async () => {
+    setEnv(clerkEnv);
+    let currentUserId = "user_1";
+    const lookups = new Map<string, number>();
+    const auth = new Authenticator({
+      clerkEmailCacheMaxEntries: 1,
+      clerkAuth: () => ({ isAuthenticated: true, userId: currentUserId, sessionClaims: { iss: "https://clerk.example" } }),
+      clerkUser: async (userId) => {
+        lookups.set(userId, (lookups.get(userId) ?? 0) + 1);
+        return {
+          primaryEmailAddressId: `email_${userId}`,
+          emailAddresses: [{ id: `email_${userId}`, emailAddress: `${userId}@example.com`, verification: { status: "verified" } }],
+        };
+      },
+    });
+    await auth.authenticate(request(), reply());
+    currentUserId = "user_2";
+    await auth.authenticate(request(), reply());
+    currentUserId = "user_1";
+    await auth.authenticate(request(), reply());
+    expect(lookups.get("user_1")).toBe(2);
+    expect(lookups.get("user_2")).toBe(1);
+  });
+
+  it("拒绝无效的 Clerk 邮箱缓存容量", () => {
+    setEnv(clerkEnv);
+    expect(() => new Authenticator({ clerkEmailCacheMaxEntries: 0 })).toThrow(/positive integer/);
+  });
+});
+
+describe("public origin normalization", () => {
+  it("normalizes an HTTPS origin and rejects paths or credentials", () => {
+    expect(normalizePublicOrigin("https://pigo.example.com/", { production: true })).toBe("https://pigo.example.com");
+    expect(() => normalizePublicOrigin("https://pigo.example.com/app", { production: true })).toThrow(/only scheme and host/);
+    expect(() => normalizePublicOrigin("https://user:pass@pigo.example.com", { production: true })).toThrow(/only scheme and host/);
+  });
+
+  it("allows HTTP only for local development", () => {
+    expect(normalizePublicOrigin("http://127.0.0.1:3100", { production: false })).toBe("http://127.0.0.1:3100");
+    expect(() => normalizePublicOrigin("http://pigo.example.com", { production: false })).toThrow(/must use HTTPS/);
+    expect(() => normalizePublicOrigin("http://localhost:3100", { production: true })).toThrow(/must use HTTPS/);
   });
 });

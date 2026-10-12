@@ -13,7 +13,8 @@ import { resolveRequestLocale, type Locale } from "../shared/i18n.js";
 import type { ConfigStatus, CurrentUser, ModelCatalogResponse, ReviewScope, Run, RunEvent, RunReleaseRecord, RunRollbackRecord, Workspace } from "../shared/types.js";
 import { AccountError, AccountService, accountAdminGate } from "./accounts.js";
 import { AlertManager, createAlertSink } from "./alerts.js";
-import { Authenticator } from "./auth.js";
+import { Authenticator, normalizePublicOrigin } from "./auth.js";
+import { ExpiringLruCache } from "./expiring-lru-cache.js";
 import { CredentialVault } from "./credential-vault.js";
 import { ReleaseSettingsStore, releaseSettingsStatus } from "./release-settings.js";
 import { ScmSettingsStore } from "./scm-settings.js";
@@ -95,8 +96,11 @@ const dataFile = process.env.PI_DATA_FILE || path.resolve("data/runs.json");
 const vaultFile = process.env.PI_VAULT_FILE || path.resolve("data/credentials.v1.json");
 const releaseSettingsFile = process.env.PI_RELEASE_SETTINGS_FILE || path.resolve("data/release-settings.v1.json");
 const scmSettingsFile = process.env.PI_SCM_SETTINGS_FILE || path.resolve("data/scm-settings.v1.json");
-const publicOrigin = process.env.PI_PUBLIC_ORIGIN || "";
 const authMode = process.env.PI_AUTH_MODE || "development";
+const configuredPublicOrigin = process.env.PI_PUBLIC_ORIGIN?.trim() || "";
+const publicOrigin = configuredPublicOrigin
+  ? normalizePublicOrigin(configuredPublicOrigin, { production: process.env.NODE_ENV === "production" })
+  : "";
 const vaultSecret = process.env.PI_VAULT_SECRET;
 if (!vaultSecret) throw new Error("PI_VAULT_SECRET is required");
 if ((authMode === "cloudflare" || authMode === "clerk") && !publicOrigin) {
@@ -210,7 +214,10 @@ const workspaces = new WorkspaceService(
   scmSettings,
 );
 const agile = new AgileService(db);
-const userCache = new Map<string, CurrentUser>();
+// Open registration means this cache can no longer be an unbounded process-wide
+// Map. The TTL also lets a verified Clerk email change flow back through the
+// identity service instead of pinning the first observed address until restart.
+const userCache = new ExpiringLruCache<CurrentUser>({ maxEntries: 5_000, ttlMs: 5 * 60_000 });
 
 const createRunSchema = z.object({
   title: z.string().trim().min(2).max(80),
@@ -690,7 +697,7 @@ app.get("/api/health", async (_request, reply) => {
   try {
     await pingDatabase();
     alerts.clear("database_unavailable");
-    return { status: "ok", service: "pigo-web", version: webVersion, db: "ok" };
+    return { status: "ok", service: "pigo-web", version: webVersion, db: "ok", authMode: auth.authMode };
   } catch (error) {
     // AT-REL-005: fail loudly instead of pretending the service is healthy.
     alerts.raise({
@@ -699,7 +706,7 @@ app.get("/api/health", async (_request, reply) => {
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
       details: { error: (error as Error).message.slice(0, 200) },
     });
-    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: webVersion, db: "unavailable", code: "DATABASE_UNAVAILABLE" });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: webVersion, db: "unavailable", authMode: auth.authMode, code: "DATABASE_UNAVAILABLE" });
   }
 });
 
