@@ -42,6 +42,7 @@
   },
   "dependencies": {
     "@clerk/fastify": "3.1.20",
+    "@clerk/localizations": "4.23.0",
     "@clerk/react": "6.17.8",
     "@fastify/compress": "^9.2.1",
     "@fastify/static": "^10.1.5",

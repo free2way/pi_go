@@ -1,25 +1,48 @@
 import { ClerkFailed, ClerkLoaded, ClerkLoading, ClerkProvider, SignIn, SignUp, useAuth, useClerk } from "@clerk/react";
+import { enUS, zhCN } from "@clerk/localizations";
 import { useEffect, useState } from "react";
 import { Bot, ShieldCheck } from "lucide-react";
 import { App } from "./App";
 import { setAuthTokenProvider } from "./api";
 import { AuthConfigurationError, AuthLoadingScreen } from "./AuthScreens";
+import { useT } from "./i18n";
+import type { Locale } from "../shared/i18n";
 
-function SignInPortal() {
+export function clerkLocalizationFor(locale: Locale) {
+  return locale === "zh" ? zhCN : enUS;
+}
+
+export function SignInPortal() {
   const [intent, setIntent] = useState<"sign-in" | "sign-up">("sign-in");
+  const { locale, locales, localeLabels, setLocale, t } = useT();
   return (
     <main className="auth-page">
+      <div className="auth-language" role="group" aria-label={t("auth.language")}>
+        {locales.map((option) => (
+          <button
+            key={option}
+            type="button"
+            lang={option === "zh" ? "zh-CN" : "en"}
+            aria-pressed={locale === option}
+            className={locale === option ? "active" : ""}
+            title={localeLabels[option]}
+            onClick={() => setLocale(option)}
+          >
+            {option === "zh" ? "中文" : "EN"}
+          </button>
+        ))}
+      </div>
       <section className="auth-story" aria-labelledby="auth-title">
         <div className="auth-brand"><span><Bot size={19} /></span><strong>PiGO</strong></div>
-        <p className="auth-kicker">MULTI-AGENT DELIVERY PLATFORM</p>
-        <h1 id="auth-title">让开发、审核与发布<br />在同一条智能工作流中完成。</h1>
-        <p className="auth-lead">使用邮箱创建账户，由多个专业 Agent 并行开发、独立审核，并把每一次决策留在可追溯的交付链路中。</p>
-        <div className="auth-trust"><ShieldCheck size={17} /><span>Clerk 安全会话 · 邮箱验证 · 最小权限</span></div>
+        <p className="auth-kicker">{t("auth.kicker")}</p>
+        <h1 id="auth-title">{t("auth.titleLine1")}<br />{t("auth.titleLine2")}</h1>
+        <p className="auth-lead">{t("auth.lead")}</p>
+        <div className="auth-trust"><ShieldCheck size={17} /><span>{t("auth.trust")}</span></div>
       </section>
-      <section className="auth-panel" aria-label={intent === "sign-in" ? "登录" : "注册"}>
-        <div className="auth-tabs" role="group" aria-label="账户操作">
-          <button type="button" aria-pressed={intent === "sign-in"} className={intent === "sign-in" ? "active" : ""} onClick={() => setIntent("sign-in")}>登录</button>
-          <button type="button" aria-pressed={intent === "sign-up"} className={intent === "sign-up" ? "active" : ""} onClick={() => setIntent("sign-up")}>邮箱注册</button>
+      <section className="auth-panel" aria-label={intent === "sign-in" ? t("auth.signIn") : t("auth.signUp")}>
+        <div className="auth-tabs" role="group" aria-label={t("auth.accountActions")}>
+          <button type="button" aria-pressed={intent === "sign-in"} className={intent === "sign-in" ? "active" : ""} onClick={() => setIntent("sign-in")}>{t("auth.signIn")}</button>
+          <button type="button" aria-pressed={intent === "sign-up"} className={intent === "sign-up" ? "active" : ""} onClick={() => setIntent("sign-up")}>{t("auth.signUp")}</button>
         </div>
         <div className="auth-clerk-slot">
           {intent === "sign-in"
@@ -35,6 +58,7 @@ function ClerkSessionGate() {
   const { isLoaded, isSignedIn, getToken } = useAuth();
   const clerk = useClerk();
   const [apiReady, setApiReady] = useState(false);
+  const { t } = useT();
 
   useEffect(() => {
     if (!isLoaded || !isSignedIn) {
@@ -51,17 +75,19 @@ function ClerkSessionGate() {
 
   if (!isLoaded) return <AuthLoadingScreen />;
   if (!isSignedIn) return <SignInPortal />;
-  if (!apiReady) return <AuthLoadingScreen label="正在建立安全会话…" />;
+  if (!apiReady) return <AuthLoadingScreen label={t("auth.establishingSession")} />;
   return <App onSignOut={() => void clerk.signOut({ redirectUrl: "/" })} />;
 }
 
 export function ClerkAuthRoot({ config }: { config: { publishableKey: string; proxyUrl: string } }) {
+  const { locale, t } = useT();
   return (
     <ClerkProvider
       publishableKey={config.publishableKey}
       proxyUrl={config.proxyUrl}
       signInFallbackRedirectUrl="/"
       signUpFallbackRedirectUrl="/"
+      localization={clerkLocalizationFor(locale)}
       appearance={{
         variables: {
           colorPrimary: "#dff854",
@@ -74,7 +100,7 @@ export function ClerkAuthRoot({ config }: { config: { publishableKey: string; pr
         },
       }}
     >
-      <ClerkFailed><AuthConfigurationError message="Clerk 身份服务加载失败，请稍后重试。" /></ClerkFailed>
+      <ClerkFailed><AuthConfigurationError message={t("auth.clerkLoadFailed")} /></ClerkFailed>
       <ClerkLoading><AuthLoadingScreen /></ClerkLoading>
       <ClerkLoaded><ClerkSessionGate /></ClerkLoaded>
     </ClerkProvider>

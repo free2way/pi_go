@@ -295,6 +295,44 @@ const enNav: Record<keyof typeof zhNav, string> = {
   "metrics.costCurrent": "Current total",
 };
 
+const zhAuth = {
+  "auth.language": "登录界面语言",
+  "auth.kicker": "多智能体交付平台",
+  "auth.titleLine1": "让开发、审核与发布",
+  "auth.titleLine2": "在同一条智能工作流中完成。",
+  "auth.lead": "使用邮箱创建账户，由多个专业 Agent 并行开发、独立审核，并把每一次决策留在可追溯的交付链路中。",
+  "auth.trust": "Clerk 安全会话 / 邮箱验证 / 最小权限",
+  "auth.signIn": "登录",
+  "auth.signUp": "邮箱注册",
+  "auth.accountActions": "账户操作",
+  "auth.loading": "正在连接身份服务…",
+  "auth.establishingSession": "正在建立安全会话…",
+  "auth.unavailableTitle": "暂时无法打开登录",
+  "auth.reload": "重新加载",
+  "auth.clerkLoadFailed": "Clerk 身份服务加载失败，请稍后重试。",
+  "auth.configHttpFailed": "身份配置请求失败（HTTP {status}）",
+  "auth.configUnavailable": "身份配置不可用",
+} as const;
+
+const enAuth: Record<keyof typeof zhAuth, string> = {
+  "auth.language": "Login language",
+  "auth.kicker": "MULTI-AGENT DELIVERY PLATFORM",
+  "auth.titleLine1": "Develop, review and ship",
+  "auth.titleLine2": "in one intelligent workflow.",
+  "auth.lead": "Create with specialist agents, review independently, and keep every decision traceable from requirement to release.",
+  "auth.trust": "Clerk secure sessions / Email verification / Least privilege",
+  "auth.signIn": "Sign in",
+  "auth.signUp": "Sign up with email",
+  "auth.accountActions": "Account actions",
+  "auth.loading": "Connecting to identity services…",
+  "auth.establishingSession": "Establishing a secure session…",
+  "auth.unavailableTitle": "Sign-in is temporarily unavailable",
+  "auth.reload": "Reload",
+  "auth.clerkLoadFailed": "Clerk could not load. Please try again shortly.",
+  "auth.configHttpFailed": "Authentication configuration failed (HTTP {status})",
+  "auth.configUnavailable": "Authentication configuration is unavailable",
+};
+
 const zhRun = {
   "topology.title": "工作流拓扑",
   "topology.round": "第 {round} 轮",
@@ -2629,6 +2667,7 @@ const enErrors: Record<keyof typeof zhErrors, string> = {
 
 const zh = {
   ...zhNav,
+  ...zhAuth,
   ...zhRun,
   ...zhChat,
   ...zhChatLabels,
@@ -2644,6 +2683,7 @@ export type MessageKey = keyof typeof zh;
 
 const en: Record<MessageKey, string> = {
   ...enNav,
+  ...enAuth,
   ...enRun,
   ...enChat,
   ...enChatLabels,
@@ -2667,8 +2707,8 @@ export function catalogKeys(locale: Locale): string[] {
  */
 export function duplicateCatalogKeys(locale: Locale): string[] {
   const sections: Array<Record<string, string>> = locale === "en"
-    ? [enNav, enRun, enChat, enChatLabels, enPages, enOps, enAgile1, enAgile2, enErrors]
-    : [zhNav, zhRun, zhChat, zhChatLabels, zhPages, zhOps, zhAgile1, zhAgile2, zhErrors];
+    ? [enNav, enAuth, enRun, enChat, enChatLabels, enPages, enOps, enAgile1, enAgile2, enErrors]
+    : [zhNav, zhAuth, zhRun, zhChat, zhChatLabels, zhPages, zhOps, zhAgile1, zhAgile2, zhErrors];
   const seen = new Set<string>();
   const duplicates = new Set<string>();
   for (const section of sections) {
