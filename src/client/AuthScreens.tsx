@@ -1,20 +1,23 @@
 import { LoaderCircle, RefreshCw } from "lucide-react";
+import { useT } from "./i18n";
 
-export function AuthLoadingScreen({ label = "正在连接身份服务…" }: { label?: string }) {
+export function AuthLoadingScreen({ label }: { label?: string }) {
+  const { t } = useT();
   return (
     <main className="auth-state" aria-live="polite">
       <LoaderCircle className="spin" size={22} />
-      <span>{label}</span>
+      <span>{label ?? t("auth.loading")}</span>
     </main>
   );
 }
 
 export function AuthConfigurationError({ message }: { message: string }) {
+  const { t } = useT();
   return (
     <main className="auth-state auth-state-error" role="alert">
-      <strong>暂时无法打开登录</strong>
+      <strong>{t("auth.unavailableTitle")}</strong>
       <span>{message}</span>
-      <button type="button" onClick={() => window.location.reload()}><RefreshCw size={15} />重新加载</button>
+      <button type="button" onClick={() => window.location.reload()}><RefreshCw size={15} />{t("auth.reload")}</button>
     </main>
   );
 }

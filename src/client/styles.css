@@ -107,11 +107,11 @@ button { color: inherit; }
 
 /* Clerk entry point: same visual language as the product shell, without making
    the identity provider look like a detached third-party page. */
-.auth-state { min-height: 100vh; display: grid; place-content: center; justify-items: center; gap: 12px; background: var(--bg); color: var(--muted); font-size: 12px; }
+.auth-state { min-height: 100dvh; display: grid; place-content: center; justify-items: center; gap: 12px; background: var(--bg); color: var(--muted); font-size: 12px; }
 .auth-state-error strong { color: var(--text); font-size: 17px; }
 .auth-state-error button { height: 36px; margin-top: 8px; padding: 0 14px; display: inline-flex; align-items: center; gap: 7px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); color: var(--text); cursor: pointer; }
-.auth-page { min-height: 100vh; overflow: auto; display: grid; grid-template-columns: minmax(360px, 1.08fr) minmax(420px, .92fr); background: radial-gradient(circle at 14% 12%, rgba(223,248,84,.07), transparent 30%), var(--bg); }
-.auth-story { min-height: 100vh; padding: clamp(42px, 7vw, 100px); display: flex; flex-direction: column; justify-content: center; border-right: 1px solid var(--line-soft); }
+.auth-page { position: relative; min-height: 100dvh; overflow: auto; display: grid; grid-template-columns: minmax(360px, 1.08fr) minmax(420px, .92fr); background: radial-gradient(circle at 14% 12%, rgba(223,248,84,.07), transparent 30%), var(--bg); }
+.auth-story { min-height: 100dvh; padding: clamp(42px, 7vw, 100px); display: flex; flex-direction: column; justify-content: center; border-right: 1px solid var(--line-soft); }
 .auth-brand { position: absolute; top: 42px; display: flex; align-items: center; gap: 10px; }
 .auth-brand span { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 9px; background: var(--accent); color: #111408; }
 .auth-brand strong { font-size: 16px; letter-spacing: -.03em; }
@@ -120,7 +120,13 @@ button { color: inherit; }
 .auth-lead { max-width: 610px; margin: 28px 0 0; color: #8d97a1; font-size: clamp(14px, 1.25vw, 18px); line-height: 1.8; }
 .auth-trust { margin-top: 36px; display: inline-flex; align-items: center; gap: 9px; color: #727c86; font-size: 11px; }
 .auth-trust svg { color: var(--green); }
-.auth-panel { min-height: 100vh; padding: 42px clamp(28px, 6vw, 88px); display: flex; flex-direction: column; align-items: center; justify-content: center; }
+.auth-language { position: absolute; top: 38px; right: 42px; z-index: 2; display: grid; grid-template-columns: 1fr 1fr; gap: 3px; padding: 3px; border: 1px solid var(--line); border-radius: 9px; background: rgba(13,17,21,.9); }
+.auth-language button { min-width: 42px; height: 30px; padding: 0 10px; border: 0; border-radius: 6px; background: transparent; color: #78828c; font: 600 10px "DM Mono", monospace; cursor: pointer; transition: color .18s ease, background .18s ease, transform .18s ease; }
+.auth-language button:hover { color: var(--text); }
+.auth-language button:active { transform: translateY(1px); }
+.auth-language button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.auth-language button.active { background: var(--surface-3); color: var(--accent); box-shadow: inset 0 0 0 1px #2c333b; }
+.auth-panel { min-height: 100dvh; padding: 42px clamp(28px, 6vw, 88px); display: flex; flex-direction: column; align-items: center; justify-content: center; }
 .auth-tabs { width: min(100%, 400px); display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 4px; border: 1px solid var(--line); border-radius: 10px; background: #0d1115; }
 .auth-tabs button { height: 36px; border: 0; border-radius: 7px; background: transparent; color: var(--muted); cursor: pointer; font-size: 12px; }
 .auth-tabs button.active { background: var(--surface-3); color: var(--text); box-shadow: inset 0 0 0 1px #2c333b; }
@@ -132,6 +138,7 @@ button { color: inherit; }
   .auth-page { grid-template-columns: 1fr; }
   .auth-story { min-height: auto; padding: 88px 28px 36px; border-right: 0; border-bottom: 1px solid var(--line-soft); }
   .auth-brand { top: 25px; }
+  .auth-language { top: 22px; right: 20px; }
   .auth-story h1 { font-size: clamp(30px, 9vw, 48px); }
   .auth-lead { margin-top: 18px; }
   .auth-trust { margin-top: 22px; }
