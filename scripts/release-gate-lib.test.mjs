@@ -20,14 +20,15 @@ import {
   summarizeResults,
 } from "./release-gate-lib.mjs";
 
-test("planGateSteps runs the eight fixed checks in order", () => {
+test("planGateSteps runs the nine fixed checks in order", () => {
   const steps = planGateSteps({});
   assert.deepEqual(
-    steps.slice(0, 8).map((step) => step.id),
+    steps.slice(0, 9).map((step) => step.id),
     [
       "typecheck",
       "test",
       "test-executor",
+      "test-scripts",
       "lint",
       "build",
       "validate-compose",
@@ -106,7 +107,7 @@ test("executeGate maps runner outcomes and never turns a SKIP into a PASS", asyn
   });
   // The skip step is not handed to the runner, but the command steps are.
   assert.ok(!seen.includes(DB_STEP_ID));
-  assert.equal(results.filter((result) => result.status === PASS).length, 7);
+  assert.equal(results.filter((result) => result.status === PASS).length, 8);
   const dbResult = results.find((result) => result.id === DB_STEP_ID);
   assert.equal(dbResult.status, SKIP);
   assert.match(dbResult.detail, /no database is touched/);
@@ -123,8 +124,8 @@ test("executeGate converts a throwing runner into a FAIL and keeps going", async
   const build = results.find((result) => result.id === "build");
   assert.equal(build.status, FAIL);
   assert.match(build.detail, /ENOENT/);
-  // Subsequent steps still ran (eight command steps + one skip).
-  assert.equal(results.length, 9);
+  // Subsequent steps still ran (nine command steps + one skip).
+  assert.equal(results.length, 10);
 });
 
 test("renderGateTable contains every id, status and detail", () => {

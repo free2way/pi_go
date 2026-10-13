@@ -42,6 +42,7 @@ export function planGateSteps(env = process.env) {
     { id: "typecheck", label: "npm run typecheck", kind: "command", command: "npm", args: ["run", "typecheck"] },
     { id: "test", label: "npm test", kind: "command", command: "npm", args: ["test"] },
     { id: "test-executor", label: "npm run test:executor", kind: "command", command: "npm", args: ["run", "test:executor"] },
+    { id: "test-scripts", label: "npm run test:scripts", kind: "command", command: "npm", args: ["run", "test:scripts"] },
     { id: "lint", label: "npm run lint -- --max-warnings=0", kind: "command", command: "npm", args: ["run", "lint", "--", "--max-warnings=0"] },
     { id: "build", label: "npm run build", kind: "command", command: "npm", args: ["run", "build"] },
     { id: "validate-compose", label: "npm run validate:compose", kind: "command", command: "npm", args: ["run", "validate:compose"] },

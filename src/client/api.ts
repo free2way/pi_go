@@ -126,11 +126,25 @@ function localeHeaders(locale?: Locale): Record<string, string> | undefined {
   return locale ? { "Accept-Language": LOCALE_TAGS[locale] } : undefined;
 }
 
+type AuthTokenProvider = () => Promise<string | null>;
+let authTokenProvider: AuthTokenProvider | undefined;
+
+/** Installs Clerk's short-lived session-token supplier without coupling this API module to React. */
+export function setAuthTokenProvider(provider?: AuthTokenProvider) {
+  authTokenProvider = provider;
+  return () => {
+    if (authTokenProvider === provider) authTokenProvider = undefined;
+  };
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
+  const token = await authTokenProvider?.();
   const response = await fetch(url, {
     ...init,
+    credentials: "same-origin",
     headers: {
       ...(init?.body ? { "Content-Type": "application/json" } : {}),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...init?.headers,
     },
   });

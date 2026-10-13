@@ -245,6 +245,19 @@ jobs:
           output-format: json
           output-file: supply-chain/vulnerability/executor.json
 
+      - name: Enforce vulnerability gate
+        if: ${{ steps.scan_runtime.outcome != 'success' || steps.scan_web.outcome != 'success' || steps.scan_worker.outcome != 'success' || steps.scan_sandbox.outcome != 'success' || steps.scan_executor.outcome != 'success' }}
+        run: |
+          echo "One or more image scans found a fixable critical vulnerability. Inspect the uploaded JSON evidence."
+          exit 1
+
+      - name: Create digest-pinned deployment environment
+        run: |
+          node scripts/oci-deployment-env.mjs \
+            --manifest supply-chain/manifest.json \
+            --expected-commit "${GITHUB_SHA}" \
+            --output supply-chain/deployment.env
+
       - name: Upload supply-chain evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -253,12 +266,6 @@ jobs:
           path: supply-chain/
           if-no-files-found: error
           retention-days: 90
-
-      - name: Enforce vulnerability gate
-        if: ${{ steps.scan_runtime.outcome != 'success' || steps.scan_web.outcome != 'success' || steps.scan_worker.outcome != 'success' || steps.scan_sandbox.outcome != 'success' || steps.scan_executor.outcome != 'success' }}
-        run: |
-          echo "One or more image scans found a fixable critical vulnerability. Inspect the uploaded JSON evidence."
-          exit 1
 
       - name: Attest runtime provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4

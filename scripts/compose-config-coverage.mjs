@@ -30,6 +30,9 @@ import path from "node:path";
  */
 export const CRITICAL_ENV = {
   web: [
+    // Clerk email registration/authentication (secret remains env-only)
+    "CLERK_PUBLISHABLE_KEY",
+    "CLERK_SECRET_KEY",
     // model catalog / credential probing (AUD-08)
     "PI_MODEL_CATALOG_JSON",
     "PI_MODEL_PROBE_MODE",
@@ -149,7 +152,7 @@ export const CRITICAL_ENV = {
  * forwarded so `PI_DECISION_ENGINE=jev` can authenticate, but it is never given
  * a value here or in the compose files (see the reverse guard below).
  */
-export const ALLOWED_NON_PI_ENV = new Set(["TYPESAFE_API_KEY"]);
+export const ALLOWED_NON_PI_ENV = new Set(["TYPESAFE_API_KEY", "CLERK_PUBLISHABLE_KEY", "CLERK_SECRET_KEY"]);
 
 /**
  * The deployment log must be readable by the web container, and mounted

@@ -1,4 +1,5 @@
 import fastifyStatic from "@fastify/static";
+import { clerkPlugin } from "@clerk/fastify";
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -12,7 +13,8 @@ import { resolveRequestLocale, type Locale } from "../shared/i18n.js";
 import type { ConfigStatus, CurrentUser, ModelCatalogResponse, ReviewScope, Run, RunEvent, RunReleaseRecord, RunRollbackRecord, Workspace } from "../shared/types.js";
 import { AccountError, AccountService, accountAdminGate } from "./accounts.js";
 import { AlertManager, createAlertSink } from "./alerts.js";
-import { Authenticator } from "./auth.js";
+import { Authenticator, normalizePublicOrigin } from "./auth.js";
+import { ExpiringLruCache } from "./expiring-lru-cache.js";
 import { CredentialVault } from "./credential-vault.js";
 import { ReleaseSettingsStore, releaseSettingsStatus } from "./release-settings.js";
 import { ScmSettingsStore } from "./scm-settings.js";
@@ -72,7 +74,7 @@ import type { PiAssistantAnswer } from "../shared/pi-assistant.js";
 const app = Fastify({
   logger: {
     redact: {
-      paths: ["req.headers.authorization", "req.headers.cf-access-jwt-assertion", "req.body.token", "developerApiKey", "reviewerApiKey", "credentials", "token"],
+      paths: ["req.headers.authorization", "req.headers.cookie", "req.headers.cf-access-jwt-assertion", "req.body.token", "developerApiKey", "reviewerApiKey", "credentials", "token"],
       censor: "[redacted]",
     },
   },
@@ -94,10 +96,16 @@ const dataFile = process.env.PI_DATA_FILE || path.resolve("data/runs.json");
 const vaultFile = process.env.PI_VAULT_FILE || path.resolve("data/credentials.v1.json");
 const releaseSettingsFile = process.env.PI_RELEASE_SETTINGS_FILE || path.resolve("data/release-settings.v1.json");
 const scmSettingsFile = process.env.PI_SCM_SETTINGS_FILE || path.resolve("data/scm-settings.v1.json");
-const publicOrigin = process.env.PI_PUBLIC_ORIGIN || "";
+const authMode = process.env.PI_AUTH_MODE || "development";
+const configuredPublicOrigin = process.env.PI_PUBLIC_ORIGIN?.trim() || "";
+const publicOrigin = configuredPublicOrigin
+  ? normalizePublicOrigin(configuredPublicOrigin, { production: process.env.NODE_ENV === "production" })
+  : "";
 const vaultSecret = process.env.PI_VAULT_SECRET;
 if (!vaultSecret) throw new Error("PI_VAULT_SECRET is required");
-if (process.env.PI_AUTH_MODE === "cloudflare" && !publicOrigin) throw new Error("PI_PUBLIC_ORIGIN is required with Cloudflare authentication");
+if ((authMode === "cloudflare" || authMode === "clerk") && !publicOrigin) {
+  throw new Error("PI_PUBLIC_ORIGIN is required with external authentication");
+}
 
 const modelCatalog = loadModelCatalog();
 const modelDefaults = defaultSelections();
@@ -108,6 +116,17 @@ const vault = new CredentialVault(vaultFile, vaultSecret, {
 const releaseSettings = new ReleaseSettingsStore(releaseSettingsFile, vaultSecret);
 const scmSettings = new ScmSettingsStore(scmSettingsFile, vaultSecret);
 const auth = new Authenticator();
+if (auth.authMode === "clerk") {
+  // Use Clerk's same-origin Frontend API proxy. Besides improving resilience to
+  // privacy/ad-blocking rules, this keeps the __session cookie first-party so
+  // native EventSource connections authenticate without putting JWTs in URLs.
+  await app.register(clerkPlugin, {
+    publishableKey: process.env.CLERK_PUBLISHABLE_KEY!,
+    secretKey: process.env.CLERK_SECRET_KEY!,
+    hookName: "onRequest",
+    frontendApiProxy: { enabled: true, path: "/__clerk" },
+  });
+}
 await Promise.all([vault.init(), releaseSettings.init(), scmSettings.init()]);
 // AUD-08 / AT-MODEL-004: live provider probe used to verify credentials. It is
 // injectable and never throws; a failed probe simply leaves a key unverified.
@@ -195,7 +214,10 @@ const workspaces = new WorkspaceService(
   scmSettings,
 );
 const agile = new AgileService(db);
-const userCache = new Map<string, CurrentUser>();
+// Open registration means this cache can no longer be an unbounded process-wide
+// Map. The TTL also lets a verified Clerk email change flow back through the
+// identity service instead of pinning the first observed address until restart.
+const userCache = new ExpiringLruCache<CurrentUser>({ maxEntries: 5_000, ttlMs: 5 * 60_000 });
 
 const createRunSchema = z.object({
   title: z.string().trim().min(2).max(80),
@@ -572,7 +594,7 @@ app.addHook("onSend", async (request, reply, payload) => {
 });
 
 app.addHook("preHandler", async (request, reply) => {
-  if (!request.url.startsWith("/api/") || request.url === "/api/health" || request.url.startsWith("/api/internal/")) return;
+  if (!request.url.startsWith("/api/") || request.url === "/api/health" || request.url === "/api/auth/config" || request.url.startsWith("/api/internal/")) return;
   if (["POST", "PUT", "PATCH", "DELETE"].includes(request.method) && publicOrigin) {
     const origin = request.headers.origin;
     if (origin && origin !== publicOrigin) return reply.code(403).send({ error: "Origin not allowed" });
@@ -675,7 +697,7 @@ app.get("/api/health", async (_request, reply) => {
   try {
     await pingDatabase();
     alerts.clear("database_unavailable");
-    return { status: "ok", service: "pigo-web", version: webVersion, db: "ok" };
+    return { status: "ok", service: "pigo-web", version: webVersion, db: "ok", authMode: auth.authMode };
   } catch (error) {
     // AT-REL-005: fail loudly instead of pretending the service is healthy.
     alerts.raise({
@@ -684,7 +706,7 @@ app.get("/api/health", async (_request, reply) => {
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
       details: { error: (error as Error).message.slice(0, 200) },
     });
-    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: webVersion, db: "unavailable", code: "DATABASE_UNAVAILABLE" });
+    return reply.code(503).send({ status: "degraded", service: "pigo-web", version: webVersion, db: "unavailable", authMode: auth.authMode, code: "DATABASE_UNAVAILABLE" });
   }
 });
 
@@ -744,6 +766,9 @@ app.get("/api/me", async (request): Promise<CurrentUser> => {
   const user = auth.user(request);
   return { ...user, isAdmin: await identities.isAdmin(user.id) };
 });
+
+/** Public bootstrap data only; Clerk's publishable key is intentionally client-safe. */
+app.get("/api/auth/config", async () => auth.publicConfig());
 
 // ---------------------------------------------------------------------------
 // 账户管理 (account management) — admin only.

@@ -52,6 +52,25 @@ if (!listItems(web, "volumes").every((entry) => !entry.includes("docker.sock")))
   problems.push("web must not mount the docker socket");
 }
 
+// OCI promotion must be able to replace every locally-built image with the
+// exact digest references produced by CI. Defaults keep local development
+// convenient, while staging/production supply the overrides via --env-file.
+const immutableImageBindings = [
+  ["runtime", "PI_RUNTIME_IMAGE"],
+  ["web", "PI_WEB_IMAGE"],
+  ["worker", "PI_WORKER_IMAGE"],
+];
+for (const [service, variable] of immutableImageBindings) {
+  const imageLine = serviceBlock(service).find((line) => line.trim().startsWith("image:"));
+  if (!imageLine?.includes(`\${${variable}:-`)) {
+    problems.push(`${service} image must support the ${variable} immutable OCI override`);
+  }
+}
+const sandboxImageLine = worker.find((line) => line.trim().startsWith("PI_SANDBOX_IMAGE:"));
+if (!sandboxImageLine?.includes("${PI_SANDBOX_IMAGE:-")) {
+  problems.push("worker must forward the PI_SANDBOX_IMAGE immutable OCI override");
+}
+
 // v0.22 (B3): every critical PI_* variable must reach the service that reads it,
 // and the deployment log must be mounted read-only for the deployment panel.
 for (const problem of checkComposeCoverage(text).problems) problems.push(problem);
@@ -61,4 +80,4 @@ if (problems.length > 0) {
   for (const problem of problems) console.error(` - ${problem}`);
   process.exit(1);
 }
-console.log("compose structure OK (worker volumes + group_add, web isolation, v0.22 config coverage)");
+console.log("compose structure OK (immutable OCI overrides, worker volumes + group_add, web isolation, config coverage)");
