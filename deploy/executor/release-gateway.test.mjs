@@ -108,7 +108,7 @@ test("managed release policy rejects host takeover primitives", () => {
       RestartPolicy: { Name: "unless-stopped", MaximumRetryCount: 0 },
       Tmpfs: { "/tmp": "rw,nosuid,nodev,noexec,size=67108864" },
       PidMode: "",
-      IpcMode: "",
+      IpcMode: "private",
       Binds: null,
       Devices: [],
       PortBindings: { "8080/tcp": [{ HostIp: "127.0.0.1", HostPort: "18080" }] },

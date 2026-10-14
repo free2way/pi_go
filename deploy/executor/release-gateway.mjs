@@ -187,7 +187,9 @@ export function validateManagedReleaseContainer(value, policy) {
     && Object.keys(value.HostConfig?.Tmpfs ?? {}).length === 1
     && ["rw", "nosuid", "nodev", "noexec", "size=67108864"].every((option) => tmpfs.includes(option))
     && !value.HostConfig?.PidMode
-    && !value.HostConfig?.IpcMode
+    // Docker 29 normalizes the secure default to "private" while older
+    // daemons report an empty string. Both mean no host/container IPC sharing.
+    && ["", "private"].includes(value.HostConfig?.IpcMode ?? "")
     && !value.HostConfig?.Binds?.length
     && !value.HostConfig?.Devices?.length
     && !value.Mounts?.length
