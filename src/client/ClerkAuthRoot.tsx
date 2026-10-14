@@ -9,7 +9,16 @@ import { useT } from "./i18n";
 import type { Locale } from "../shared/i18n";
 
 export function clerkLocalizationFor(locale: Locale) {
-  return locale === "zh" ? zhCN : enUS;
+  if (locale === "en") return enUS;
+  return {
+    ...zhCN,
+    // Clerk's zh-CN catalog currently leaves these two placeholders undefined,
+    // which makes the component fall back to English inside an otherwise
+    // Chinese form. Keep the narrow overrides here until the upstream catalog
+    // provides them.
+    formFieldInputPlaceholder__password: "请输入密码",
+    formFieldInputPlaceholder__signUpPassword: "请创建密码",
+  };
 }
 
 export function SignInPortal() {

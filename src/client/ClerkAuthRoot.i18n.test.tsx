@@ -37,6 +37,8 @@ describe("Clerk authentication locale wiring", () => {
 
   it("selects the matching official Clerk localization", () => {
     expect(clerkLocalizationFor("zh").locale).toBe("zh-CN");
+    expect(clerkLocalizationFor("zh").formFieldInputPlaceholder__password).toBe("请输入密码");
+    expect(clerkLocalizationFor("zh").formFieldInputPlaceholder__signUpPassword).toBe("请创建密码");
     expect(clerkLocalizationFor("en").locale).toBe("en-US");
   });
 });
