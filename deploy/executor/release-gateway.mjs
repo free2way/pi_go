@@ -213,6 +213,36 @@ async function findContainer(config, environment, name, runCommand) {
   return parsed[0];
 }
 
+export async function ensureTargetNetwork(config, environment, runCommand = command) {
+  const listed = await docker(config, environment, [
+    "network", "ls", "--filter", `name=^${config.targetNetwork}$`, "--format", "{{.Name}}",
+  ], {}, runCommand);
+  if (!listed.stdout) {
+    await docker(config, environment, [
+      "network", "create",
+      "--driver", "bridge",
+      "--opt", "com.docker.network.bridge.host_binding_ipv4=127.0.0.1",
+      "--label", "pigo.release.gateway=1",
+      config.targetNetwork,
+    ], {}, runCommand);
+  } else if (listed.stdout !== config.targetNetwork) {
+    throw new Error("Docker returned an ambiguous target network name");
+  }
+  const inspected = await docker(config, environment, ["network", "inspect", config.targetNetwork], {}, runCommand);
+  const decoded = JSON.parse(inspected.stdout);
+  const network = Array.isArray(decoded) && decoded.length === 1 ? decoded[0] : undefined;
+  if (!network
+    || network.Name !== config.targetNetwork
+    || network.Driver !== "bridge"
+    || network.Internal !== false
+    || network.Attachable !== false
+    || network.Ingress !== false
+    || network.Labels?.["pigo.release.gateway"] !== "1"
+    || network.Options?.["com.docker.network.bridge.host_binding_ipv4"] !== "127.0.0.1") {
+    throw new Error("target network does not match the fixed release policy");
+  }
+}
+
 const FIXED_SMOKE_SCRIPT = String.raw`
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 let healthy = false;
@@ -248,6 +278,7 @@ async function deployManagedContainer(config, payload, artifact, runtime) {
     name, image: artifact.image, environment: payload.environment, commit: payload.commit,
     network: config.targetNetwork, hostPort, containerPort: 8080,
   };
+  await ensureTargetNetwork(config, payload.environment, runtime.runCommand);
   const existingBackup = await findContainer(config, payload.environment, backup, runtime.runCommand);
   if (existingBackup) {
     const backupPolicy = { ...policy, name: backup, image: existingBackup.Config?.Image,

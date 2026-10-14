@@ -107,9 +107,6 @@ networks:
   pigo-network:
     name: ${PIGO_DOCKER_NETWORK:-pi-agent-network}
     external: true
-  release-targets:
-    name: ${PIGO_EXECUTOR_TARGET_NETWORK:-pigo-release-targets}
-    internal: true
   release-control:
     name: pigo-release-control
     internal: true

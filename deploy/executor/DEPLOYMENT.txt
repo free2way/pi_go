@@ -28,7 +28,7 @@ the approved digest.
 
 The gateway creates the order-status container itself with a fixed non-root
 user, read-only root filesystem, tmpfs, all capabilities dropped,
-no-new-privileges, resource limits, an internal network and a loopback-only host
+no-new-privileges, resource limits, a dedicated bridge and a loopback-only host
 port. It inspects the resulting container before start and refuses any mismatch.
 It then performs fixed /healthz and three /api/orders/evaluate checks. Repository
 ops/deploy.sh, ops/smoke.sh and compose.yaml remain useful for reviewed manual
@@ -136,7 +136,7 @@ Copy executor.env.example to a temporary path outside the repository and fill:
   PIGO_EXECUTOR_STAGING_URL / PIGO_EXECUTOR_PRODUCTION_URL
     Internal deployment and smoke-check URLs. For host.docker.internal URLs,
     the executor resolves the one container publishing the configured port,
-    attaches it to the dedicated internal network, and gives smoke.sh a private
+    attaches it to the dedicated target bridge, and gives smoke.sh a private
     container address. Host ports can therefore remain bound to 127.0.0.1.
 
   PIGO_EXECUTOR_STAGING_PUBLIC_URL / PIGO_EXECUTOR_PRODUCTION_PUBLIC_URL

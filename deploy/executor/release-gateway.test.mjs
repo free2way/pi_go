@@ -8,6 +8,7 @@ import {
   authorizeReleaseGateway,
   createReleaseGateway,
   ensureImage,
+  ensureTargetNetwork,
   loadReleaseGatewayConfig,
   validateManagedReleaseContainer,
   validateReleaseRequest,
@@ -73,6 +74,48 @@ test("staging always rebuilds the reviewed commit while production only reuses i
   }, target, runCommand);
   assert.deepEqual(production, { image, imageDigest: digest });
   assert.equal(calls.some(({ args }) => args[0] === "build"), false);
+});
+
+test("release gateway creates and verifies a dedicated loopback-bound target bridge", async () => {
+  const calls = [];
+  const config = { targetNetwork: "pigo-release-targets" };
+  const runCommand = async (_command, args) => {
+    calls.push(args);
+    if (args[0] === "network" && args[1] === "ls") return { stdout: "", stderr: "" };
+    if (args[0] === "network" && args[1] === "inspect") {
+      return { stdout: JSON.stringify([{
+        Name: config.targetNetwork,
+        Driver: "bridge",
+        Internal: false,
+        Attachable: false,
+        Ingress: false,
+        Labels: { "pigo.release.gateway": "1" },
+        Options: { "com.docker.network.bridge.host_binding_ipv4": "127.0.0.1" },
+      }]), stderr: "" };
+    }
+    return { stdout: config.targetNetwork, stderr: "" };
+  };
+  await ensureTargetNetwork(config, "staging", runCommand);
+  assert.deepEqual(calls[1], [
+    "network", "create",
+    "--driver", "bridge",
+    "--opt", "com.docker.network.bridge.host_binding_ipv4=127.0.0.1",
+    "--label", "pigo.release.gateway=1",
+    config.targetNetwork,
+  ]);
+
+  const incompatible = async (_command, args) => args[1] === "ls"
+    ? { stdout: config.targetNetwork, stderr: "" }
+    : { stdout: JSON.stringify([{
+      Name: config.targetNetwork,
+      Driver: "bridge",
+      Internal: true,
+      Attachable: false,
+      Ingress: false,
+      Labels: { "pigo.release.gateway": "1" },
+      Options: { "com.docker.network.bridge.host_binding_ipv4": "127.0.0.1" },
+    }]), stderr: "" };
+  await assert.rejects(() => ensureTargetNetwork(config, "staging", incompatible), /fixed release policy/);
 });
 
 test("managed release policy rejects host takeover primitives", () => {
