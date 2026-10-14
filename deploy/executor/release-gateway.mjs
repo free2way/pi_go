@@ -140,16 +140,18 @@ async function inspectImage(config, environment, image, runCommand) {
   return { digest: digest.stdout, revision: revision.stdout.toLowerCase() };
 }
 
-async function ensureImage(config, payload, target, runCommand) {
+export async function ensureImage(config, payload, target, runCommand) {
   const image = `${config.imageRepository}:${payload.commit}`;
   let inspected;
-  try { inspected = await inspectImage(config, payload.environment, image, runCommand); } catch (error) {
-    if (payload.environment !== "staging") throw error;
-  }
-  if (!inspected) {
+  if (payload.environment === "staging") {
+    // Staging is the build boundary. Rebuild from the reviewed checkout even
+    // when a same-tag image already exists; a stale or attacker-created local
+    // tag must never be accepted as evidence of the reviewed source.
     await docker(config, payload.environment, [
       "build", "--label", `org.opencontainers.image.revision=${payload.commit}`, "--tag", image, ".",
     ], { cwd: target.appDirectory, timeout: 15 * 60_000 }, runCommand);
+    inspected = await inspectImage(config, payload.environment, image, runCommand);
+  } else {
     inspected = await inspectImage(config, payload.environment, image, runCommand);
   }
   if (inspected.revision !== payload.commit) throw new Error("image revision label does not match the reviewed commit");

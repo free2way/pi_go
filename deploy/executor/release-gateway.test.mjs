@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import {
   authorizeReleaseGateway,
   createReleaseGateway,
+  ensureImage,
   loadReleaseGatewayConfig,
   validateManagedReleaseContainer,
   validateReleaseRequest,
@@ -44,6 +45,34 @@ test("release gateway configuration fails closed", () => {
   assert.throws(() => loadReleaseGatewayConfig({ ...valid, PIGO_EXECUTOR_WORKSPACE_ROOT: "/" }), /non-root/);
   assert.throws(() => loadReleaseGatewayConfig({ ...valid, PIGO_EXECUTOR_APP_PATH: "../outside" }), /safe relative/);
   assert.throws(() => loadReleaseGatewayConfig({ ...valid, PIGO_EXECUTOR_TARGET_NETWORK: "host" }), /invalid/);
+});
+
+test("staging always rebuilds the reviewed commit while production only reuses its approved digest", async () => {
+  const commit = "a".repeat(40);
+  const image = `local/app:${commit}`;
+  const config = { imageRepository: "local/app" };
+  const target = { appDirectory: "/workspace/project-a/apps/order-status-app" };
+  const calls = [];
+  const runCommand = async (command, args, options) => {
+    calls.push({ command, args, options });
+    if (args[0] === "build") return { stdout: "", stderr: "" };
+    if (args.at(-1) === "{{.Id}}") return { stdout: digest, stderr: "" };
+    return { stdout: commit, stderr: "" };
+  };
+
+  const staging = await ensureImage(config, { environment: "staging", commit }, target, runCommand);
+  assert.deepEqual(staging, { image, imageDigest: digest });
+  assert.deepEqual(calls[0].args, [
+    "build", "--label", `org.opencontainers.image.revision=${commit}`, "--tag", image, ".",
+  ]);
+  assert.equal(calls[0].options.cwd, target.appDirectory);
+
+  calls.length = 0;
+  const production = await ensureImage(config, {
+    environment: "production", commit, expectedImageDigest: digest,
+  }, target, runCommand);
+  assert.deepEqual(production, { image, imageDigest: digest });
+  assert.equal(calls.some(({ args }) => args[0] === "build"), false);
 });
 
 test("managed release policy rejects host takeover primitives", () => {
