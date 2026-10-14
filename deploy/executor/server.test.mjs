@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -16,6 +16,7 @@ import {
   postCallback,
   postProgress,
   prepareSmokeUrl,
+  runDeploy,
   runReleaseRegistration,
   validatePayload,
 } from "./server.mjs";
@@ -137,14 +138,18 @@ test("workspace containment rejects siblings and prefix tricks", () => {
 test("configuration fails closed for missing origin, weak token and invalid ports", () => {
   const valid = {
     PIGO_EXECUTOR_TOKEN: token,
+    PIGO_RELEASE_GATEWAY_TOKEN: `${token}-gateway`,
     PIGO_EXECUTOR_CALLBACK_ORIGIN: "https://pigo.example.com",
   };
   assert.equal(loadConfig(valid).port, 3300);
   assert.equal(loadConfig(valid).targetNetwork, "pigo-release-targets");
+  assert.equal(loadConfig(valid).releaseGatewayUrl, "http://release-gateway:3310");
   assert.equal(loadConfig(valid).stagingPublicUrl, "");
   assert.equal(loadConfig({ ...valid, PIGO_EXECUTOR_STAGING_PUBLIC_URL: "https://staging.example.com/app" }).stagingPublicUrl, "https://staging.example.com/app");
   assert.throws(() => loadConfig({ ...valid, PIGO_EXECUTOR_CALLBACK_ORIGIN: "" }), /CALLBACK_ORIGIN is required/);
   assert.throws(() => loadConfig({ ...valid, PIGO_EXECUTOR_TOKEN: "too-short" }), /at least 32/);
+  assert.throws(() => loadConfig({ ...valid, PIGO_RELEASE_GATEWAY_TOKEN: "too-short" }), /at least 32/);
+  assert.throws(() => loadConfig({ ...valid, PIGO_RELEASE_GATEWAY_URL: "https://release-gateway.example" }), /HTTP origin/);
   assert.throws(() => loadConfig({ ...valid, PORT: "70000" }), /integer TCP port/);
   assert.throws(() => loadConfig({ ...valid, PIGO_EXECUTOR_TARGET_NETWORK: "unsafe/network" }), /TARGET_NETWORK is invalid/);
   assert.throws(() => loadConfig({ ...valid, PIGO_EXECUTOR_STAGING_PUBLIC_URL: "http://host.docker.internal:18080" }), /user's browser/);
@@ -189,6 +194,64 @@ test("non-host smoke URL passes through without Docker network mutation", async 
   }, "staging", async () => { called = true; });
   assert.equal(url, "https://staging.example.com");
   assert.equal(called, false);
+});
+
+test("run deployment delegates the fixed reviewed target to the isolated release gateway", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "pigo-executor-gateway-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const repository = path.join(root, "project-a");
+  const app = path.join(repository, "app");
+  await mkdir(app, { recursive: true });
+  await writeFile(path.join(app, "Dockerfile"), "FROM scratch\n");
+  const git = (args) => execFileSync("git", ["-c", "core.hooksPath=/dev/null", ...args], {
+    cwd: repository, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+  git(["init", "-b", "main"]);
+  git(["config", "user.name", "Test"]);
+  git(["config", "user.email", ["test", "example.invalid"].join("@")]);
+  git(["add", "."]);
+  git(["commit", "-m", "fixture"]);
+  const commit = git(["rev-parse", "HEAD"]);
+  let observed;
+  const image = `local/app:${commit}`;
+  const config = {
+    workspaceRoot: root,
+    appPath: "app",
+    imageRepository: "local/app",
+    releaseGatewayUrl: "http://release-gateway:3310",
+    releaseGatewayToken: `${token}-gateway`,
+    stagingUrl: "http://host.docker.internal:18080",
+    productionUrl: "http://host.docker.internal:18081",
+    stagingPort: 18080,
+    productionPort: 18081,
+    stagingPublicUrl: "",
+    productionPublicUrl: "",
+    fetchImpl: async (url, options) => {
+      observed = { url, options };
+      const requested = JSON.parse(options.body);
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          status: "succeeded", event: "deploy", environment: "staging",
+          repository: requested.repository, commit, image, imageDigest: digest,
+        }),
+      };
+    },
+  };
+  const store = new JsonStateStore(path.join(root, "state.json"));
+  const result = await runDeploy(config, store, {
+    event: "run.release_requested", environment: "staging", repository, commit,
+  });
+  assert.equal(observed.url, "http://release-gateway:3310/v1/deploy");
+  assert.equal(observed.options.headers.Authorization, `Bearer ${token}-gateway`);
+  const requested = JSON.parse(observed.options.body);
+  assert.equal(requested.event, "deploy");
+  assert.equal(requested.environment, "staging");
+  assert.equal(requested.commit, commit);
+  assert.deepEqual(Object.keys(requested).sort(), ["commit", "environment", "event", "repository"]);
+  assert.match(requested.repository, /project-a$/);
+  assert.equal(result.imageDigest, digest);
 });
 
 test("run deployments emit authenticated, attempt-scoped progress callbacks", async () => {

@@ -35,7 +35,7 @@ TARBALL="$(mktemp -t pigo-executor-src).tar.gz"
 trap 'rm -f "$TARBALL"' EXIT
 
 tar -czf "$TARBALL" -C "$ROOT" \
-  Dockerfile compose.yaml server.mjs executor.env.example remote-install.sh || exit 3
+  Dockerfile compose.yaml server.mjs release-gateway.mjs executor.env.example remote-install.sh || exit 3
 gzip -t "$TARBALL"
 
 SSH_OPTIONS=(-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)

@@ -6,7 +6,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const SERVICE = "pigo-release-executor";
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 const BODY_LIMIT = 128 * 1024;
 const LOG_LIMIT = 64 * 1024;
 const COMMAND_TIMEOUT_MS = 15 * 60_000;
@@ -137,7 +137,7 @@ function appendTail(current, chunk) {
   return combined.length <= LOG_LIMIT ? combined : combined.slice(-LOG_LIMIT);
 }
 
-function command(file, args, options = {}) {
+export function command(file, args, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(file, args, {
       cwd: options.cwd,
@@ -264,7 +264,7 @@ export class JsonStateStore {
   }
 }
 
-function executorEnvironment(config, environment) {
+export function executorEnvironment(config, environment) {
   return {
     PATH: process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     HOME: "/tmp",
@@ -338,7 +338,7 @@ export async function prepareSmokeUrl(config, environment, runCommand = command)
   return `http://${address}:${matchingPorts[0]}${target.pathname === "/" ? "" : target.pathname}${target.search}`;
 }
 
-async function imageDigest(image) {
+export async function imageDigest(image) {
   const result = await command("docker", ["image", "inspect", image, "--format", "{{.Id}}"], { timeout: 30_000, env: executorEnvironment({
     stagingUrl: "", productionUrl: "", stagingPort: 0, productionPort: 0,
   }, "staging") });
@@ -346,7 +346,7 @@ async function imageDigest(image) {
   return result.stdout;
 }
 
-async function resolveRunTarget(config, payload, options = {}) {
+export async function resolveApplicationTarget(config, payload, options = {}) {
   const workspaceRoot = await realpath(config.workspaceRoot);
   const requestedRepository = path.isAbsolute(payload.repository)
     ? payload.repository
@@ -366,6 +366,12 @@ async function resolveRunTarget(config, payload, options = {}) {
   if ((await git(["status", "--porcelain"])).stdout) throw new Error("workspace is dirty; deployment refused");
   const appDirectory = await realpath(path.join(repository, config.appPath));
   if (!pathWithin(repository, appDirectory)) throw new Error("application path escapes the repository");
+  return { repository, appDirectory };
+}
+
+export async function resolveRunTarget(config, payload, options = {}) {
+  const target = await resolveApplicationTarget(config, payload, options);
+  const { appDirectory } = target;
   const opsDirectory = await realpath(path.join(appDirectory, "ops"));
   if (!pathWithin(appDirectory, opsDirectory)) throw new Error("ops path escapes the application directory");
   const deployScript = await realpath(path.join(opsDirectory, "deploy.sh"));
@@ -376,12 +382,32 @@ async function resolveRunTarget(config, payload, options = {}) {
   const [deployStats, smokeStats] = await Promise.all([stat(deployScript), stat(smokeScript)]);
   if (!deployStats.isFile() || (deployStats.mode & 0o111) === 0) throw new Error("ops/deploy.sh is not executable");
   if (!smokeStats.isFile() || (smokeStats.mode & 0o111) === 0) throw new Error("ops/smoke.sh is not executable");
-  return { repository, appDirectory, deployScript, smokeScript };
+  return { ...target, deployScript, smokeScript };
 }
 
-async function runDeploy(config, store, payload, reportProgress = async () => undefined) {
+async function releaseGatewayRequest(config, body) {
+  const response = await (config.fetchImpl ?? fetch)(`${config.releaseGatewayUrl}/v1/deploy`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${config.releaseGatewayToken}`,
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(COMMAND_TIMEOUT_MS),
+  });
+  const raw = await response.text();
+  let decoded;
+  try { decoded = raw ? JSON.parse(raw) : {}; } catch { throw new Error("release gateway returned invalid JSON"); }
+  if (!response.ok) throw new Error(`release gateway rejected deployment: ${String(decoded.error || `HTTP ${response.status}`).slice(0, 300)}`);
+  if (!decoded || typeof decoded !== "object" || !/^sha256:[a-f0-9]{64}$/.test(decoded.imageDigest ?? "")) {
+    throw new Error("release gateway returned incomplete deployment evidence");
+  }
+  return decoded;
+}
+
+export async function runDeploy(config, store, payload, reportProgress = async () => undefined) {
   await reportProgress("validating", "workspace and reviewed commit validation started");
-  const target = await resolveRunTarget(config, payload);
+  const target = await resolveApplicationTarget(config, payload);
   const image = `${config.imageRepository}:${payload.commit}`;
   let staging;
   if (payload.environment === "production") {
@@ -392,27 +418,20 @@ async function runDeploy(config, store, payload, reportProgress = async () => un
     if (payload.expectedImageDigest !== staging.imageDigest) {
       throw new Error("requested production digest does not match the successful staging deployment");
     }
-    const before = await imageDigest(image);
-    if (before !== staging.imageDigest) throw new Error("staging image digest no longer matches the local immutable image");
   }
-  const env = {
-    ...executorEnvironment(config, payload.environment),
-    PIGO_DEPLOY_IMAGE: image,
-    // Compatibility alias for the currently reviewed order-status app contract.
-    // The value is still executor-owned; callers cannot select an image.
-    ORDER_STATUS_IMAGE: image,
-    PIGO_DEPLOY_REPOSITORY: target.repository,
-    PIGO_DEPLOY_COMMIT: payload.commit,
-    ...(staging?.imageDigest ? { PIGO_DEPLOY_IMAGE_ID: staging.imageDigest } : {}),
-  };
-  await reportProgress("deploying", "fixed deployment script started");
-  await command(target.deployScript, [payload.environment, payload.commit], { cwd: target.appDirectory, env });
-  await reportProgress("networking", "private smoke network is being prepared");
-  const smokeUrl = await prepareSmokeUrl(config, payload.environment);
-  await reportProgress("smoke", "readiness and functional smoke checks started");
-  await command(target.smokeScript, [], { cwd: target.appDirectory, env: { ...env, APP_BASE_URL: smokeUrl } });
-  await reportProgress("verifying", "immutable image digest verification started");
-  const digest = await imageDigest(image);
+  await reportProgress("deploying", "isolated release gateway deployment and smoke checks started");
+  const deployed = await releaseGatewayRequest(config, {
+    event: "deploy",
+    environment: payload.environment,
+    repository: target.repository,
+    commit: payload.commit,
+    ...(staging?.imageDigest ? { expectedImageDigest: staging.imageDigest } : {}),
+  });
+  await reportProgress("verifying", "isolated release gateway evidence verification started");
+  if (deployed.image !== image || deployed.repository !== target.repository || deployed.commit !== payload.commit) {
+    throw new Error("release gateway evidence does not match the requested deployment");
+  }
+  const digest = deployed.imageDigest;
   if (payload.environment === "production") {
     if (digest !== staging.imageDigest || digest !== payload.expectedImageDigest) {
       throw new Error("production deployment changed the staged image digest");
@@ -433,7 +452,7 @@ async function runDeploy(config, store, payload, reportProgress = async () => un
 
 export async function runRollback(config, store, payload, reportProgress = async () => undefined) {
   await reportProgress("validating", "immutable rollback target validation started");
-  const target = await resolveRunTarget(config, payload, { requireHead: false });
+  const target = await resolveApplicationTarget(config, payload, { requireHead: false });
   const previous = store.latest("production");
   if (!previous || previous.status !== "succeeded" || !previous.imageDigest || !previous.commit) {
     throw new Error("current production deployment evidence is unavailable");
@@ -446,24 +465,19 @@ export async function runRollback(config, store, payload, reportProgress = async
   if (previous.imageDigest === historical.imageDigest) throw new Error("rollback target is already active in production");
 
   const image = `${config.imageRepository}:${payload.commit}`;
-  const before = await imageDigest(image);
-  if (before !== historical.imageDigest) throw new Error("rollback image digest no longer matches historical production evidence");
-  const env = {
-    ...executorEnvironment(config, "production"),
-    PIGO_DEPLOY_IMAGE: image,
-    ORDER_STATUS_IMAGE: image,
-    PIGO_DEPLOY_REPOSITORY: target.repository,
-    PIGO_DEPLOY_COMMIT: payload.commit,
-    PIGO_DEPLOY_IMAGE_ID: historical.imageDigest,
-  };
-  await reportProgress("deploying", "fixed deployment script started for historical image");
-  await command(target.deployScript, ["production", payload.commit], { cwd: target.appDirectory, env });
-  await reportProgress("networking", "private smoke network is being prepared");
-  const smokeUrl = await prepareSmokeUrl(config, "production");
-  await reportProgress("smoke", "post-rollback smoke checks started");
-  await command(target.smokeScript, [], { cwd: target.appDirectory, env: { ...env, APP_BASE_URL: smokeUrl } });
-  await reportProgress("verifying", "rollback image digest verification started");
-  const digest = await imageDigest(image);
+  await reportProgress("deploying", "isolated release gateway rollback and smoke checks started");
+  const deployed = await releaseGatewayRequest(config, {
+    event: "rollback",
+    environment: "production",
+    repository: target.repository,
+    commit: payload.commit,
+    expectedImageDigest: historical.imageDigest,
+  });
+  await reportProgress("verifying", "isolated release gateway rollback evidence verification started");
+  if (deployed.image !== image || deployed.repository !== target.repository || deployed.commit !== payload.commit) {
+    throw new Error("release gateway evidence does not match the requested rollback");
+  }
+  const digest = deployed.imageDigest;
   if (digest !== historical.imageDigest || digest !== payload.expectedImageDigest) {
     throw new Error("rollback changed the historical image digest");
   }
@@ -598,6 +612,12 @@ export function loadConfig(environment = process.env) {
   if (!/^[a-z0-9][a-z0-9._/-]*$/i.test(imageRepository)) throw new Error("PIGO_EXECUTOR_IMAGE_REPOSITORY is invalid");
   const targetNetwork = environment.PIGO_EXECUTOR_TARGET_NETWORK || "pigo-release-targets";
   if (!/^[a-z0-9][a-z0-9_.-]*$/i.test(targetNetwork)) throw new Error("PIGO_EXECUTOR_TARGET_NETWORK is invalid");
+  const releaseGatewayToken = environment.PIGO_RELEASE_GATEWAY_TOKEN?.trim() ?? "";
+  if (releaseGatewayToken.length < 32) throw new Error("PIGO_RELEASE_GATEWAY_TOKEN must contain at least 32 characters");
+  const releaseGateway = new URL(environment.PIGO_RELEASE_GATEWAY_URL || "http://release-gateway:3310");
+  if (releaseGateway.protocol !== "http:" || releaseGateway.username || releaseGateway.password || releaseGateway.pathname !== "/") {
+    throw new Error("PIGO_RELEASE_GATEWAY_URL must be an HTTP origin without credentials or a path");
+  }
   const publicUrl = (name) => {
     const raw = environment[name]?.trim() || "";
     if (!raw) return "";
@@ -622,6 +642,8 @@ export function loadConfig(environment = process.env) {
     callbackInternalOrigin,
     imageRepository,
     targetNetwork,
+    releaseGatewayToken,
+    releaseGatewayUrl: releaseGateway.origin,
     stagingUrl: environment.PIGO_EXECUTOR_STAGING_URL || "http://127.0.0.1:18080",
     productionUrl: environment.PIGO_EXECUTOR_PRODUCTION_URL || "http://127.0.0.1:18081",
     stagingPublicUrl: publicUrl("PIGO_EXECUTOR_STAGING_PUBLIC_URL"),

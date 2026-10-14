@@ -3,10 +3,13 @@ PiGO Webhook Executor — deployment and operations guide
 
 Scope
 -----
-This service is intentionally separate from PiGO Web. It accepts only two
-signed PiGO events and never accepts a caller-supplied command:
+This deployment contains two separately networked processes. The executor is
+the only process that accepts signed PiGO events and it has no Docker socket.
+It delegates a validated high-level deploy/rollback request to an internal
+release gateway that is not published on a host port:
 
-  run.release_requested  -> fixed apps/<app>/ops/deploy.sh, then ops/smoke.sh
+  run.release_requested  -> internal gateway -> fixed build/container policy + smoke
+  run.rollback_requested -> internal gateway -> approved historical image + smoke
   release.published      -> register the latest successful deployment
 
 Only staging and production are valid environments. The repository must resolve
@@ -15,37 +18,37 @@ full commit SHA. Production promotion additionally requires a successful staging
 deployment for the same canonical repository and commit, with the same Docker
 image digest.
 
-Application ops contract
-------------------------
-The reviewed repository must provide executable files at the configured app
-path:
+Application release contract
+----------------------------
+The automated path intentionally does not execute repository `ops` scripts or
+the repository Compose file. Staging builds the configured application directory
+with its Dockerfile and adds the reviewed full commit as the OCI revision label.
+Production and rollback only use an already present image whose image ID matches
+the approved digest.
 
-  ops/deploy.sh <staging|production> <full-commit-sha>
-  ops/smoke.sh
-
-Both run with the application directory as cwd and receive only a scrubbed PATH,
-HOME and these release variables:
-
-  APP_BASE_URL, ORDER_STATUS_PORT, COMPOSE_PROJECT_NAME,
-  PIGO_DEPLOY_ENVIRONMENT, PIGO_DEPLOY_IMAGE, ORDER_STATUS_IMAGE,
-  PIGO_DEPLOY_REPOSITORY, PIGO_DEPLOY_COMMIT
-
-Production also receives PIGO_DEPLOY_IMAGE_ID, the exact image id proven in
-staging. Production deploy.sh must run that existing image id and must never
-rebuild it. Staging deploy.sh must build/tag PIGO_DEPLOY_IMAGE, whose tag is the
-full commit SHA. The scripts must not use host source bind mounts; build contexts
-can be sent through Docker, but a /workspace path inside this container is not a
-valid bind source on the Docker host. smoke.sh must perform a real readiness and
-functional check against APP_BASE_URL and exit nonzero on failure.
+The gateway creates the order-status container itself with a fixed non-root
+user, read-only root filesystem, tmpfs, all capabilities dropped,
+no-new-privileges, resource limits, an internal network and a loopback-only host
+port. It inspects the resulting container before start and refuses any mismatch.
+It then performs fixed /healthz and three /api/orders/evaluate checks. Repository
+ops/deploy.sh, ops/smoke.sh and compose.yaml remain useful for reviewed manual
+operations, but are not part of the privileged automated release path.
 
 Trust boundary
 --------------
-The executor has Docker socket access. Docker socket access is effectively host
-root, even though the process runs as an unprivileged user with all Linux
-capabilities dropped. Keep the host dedicated, expose the service only on the
-existing private PiGO Docker network plus the host loopback health port, and
-permit changes to ops/deploy.sh and ops/smoke.sh only through the normal reviewed
-merge flow. Do not mount arbitrary directories.
+The network-facing executor does not mount the Docker socket and cannot reach
+the deployment target network. A separate release gateway is reachable only on
+the internal release-control network, uses an independent bearer secret, and
+accepts only the fixed event/environment/repository/commit/digest schema. It has
+no host-published port and is the only service in this deployment that mounts
+the Docker socket.
+
+Docker socket access remains host-equivalent privilege inside the small release
+gateway process. Keep the host dedicated. The gateway does not execute
+repository shell/Compose deployment logic and validates the container returned
+by Docker, but a host daemon authorization policy or an isolated rootless
+deployment daemon remains the stronger defense against a gateway process
+compromise.
 
 Protocol
 --------
@@ -78,7 +81,7 @@ Prerequisites
   - SSH public-key authentication for an unprivileged deployment account that
     can use Docker and write only the selected install directory
   - PiGO workspace root on the same host
-  - Application ops/deploy.sh and ops/smoke.sh are executable and tracked in Git
+  - Application Dockerfile and runtime contract use container port 8080
   - The existing private PiGO Docker network
 
 Do not place credentials, real hostnames, private addresses, account names or
@@ -92,6 +95,11 @@ Copy executor.env.example to a temporary path outside the repository and fill:
   PIGO_EXECUTOR_TOKEN
     Generate with `openssl rand -hex 32`. Use this exact value in PiGO release
     settings. Never print it in CI logs.
+
+  PIGO_RELEASE_GATEWAY_TOKEN
+    Generate a different value with `openssl rand -hex 32`. It is shared only
+    by the executor and the internal release gateway. Existing installations
+    receive a generated value during upgrade when this entry is absent.
 
   DOCKER_GID
     May be any placeholder for first install; the remote installer replaces it
@@ -118,7 +126,7 @@ Copy executor.env.example to a temporary path outside the repository and fill:
     pi-agent-network.
 
   PIGO_EXECUTOR_IMAGE_REPOSITORY
-    Fixed local image repository used by ops/deploy.sh.
+    Fixed local image repository controlled by the release gateway.
 
   PIGO_EXECUTOR_TARGET_NETWORK
     Dedicated internal Docker network used only between the executor and the
@@ -137,7 +145,7 @@ Copy executor.env.example to a temporary path outside the repository and fill:
     reverse proxy or tunnel. Container-only and loopback hosts are rejected.
 
   PIGO_EXECUTOR_STAGING_PORT / PIGO_EXECUTOR_PRODUCTION_PORT
-    Distinct host ports passed to the fixed deployment script.
+    Distinct loopback host ports enforced by the release gateway.
 
 Validate that the file is not inside the Git work tree and restrict it:
 
@@ -262,12 +270,13 @@ Token rotation:
 Rollback:
   The installer prints no secret and creates a rollback image tag plus a source
   backup. Restore the matching source backup, retag the rollback image as
-  local/pigo-release-executor:0.2.5, and run `docker compose up -d executor`.
+  local/pigo-release-executor:0.5.0, and run
+  `docker compose up -d release-gateway executor`.
   Never roll back executions.json independently of the deployed application;
   doing so could forget a completed delivery and permit it to run again.
 
 Incident response:
   Stop the executor, remove the Tunnel hostname, rotate the shared token, retain
-  executions.json and Docker logs, inspect reviewed ops script history, deployed
+  executions.json and Docker logs, inspect the reviewed Dockerfile history, deployed
   image digests and PiGO release audit events, then restore service only after
   reconciling staging and production state.

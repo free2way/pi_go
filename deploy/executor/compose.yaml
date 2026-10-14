@@ -4,19 +4,20 @@ services:
   executor:
     build:
       context: .
-    image: ${PIGO_EXECUTOR_IMAGE:-local/pigo-release-executor:0.4.0}
+    image: ${PIGO_EXECUTOR_IMAGE:-local/pigo-release-executor:0.5.0}
     container_name: pigo-release-executor
     restart: unless-stopped
     init: true
+    depends_on:
+      release-gateway:
+        condition: service_healthy
     ports:
       - target: 3300
         published: "3300"
         host_ip: 127.0.0.1
     networks:
       - pigo-network
-      - release-targets
-    extra_hosts:
-      - host.docker.internal:host-gateway
+      - release-control
     environment:
       HOST: 0.0.0.0
       PORT: 3300
@@ -28,18 +29,17 @@ services:
       PIGO_EXECUTOR_CALLBACK_INTERNAL_ORIGIN: ${PIGO_EXECUTOR_CALLBACK_INTERNAL_ORIGIN:?Set the host-local PiGO origin}
       PIGO_EXECUTOR_IMAGE_REPOSITORY: ${PIGO_EXECUTOR_IMAGE_REPOSITORY:-local/order-status-app}
       PIGO_EXECUTOR_TARGET_NETWORK: ${PIGO_EXECUTOR_TARGET_NETWORK:-pigo-release-targets}
-      PIGO_EXECUTOR_STAGING_URL: ${PIGO_EXECUTOR_STAGING_URL:-http://127.0.0.1:18080}
-      PIGO_EXECUTOR_PRODUCTION_URL: ${PIGO_EXECUTOR_PRODUCTION_URL:-http://127.0.0.1:18081}
+      PIGO_RELEASE_GATEWAY_URL: http://release-gateway:3310
+      PIGO_RELEASE_GATEWAY_TOKEN: ${PIGO_RELEASE_GATEWAY_TOKEN:?Set PIGO_RELEASE_GATEWAY_TOKEN}
+      PIGO_EXECUTOR_STAGING_URL: ${PIGO_EXECUTOR_STAGING_URL:-http://host.docker.internal:18080}
+      PIGO_EXECUTOR_PRODUCTION_URL: ${PIGO_EXECUTOR_PRODUCTION_URL:-http://host.docker.internal:18081}
       PIGO_EXECUTOR_STAGING_PUBLIC_URL: ${PIGO_EXECUTOR_STAGING_PUBLIC_URL:-}
       PIGO_EXECUTOR_PRODUCTION_PUBLIC_URL: ${PIGO_EXECUTOR_PRODUCTION_PUBLIC_URL:-}
       PIGO_EXECUTOR_STAGING_PORT: ${PIGO_EXECUTOR_STAGING_PORT:-18080}
       PIGO_EXECUTOR_PRODUCTION_PORT: ${PIGO_EXECUTOR_PRODUCTION_PORT:-18081}
     volumes:
       - ${PIGO_HOST_WORKSPACE_ROOT:?Set the exact host workspace root}:/workspace:ro
-      - /var/run/docker.sock:/var/run/docker.sock
       - executor-data:/data
-    group_add:
-      - "${DOCKER_GID:?Set DOCKER_GID to the Docker socket group id}"
     read_only: true
     tmpfs:
       - /tmp:size=128m,mode=1777
@@ -57,6 +57,48 @@ services:
       retries: 3
       start_period: 10s
 
+  release-gateway:
+    build:
+      context: .
+    image: ${PIGO_EXECUTOR_IMAGE:-local/pigo-release-executor:0.5.0}
+    container_name: pigo-release-gateway
+    restart: unless-stopped
+    init: true
+    command: ["node", "/app/release-gateway.mjs"]
+    networks:
+      - release-control
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3310
+      PIGO_RELEASE_GATEWAY_TOKEN: ${PIGO_RELEASE_GATEWAY_TOKEN:?Set PIGO_RELEASE_GATEWAY_TOKEN}
+      PIGO_EXECUTOR_WORKSPACE_ROOT: /workspace
+      PIGO_EXECUTOR_APP_PATH: ${PIGO_EXECUTOR_APP_PATH:-apps/order-status-app}
+      PIGO_EXECUTOR_IMAGE_REPOSITORY: ${PIGO_EXECUTOR_IMAGE_REPOSITORY:-local/order-status-app}
+      PIGO_EXECUTOR_TARGET_NETWORK: ${PIGO_EXECUTOR_TARGET_NETWORK:-pigo-release-targets}
+      PIGO_EXECUTOR_STAGING_PORT: ${PIGO_EXECUTOR_STAGING_PORT:-18080}
+      PIGO_EXECUTOR_PRODUCTION_PORT: ${PIGO_EXECUTOR_PRODUCTION_PORT:-18081}
+    volumes:
+      - ${PIGO_HOST_WORKSPACE_ROOT:?Set the exact host workspace root}:/workspace:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "${DOCKER_GID:?Set DOCKER_GID to the Docker socket group id}"
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3310/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
 volumes:
   executor-data:
     name: pigo-release-executor-data
@@ -67,4 +109,7 @@ networks:
     external: true
   release-targets:
     name: ${PIGO_EXECUTOR_TARGET_NETWORK:-pigo-release-targets}
+    internal: true
+  release-control:
+    name: pigo-release-control
     internal: true
