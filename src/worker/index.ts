@@ -3174,7 +3174,7 @@ process.stdout.write(`[sandbox] mode=${sandboxMode}${sandboxReason ? ` (${sandbo
 if (sandboxMode === "unavailable") {
   process.stderr.write(
     "[sandbox] 容器沙箱不可用：已启用 fail-closed，worker 将拒绝执行任何 Agent。"
-    + "请修复 Docker daemon / PI_DOCKER_SOCKET / 沙箱镜像后重启；"
+    + "请修复 Sandbox Gateway / Docker runtime / 沙箱镜像后重启；"
     + "仅在明确接受关闭隔离时，才可设置 PI_SANDBOX_ALLOW_DEGRADED=1 允许降级执行。\n",
   );
 }

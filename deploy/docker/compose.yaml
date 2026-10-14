@@ -194,6 +194,59 @@ services:
       retries: 3
       start_period: 10s
 
+  # The only standard-deployment service allowed to reach the Docker daemon.
+  # It exposes a deliberately tiny, authenticated API for sandbox lifecycle
+  # operations; arbitrary Docker Engine endpoints are not proxied.
+  sandbox-gateway:
+    build:
+      context: ${WEB_BUILD_CONTEXT:-../..}
+      dockerfile: deploy/docker/Dockerfile.worker
+    image: ${PI_WORKER_IMAGE:-local/pigo-worker:0.1.0}
+    restart: unless-stopped
+    init: true
+    entrypoint: ["node", "/app/sandbox-gateway.mjs"]
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3210
+      PI_DOCKER_GATEWAY_TOKEN: ${PI_DOCKER_GATEWAY_TOKEN:?Set PI_DOCKER_GATEWAY_TOKEN in the deployment environment}
+      PI_DOCKER_SOCKET: ${PI_DOCKER_SOCKET:-/var/run/docker.sock}
+      PI_DOCKER_API_VERSION: ${PI_DOCKER_API_VERSION:-v1.43}
+      PI_SANDBOX_IMAGE: ${PI_SANDBOX_IMAGE:-local/pigo-sandbox:0.1.0}
+      PI_SANDBOX_NETWORK: ${PI_SANDBOX_NETWORK:-pi-agent-network}
+      PI_HOST_WORKSPACE_ROOT: ${PI_HOST_WORKSPACE_ROOT:?Set PI_HOST_WORKSPACE_ROOT to the absolute host workspace path}
+      PI_SANDBOX_MODELS_FILE: ${PI_SANDBOX_MODELS_FILE:?Set PI_SANDBOX_MODELS_FILE to the absolute host models file}
+      PI_SANDBOX_PLUGIN_ROOTS: ${PI_SANDBOX_PLUGIN_ROOTS:-}
+      PI_SANDBOX_MAX_PIDS: ${PI_SANDBOX_MAX_PIDS:-256}
+      PI_SANDBOX_MAX_MEMORY_BYTES: ${PI_SANDBOX_MAX_MEMORY_BYTES:-2147483648}
+      PI_SANDBOX_MAX_NANO_CPUS: ${PI_SANDBOX_MAX_NANO_CPUS:-1500000000}
+      PI_SANDBOX_GATEWAY_WAIT_TIMEOUT_MS: ${PI_SANDBOX_GATEWAY_WAIT_TIMEOUT_MS:-7200000}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Policy validation resolves every bind source from the same absolute host
+      # paths that Docker will use. The gateway receives these read-only.
+      - ${PI_HOST_WORKSPACE_ROOT:?Set PI_HOST_WORKSPACE_ROOT to the absolute host workspace path}:${PI_HOST_WORKSPACE_ROOT:?Set PI_HOST_WORKSPACE_ROOT to the absolute host workspace path}:ro
+      - ${PI_SANDBOX_MODELS_FILE:?Set PI_SANDBOX_MODELS_FILE to the absolute host models file}:${PI_SANDBOX_MODELS_FILE:?Set PI_SANDBOX_MODELS_FILE to the absolute host models file}:ro
+    group_add:
+      - "${PI_DOCKER_GID:-983}"
+    networks:
+      - sandbox-control
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.25
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3210/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
   worker:
     build:
       context: ${WEB_BUILD_CONTEXT:-../..}
@@ -222,8 +275,8 @@ services:
       PI_SANDBOX_ALLOW_DEGRADED: ${PI_SANDBOX_ALLOW_DEGRADED:-}
       PI_SANDBOX_IMAGE: ${PI_SANDBOX_IMAGE:-local/pigo-sandbox:0.1.0}
       PI_SANDBOX_NETWORK: ${PI_SANDBOX_NETWORK:-pi-agent-network}
-      PI_HOST_WORKSPACE_ROOT: ${PI_HOST_WORKSPACE_ROOT:-/app/pi-agent/workspace}
-      PI_SANDBOX_MODELS_FILE: ${PI_SANDBOX_MODELS_FILE:-/app/pi-agent/pi-models.json}
+      PI_HOST_WORKSPACE_ROOT: ${PI_HOST_WORKSPACE_ROOT:?Set PI_HOST_WORKSPACE_ROOT to the absolute host workspace path}
+      PI_SANDBOX_MODELS_FILE: ${PI_SANDBOX_MODELS_FILE:?Set PI_SANDBOX_MODELS_FILE to the absolute host models file}
       # v0.22: worker identity, reported by /health and the deployment panel.
       PI_WORKER_ID: ${PI_WORKER_ID:-}
       PI_WORKER_VERSION: ${PI_WORKER_VERSION:-}
@@ -267,8 +320,11 @@ services:
       PI_SESSION_REUSE: ${PI_SESSION_REUSE:-on}
       PI_CALLBACK_MAX_BYTES: ${PI_CALLBACK_MAX_BYTES:-}
       PI_WORKSPACE_LOCK_STALE_SECONDS: ${PI_WORKSPACE_LOCK_STALE_SECONDS:-300}
-      # Sandbox / docker plumbing (defaults match the code).
-      PI_DOCKER_SOCKET: ${PI_DOCKER_SOCKET:-/var/run/docker.sock}
+      # Sandbox lifecycle goes through the allowlisted gateway. The worker never
+      # receives the Docker socket or its host group membership.
+      PI_DOCKER_GATEWAY_URL: http://sandbox-gateway:3210
+      PI_DOCKER_GATEWAY_TOKEN: ${PI_DOCKER_GATEWAY_TOKEN:?Set PI_DOCKER_GATEWAY_TOKEN in the deployment environment}
+      PI_DOCKER_GATEWAY_REQUIRED: "1"
       PI_DOCKER_API_VERSION: ${PI_DOCKER_API_VERSION:-v1.43}
       PI_GIT_EMPTY_CONFIG: ${PI_GIT_EMPTY_CONFIG:-/dev/null}
       PI_SANDBOX_EXTRA_BINDS: ${PI_SANDBOX_EXTRA_BINDS:-}
@@ -280,17 +336,13 @@ services:
       # the web for one sweep per hour (the web owns the window and the row cap).
       PI_DECISION_AUDIT_RETENTION_DAYS: ${PI_DECISION_AUDIT_RETENTION_DAYS:-}
     volumes:
-      - ./workspace:/workspace
-      # The worker creates the per-task sandbox containers through the Docker
-      # socket. It is a privileged mount: see docs/03 安全组说明 for the tradeoff
-      # (replace with a socket proxy if the host is shared with untrusted users).
-      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PI_HOST_WORKSPACE_ROOT:?Set PI_HOST_WORKSPACE_ROOT to the absolute host workspace path}:/workspace
       # SEC-004: agent processes must not see the interactive Pi configuration
       # volume (auth.json, session transcripts, caches). Only the secret-free
       # provider/model definition is mounted, read-only; keys arrive per job via
       # the vault and are injected into the child environment for the current
       # role only. Regenerate the file with `deploy/docker/export-models.sh`.
-      - ./pi-models.json:/home/node/.pi/agent/models.json:ro
+      - ${PI_SANDBOX_MODELS_FILE:?Set PI_SANDBOX_MODELS_FILE to the absolute host models file}:/home/node/.pi/agent/models.json:ro
       # Sprint 2: read-only SHA-256 plugin registry (see PI_PLUGIN_REGISTRY).
       # Defaults to the shipped example (all-zero placeholder digests) so the
       # mount always resolves to a real file; point
@@ -298,13 +350,12 @@ services:
       # enabling PI_PLUGIN_REGISTRY.
       - ${PI_PLUGIN_REGISTRY_HOST_FILE:-./pi-plugins.example.json}:/app/pi-agent/pi-plugins.json:ro
       - pigo-worker-state:/home/node/.pi
-    # The socket is owned by root:docker (typically 0660); the non-root worker
-    # user joins that group so it can create sandbox containers without running
-    # as root itself. Find the value with: stat -c %g /var/run/docker.sock
-    group_add:
-      - "${PI_DOCKER_GID:-983}"
     networks:
       - pi-network
+      - sandbox-control
+    depends_on:
+      sandbox-gateway:
+        condition: service_healthy
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -325,6 +376,8 @@ services:
 networks:
   pi-network:
     name: pi-agent-network
+  sandbox-control:
+    internal: true
 
 volumes:
   pi-config:

@@ -132,7 +132,9 @@ export const CRITICAL_ENV = {
     // identity / sandbox plumbing
     "PI_WORKER_ID",
     "PI_WORKER_VERSION",
-    "PI_DOCKER_SOCKET",
+    "PI_DOCKER_GATEWAY_URL",
+    "PI_DOCKER_GATEWAY_TOKEN",
+    "PI_DOCKER_GATEWAY_REQUIRED",
     "PI_DOCKER_API_VERSION",
     "PI_GIT_EMPTY_CONFIG",
     "PI_SANDBOX_EXTRA_BINDS",
@@ -143,6 +145,20 @@ export const CRITICAL_ENV = {
     // (the web owns the window + row cap and performs the delete), so only the
     // day count has to reach this service.
     "PI_DECISION_AUDIT_RETENTION_DAYS",
+  ],
+  "sandbox-gateway": [
+    "PI_DOCKER_GATEWAY_TOKEN",
+    "PI_DOCKER_SOCKET",
+    "PI_DOCKER_API_VERSION",
+    "PI_SANDBOX_IMAGE",
+    "PI_SANDBOX_NETWORK",
+    "PI_HOST_WORKSPACE_ROOT",
+    "PI_SANDBOX_MODELS_FILE",
+    "PI_SANDBOX_PLUGIN_ROOTS",
+    "PI_SANDBOX_MAX_PIDS",
+    "PI_SANDBOX_MAX_MEMORY_BYTES",
+    "PI_SANDBOX_MAX_NANO_CPUS",
+    "PI_SANDBOX_GATEWAY_WAIT_TIMEOUT_MS",
   ],
 };
 

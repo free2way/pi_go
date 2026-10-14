@@ -57,6 +57,7 @@ function isReplacedTreeSegment(segment) {
 export const DEMO_DB_NAME = "pigo_demo";
 export const DEMO_WEB_SERVICE = "demo-web";
 export const DEMO_WORKER_SERVICE = "demo-worker";
+export const DEMO_SANDBOX_GATEWAY_SERVICE = "demo-sandbox-gateway";
 export const DEMO_VAULT_IN_CONTAINER = "/app/data/credentials.v1.json";
 export const DEMO_DATA_MOUNT = "/app/data";
 
@@ -93,6 +94,7 @@ export const REQUIRED_DEMO_ENV = [
   "PIGO_DEMO_WORKSPACE_ROOT",
   "PIGO_DEMO_MODELS_FILE",
   "PIGO_DEMO_WEB_BIND_ADDRESS",
+  "PIGO_DEMO_DOCKER_GATEWAY_TOKEN",
 ];
 
 /** Placeholders shipped in demo.env.example; a copied-but-unedited file must not start. */
@@ -550,16 +552,19 @@ function identityLabelList(identities) {
 export function checkDemoCompose(config, options = {}) {
   const webName = options.webService ?? DEMO_WEB_SERVICE;
   const workerName = options.workerService ?? DEMO_WORKER_SERVICE;
+  const gatewayName = options.gatewayService ?? DEMO_SANDBOX_GATEWAY_SERVICE;
   const expectedPort = String(options.webPort ?? "3101");
   const expectedBind = String(options.webBindAddress ?? "0.0.0.0");
   const services = extractServices(config);
   const web = services[webName];
   const worker = services[workerName];
+  const gateway = services[gatewayName];
   const problems = [];
   const facts = {};
 
   if (!web) problems.push(`service "${webName}" not found in the resolved compose config`);
   if (!worker) problems.push(`service "${workerName}" not found in the resolved compose config`);
+  if (!gateway) problems.push(`service "${gatewayName}" not found in the resolved compose config`);
 
   // Every resolved database URL, in every service, must be the demo database.
   for (const [serviceName, service] of Object.entries(services)) {
@@ -594,13 +599,16 @@ export function checkDemoCompose(config, options = {}) {
     facts.workerVersion = worker.env.PI_WORKER_VERSION ?? "";
     facts.callbackUrl = worker.env.PI_WEB_CALLBACK_URL ?? "";
     facts.sandboxMode = worker.env.PI_SANDBOX_MODE ?? "";
-    if (!worker.volumes.some((volume) => String(typeof volume === "string" ? volume : volume?.source ?? volume?.target ?? "").includes("docker.sock"))) {
-      problems.push(`${workerName} does not mount /var/run/docker.sock — sandbox containers cannot be created`);
+    if (worker.volumes.some((volume) => String(typeof volume === "string" ? volume : volume?.source ?? volume?.target ?? "").includes("docker.sock"))) {
+      problems.push(`${workerName} must not mount /var/run/docker.sock — use ${gatewayName}`);
     }
     const groupAdd = worker.groupAdd;
-    if (groupAdd.length === 0) problems.push(`${workerName}.group_add is empty — the non-root worker cannot use the docker socket`);
-    for (const entry of groupAdd) {
-      if (String(entry).includes("/") || String(entry).includes(":")) problems.push(`${workerName}.group_add contains a mount-like entry: ${entry}`);
+    if (groupAdd.length > 0) problems.push(`${workerName}.group_add must be empty — Docker gid belongs only to ${gatewayName}`);
+    if (String(worker.env.PI_DOCKER_GATEWAY_URL ?? "") !== `http://${gatewayName}:3210`) {
+      problems.push(`${workerName}.PI_DOCKER_GATEWAY_URL must be http://${gatewayName}:3210`);
+    }
+    if (String(worker.env.PI_DOCKER_GATEWAY_REQUIRED ?? "") !== "1") {
+      problems.push(`${workerName}.PI_DOCKER_GATEWAY_REQUIRED must be 1 (fail closed)`);
     }
     try {
       const callback = new URL(String(worker.env.PI_WEB_CALLBACK_URL ?? ""));
@@ -623,6 +631,14 @@ export function checkDemoCompose(config, options = {}) {
         `${workerName}.PI_HOST_WORKSPACE_ROOT is "${workerHostRoot}" but the ${WORKSPACE_CONTAINER_ROOT} mount comes from "${workerRootMount.source}" — sandbox containers would be bound to the wrong host path`,
       );
     }
+  }
+
+  if (gateway) {
+    if (!gateway.volumes.some((volume) => String(typeof volume === "string" ? volume : volume?.source ?? volume?.target ?? "").includes("docker.sock"))) {
+      problems.push(`${gatewayName} does not mount /var/run/docker.sock — sandbox containers cannot be created`);
+    }
+    if (gateway.groupAdd.length !== 1) problems.push(`${gatewayName}.group_add must contain exactly the Docker socket gid`);
+    if (String(gateway.env.PI_DOCKER_GATEWAY_TOKEN ?? "") === "") problems.push(`${gatewayName}.PI_DOCKER_GATEWAY_TOKEN is unset`);
   }
 
   // P1: the workspace root must be mounted EXACTLY ONCE, at /workspace, in BOTH
@@ -672,6 +688,15 @@ export function checkDemoCompose(config, options = {}) {
     ]);
     facts.version = version.report;
     if (!version.ok) problems.push(version.report);
+  }
+  if (worker && gateway) {
+    const token = checkSecretParity(
+      "PI_DOCKER_GATEWAY_TOKEN (worker/gateway)",
+      worker.env.PI_DOCKER_GATEWAY_TOKEN,
+      gateway.env.PI_DOCKER_GATEWAY_TOKEN,
+    );
+    facts.gatewayToken = token.report;
+    if (!token.ok) problems.push(token.report);
   }
 
   return { ok: problems.length === 0, problems, facts };
@@ -1208,7 +1233,8 @@ function cmdDoctor(_argv) {
   ]);
   record("version-parity", version.ok, version.report, "set one PIGO_DEMO_VERSION value used by both services");
 
-  // Docker socket usability, checked inside the running demo worker.
+  // Docker socket usability, checked only inside the constrained gateway. The
+  // worker itself must never receive the socket or its group membership.
   const socketScript = [
     "const fs=require('node:fs');const p='/var/run/docker.sock';",
     "try{const st=fs.statSync(p);if(!st.isSocket()){console.error('not a socket');process.exit(1)}",
@@ -1216,12 +1242,12 @@ function cmdDoctor(_argv) {
     "console.log(`socket ok gid=${st.gid} groups=[${groups.join(',')}]`)}",
     "catch(e){console.error(e.code||e.message);process.exit(1)}",
   ].join("");
-  const socket = compose(["exec", "-T", DEMO_WORKER_SERVICE, "node", "-e", socketScript], env, envFile);
+  const socket = compose(["exec", "-T", DEMO_SANDBOX_GATEWAY_SERVICE, "node", "-e", socketScript], env, envFile);
   record(
     "docker-socket",
     socket.status === 0,
     (socket.stdout || socket.stderr).trim() || "no output",
-    "set PIGO_DEMO_DOCKER_GID to `stat -c %g /var/run/docker.sock` and ensure the socket is mounted into demo-worker",
+    "set PIGO_DEMO_DOCKER_GID to `stat -c %g /var/run/docker.sock` and ensure the socket is mounted only into demo-sandbox-gateway",
   );
 
   const webHealth = healthJson(DEMO_WEB_SERVICE, "http://127.0.0.1:3100/api/health", env, 5000, 2000, envFile);

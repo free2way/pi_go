@@ -267,9 +267,20 @@ function demoConfig(overrides = {}) {
           PI_SANDBOX_MODE: "auto",
           PI_WORKSPACE_ROOT: "/workspace",
           PI_HOST_WORKSPACE_ROOT: "/app/pi-agent/demo-workspace",
+          PI_DOCKER_GATEWAY_URL: "http://demo-sandbox-gateway:3210",
+          PI_DOCKER_GATEWAY_TOKEN: "gateway-token",
+          PI_DOCKER_GATEWAY_REQUIRED: "1",
         },
         volumes: [
           { type: "bind", source: "/app/pi-agent/demo-workspace", target: "/workspace" },
+        ],
+        group_add: [],
+      },
+      "demo-sandbox-gateway": {
+        environment: {
+          PI_DOCKER_GATEWAY_TOKEN: "gateway-token",
+        },
+        volumes: [
           { type: "bind", source: "/var/run/docker.sock", target: "/var/run/docker.sock" },
         ],
         group_add: ["983"],
@@ -313,12 +324,15 @@ test("checkDemoCompose: refuses a callback into the production web service", () 
   assert.ok(problems.some((problem) => /PI_WEB_CALLBACK_URL/.test(problem)), problems.join("\n"));
 });
 
-test("checkDemoCompose: refuses token/version drift and a missing docker socket", () => {
+test("checkDemoCompose: refuses token/version drift and a missing gateway socket", () => {
   const config = withServiceOverride("demo-worker", {
     environment: { PI_INTERNAL_TOKEN: "different", PI_WORKER_VERSION: "demo-other" },
-    volumes: [{ type: "bind", source: "/app/pi-agent/demo-workspace", target: "/workspace" }],
-    group_add: [],
   });
+  config.services["demo-sandbox-gateway"] = {
+    ...config.services["demo-sandbox-gateway"],
+    volumes: [],
+    group_add: [],
+  };
   const { ok, problems } = checkDemoCompose(config);
   assert.equal(ok, false);
   const joined = problems.join("\n");
@@ -369,7 +383,11 @@ test("compose.demo.yaml joins the existing production network and exposes the de
   assert.match(codeLines, /host_ip: \$\{PIGO_DEMO_WEB_BIND_ADDRESS:\?[^}]*\}/);
 });
 
-test("compose.demo.yaml gives the worker the docker socket and its gid", () => {
+test("compose.demo.yaml confines the docker socket and gid to the sandbox gateway", () => {
+  const workerBlock = composeText.slice(composeText.indexOf("  demo-worker:"), composeText.indexOf("\nnetworks:"));
+  assert.ok(!workerBlock.includes("/var/run/docker.sock"));
+  assert.ok(!workerBlock.includes("group_add:"));
+  assert.match(workerBlock, /PI_DOCKER_GATEWAY_URL: http:\/\/demo-sandbox-gateway:3210/);
   assert.match(codeLines, /\/var\/run\/docker\.sock:\/var\/run\/docker\.sock/);
   assert.match(codeLines, /group_add:\s*\n\s*-\s*"\$\{PIGO_DEMO_DOCKER_GID:-983\}"/);
 });

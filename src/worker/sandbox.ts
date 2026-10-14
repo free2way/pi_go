@@ -151,7 +151,7 @@ export class SandboxUnavailableError extends Error {
   constructor(reason?: string) {
     super(
       "容器沙箱不可用，已按 fail-closed 策略拒绝执行本次 Agent（不会降级为进程内运行，避免隔离静默失效）。"
-      + "请检查 Docker daemon 与 PI_DOCKER_SOCKET 是否可用、沙箱镜像（PI_SANDBOX_IMAGE）是否存在后重试；"
+      + "请检查 Sandbox Gateway（PI_DOCKER_GATEWAY_URL）或本地 Docker 连接是否可用、沙箱镜像（PI_SANDBOX_IMAGE）是否存在后重试；"
       + "仅在完全受信且明确接受关闭隔离的环境，才可显式设置 PI_SANDBOX_ALLOW_DEGRADED=1（仅接受字面值 1）后重启 worker。"
       + (reason ? `原因：${reason}` : ""),
     );
@@ -163,7 +163,7 @@ export class SandboxUnavailableError extends Error {
  * P1 (fail-closed): sandbox mode is explicit.
  *
  * - `process` is a deliberate operator opt-out (PI_SANDBOX_MODE=process).
- * - `container`/`auto` require a reachable Docker socket. When it is unusable
+ * - `container`/`auto` require a reachable sandbox gateway/runtime. When unusable
  *   the result is `unavailable` — never a silent fall back to in-process
  *   execution. Only `allowDegraded` (PI_SANDBOX_ALLOW_DEGRADED=1) permits the
  *   degraded `process` mode, and the result is flagged `degraded` so the run can
@@ -180,8 +180,8 @@ export async function resolveSandboxMode(
     await ping();
   } catch (error) {
     reason = mode === "container"
-      ? `docker socket not usable: ${(error as Error).message}`
-      : `docker socket unavailable: ${(error as Error).message}`;
+      ? `sandbox runtime not usable: ${(error as Error).message}`
+      : `sandbox runtime unavailable: ${(error as Error).message}`;
   }
   if (reason === undefined) return { mode: "container" };
   if (options.allowDegraded) return { mode: "process", reason, degraded: true };
