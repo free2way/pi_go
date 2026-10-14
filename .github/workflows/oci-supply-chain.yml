@@ -14,6 +14,12 @@ env:
   OCI_IMAGE_PREFIX: ghcr.io/${{ github.repository }}
 
 jobs:
+  quality-gates:
+    name: Required quality gates for this commit
+    permissions:
+      contents: read
+    uses: ./.github/workflows/pr-gate.yml
+
   validate-images:
     name: OCI reproducible image builds
     runs-on: ubuntu-24.04
@@ -47,7 +53,7 @@ jobs:
   publish-images:
     name: Publish immutable OCI evidence
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: validate-images
+    needs: [validate-images, quality-gates]
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     permissions:
@@ -185,70 +191,70 @@ jobs:
           upload-artifact: false
           upload-release-assets: false
 
-      - name: Scan runtime for fixable critical vulnerabilities
+      - name: Scan runtime for high and critical vulnerabilities
         id: scan_runtime
         continue-on-error: true
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
         with:
           sbom: supply-chain/sbom/runtime.spdx.json
           fail-build: true
-          severity-cutoff: critical
-          only-fixed: true
+          severity-cutoff: high
+          only-fixed: false
           output-format: json
           output-file: supply-chain/vulnerability/runtime.json
 
-      - name: Scan web for fixable critical vulnerabilities
+      - name: Scan web for high and critical vulnerabilities
         id: scan_web
         continue-on-error: true
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
         with:
           sbom: supply-chain/sbom/web.spdx.json
           fail-build: true
-          severity-cutoff: critical
-          only-fixed: true
+          severity-cutoff: high
+          only-fixed: false
           output-format: json
           output-file: supply-chain/vulnerability/web.json
 
-      - name: Scan worker for fixable critical vulnerabilities
+      - name: Scan worker for high and critical vulnerabilities
         id: scan_worker
         continue-on-error: true
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
         with:
           sbom: supply-chain/sbom/worker.spdx.json
           fail-build: true
-          severity-cutoff: critical
-          only-fixed: true
+          severity-cutoff: high
+          only-fixed: false
           output-format: json
           output-file: supply-chain/vulnerability/worker.json
 
-      - name: Scan sandbox for fixable critical vulnerabilities
+      - name: Scan sandbox for high and critical vulnerabilities
         id: scan_sandbox
         continue-on-error: true
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
         with:
           sbom: supply-chain/sbom/sandbox.spdx.json
           fail-build: true
-          severity-cutoff: critical
-          only-fixed: true
+          severity-cutoff: high
+          only-fixed: false
           output-format: json
           output-file: supply-chain/vulnerability/sandbox.json
 
-      - name: Scan executor for fixable critical vulnerabilities
+      - name: Scan executor for high and critical vulnerabilities
         id: scan_executor
         continue-on-error: true
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
         with:
           sbom: supply-chain/sbom/executor.spdx.json
           fail-build: true
-          severity-cutoff: critical
-          only-fixed: true
+          severity-cutoff: high
+          only-fixed: false
           output-format: json
           output-file: supply-chain/vulnerability/executor.json
 
       - name: Enforce vulnerability gate
         if: ${{ steps.scan_runtime.outcome != 'success' || steps.scan_web.outcome != 'success' || steps.scan_worker.outcome != 'success' || steps.scan_sandbox.outcome != 'success' || steps.scan_executor.outcome != 'success' }}
         run: |
-          echo "One or more image scans found a fixable critical vulnerability. Inspect the uploaded JSON evidence."
+          echo "One or more image scans found a high or critical vulnerability. Inspect the uploaded JSON evidence."
           exit 1
 
       - name: Create digest-pinned deployment environment

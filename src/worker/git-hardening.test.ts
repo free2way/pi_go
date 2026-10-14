@@ -2,7 +2,7 @@ import { appendFile, mkdtemp, readFile, readdir, rm, stat, writeFile } from "nod
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { hardenedGitConfigArgs, hardenedGitEnvironment, safeGitConfigValue } from "./git-hardening.js";
+import { hardenedGitConfigArgs, hardenedGitEnvironment, runHardenedGit, safeGitConfigValue } from "./git-hardening.js";
 import { defaultGitExec } from "./review-snapshot.js";
 import { gitAvailable } from "./git-test-helpers.js";
 
@@ -67,6 +67,13 @@ describe("hardenedGitEnvironment (NEW-01)", () => {
 });
 
 describe.skipIf(!gitAvailable)("hardenedGitConfigArgs (NEW-01)", () => {
+  it("security scans fail rather than accept a truncated Git response", async () => {
+    const repo = await initRepo();
+    const result = await runHardenedGit({ cwd: repo, args: ["rev-parse", "HEAD"], maxOutput: 8, failOnOutputLimit: true });
+    expect(result.code).not.toBe(0);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe("Git output limit exceeded");
+  });
   it("enumerates repository-local config including included files", async () => {
     const repo = await initRepo();
     const includePath = path.join(repo, "inc.cfg");

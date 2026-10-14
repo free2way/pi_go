@@ -236,7 +236,7 @@ export class JsonStateStore {
       .sort((left, right) => String(right.finishedAt).localeCompare(String(left.finishedAt)))[0];
   }
 
-  successfulDeploymentForCommits(environment, commits) {
+  successfulDeploymentsForCommits(environment, commits) {
     const allowed = new Set(commits);
     return Object.values(this.value.deliveries)
       .filter((item) => item.event === "run.release_requested"
@@ -244,7 +244,7 @@ export class JsonStateStore {
         && item.status === "succeeded"
         && allowed.has(item.commit)
         && item.imageDigest)
-      .sort((left, right) => String(right.finishedAt).localeCompare(String(left.finishedAt)))[0];
+      .sort((left, right) => String(right.finishedAt).localeCompare(String(left.finishedAt)));
   }
 
   summary() {
@@ -480,8 +480,17 @@ export async function runRollback(config, store, payload, reportProgress = async
   };
 }
 
-async function runReleaseRegistration(store, payload) {
-  const deployed = store.successfulDeploymentForCommits(payload.environment, payload.commits);
+export async function runReleaseRegistration(config, store, payload, containsCommit = deploymentContainsCommit) {
+  const candidates = store.successfulDeploymentsForCommits(payload.environment, payload.commits);
+  let deployed;
+  for (const candidate of candidates) {
+    if (payload.environment === "production" && candidate.imageDigest !== payload.expectedImageDigest) continue;
+    let includesAll = true;
+    for (const commit of payload.commits) {
+      if (!await containsCommit(config, candidate, commit)) { includesAll = false; break; }
+    }
+    if (includesAll) { deployed = candidate; break; }
+  }
   if (!deployed) throw new Error(`no successful ${payload.environment} deployment matches the reviewed release commits`);
   if (payload.environment === "production" && deployed.imageDigest !== payload.expectedImageDigest) {
     throw new Error("production release does not match the staged image digest");
@@ -494,6 +503,20 @@ async function runReleaseRegistration(store, payload) {
     image: deployed.image,
     imageDigest: deployed.imageDigest,
   };
+}
+
+async function deploymentContainsCommit(config, deployment, commit) {
+  if (!/^[a-f0-9]{40}$/.test(commit) || !/^[a-f0-9]{40}$/.test(deployment.commit ?? "")) return false;
+  const root = await realpath(config.workspaceRoot);
+  const repository = await realpath(deployment.repository);
+  if (!pathWithin(root, repository)) throw new Error("release repository is outside the workspace allowlist");
+  try {
+    await command("git", ["--no-replace-objects", "-c", `safe.directory=${repository}`, "-C", repository,
+      "merge-base", "--is-ancestor", commit, deployment.commit], {
+      timeout: 30_000, env: executorEnvironment(config, deployment.environment),
+    });
+    return true;
+  } catch { return false; }
 }
 
 export async function postCallback(config, payload, outcome) {
@@ -628,7 +651,7 @@ export async function createExecutor(options = {}) {
         ? await runDeploy(config, store, payload, reportProgress)
         : payload.event === "run.rollback_requested"
           ? await runRollback(config, store, payload, reportProgress)
-          : await runReleaseRegistration(store, payload);
+          : await runReleaseRegistration(config, store, payload);
       outcome = { status: "succeeded", ...result };
     } catch (error) {
       outcome = { status: "failed", detail: (error instanceof Error ? error.message : "deployment failed").slice(0, 500) };

@@ -180,6 +180,8 @@ export interface HardenedGitOptions {
   timeoutMs?: number;
   /** Bounded stdout/stderr capture (defaults to 4 MiB). */
   maxOutput?: number;
+  /** Security scans must reject truncated output, not scan a partial tail. */
+  failOnOutputLimit?: boolean;
 }
 
 /**
@@ -210,9 +212,15 @@ export async function runHardenedGit(options: HardenedGitOptions): Promise<Harde
     });
     let stdout = "";
     let stderr = "";
+    let outputExceeded = false;
+    child.stdout.setEncoding("utf8");
     const timeoutMs = Number(options.timeoutMs);
     const timer = timeoutMs > 0 ? setTimeout(() => child.kill("SIGTERM"), timeoutMs) : undefined;
-    child.stdout.on("data", (chunk) => { stdout = `${stdout}${String(chunk)}`.slice(-captureLimit); });
+    child.stdout.on("data", (chunk) => {
+      const next = `${stdout}${String(chunk)}`;
+      if (next.length > captureLimit) outputExceeded = true;
+      stdout = next.slice(-captureLimit);
+    });
     child.stderr.on("data", (chunk) => { stderr = `${stderr}${String(chunk)}`.slice(-captureLimit); });
     child.on("error", (error) => {
       if (timer) clearTimeout(timer);
@@ -221,7 +229,8 @@ export async function runHardenedGit(options: HardenedGitOptions): Promise<Harde
     });
     child.on("close", (code) => {
       if (timer) clearTimeout(timer);
-      resolve({ code: code ?? 1, stdout, stderr });
+      if (options.failOnOutputLimit && outputExceeded) resolve({ code: 1, stdout: "", stderr: "Git output limit exceeded" });
+      else resolve({ code: code ?? 1, stdout, stderr });
     });
   });
 }

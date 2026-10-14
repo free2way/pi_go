@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -15,6 +16,7 @@ import {
   postCallback,
   postProgress,
   prepareSmokeUrl,
+  runReleaseRegistration,
   validatePayload,
 } from "./server.mjs";
 
@@ -63,6 +65,35 @@ test("release payload keeps environment-scoped idempotency identity", () => {
   assert.equal(payload.releaseId, "rel_1");
   assert.equal(payload.expectedImageDigest, digest);
   assert.throws(() => validatePayload({ ...payload, expectedImageDigest: undefined }, payload.deliveryId), /requires expectedImageDigest/);
+});
+
+test("release registration requires every story commit in one deployed artifact", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "pigo-release-history-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const git = (args) => execFileSync("git", ["-c", "core.hooksPath=/dev/null", ...args], { cwd: directory, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  git(["init", "-b", "main"]);
+  git(["config", "user.name", "Test"]);
+  git(["config", "user.email", ["test", "example.invalid"].join("@")]);
+  const commit = () => { git(["commit", "--allow-empty", "-m", "fixture"]); return git(["rev-parse", "HEAD"]); };
+  const first = commit();
+  git(["switch", "-c", "other"]);
+  const divergent = commit();
+  git(["switch", "main"]);
+  // Distinct commit contents prevent identical empty commit IDs in the same second.
+  await writeFile(path.join(directory, "source.txt"), "fixture");
+  git(["add", "."]);
+  const last = commit();
+  const deployment = { event: "run.release_requested", environment: "staging", status: "succeeded", commit: last,
+    repository: directory, imageDigest: digest, image: "local/test:fixture", finishedAt: "2026-10-13T00:00:00Z" };
+  const store = new JsonStateStore(path.join(directory, "state.json"));
+  store.value.deliveries = { deployment };
+  const payload = { environment: "staging", commits: [first, last], version: "v1" };
+  assert.equal((await runReleaseRegistration({ workspaceRoot: directory }, store, payload)).commit, last);
+  await assert.rejects(() => runReleaseRegistration({ workspaceRoot: directory }, store, { ...payload, commits: [divergent, last] }), /no successful/);
+  store.value.deliveries.deployment.commit = first;
+  await assert.rejects(() => runReleaseRegistration({ workspaceRoot: directory }, store, payload), /no successful/);
+  store.value.deliveries.deployment = { ...deployment, commit: last, environment: "production" };
+  await assert.rejects(() => runReleaseRegistration({ workspaceRoot: directory }, store, { ...payload, environment: "production", expectedImageDigest: `sha256:${"f".repeat(64)}` }), /no successful/);
 });
 
 test("rollback payload is production-only and requires a reason plus immutable digest", () => {
@@ -308,8 +339,8 @@ test("state recovery fails interrupted work and promotion lookup is repository/c
     assert.match(store.getDelivery("pending").detail, /restarted/);
     assert.equal(store.successfulDeployment("staging", "/workspace/project-a", "a".repeat(40))?.status, "succeeded");
     assert.equal(store.successfulDeployment("staging", "/workspace/project-b", "a".repeat(40)), undefined);
-    assert.equal(store.successfulDeploymentForCommits("staging", ["a".repeat(40)])?.repository, "/workspace/project-a");
-    assert.equal(store.successfulDeploymentForCommits("staging", ["c".repeat(40)]), undefined);
+    assert.equal(store.successfulDeploymentsForCommits("staging", ["a".repeat(40)])[0]?.repository, "/workspace/project-a");
+    assert.deepEqual(store.successfulDeploymentsForCommits("staging", ["c".repeat(40)]), []);
     assert.equal(store.latest("production")?.commit, "e".repeat(40));
     assert.equal(store.successfulDeployment("production", "/workspace/project-a", "d".repeat(40))?.imageDigest, `sha256:${"d".repeat(64)}`);
     assert.equal(JSON.parse(await readFile(file, "utf8")).deliveries.pending.status, "failed");

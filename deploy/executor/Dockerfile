@@ -38,7 +38,7 @@ COPY --from=docker-cli-build /out/docker /usr/local/bin/docker
 COPY --from=docker-compose-build /out/docker-compose /usr/local/lib/docker/cli-plugins/docker-compose
 
 WORKDIR /app
-COPY server.mjs ./server.mjs
+COPY --chown=node:node --chmod=0644 server.mjs ./server.mjs
 
 USER node
 EXPOSE 3300

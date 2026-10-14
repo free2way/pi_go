@@ -960,7 +960,8 @@ async function workspaceScmGit(relativePath: string) {
       args,
       env,
       timeoutMs: 120_000,
-      maxOutput,
+      maxOutput: 4 * 1024 * 1024,
+      failOnOutputLimit: true,
     }),
   };
 }

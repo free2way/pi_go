@@ -5,6 +5,7 @@ import type {
   WorkspaceRemoteRelation,
   WorkspaceRemoteStatus,
 } from "../shared/types.js";
+import { inspectExportHistory, type ExportFinding } from "../shared/repository-export-policy.mjs";
 
 export interface WorkspaceScmCredentialInput {
   provider?: ScmProvider;
@@ -19,101 +20,18 @@ export type ScmGitExec = (args: string[], env?: Record<string, string>) => Promi
 export class WorkspaceScmError extends Error {
   constructor(readonly code: string, message: string) { super(message); }
 }
+export type WorkspacePushPolicyViolation = ExportFinding;
 
-export type WorkspacePushPolicyCategory = "documentation" | "credential_file" | "account_export" | "secret" | "internal_network" | "embedded_credentials" | "account_data" | "ai_prompt";
-
-export interface WorkspacePushPolicyViolation {
-  category: WorkspacePushPolicyCategory;
-  path: string;
-}
-
-const contentPolicies: Array<{ category: WorkspacePushPolicyCategory; pattern: string; ignoreCase?: boolean }> = [
-  {
-    category: "secret",
-    pattern: "(BEGIN (RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{20,})",
-  },
-  {
-    category: "internal_network",
-    pattern: "(^|[^0-9])(10\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}|192\\.168\\.[0-9]{1,3}\\.[0-9]{1,3}|172\\.(1[6-9]|2[0-9]|3[01])\\.[0-9]{1,3}\\.[0-9]{1,3})([^0-9]|$)",
-  },
-  {
-    category: "embedded_credentials",
-    pattern: "https?://[^:/[:space:]@]+:[^@/[:space:]]+@",
-  },
-  {
-    category: "ai_prompt",
-    // Split the natural-language markers so this policy source does not flag itself.
-    pattern: `(${"You" + " are"}|${"Act" + " as"}|${"system" + " prompt"}|${"developer" + " prompt"}|${"reviewer" + " prompt"}|${"prompt" + " template"}|systemPrompt|developerPrompt|reviewerPrompt|promptTemplate|${"系统" + "提示词"}|${"开发者" + "提示词"}|${"审查" + "提示词"}|${"你" + "是"}|${"你将" + "作为"})`,
-  },
-  {
-    category: "account_data",
-    pattern: "([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}|((ssh|deploy|git|db|database)[_-]?(user|username))[^[:space:]]{0,80}(:-|[:=])[^[:space:]]*[A-Za-z0-9][A-Za-z0-9._@+-]{3,})",
-    ignoreCase: true,
-  },
-];
-
-const accountConfigPattern = "(password|passwd|access[_-]?token|api[_-]?key|secret|username|user[_-]?name|account[_-]?id|email)['\"]?[[:space:]]*[:=][[:space:]]*['\"]?[A-Za-z0-9][A-Za-z0-9@._+:/-]{7,}";
-
-function pathPolicy(pathName: string): WorkspacePushPolicyCategory | undefined {
-  const normalized = pathName.replaceAll("\\", "/");
-  const lower = normalized.toLowerCase();
-  if (lower.startsWith("docs/") || lower.includes("/docs/")) return "documentation";
-  if (/\.(md|mdx)$/i.test(lower) && /(^|[._/-])(acceptance|development|dev-plan|architecture|system-design|验收|开发|架构)([._/-]|$)/i.test(lower)) return "documentation";
-  if (/(^|[._/-])(prompt|prompts|system-prompt|agent-instruction|提示词)([._/-]|$)/i.test(lower)) return "ai_prompt";
-  if (/(^|\/)(id_rsa|id_dsa|id_ecdsa|id_ed25519|credentials|secrets?)(\.|$)/i.test(normalized) || /\.(pem|key|p12|pfx|jks|keystore)$/i.test(lower)) return "credential_file";
-  if (/(^|\/)(accounts?|users?[-_.]?(export|backup|dump)|credentials)[-_.].*\.(csv|json|ya?ml|sql|xlsx?)$/i.test(normalized)) return "account_export";
-  return undefined;
-}
-
-function nulPaths(output: string) {
-  return output.split("\0").map((value) => value.replace(/^HEAD:/, "")).filter(Boolean);
-}
-
-function displayPolicyPath(pathName: string) {
-  return pathName.replace(/[\u0000-\u001f\u007f]/g, "?").slice(0, 180);
-}
-
-async function grepPolicyFiles(git: ScmGitExec, pattern: string, files: string[], ignoreCase = false) {
-  const matches = new Set<string>();
-  for (let index = 0; index < files.length; index += 80) {
-    const result = await git(["grep", "-I", "-l", "-z", ...(ignoreCase ? ["-i"] : []), "-E", pattern, "HEAD", "--", ...files.slice(index, index + 80)]);
-    if (result.code !== 0 && result.code !== 1) {
-      throw new WorkspaceScmError("SCM_EXPORT_POLICY_FAILED", "Unable to complete the repository export policy scan");
-    }
-    for (const pathName of nulPaths(result.stdout)) matches.add(pathName);
-  }
-  return matches;
-}
-
-/**
- * Scans only blobs that the next push would introduce. Findings contain a
- * category and path only: matching source text (which may itself be secret) is
- * never returned to the web service or written to the audit log.
- */
+/** The push and CI paths share one fail-closed history scanner. */
 export async function inspectWorkspacePushPolicy(input: {
   before: WorkspaceRemoteStatus;
   git: ScmGitExec;
 }): Promise<WorkspacePushPolicyViolation[]> {
-  const listed = input.before.remoteHead
-    ? await input.git(["diff", "--name-only", "-z", "--diff-filter=ACMR", `${input.before.remoteHead}..HEAD`, "--"])
-    : await input.git(["ls-tree", "-r", "--name-only", "-z", "HEAD"]);
-  if (listed.code !== 0) throw new WorkspaceScmError("SCM_EXPORT_POLICY_FAILED", "Unable to enumerate files for the repository export policy scan");
-  const files = [...new Set(nulPaths(listed.stdout))];
-  const findings = new Map<string, WorkspacePushPolicyViolation>();
-  const add = (category: WorkspacePushPolicyCategory, pathName: string) => {
-    const path = displayPolicyPath(pathName);
-    findings.set(`${category}:${path}`, { category, path });
-  };
-  for (const pathName of files) {
-    const category = pathPolicy(pathName);
-    if (category) add(category, pathName);
+  try {
+    return await inspectExportHistory({ git: input.git, head: input.before.localHead, base: input.before.remoteHead });
+  } catch {
+    throw new WorkspaceScmError("SCM_EXPORT_POLICY_FAILED", "Unable to scan complete export history; push is blocked");
   }
-  for (const policy of contentPolicies) {
-    for (const pathName of await grepPolicyFiles(input.git, policy.pattern, files, policy.ignoreCase)) add(policy.category, pathName);
-  }
-  const accountFiles = files.filter((pathName) => /(^|\/)(\.env[^/]*|[^/]+\.(json|ya?ml|toml|ini|conf|properties|csv|sql))$/i.test(pathName));
-  for (const pathName of await grepPolicyFiles(input.git, accountConfigPattern, accountFiles, true)) add("account_data", pathName);
-  return [...findings.values()];
 }
 
 export function redactRemoteUrl(value: string): string {
@@ -275,7 +193,8 @@ export async function pushWorkspaceBranch(input: {
     );
   }
   const env = scmAuthEnvironment(rawRemote, { ...input.credential, provider: input.credential?.provider ?? before.provider });
-  const pushed = await input.git(["push", "--porcelain", "origin", `HEAD:refs/heads/${safeBranch(input.branch)}`], env);
+  // Push exactly the scanned commit, even if another process advances HEAD.
+  const pushed = await input.git(["-c", "push.followTags=false", "push", "--porcelain", "origin", `${before.localHead}:refs/heads/${safeBranch(input.branch)}`], env);
   if (pushed.code !== 0) throw new WorkspaceScmError("SCM_PUSH_FAILED", failure(pushed, "Git push failed", input.credential?.token));
   const after = await inspectWorkspaceRemote(input);
   if (after.relation !== "synchronized") throw new WorkspaceScmError("SCM_PUSH_UNVERIFIED", "Push returned successfully but origin does not match local HEAD");
