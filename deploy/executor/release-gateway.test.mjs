@@ -5,10 +5,12 @@ import { Readable } from "node:stream";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  assertRequiredDockerSecurity,
   authorizeReleaseGateway,
   createReleaseGateway,
   ensureImage,
   ensureTargetNetwork,
+  isRootlessDockerSecurityOptions,
   loadReleaseGatewayConfig,
   validateManagedReleaseContainer,
   validateReleaseRequest,
@@ -46,6 +48,26 @@ test("release gateway configuration fails closed", () => {
   assert.throws(() => loadReleaseGatewayConfig({ ...valid, PIGO_EXECUTOR_WORKSPACE_ROOT: "/" }), /non-root/);
   assert.throws(() => loadReleaseGatewayConfig({ ...valid, PIGO_EXECUTOR_APP_PATH: "../outside" }), /safe relative/);
   assert.throws(() => loadReleaseGatewayConfig({ ...valid, PIGO_EXECUTOR_TARGET_NETWORK: "host" }), /invalid/);
+  assert.throws(() => loadReleaseGatewayConfig({ ...valid, PIGO_RELEASE_REQUIRE_ROOTLESS: "true" }), /literal 1/);
+  assert.equal(loadReleaseGatewayConfig({ ...valid, PIGO_RELEASE_REQUIRE_ROOTLESS: "1" }).requireRootless, true);
+});
+
+test("release gateway verifies a required rootless execution daemon before listening", async () => {
+  assert.equal(isRootlessDockerSecurityOptions(["name=seccomp,profile=builtin", "name=rootless"]), true);
+  assert.equal(isRootlessDockerSecurityOptions(["name=seccomp,profile=builtin"]), false);
+  const config = { requireRootless: true };
+  await assertRequiredDockerSecurity(config, async (_command, args) => {
+    assert.deepEqual(args, ["info", "--format", "{{json .SecurityOptions}}"]);
+    return { stdout: JSON.stringify(["name=rootless"]), stderr: "" };
+  });
+  await assert.rejects(
+    () => assertRequiredDockerSecurity(config, async () => ({ stdout: JSON.stringify(["name=seccomp"]), stderr: "" })),
+    /configured Docker engine is not rootless/,
+  );
+  await assert.rejects(
+    () => assertRequiredDockerSecurity(config, async () => ({ stdout: "not-json", stderr: "" })),
+    /invalid security options/,
+  );
 });
 
 test("staging always rebuilds the reviewed commit while production only reuses its approved digest", async () => {
@@ -215,7 +237,8 @@ test("compose keeps Docker socket only on the internal release gateway", async (
   const gateway = compose.slice(gatewayStart, compose.indexOf("\nvolumes:"));
   assert.doesNotMatch(executor, /docker\.sock|DOCKER_GID|group_add/);
   assert.match(executor, /release-control/);
-  assert.match(gateway, /\/var\/run\/docker\.sock/);
+  assert.match(gateway, /\$\{PIGO_RELEASE_DOCKER_SOCKET:-\/var\/run\/docker\.sock\}:\/var\/run\/docker\.sock/);
+  assert.match(gateway, /PIGO_RELEASE_REQUIRE_ROOTLESS/);
   assert.match(gateway, /release-control/);
   assert.doesNotMatch(gateway, /^\s+- release-targets$/mu);
   assert.doesNotMatch(gateway, /ports:/);

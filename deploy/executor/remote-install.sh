@@ -35,6 +35,10 @@ trap cleanup EXIT
 
 command -v docker >/dev/null || { echo "docker is required" >&2; exit 2; }
 command -v openssl >/dev/null || { echo "openssl is required" >&2; exit 2; }
+# Installation always manages the outer Executor/Gateway services with the
+# system daemon. The Gateway's execution daemon is selected separately by its
+# socket bind, so a user's current Docker context cannot redirect this script.
+export DOCKER_HOST=unix:///var/run/docker.sock
 docker compose version >/dev/null
 gzip -t "$BUNDLE"
 
@@ -69,9 +73,15 @@ if ! grep -q '^PIGO_RELEASE_GATEWAY_TOKEN=.' "$REMOTE_DIR/.env"; then
   printf '\nPIGO_RELEASE_GATEWAY_TOKEN=%s\n' "$(openssl rand -hex 32)" >> "$REMOTE_DIR/.env"
 fi
 
-# Docker group ids vary by host. Keep this mechanical value current without
-# reading or printing any other entry in the protected environment file.
-DOCKER_GID="$(stat -c %g /var/run/docker.sock)"
+# Docker group ids vary by socket. Keep this mechanical value current without
+# reading or printing any secret from the protected environment file.
+RELEASE_DOCKER_SOCKET="$(sed -n 's/^PIGO_RELEASE_DOCKER_SOCKET=//p' "$REMOTE_DIR/.env" | tail -n 1)"
+RELEASE_DOCKER_SOCKET="${RELEASE_DOCKER_SOCKET:-/var/run/docker.sock}"
+if [[ ! "$RELEASE_DOCKER_SOCKET" =~ ^/[A-Za-z0-9._/-]+\.sock$ || ! -S "$RELEASE_DOCKER_SOCKET" ]]; then
+  echo "configured release Docker socket is not a valid local socket" >&2
+  exit 6
+fi
+DOCKER_GID="$(stat -c %g "$RELEASE_DOCKER_SOCKET")"
 if grep -q '^DOCKER_GID=' "$REMOTE_DIR/.env"; then
   sed -i "s/^DOCKER_GID=.*/DOCKER_GID=$DOCKER_GID/" "$REMOTE_DIR/.env"
 else

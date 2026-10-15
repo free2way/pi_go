@@ -77,9 +77,10 @@ services:
       PIGO_EXECUTOR_TARGET_NETWORK: ${PIGO_EXECUTOR_TARGET_NETWORK:-pigo-release-targets}
       PIGO_EXECUTOR_STAGING_PORT: ${PIGO_EXECUTOR_STAGING_PORT:-18080}
       PIGO_EXECUTOR_PRODUCTION_PORT: ${PIGO_EXECUTOR_PRODUCTION_PORT:-18081}
+      PIGO_RELEASE_REQUIRE_ROOTLESS: ${PIGO_RELEASE_REQUIRE_ROOTLESS:-}
     volumes:
       - ${PIGO_HOST_WORKSPACE_ROOT:?Set the exact host workspace root}:/workspace:ro
-      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PIGO_RELEASE_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
     group_add:
       - "${DOCKER_GID:?Set DOCKER_GID to the Docker socket group id}"
     read_only: true

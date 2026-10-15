@@ -27,6 +27,12 @@ function secret(value, name) {
   return text;
 }
 
+function strictFlag(value, name) {
+  if (value === undefined || value === "") return false;
+  if (value === "1") return true;
+  throw new Error(`${name} must be the literal 1 or empty`);
+}
+
 function safeEqual(left, right) {
   const a = createHash("sha256").update(String(left)).digest();
   const b = createHash("sha256").update(String(right)).digest();
@@ -120,6 +126,7 @@ export function loadReleaseGatewayConfig(environment = process.env) {
     productionUrl: environment.PIGO_EXECUTOR_PRODUCTION_URL || "http://host.docker.internal:18081",
     stagingPort,
     productionPort,
+    requireRootless: strictFlag(environment.PIGO_RELEASE_REQUIRE_ROOTLESS, "PIGO_RELEASE_REQUIRE_ROOTLESS"),
   };
 }
 
@@ -129,6 +136,27 @@ async function docker(config, environment, args, options = {}, runCommand = comm
     cwd: options.cwd,
     env: executorEnvironment(config, environment),
   });
+}
+
+export function isRootlessDockerSecurityOptions(value) {
+  return Array.isArray(value)
+    && value.some((entry) => typeof entry === "string" && /(?:^|,)name=rootless(?:,|$)/u.test(entry));
+}
+
+export async function assertRequiredDockerSecurity(config, runCommand = command) {
+  if (!config.requireRootless) return;
+  const result = await docker(
+    config,
+    "staging",
+    ["info", "--format", "{{json .SecurityOptions}}"],
+    {},
+    runCommand,
+  );
+  let securityOptions;
+  try { securityOptions = JSON.parse(result.stdout); } catch { throw new Error("Docker returned invalid security options"); }
+  if (!isRootlessDockerSecurityOptions(securityOptions)) {
+    throw new Error("PIGO_RELEASE_REQUIRE_ROOTLESS=1 but the configured Docker engine is not rootless");
+  }
 }
 
 async function inspectImage(config, environment, image, runCommand) {
@@ -400,9 +428,16 @@ export function createReleaseGateway(config, execute = executeRelease) {
 
 async function main() {
   const config = loadReleaseGatewayConfig();
+  await assertRequiredDockerSecurity(config);
   const server = createReleaseGateway(config);
   server.listen(config.port, config.host, () => {
-    console.log(JSON.stringify({ level: "info", event: "release_gateway.started", port: config.port, version: VERSION }));
+    console.log(JSON.stringify({
+      level: "info",
+      event: "release_gateway.started",
+      port: config.port,
+      version: VERSION,
+      rootlessRequired: config.requireRootless,
+    }));
   });
 }
 
