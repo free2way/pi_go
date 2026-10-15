@@ -89,7 +89,7 @@ describe("buildContainerSpec", () => {
   it("maps sandbox root scratch ownership for a rootless Docker daemon", () => {
     const spec = buildContainerSpec({ ...base, user: "0:0" });
     expect(spec.User).toBe("0:0");
-    expect(spec.HostConfig.Tmpfs["/home/node/.cache"]).toContain("uid=0,gid=0");
+    expect(spec.HostConfig.Tmpfs?.["/home/node/.cache"]).toContain("uid=0,gid=0");
   });
 
   it("passes only the supplied environment (SEC-003/010)", () => {
