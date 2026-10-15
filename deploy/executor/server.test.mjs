@@ -364,7 +364,32 @@ test("state recovery fails interrupted work and promotion lookup is repository/c
   await writeFile(file, JSON.stringify({
     version: 1,
     deliveries: {
-      pending: { status: "pending", callbackStatus: "pending" },
+      pending: {
+        event: "run.release_requested",
+        environment: "staging",
+        deliveryId: "release:run_pending:staging",
+        attempt: 2,
+        callbackUrl: "https://pigo.example.com/api/internal/runs/run_pending/release-result",
+        status: "pending",
+        callbackStatus: "pending",
+      },
+      legacyPending: { status: "pending", callbackStatus: "pending" },
+      settledPendingCallback: {
+        event: "run.release_requested",
+        environment: "staging",
+        deliveryId: "release:run_settled:staging",
+        attempt: 1,
+        callbackUrl: "https://pigo.example.com/api/internal/runs/run_settled/release-result",
+        status: "succeeded",
+        callbackStatus: "pending",
+        detail: "staging deploy and smoke checks passed",
+        deploymentId: "order-status-staging-aaaaaaaaaaaa",
+        repository: "/workspace/project-a",
+        commit: "a".repeat(40),
+        image: `local/order-status-app:${"a".repeat(40)}`,
+        imageDigest: `sha256:${"b".repeat(64)}`,
+        finishedAt: "2026-10-09T00:00:00.000Z",
+      },
       good: {
         event: "run.release_requested",
         environment: "staging",
@@ -399,7 +424,38 @@ test("state recovery fails interrupted work and promotion lookup is repository/c
     const store = new JsonStateStore(file);
     await store.init();
     assert.equal(store.getDelivery("pending").status, "failed");
+    assert.equal(store.getDelivery("pending").callbackStatus, "pending");
     assert.match(store.getDelivery("pending").detail, /restarted/);
+    assert.equal(store.getDelivery("legacyPending").status, "failed");
+    assert.equal(store.getDelivery("legacyPending").callbackStatus, "failed");
+    assert.deepEqual(store.takeRecoveredCallbacks(), [
+      {
+        key: "pending",
+        payload: {
+          deliveryId: "release:run_pending:staging",
+          attempt: 2,
+          callbackUrl: "https://pigo.example.com/api/internal/runs/run_pending/release-result",
+        },
+        outcome: { status: "failed", detail: "executor restarted before deployment completed; submit a new attempt" },
+      },
+      {
+        key: "settledPendingCallback",
+        payload: {
+          deliveryId: "release:run_settled:staging",
+          attempt: 1,
+          callbackUrl: "https://pigo.example.com/api/internal/runs/run_settled/release-result",
+        },
+        outcome: {
+          status: "succeeded",
+          detail: "staging deploy and smoke checks passed",
+          deploymentId: "order-status-staging-aaaaaaaaaaaa",
+          commit: "a".repeat(40),
+          image: `local/order-status-app:${"a".repeat(40)}`,
+          imageDigest: `sha256:${"b".repeat(64)}`,
+        },
+      },
+    ]);
+    assert.deepEqual(store.takeRecoveredCallbacks(), []);
     assert.equal(store.successfulDeployment("staging", "/workspace/project-a", "a".repeat(40))?.status, "succeeded");
     assert.equal(store.successfulDeployment("staging", "/workspace/project-b", "a".repeat(40)), undefined);
     assert.equal(store.successfulDeploymentsForCommits("staging", ["a".repeat(40)])[0]?.repository, "/workspace/project-a");
@@ -407,6 +463,72 @@ test("state recovery fails interrupted work and promotion lookup is repository/c
     assert.equal(store.latest("production")?.commit, "e".repeat(40));
     assert.equal(store.successfulDeployment("production", "/workspace/project-a", "d".repeat(40))?.imageDigest, `sha256:${"d".repeat(64)}`);
     assert.equal(JSON.parse(await readFile(file, "utf8")).deliveries.pending.status, "failed");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("executor restart immediately reports an interrupted delivery through its validated callback", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "pigo-executor-recovery-callback-"));
+  const file = path.join(directory, "executions.json");
+  await writeFile(file, JSON.stringify({
+    version: 1,
+    deliveries: {
+      "release:run_recovered:staging:4": {
+        event: "run.release_requested",
+        environment: "staging",
+        deliveryId: "release:run_recovered:staging",
+        attempt: 4,
+        callbackUrl: "https://pigo.example.com/api/internal/runs/run_recovered/release-result",
+        status: "pending",
+        callbackStatus: "pending",
+      },
+    },
+    latestByEnvironment: {},
+  }));
+  let callback;
+  try {
+    const { store } = await createExecutor({
+      config: {
+        token,
+        host: "127.0.0.1",
+        port: 0,
+        workspaceRoot: "/workspace",
+        appPath: "apps/order-status-app",
+        dataFile: file,
+        callbackPublicOrigin: "https://pigo.example.com",
+        callbackInternalOrigin: "http://127.0.0.1:3100",
+        imageRepository: "local/order-status-app",
+        targetNetwork: "pigo-release-targets",
+        releaseGatewayToken: token,
+        releaseGatewayUrl: "http://release-gateway:3310",
+        stagingUrl: "http://127.0.0.1:18080",
+        productionUrl: "http://127.0.0.1:18081",
+        stagingPort: 18080,
+        productionPort: 18081,
+        fetchImpl: async (url, options) => {
+          callback = { url, body: JSON.parse(options.body), authorization: options.headers.Authorization };
+          return { ok: true, status: 200 };
+        },
+      },
+    });
+    for (let attempt = 0; callback === undefined && attempt < 50; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.deepEqual(callback, {
+      url: "http://127.0.0.1:3100/api/internal/runs/run_recovered/release-result",
+      authorization: `Bearer ${token}`,
+      body: {
+        deliveryId: "release:run_recovered:staging",
+        attempt: 4,
+        status: "failed",
+        detail: "executor restarted before deployment completed; submit a new attempt",
+      },
+    });
+    for (let attempt = 0; store.getDelivery("release:run_recovered:staging:4").callbackStatus !== "succeeded" && attempt < 50; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(store.getDelivery("release:run_recovered:staging:4").callbackStatus, "succeeded");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

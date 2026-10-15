@@ -179,10 +179,12 @@ export class JsonStateStore {
   constructor(file) {
     this.file = file;
     this.value = { version: 1, deliveries: {}, latestByEnvironment: {} };
+    this.recoveredCallbacks = [];
     this.queue = Promise.resolve();
   }
 
   async init() {
+    this.recoveredCallbacks = [];
     await mkdir(path.dirname(this.file), { recursive: true });
     try {
       const value = JSON.parse(await readFile(this.file, "utf8"));
@@ -190,13 +192,42 @@ export class JsonStateStore {
       this.value = value;
       const recoveredAt = new Date().toISOString();
       let recovered = false;
-      for (const delivery of Object.values(this.value.deliveries)) {
-        if (delivery.status !== "pending") continue;
-        delivery.status = "failed";
-        delivery.callbackStatus = "failed";
-        delivery.detail = "executor restarted before deployment completed; submit a new attempt";
-        delivery.finishedAt = recoveredAt;
-        recovered = true;
+      for (const [key, delivery] of Object.entries(this.value.deliveries)) {
+        if (delivery.status === "pending") {
+          delivery.status = "failed";
+          delivery.callbackStatus = "pending";
+          delivery.detail = "executor restarted before deployment completed; submit a new attempt";
+          delivery.finishedAt = recoveredAt;
+          recovered = true;
+        }
+        if ((delivery.status !== "failed" && delivery.status !== "succeeded") || delivery.callbackStatus !== "pending") continue;
+        if (typeof delivery.callbackUrl !== "string" || !delivery.callbackUrl
+          || typeof delivery.deliveryId !== "string" || !Number.isInteger(delivery.attempt)) {
+          // Legacy state did not persist callbackUrl. Keep it retryable without
+          // inventing a callback target or weakening the callback allowlist.
+          delivery.callbackStatus = "failed";
+          recovered = true;
+          continue;
+        }
+        this.recoveredCallbacks.push({
+          key,
+          payload: {
+            deliveryId: delivery.deliveryId,
+            attempt: delivery.attempt,
+            callbackUrl: delivery.callbackUrl,
+          },
+          outcome: {
+            status: delivery.status,
+            detail: String(delivery.detail ?? "deployment result recovered after executor restart"),
+            ...(delivery.deploymentId ? { deploymentId: delivery.deploymentId } : {}),
+            ...(delivery.url ? { url: delivery.url } : {}),
+            ...(delivery.commit ? { commit: delivery.commit } : {}),
+            ...(delivery.image ? { image: delivery.image } : {}),
+            ...(delivery.imageDigest ? { imageDigest: delivery.imageDigest } : {}),
+            ...(delivery.rolledBackFromCommit ? { rolledBackFromCommit: delivery.rolledBackFromCommit } : {}),
+            ...(delivery.rolledBackFromDigest ? { rolledBackFromDigest: delivery.rolledBackFromDigest } : {}),
+          },
+        });
       }
       await chmod(this.file, 0o600);
       if (recovered) await this.persist();
@@ -218,6 +249,10 @@ export class JsonStateStore {
 
   getDelivery(key) {
     return this.value.deliveries[key];
+  }
+
+  takeRecoveredCallbacks() {
+    return this.recoveredCallbacks.splice(0);
   }
 
   latest(environment) {
@@ -701,6 +736,12 @@ export async function createExecutor(options = {}) {
     }
   }
 
+  for (const recovered of store.takeRecoveredCallbacks?.() ?? []) {
+    jobs = jobs.then(() => retryCallback(recovered.payload, recovered.key, recovered.outcome)).catch((error) => {
+      console.error(JSON.stringify({ level: "error", event: "recovery.callback_unhandled", deliveryId: recovered.payload.deliveryId, message: error.message }));
+    });
+  }
+
   const server = http.createServer(async (request, reply) => {
     try {
       if (request.method === "GET" && request.url === "/healthz") {
@@ -755,6 +796,7 @@ export async function createExecutor(options = {}) {
           environment: payload.environment,
           deliveryId: payload.deliveryId,
           attempt: payload.attempt,
+          callbackUrl: payload.callbackUrl,
           fingerprint,
           status: "pending",
           callbackStatus: "pending",
