@@ -86,6 +86,12 @@ describe("buildContainerSpec", () => {
     expect(spec.Labels["pigo.sandbox"]).toBe("1");
   });
 
+  it("maps sandbox root scratch ownership for a rootless Docker daemon", () => {
+    const spec = buildContainerSpec({ ...base, user: "0:0" });
+    expect(spec.User).toBe("0:0");
+    expect(spec.HostConfig.Tmpfs["/home/node/.cache"]).toContain("uid=0,gid=0");
+  });
+
   it("passes only the supplied environment (SEC-003/010)", () => {
     const spec = buildContainerSpec({ ...base, env: { DEEPSEEK_API_KEY: "role-key", PATH: "/usr/bin" } });
     expect(spec.Env).toEqual(["DEEPSEEK_API_KEY=role-key", "PATH=/usr/bin"]);

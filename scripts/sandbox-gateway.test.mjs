@@ -7,6 +7,7 @@ import path from "node:path";
 import {
   authorizeGateway,
   classifyGatewayRequest,
+  isRootlessDockerInfo,
   isManagedSandboxInspection,
   loadGatewayConfig,
   validateSandboxSpec,
@@ -27,6 +28,7 @@ async function fixture() {
   ]);
   const policy = {
     image: "registry.example/pigo-sandbox@sha256:" + "a".repeat(64),
+    user: "node",
     network: "pi-agent-network",
     hostRunsRoot: path.join(workspace, "runs"),
     hostProjectsRoot: path.join(workspace, "projects"),
@@ -108,6 +110,34 @@ test("config fails closed for missing secrets and invalid numeric limits", () =>
   assert.throws(() => loadGatewayConfig({ ...base, PI_DOCKER_GATEWAY_TOKEN: token, PI_SANDBOX_NETWORK: "host" }), /non-host/);
   assert.throws(() => loadGatewayConfig({ ...base, PI_DOCKER_GATEWAY_TOKEN: token, PI_HOST_WORKSPACE_ROOT: "/" }), /non-root/);
   assert.throws(() => loadGatewayConfig({ ...base, PI_DOCKER_GATEWAY_TOKEN: token, PI_SANDBOX_PLUGIN_ROOTS: "/" }), /non-root/);
+  assert.throws(() => loadGatewayConfig({ ...base, PI_DOCKER_GATEWAY_TOKEN: token, PI_DOCKER_REQUIRE_ROOTLESS: "true" }), /literal 1/);
+  assert.throws(() => loadGatewayConfig({ ...base, PI_DOCKER_GATEWAY_TOKEN: token, PI_SANDBOX_USER: "0:0" }), /requires PI_DOCKER_REQUIRE_ROOTLESS=1/);
+  assert.throws(() => loadGatewayConfig({ ...base, PI_DOCKER_GATEWAY_TOKEN: token, PI_DOCKER_SOCKET: "tcp://docker:2375" }), /absolute .sock/);
+  const rootless = loadGatewayConfig({
+    ...base,
+    PI_DOCKER_GATEWAY_TOKEN: token,
+    PI_DOCKER_SOCKET: "/run/user/1000/docker.sock",
+    PI_DOCKER_REQUIRE_ROOTLESS: "1",
+    PI_SANDBOX_USER: "0:0",
+  });
+  assert.equal(rootless.requireRootless, true);
+  assert.equal(rootless.policy.user, "0:0");
+});
+
+test("rootless engine detection accepts only Docker's explicit security option", () => {
+  assert.equal(isRootlessDockerInfo({ SecurityOptions: ["name=seccomp,profile=builtin", "name=rootless"] }), true);
+  assert.equal(isRootlessDockerInfo({ SecurityOptions: ["name=seccomp,profile=builtin"] }), false);
+  assert.equal(isRootlessDockerInfo({ SecurityOptions: "name=rootless" }), false);
+  assert.equal(isRootlessDockerInfo({}), false);
+});
+
+test("root sandbox identity is accepted only by a rootless-verified policy", async (t) => {
+  const { root, policy, spec } = await fixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  policy.user = "0:0";
+  spec.User = "0:0";
+  spec.HostConfig.Tmpfs["/home/node/.cache"] = "size=64m,mode=700,uid=0,gid=0";
+  assert.equal(await validateSandboxSpec(spec, policy), spec);
 });
 
 test("gateway authentication is exact and fail-closed", () => {

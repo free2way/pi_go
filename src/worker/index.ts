@@ -211,6 +211,7 @@ const workerId = process.env.PI_WORKER_ID || `worker-${process.pid}`;
 // SEC-004 / AT-SEC-007:每次 Agent 调用与检查命令都在独立容器中执行，只挂载本次
 // 运行的 worktree（及其仓库 .git 元数据）、只读模型定义与本次运行的 Pi 状态目录。
 const sandboxImage = process.env.PI_SANDBOX_IMAGE || "local/pigo-sandbox:0.1.0";
+const sandboxUser = process.env.PI_SANDBOX_USER || "node";
 /** Network used for agent calls (provider egress). Checks always run with none. */
 const agentNetwork = process.env.PI_SANDBOX_NETWORK || "pi-agent-network";
 const hostWorkspaceRoot = process.env.PI_HOST_WORKSPACE_ROOT || workspaceRoot;
@@ -372,6 +373,7 @@ async function runInSandbox(input: SandboxRunInput): Promise<CommandResult> {
   await prepareSandboxStateDirectory(runStateDir);
   const spec = buildContainerSpec({
     image: imageForSandbox,
+    user: sandboxUser,
     worktree: input.worktree,
     hostWorktreePath: hostPathFor(input.worktree, workspaceRoot, hostWorkspaceRoot),
     readOnly: input.readOnly,

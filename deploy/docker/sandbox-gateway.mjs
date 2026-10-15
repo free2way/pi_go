@@ -32,6 +32,16 @@ function integer(value, name, minimum, maximum) {
   }
 }
 
+function strictFlag(value, name) {
+  if (value === undefined || value === "") return false;
+  if (value === "1") return true;
+  throw new Error(`${name} must be the literal 1 or empty`);
+}
+
+function rootUser(value) {
+  return value === "root" || value === "0" || value === "0:0";
+}
+
 function object(value, name) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${name} must be an object`);
   return value;
@@ -93,11 +103,12 @@ function parseBind(value) {
   return { source: path.resolve(source), destination: path.posix.normalize(destination), mode };
 }
 
-function validTmpfs(tmpfs) {
+function validTmpfs(tmpfs, user) {
+  const cacheOwner = rootUser(user) ? "uid=0,gid=0" : "uid=1000,gid=1000";
   const expected = new Map([
     ["/tmp", "size=512m,mode=1777"],
     ["/run", "size=16m,mode=755"],
-    ["/home/node/.cache", "size=64m,mode=700,uid=1000,gid=1000"],
+    ["/home/node/.cache", `size=64m,mode=700,${cacheOwner}`],
   ]);
   if (!tmpfs || typeof tmpfs !== "object" || Array.isArray(tmpfs) || Object.keys(tmpfs).length !== expected.size) return false;
   return [...expected].every(([key, value]) => tmpfs[key] === value);
@@ -109,7 +120,7 @@ export async function validateSandboxSpec(spec, policy) {
   if (value.Image !== policy.image) throw new Error("sandbox image is not the configured immutable image");
   if (!Array.isArray(value.Cmd) || value.Cmd.length === 0 || value.Cmd.length > 128
     || value.Cmd.some((item) => typeof item !== "string" || item.length > 32_768)) throw new Error("sandbox command is invalid");
-  if (value.User !== "node" && value.User !== "1000" && value.User !== "1000:1000") throw new Error("sandbox user must be non-root node");
+  if (value.User !== policy.user) throw new Error("sandbox user does not match the configured policy");
   if (typeof value.WorkingDir !== "string" || !inside("/workspace/runs", path.posix.normalize(value.WorkingDir))) {
     throw new Error("sandbox working directory must be below /workspace/runs");
   }
@@ -133,7 +144,7 @@ export async function validateSandboxSpec(spec, policy) {
   integer(host.PidsLimit, "HostConfig.PidsLimit", 1, policy.maxPids);
   integer(host.Memory, "HostConfig.Memory", 64 * 1024 * 1024, policy.maxMemory);
   integer(host.NanoCpus, "HostConfig.NanoCpus", 1, policy.maxNanoCpus);
-  if (!validTmpfs(host.Tmpfs)) throw new Error("sandbox tmpfs policy is invalid");
+  if (!validTmpfs(host.Tmpfs, policy.user)) throw new Error("sandbox tmpfs policy is invalid");
   if (!Array.isArray(host.Binds) || host.Binds.length < 2 || host.Binds.length > 16) throw new Error("sandbox bind list is invalid");
 
   let hasWorktree = false;
@@ -241,7 +252,7 @@ export function isManagedSandboxInspection(value, policy) {
     && typeof value.Name === "string"
     && NAME.test(value.Name.replace(/^\//u, ""))
     && value.Config?.Image === policy.image
-    && ["node", "1000", "1000:1000"].includes(value.Config?.User)
+    && value.Config?.User === policy.user
     && value.Config?.Labels?.["pigo.sandbox"] === "1"
     && value.HostConfig?.Privileged === false
     && value.HostConfig?.ReadonlyRootfs === true
@@ -255,6 +266,19 @@ export function isManagedSandboxInspection(value, policy) {
     && !value.HostConfig?.IpcMode
     && !value.HostConfig?.Devices?.length
   );
+}
+
+export function isRootlessDockerInfo(value) {
+  return Array.isArray(value?.SecurityOptions)
+    && value.SecurityOptions.some((entry) => typeof entry === "string" && /(?:^|,)name=rootless(?:,|$)/u.test(entry));
+}
+
+export async function assertRequiredDockerSecurity(config) {
+  if (!config.requireRootless) return;
+  const info = await dockerJson(config, "GET", `/${config.apiVersion}/info`);
+  if (!isRootlessDockerInfo(info)) {
+    throw new Error("PI_DOCKER_REQUIRE_ROOTLESS=1 but the configured Docker engine is not rootless");
+  }
 }
 
 async function recoverManagedSandbox(config, id) {
@@ -295,15 +319,29 @@ export function loadGatewayConfig(env = process.env) {
     }
     return path.resolve(item);
   });
+  const requireRootless = strictFlag(env.PI_DOCKER_REQUIRE_ROOTLESS, "PI_DOCKER_REQUIRE_ROOTLESS");
+  const sandboxUser = String(env.PI_SANDBOX_USER || "node").trim();
+  if (!["node", "1000", "1000:1000", "root", "0", "0:0"].includes(sandboxUser)) {
+    throw new Error("PI_SANDBOX_USER is outside the supported sandbox identities");
+  }
+  if (rootUser(sandboxUser) && !requireRootless) {
+    throw new Error("a root sandbox user requires PI_DOCKER_REQUIRE_ROOTLESS=1");
+  }
+  const socketPath = env.PI_DOCKER_SOCKET || "/var/run/docker.sock";
+  if (!path.isAbsolute(socketPath) || !socketPath.endsWith(".sock")) {
+    throw new Error("PI_DOCKER_SOCKET must be an absolute .sock path");
+  }
   const config = {
     host: env.HOST || "0.0.0.0",
     port: Number(env.PORT || 3210),
     token: secret(env.PI_DOCKER_GATEWAY_TOKEN, "PI_DOCKER_GATEWAY_TOKEN"),
-    socketPath: env.PI_DOCKER_SOCKET || "/var/run/docker.sock",
+    socketPath,
+    requireRootless,
     apiVersion: env.PI_DOCKER_API_VERSION || "v1.43",
     waitTimeoutMs: Number(env.PI_SANDBOX_GATEWAY_WAIT_TIMEOUT_MS || 2 * 60 * 60_000),
     policy: {
       image: required(env.PI_SANDBOX_IMAGE, "PI_SANDBOX_IMAGE"),
+      user: sandboxUser,
       network,
       hostRunsRoot: path.join(workspace, "runs"),
       hostProjectsRoot: path.join(workspace, "projects"),
@@ -398,8 +436,14 @@ export function createGateway(config) {
 
 async function main() {
   const config = loadGatewayConfig();
+  await assertRequiredDockerSecurity(config);
   const server = createGateway(config);
-  server.listen(config.port, config.host, () => console.log(JSON.stringify({ level: "info", event: "sandbox_gateway.started", port: config.port })));
+  server.listen(config.port, config.host, () => console.log(JSON.stringify({
+    level: "info",
+    event: "sandbox_gateway.started",
+    port: config.port,
+    rootlessRequired: config.requireRootless,
+  })));
 }
 
 const invoked = process.argv[1] ? pathToFileURL(process.argv[1]).href : "";

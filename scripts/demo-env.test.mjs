@@ -270,6 +270,7 @@ function demoConfig(overrides = {}) {
           PI_DOCKER_GATEWAY_URL: "http://demo-sandbox-gateway:3210",
           PI_DOCKER_GATEWAY_TOKEN: "gateway-token",
           PI_DOCKER_GATEWAY_REQUIRED: "1",
+          PI_SANDBOX_USER: "node",
         },
         volumes: [
           { type: "bind", source: "/app/pi-agent/demo-workspace", target: "/workspace" },
@@ -279,6 +280,9 @@ function demoConfig(overrides = {}) {
       "demo-sandbox-gateway": {
         environment: {
           PI_DOCKER_GATEWAY_TOKEN: "gateway-token",
+          PI_DOCKER_SOCKET: "/var/run/docker.sock",
+          PI_DOCKER_REQUIRE_ROOTLESS: "",
+          PI_SANDBOX_USER: "node",
         },
         volumes: [
           { type: "bind", source: "/var/run/docker.sock", target: "/var/run/docker.sock" },
@@ -301,6 +305,29 @@ test("checkDemoCompose: accepts a well-formed demo config", () => {
   assert.deepEqual(result.problems, []);
   assert.equal(result.ok, true);
   assert.equal(result.facts.sandboxMode, "auto");
+});
+
+test("checkDemoCompose: accepts a dedicated rootless Docker socket", () => {
+  const socket = "/run/user/1000/docker.sock";
+  const config = withServiceOverride("demo-sandbox-gateway", {
+    environment: { PI_DOCKER_SOCKET: socket, PI_DOCKER_REQUIRE_ROOTLESS: "1", PI_SANDBOX_USER: "0:0" },
+    volumes: [{ type: "bind", source: socket, target: socket }],
+    group_add: ["1000"],
+  });
+  config.services["demo-worker"].environment.PI_SANDBOX_USER = "0:0";
+  const result = checkDemoCompose(config);
+  assert.deepEqual(result.problems, []);
+  assert.equal(result.facts.dockerSocketPath, socket);
+});
+
+test("checkDemoCompose: refuses sandbox user drift and unverified root identity", () => {
+  const config = withServiceOverride("demo-sandbox-gateway", {
+    environment: { PI_SANDBOX_USER: "0:0", PI_DOCKER_REQUIRE_ROOTLESS: "" },
+  });
+  const { ok, problems } = checkDemoCompose(config);
+  assert.equal(ok, false);
+  assert.ok(problems.some((problem) => /must match/.test(problem)), problems.join("\n"));
+  assert.ok(problems.some((problem) => /requires PI_DOCKER_REQUIRE_ROOTLESS=1/.test(problem)), problems.join("\n"));
 });
 
 test("checkDemoCompose: refuses a production database URL", () => {
@@ -338,7 +365,7 @@ test("checkDemoCompose: refuses token/version drift and a missing gateway socket
   const joined = problems.join("\n");
   assert.match(joined, /PI_INTERNAL_TOKEN.*MISMATCH/);
   assert.match(joined, /VERSION: MISMATCH/i);
-  assert.match(joined, /docker\.sock/);
+  assert.match(joined, /PI_DOCKER_SOCKET/);
   assert.match(joined, /group_add/);
 });
 
@@ -388,7 +415,7 @@ test("compose.demo.yaml confines the docker socket and gid to the sandbox gatewa
   assert.ok(!workerBlock.includes("/var/run/docker.sock"));
   assert.ok(!workerBlock.includes("group_add:"));
   assert.match(workerBlock, /PI_DOCKER_GATEWAY_URL: http:\/\/demo-sandbox-gateway:3210/);
-  assert.match(codeLines, /\/var\/run\/docker\.sock:\/var\/run\/docker\.sock/);
+  assert.match(codeLines, /\$\{PIGO_DEMO_DOCKER_SOCKET:-\/var\/run\/docker\.sock\}:\$\{PIGO_DEMO_DOCKER_SOCKET:-\/var\/run\/docker\.sock\}/);
   assert.match(codeLines, /group_add:\s*\n\s*-\s*"\$\{PIGO_DEMO_DOCKER_GID:-983\}"/);
 });
 

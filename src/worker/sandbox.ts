@@ -72,12 +72,14 @@ export function buildContainerSpec(request: SandboxRequest): ContainerCreateSpec
 
   const env = Object.entries(request.env).map(([key, value]) => `${key}=${value}`);
 
+  const user = request.user ?? "node";
+  const cacheOwner = ["root", "0", "0:0"].includes(user) ? "uid=0,gid=0" : "uid=1000,gid=1000";
   return {
     Image: request.image,
     Cmd: request.argv,
     Env: env,
     WorkingDir: request.worktree,
-    User: request.user ?? "node",
+    User: user,
     HostConfig: {
       Binds: binds,
       NetworkMode: request.network,
@@ -88,7 +90,7 @@ export function buildContainerSpec(request: SandboxRequest): ContainerCreateSpec
       Tmpfs: {
         "/tmp": "size=512m,mode=1777",
         "/run": "size=16m,mode=755",
-        "/home/node/.cache": "size=64m,mode=700,uid=1000,gid=1000",
+        "/home/node/.cache": `size=64m,mode=700,${cacheOwner}`,
       },
       CapDrop: ["ALL"],
       SecurityOpt: ["no-new-privileges:true"],

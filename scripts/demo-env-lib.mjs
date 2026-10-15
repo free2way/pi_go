@@ -599,8 +599,8 @@ export function checkDemoCompose(config, options = {}) {
     facts.workerVersion = worker.env.PI_WORKER_VERSION ?? "";
     facts.callbackUrl = worker.env.PI_WEB_CALLBACK_URL ?? "";
     facts.sandboxMode = worker.env.PI_SANDBOX_MODE ?? "";
-    if (worker.volumes.some((volume) => String(typeof volume === "string" ? volume : volume?.source ?? volume?.target ?? "").includes("docker.sock"))) {
-      problems.push(`${workerName} must not mount /var/run/docker.sock — use ${gatewayName}`);
+    if (worker.volumes.some((volume) => mountTarget(volume).endsWith(".sock") || mountSource(volume).endsWith(".sock"))) {
+      problems.push(`${workerName} must not mount a Docker socket — use ${gatewayName}`);
     }
     const groupAdd = worker.groupAdd;
     if (groupAdd.length > 0) problems.push(`${workerName}.group_add must be empty — Docker gid belongs only to ${gatewayName}`);
@@ -634,11 +634,29 @@ export function checkDemoCompose(config, options = {}) {
   }
 
   if (gateway) {
-    if (!gateway.volumes.some((volume) => String(typeof volume === "string" ? volume : volume?.source ?? volume?.target ?? "").includes("docker.sock"))) {
-      problems.push(`${gatewayName} does not mount /var/run/docker.sock — sandbox containers cannot be created`);
+    const socketPath = String(gateway.env.PI_DOCKER_SOCKET ?? "");
+    facts.dockerSocketPath = socketPath;
+    if (!path.isAbsolute(socketPath) || !socketPath.endsWith(".sock")) {
+      problems.push(`${gatewayName}.PI_DOCKER_SOCKET must be an absolute .sock path`);
+    }
+    const socketMounts = gateway.volumes.filter((volume) => mountSource(volume) === socketPath && mountTarget(volume) === socketPath);
+    if (socketMounts.length !== 1) {
+      problems.push(`${gatewayName} must mount PI_DOCKER_SOCKET source-to-same-target exactly once`);
     }
     if (gateway.groupAdd.length !== 1) problems.push(`${gatewayName}.group_add must contain exactly the Docker socket gid`);
     if (String(gateway.env.PI_DOCKER_GATEWAY_TOKEN ?? "") === "") problems.push(`${gatewayName}.PI_DOCKER_GATEWAY_TOKEN is unset`);
+    const gatewayUser = String(gateway.env.PI_SANDBOX_USER ?? "node");
+    const workerUser = String(worker?.env.PI_SANDBOX_USER ?? "node");
+    if (gatewayUser !== workerUser) {
+      problems.push(`${gatewayName}.PI_SANDBOX_USER must match ${workerName}.PI_SANDBOX_USER`);
+    }
+    const requireRootless = String(gateway.env.PI_DOCKER_REQUIRE_ROOTLESS ?? "");
+    if (requireRootless !== "" && requireRootless !== "1") {
+      problems.push(`${gatewayName}.PI_DOCKER_REQUIRE_ROOTLESS must be empty or 1`);
+    }
+    if (["root", "0", "0:0"].includes(gatewayUser) && requireRootless !== "1") {
+      problems.push(`${gatewayName} root sandbox identity requires PI_DOCKER_REQUIRE_ROOTLESS=1`);
+    }
   }
 
   // P1: the workspace root must be mounted EXACTLY ONCE, at /workspace, in BOTH
@@ -1236,7 +1254,7 @@ function cmdDoctor(_argv) {
   // Docker socket usability, checked only inside the constrained gateway. The
   // worker itself must never receive the socket or its group membership.
   const socketScript = [
-    "const fs=require('node:fs');const p='/var/run/docker.sock';",
+    "const fs=require('node:fs');const p=process.env.PI_DOCKER_SOCKET||'/var/run/docker.sock';",
     "try{const st=fs.statSync(p);if(!st.isSocket()){console.error('not a socket');process.exit(1)}",
     "const groups=process.getgroups();if(!groups.includes(st.gid)){console.error(`socket gid ${st.gid} not in process groups [${groups.join(',')}]`);process.exit(1)}",
     "console.log(`socket ok gid=${st.gid} groups=[${groups.join(',')}]`)}",
@@ -1247,7 +1265,7 @@ function cmdDoctor(_argv) {
     "docker-socket",
     socket.status === 0,
     (socket.stdout || socket.stderr).trim() || "no output",
-    "set PIGO_DEMO_DOCKER_GID to `stat -c %g /var/run/docker.sock` and ensure the socket is mounted only into demo-sandbox-gateway",
+    "set PIGO_DEMO_DOCKER_SOCKET to the dedicated daemon socket, set PIGO_DEMO_DOCKER_GID to its gid, and mount it only into demo-sandbox-gateway",
   );
 
   const webHealth = healthJson(DEMO_WEB_SERVICE, "http://127.0.0.1:3100/api/health", env, 5000, 2000, envFile);

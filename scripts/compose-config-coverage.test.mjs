@@ -64,11 +64,15 @@ test("parser reads environment keys and volumes per service", () => {
   const lines = composeText.split("\n");
   const workerEnv = environmentKeys(serviceBlock(lines, "worker"));
   assert.ok(workerEnv.includes("PI_SANDBOX_MODE"));
+  assert.ok(workerEnv.includes("PI_SANDBOX_USER"));
   assert.ok(workerEnv.includes("PI_DOCKER_GATEWAY_URL"));
   const workerVolumes = listItems(serviceBlock(lines, "worker"), "volumes");
   assert.ok(workerVolumes.every((entry) => !entry.includes("/var/run/docker.sock")));
   const gatewayVolumes = listItems(serviceBlock(lines, "sandbox-gateway"), "volumes");
-  assert.ok(gatewayVolumes.some((entry) => entry.includes("/var/run/docker.sock")));
+  assert.ok(gatewayVolumes.some((entry) => entry.includes("${PI_DOCKER_SOCKET:-/var/run/docker.sock}")));
+  const gatewayEnv = environmentKeys(serviceBlock(lines, "sandbox-gateway"));
+  assert.ok(gatewayEnv.includes("PI_DOCKER_REQUIRE_ROOTLESS"));
+  assert.ok(gatewayEnv.includes("PI_SANDBOX_USER"));
 });
 
 test("checker FAILS with a clear diff when a variable is missing", () => {

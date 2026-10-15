@@ -55,8 +55,8 @@ if (!listItems(worker, "networks").includes("sandbox-control")) problems.push("w
 const gateway = serviceBlock("sandbox-gateway");
 const gatewayVolumes = listItems(gateway, "volumes");
 const gatewayGroupAdd = listItems(gateway, "group_add");
-if (!gatewayVolumes.some((entry) => entry.includes("/var/run/docker.sock:/var/run/docker.sock"))) {
-  problems.push("sandbox-gateway must mount the Docker socket");
+if (!gatewayVolumes.some((entry) => entry.includes("${PI_DOCKER_SOCKET:-/var/run/docker.sock}:${PI_DOCKER_SOCKET:-/var/run/docker.sock}"))) {
+  problems.push("sandbox-gateway must mount only the configured PI_DOCKER_SOCKET path");
 }
 if (gatewayGroupAdd.length !== 1) problems.push(`sandbox-gateway group_add must hold exactly the docker gid, found ${JSON.stringify(gatewayGroupAdd)}`);
 if (!listItems(gateway, "networks").includes("sandbox-control")) problems.push("sandbox-gateway must join sandbox-control");
