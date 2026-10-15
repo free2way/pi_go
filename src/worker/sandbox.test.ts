@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import {
   awaitSandboxExit,
   buildContainerSpec,
@@ -11,6 +14,7 @@ import {
   isContainerGoneError,
   MAX_SANDBOX_TEARDOWN_PASSES,
   parseSandboxAllowDegraded,
+  prepareSandboxStateDirectory,
   resolveSandboxMode,
   SANDBOX_TEARDOWN_MARGIN_MS,
   SandboxClosingError,
@@ -110,6 +114,22 @@ describe("sandboxStateDirectory", () => {
     expect(sandboxStateDirectory(worktree, "/workspace/runs/run-1.state/subagents/api"))
       .toBe("/workspace/runs/run-1.state/subagents/api");
     expect(() => sandboxStateDirectory(worktree, `${worktree}/.pi`)).toThrow(/outside worktree/);
+  });
+});
+
+describe("prepareSandboxStateDirectory", () => {
+  it("pre-creates a worker-owned model mountpoint and remains removable", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "pigo-sandbox-state-"));
+    const state = path.join(root, "run.state");
+    try {
+      await prepareSandboxStateDirectory(state);
+      expect(await readFile(path.join(state, "agent", "models.json"), "utf8")).toBe("");
+      expect((await stat(path.join(state, "agent", "models.json"))).mode & 0o777).toBe(0o600);
+      await rm(state, { recursive: true });
+      await expect(stat(state)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 

@@ -1,3 +1,4 @@
+import { mkdir, open } from "node:fs/promises";
 import path from "node:path";
 import type { ContainerCreateSpec } from "./docker-api.js";
 
@@ -119,6 +120,22 @@ export function sandboxStateDirectory(worktree: string, override?: string): stri
     throw new Error(`Sandbox state directory must be outside worktree: ${state}`);
   }
   return state;
+}
+
+/**
+ * Pre-creates the nested model bind target as the worker user.
+ *
+ * Docker creates a missing target below the state-directory bind as root. After
+ * the sandbox exits that root-owned `agent/models.json` placeholder prevents the
+ * non-root worker from deleting the per-run state directory. Creating the empty
+ * mountpoint first keeps ownership with the worker; Docker only overlays it with
+ * the read-only host model file while the container is running.
+ */
+export async function prepareSandboxStateDirectory(stateDirectory: string): Promise<void> {
+  const agentDirectory = path.join(stateDirectory, "agent");
+  await mkdir(agentDirectory, { recursive: true });
+  const mountpoint = await open(path.join(agentDirectory, "models.json"), "a", 0o600);
+  await mountpoint.close();
 }
 
 export type SandboxMode = "container" | "process" | "unavailable";
