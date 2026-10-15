@@ -8,6 +8,7 @@ import {
   assertRequiredDockerSecurity,
   authorizeReleaseGateway,
   createReleaseGateway,
+  deployManagedContainer,
   ensureImage,
   ensureTargetNetwork,
   isRootlessDockerSecurityOptions,
@@ -199,6 +200,106 @@ test("managed release policy rejects host takeover primitives", () => {
     mutate(malicious);
     assert.equal(validateManagedReleaseContainer(malicious, policy), false);
   }
+});
+
+test("failed smoke restores the previous managed container", async () => {
+  const commit = "a".repeat(40);
+  const previousCommit = "b".repeat(40);
+  const config = {
+    imageRepository: "local/app",
+    targetNetwork: "pigo-release-targets",
+    stagingPort: 18080,
+    productionPort: 18081,
+  };
+  const payload = { event: "deploy", environment: "staging", commit };
+  const artifact = { image: `local/app:${commit}`, imageDigest: digest };
+  const container = (name, image, revision) => ({
+    Name: `/${name}`,
+    Image: digest,
+    Config: {
+      Image: image,
+      User: "1000:1000",
+      Labels: {
+        "pigo.release.gateway": "1",
+        "pigo.release.environment": "staging",
+        "org.opencontainers.image.revision": revision,
+      },
+    },
+    HostConfig: {
+      Privileged: false,
+      ReadonlyRootfs: true,
+      CapDrop: ["ALL"],
+      SecurityOpt: ["no-new-privileges:true"],
+      NetworkMode: config.targetNetwork,
+      PidsLimit: 128,
+      Memory: 268435456,
+      NanoCpus: 1_000_000_000,
+      RestartPolicy: { Name: "unless-stopped", MaximumRetryCount: 0 },
+      Tmpfs: { "/tmp": "rw,nosuid,nodev,noexec,size=67108864" },
+      PidMode: "",
+      IpcMode: "private",
+      Binds: null,
+      Devices: [],
+      PortBindings: { "8080/tcp": [{ HostIp: "127.0.0.1", HostPort: "18080" }] },
+    },
+    Mounts: [],
+  });
+  const name = "pigo-release-order-status-staging";
+  const backup = `${name}-previous`;
+  let active = container(name, `local/app:${previousCommit}`, previousCommit);
+  let saved;
+  const calls = [];
+  const runCommand = async (_command, args) => {
+    calls.push(args);
+    if (args[0] === "network" && args[1] === "ls") return { stdout: config.targetNetwork, stderr: "" };
+    if (args[0] === "network" && args[1] === "inspect") return { stdout: JSON.stringify([{
+      Name: config.targetNetwork,
+      Driver: "bridge",
+      Internal: false,
+      Attachable: false,
+      Ingress: false,
+      Labels: { "pigo.release.gateway": "1" },
+      Options: { "com.docker.network.bridge.host_binding_ipv4": "127.0.0.1" },
+    }]), stderr: "" };
+    if (args[0] === "container" && args[1] === "ls") {
+      const requested = args[4].slice("name=^/".length, -1);
+      return { stdout: requested === name ? active ? name : "" : saved ? backup : "", stderr: "" };
+    }
+    if (args[0] === "container" && args[1] === "inspect") {
+      const value = args[2] === name ? active : saved;
+      return { stdout: JSON.stringify([value]), stderr: "" };
+    }
+    if (args[0] === "container" && args[1] === "rename" && args[2] === name) {
+      saved = { ...active, Name: `/${backup}` };
+      active = undefined;
+      return { stdout: "", stderr: "" };
+    }
+    if (args[0] === "container" && args[1] === "rename" && args[2] === backup) {
+      active = { ...saved, Name: `/${name}` };
+      saved = undefined;
+      return { stdout: "", stderr: "" };
+    }
+    if (args[0] === "container" && args[1] === "create") {
+      active = container(name, artifact.image, commit);
+      return { stdout: "candidate", stderr: "" };
+    }
+    if (args[0] === "container" && args[1] === "rm" && args.at(-1) === name) {
+      active = undefined;
+      return { stdout: "", stderr: "" };
+    }
+    if (args[0] === "container" && args[1] === "exec") throw new Error("fixed functional smoke check failed");
+    return { stdout: "", stderr: "" };
+  };
+
+  await assert.rejects(
+    () => deployManagedContainer(config, payload, artifact, { runCommand }),
+    /fixed functional smoke check failed/,
+  );
+  assert.equal(active.Config.Labels["org.opencontainers.image.revision"], previousCommit);
+  assert.equal(saved, undefined);
+  assert.equal(calls.some((args) => args[1] === "rename" && args[2] === name && args[3] === backup), true);
+  assert.equal(calls.some((args) => args[1] === "rename" && args[2] === backup && args[3] === name), true);
+  assert.equal(calls.some((args) => args[1] === "rm" && args.at(-1) === name), true);
 });
 
 test("release gateway HTTP surface exposes no generic Docker route", async () => {

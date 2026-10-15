@@ -298,7 +298,7 @@ for (const [input, expected] of cases) {
 }
 `;
 
-async function deployManagedContainer(config, payload, artifact, runtime) {
+export async function deployManagedContainer(config, payload, artifact, runtime) {
   const name = `pigo-release-order-status-${payload.environment}`;
   const backup = `${name}-previous`;
   const hostPort = payload.environment === "staging" ? config.stagingPort : config.productionPort;
