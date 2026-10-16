@@ -75,7 +75,11 @@ function composeFixture({ webWorkspaceTargets = [WORKSPACE_CONTAINER_ROOT], work
         group_add: [],
       },
       "demo-sandbox-gateway": {
-        environment: { PI_DOCKER_GATEWAY_TOKEN: "gateway-token", PI_DOCKER_SOCKET: "/var/run/docker.sock" },
+        environment: {
+          PI_DOCKER_GATEWAY_TOKEN: "gateway-token",
+          PI_DOCKER_SOCKET: "/var/run/docker.sock",
+          PI_DOCKER_REQUIRE_ROOTLESS: "0",
+        },
         volumes: [{ type: "bind", source: "/var/run/docker.sock", target: "/var/run/docker.sock" }],
         group_add: ["983"],
       },

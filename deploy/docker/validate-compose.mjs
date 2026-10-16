@@ -60,6 +60,9 @@ if (!gatewayVolumes.some((entry) => entry.includes("${PI_DOCKER_SOCKET:-/var/run
 }
 if (gatewayGroupAdd.length !== 1) problems.push(`sandbox-gateway group_add must hold exactly the docker gid, found ${JSON.stringify(gatewayGroupAdd)}`);
 if (!listItems(gateway, "networks").includes("sandbox-control")) problems.push("sandbox-gateway must join sandbox-control");
+if (!gateway.some((line) => line.includes("PI_DOCKER_REQUIRE_ROOTLESS: ${PI_DOCKER_REQUIRE_ROOTLESS:-1}"))) {
+  problems.push("sandbox-gateway must require rootless Docker by default");
+}
 if (!gateway.some((line) => line.trim() === "read_only: true")) problems.push("sandbox-gateway root filesystem must be read-only");
 if (!gateway.some((line) => line.trim() === "- no-new-privileges:true")) problems.push("sandbox-gateway must enable no-new-privileges");
 

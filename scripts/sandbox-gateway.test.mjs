@@ -110,9 +110,11 @@ test("config fails closed for missing secrets and invalid numeric limits", () =>
   assert.throws(() => loadGatewayConfig({ ...base, PI_DOCKER_GATEWAY_TOKEN: token, PI_SANDBOX_NETWORK: "host" }), /non-host/);
   assert.throws(() => loadGatewayConfig({ ...base, PI_DOCKER_GATEWAY_TOKEN: token, PI_HOST_WORKSPACE_ROOT: "/" }), /non-root/);
   assert.throws(() => loadGatewayConfig({ ...base, PI_DOCKER_GATEWAY_TOKEN: token, PI_SANDBOX_PLUGIN_ROOTS: "/" }), /non-root/);
-  assert.throws(() => loadGatewayConfig({ ...base, PI_DOCKER_GATEWAY_TOKEN: token, PI_DOCKER_REQUIRE_ROOTLESS: "true" }), /literal 1/);
-  assert.throws(() => loadGatewayConfig({ ...base, PI_DOCKER_GATEWAY_TOKEN: token, PI_SANDBOX_USER: "0:0" }), /requires PI_DOCKER_REQUIRE_ROOTLESS=1/);
+  assert.throws(() => loadGatewayConfig({ ...base, PI_DOCKER_GATEWAY_TOKEN: token, PI_DOCKER_REQUIRE_ROOTLESS: "true" }), /literal 0 or 1/);
+  assert.throws(() => loadGatewayConfig({ ...base, PI_DOCKER_GATEWAY_TOKEN: token, PI_DOCKER_REQUIRE_ROOTLESS: "0", PI_SANDBOX_USER: "0:0" }), /requires PI_DOCKER_REQUIRE_ROOTLESS=1/);
   assert.throws(() => loadGatewayConfig({ ...base, PI_DOCKER_GATEWAY_TOKEN: token, PI_DOCKER_SOCKET: "tcp://docker:2375" }), /absolute .sock/);
+  assert.equal(loadGatewayConfig({ ...base, PI_DOCKER_GATEWAY_TOKEN: token }).requireRootless, true);
+  assert.equal(loadGatewayConfig({ ...base, PI_DOCKER_GATEWAY_TOKEN: token, PI_DOCKER_REQUIRE_ROOTLESS: "0" }).requireRootless, false);
   const rootless = loadGatewayConfig({
     ...base,
     PI_DOCKER_GATEWAY_TOKEN: token,

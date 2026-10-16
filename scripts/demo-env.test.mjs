@@ -281,7 +281,7 @@ function demoConfig(overrides = {}) {
         environment: {
           PI_DOCKER_GATEWAY_TOKEN: "gateway-token",
           PI_DOCKER_SOCKET: "/var/run/docker.sock",
-          PI_DOCKER_REQUIRE_ROOTLESS: "",
+          PI_DOCKER_REQUIRE_ROOTLESS: "0",
           PI_SANDBOX_USER: "node",
         },
         volumes: [
@@ -322,7 +322,7 @@ test("checkDemoCompose: accepts a dedicated rootless Docker socket", () => {
 
 test("checkDemoCompose: refuses sandbox user drift and unverified root identity", () => {
   const config = withServiceOverride("demo-sandbox-gateway", {
-    environment: { PI_SANDBOX_USER: "0:0", PI_DOCKER_REQUIRE_ROOTLESS: "" },
+    environment: { PI_SANDBOX_USER: "0:0", PI_DOCKER_REQUIRE_ROOTLESS: "0" },
   });
   const { ok, problems } = checkDemoCompose(config);
   assert.equal(ok, false);

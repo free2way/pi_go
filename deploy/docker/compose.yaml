@@ -210,9 +210,9 @@ services:
       PORT: 3210
       PI_DOCKER_GATEWAY_TOKEN: ${PI_DOCKER_GATEWAY_TOKEN:?Set PI_DOCKER_GATEWAY_TOKEN in the deployment environment}
       PI_DOCKER_SOCKET: ${PI_DOCKER_SOCKET:-/var/run/docker.sock}
-      # Set to 1 for a dedicated rootless daemon. Gateway startup verifies the
-      # daemon's SecurityOptions and exits instead of trusting the socket path.
-      PI_DOCKER_REQUIRE_ROOTLESS: ${PI_DOCKER_REQUIRE_ROOTLESS:-}
+      # Rootless verification is fail-closed by default. Local compatibility
+      # may opt out explicitly with 0; production must keep this at 1.
+      PI_DOCKER_REQUIRE_ROOTLESS: ${PI_DOCKER_REQUIRE_ROOTLESS:-1}
       PI_DOCKER_API_VERSION: ${PI_DOCKER_API_VERSION:-v1.43}
       PI_SANDBOX_IMAGE: ${PI_SANDBOX_IMAGE:-local/pigo-sandbox:0.1.0}
       PI_SANDBOX_USER: ${PI_SANDBOX_USER:-node}

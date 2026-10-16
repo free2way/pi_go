@@ -651,8 +651,8 @@ export function checkDemoCompose(config, options = {}) {
       problems.push(`${gatewayName}.PI_SANDBOX_USER must match ${workerName}.PI_SANDBOX_USER`);
     }
     const requireRootless = String(gateway.env.PI_DOCKER_REQUIRE_ROOTLESS ?? "");
-    if (requireRootless !== "" && requireRootless !== "1") {
-      problems.push(`${gatewayName}.PI_DOCKER_REQUIRE_ROOTLESS must be empty or 1`);
+    if (requireRootless !== "0" && requireRootless !== "1") {
+      problems.push(`${gatewayName}.PI_DOCKER_REQUIRE_ROOTLESS must be 0 or 1`);
     }
     if (["root", "0", "0:0"].includes(gatewayUser) && requireRootless !== "1") {
       problems.push(`${gatewayName} root sandbox identity requires PI_DOCKER_REQUIRE_ROOTLESS=1`);

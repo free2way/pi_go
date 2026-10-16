@@ -45,12 +45,14 @@ test("release gateway accepts only fixed high-level deployment fields", () => {
 test("release gateway configuration fails closed", () => {
   const valid = { PIGO_RELEASE_GATEWAY_TOKEN: token };
   assert.equal(loadReleaseGatewayConfig(valid).port, 3310);
+  assert.equal(loadReleaseGatewayConfig(valid).requireRootless, true);
   assert.throws(() => loadReleaseGatewayConfig({ ...valid, PIGO_RELEASE_GATEWAY_TOKEN: "short" }), /between 32 and 4096/);
   assert.throws(() => loadReleaseGatewayConfig({ ...valid, PIGO_EXECUTOR_WORKSPACE_ROOT: "/" }), /non-root/);
   assert.throws(() => loadReleaseGatewayConfig({ ...valid, PIGO_EXECUTOR_APP_PATH: "../outside" }), /safe relative/);
   assert.throws(() => loadReleaseGatewayConfig({ ...valid, PIGO_EXECUTOR_TARGET_NETWORK: "host" }), /invalid/);
-  assert.throws(() => loadReleaseGatewayConfig({ ...valid, PIGO_RELEASE_REQUIRE_ROOTLESS: "true" }), /literal 1/);
+  assert.throws(() => loadReleaseGatewayConfig({ ...valid, PIGO_RELEASE_REQUIRE_ROOTLESS: "true" }), /literal 0 or 1/);
   assert.equal(loadReleaseGatewayConfig({ ...valid, PIGO_RELEASE_REQUIRE_ROOTLESS: "1" }).requireRootless, true);
+  assert.equal(loadReleaseGatewayConfig({ ...valid, PIGO_RELEASE_REQUIRE_ROOTLESS: "0" }).requireRootless, false);
 });
 
 test("release gateway verifies a required rootless execution daemon before listening", async () => {
@@ -339,7 +341,7 @@ test("compose keeps Docker socket only on the internal release gateway", async (
   assert.doesNotMatch(executor, /docker\.sock|DOCKER_GID|group_add/);
   assert.match(executor, /release-control/);
   assert.match(gateway, /\$\{PIGO_RELEASE_DOCKER_SOCKET:-\/var\/run\/docker\.sock\}:\/var\/run\/docker\.sock/);
-  assert.match(gateway, /PIGO_RELEASE_REQUIRE_ROOTLESS/);
+  assert.match(gateway, /PIGO_RELEASE_REQUIRE_ROOTLESS: \$\{PIGO_RELEASE_REQUIRE_ROOTLESS:-1\}/);
   assert.match(gateway, /release-control/);
   assert.doesNotMatch(gateway, /^\s+- release-targets$/mu);
   assert.doesNotMatch(gateway, /ports:/);

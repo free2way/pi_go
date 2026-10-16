@@ -28,9 +28,10 @@ function secret(value, name) {
 }
 
 function strictFlag(value, name) {
-  if (value === undefined || value === "") return false;
+  if (value === undefined || value === "") return true;
   if (value === "1") return true;
-  throw new Error(`${name} must be the literal 1 or empty`);
+  if (value === "0") return false;
+  throw new Error(`${name} must be the literal 0 or 1`);
 }
 
 function safeEqual(left, right) {
