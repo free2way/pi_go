@@ -190,6 +190,14 @@ test("restart recovery accepts only a constrained PiGO sandbox inspection", asyn
     },
   };
   assert.equal(isManagedSandboxInspection(inspection, policy), true);
+  const privateIpc = structuredClone(inspection);
+  privateIpc.HostConfig.IpcMode = "private";
+  assert.equal(isManagedSandboxInspection(privateIpc, policy), true);
+  for (const mode of ["host", "container:other", "shareable", "unknown", undefined, null]) {
+    const unsafeIpc = structuredClone(inspection);
+    unsafeIpc.HostConfig.IpcMode = mode;
+    assert.equal(isManagedSandboxInspection(unsafeIpc, policy), false, `IPC ${mode}`);
+  }
   for (const mutate of [
     (value) => { value.Name = "/database"; },
     (value) => { value.Config.Image = "other"; },

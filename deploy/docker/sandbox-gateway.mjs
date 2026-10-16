@@ -264,7 +264,9 @@ export function isManagedSandboxInspection(value, policy) {
     && value.HostConfig.SecurityOpt.includes("no-new-privileges:true")
     && ["none", policy.network].includes(value.HostConfig?.NetworkMode)
     && !value.HostConfig?.PidMode
-    && !value.HostConfig?.IpcMode
+    // Docker normalizes an omitted IPC mode to "private" on current engines.
+    // Recovery must accept that isolated namespace, never host/container IPC.
+    && ["", "private"].includes(value.HostConfig?.IpcMode)
     && !value.HostConfig?.Devices?.length
   );
 }
