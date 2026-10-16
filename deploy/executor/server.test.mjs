@@ -15,7 +15,6 @@ import {
   pathWithin,
   postCallback,
   postProgress,
-  prepareSmokeUrl,
   runDeploy,
   runReleaseRegistration,
   validatePayload,
@@ -153,47 +152,6 @@ test("configuration fails closed for missing origin, weak token and invalid port
   assert.throws(() => loadConfig({ ...valid, PORT: "70000" }), /integer TCP port/);
   assert.throws(() => loadConfig({ ...valid, PIGO_EXECUTOR_TARGET_NETWORK: "unsafe/network" }), /TARGET_NETWORK is invalid/);
   assert.throws(() => loadConfig({ ...valid, PIGO_EXECUTOR_STAGING_PUBLIC_URL: "http://host.docker.internal:18080" }), /user's browser/);
-});
-
-test("host-gateway smoke URL resolves through the dedicated target network", async () => {
-  const calls = [];
-  let inspections = 0;
-  const run = async (file, args) => {
-    calls.push([file, ...args]);
-    if (args[0] === "ps") return { stdout: "0123456789ab", stderr: "" };
-    if (args[0] === "network") return { stdout: "", stderr: "" };
-    inspections += 1;
-    return {
-      stdout: JSON.stringify([{
-        NetworkSettings: {
-          Ports: { "8080/tcp": [{ HostIp: "127.0.0.1", HostPort: "18080" }] },
-          Networks: inspections === 1 ? {} : { "pigo-release-targets": { IPAddress: "203.0.113.4" } },
-        },
-      }]),
-      stderr: "",
-    };
-  };
-  const url = await prepareSmokeUrl({
-    stagingUrl: "http://host.docker.internal:18080",
-    productionUrl: "http://host.docker.internal:18081",
-    stagingPort: 18080,
-    productionPort: 18081,
-    targetNetwork: "pigo-release-targets",
-  }, "staging", run);
-  assert.equal(url, "http://203.0.113.4:8080");
-  assert.deepEqual(calls[2], ["docker", "network", "connect", "pigo-release-targets", "0123456789ab"]);
-});
-
-test("non-host smoke URL passes through without Docker network mutation", async () => {
-  let called = false;
-  const url = await prepareSmokeUrl({
-    stagingUrl: "https://staging.example.com",
-    productionUrl: "https://example.com",
-    stagingPort: 18080,
-    productionPort: 18081,
-  }, "staging", async () => { called = true; });
-  assert.equal(url, "https://staging.example.com");
-  assert.equal(called, false);
 });
 
 test("run deployment delegates the fixed reviewed target to the isolated release gateway", async (t) => {
@@ -347,15 +305,6 @@ test("rollback callbacks carry the previous and restored digests", async () => {
   assert.equal(body.imageDigest, digest);
   assert.equal(body.rolledBackFromCommit, "b".repeat(40));
   assert.equal(body.rolledBackFromDigest, `sha256:${"e".repeat(64)}`);
-});
-
-test("host-gateway smoke resolution fails closed when the published port is ambiguous", async () => {
-  await assert.rejects(() => prepareSmokeUrl({
-    stagingUrl: "http://host.docker.internal:18080",
-    productionUrl: "http://host.docker.internal:18081",
-    stagingPort: 18080,
-    productionPort: 18081,
-  }, "staging", async () => ({ stdout: "0123456789ab\nabcdefabcdef", stderr: "" })), /exactly one/);
 });
 
 test("state recovery fails interrupted work and promotion lookup is repository/commit exact", async () => {

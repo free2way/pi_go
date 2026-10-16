@@ -310,77 +310,6 @@ export function executorEnvironment(config, environment) {
   };
 }
 
-function parseDockerInspect(stdout, containerId) {
-  let parsed;
-  try {
-    parsed = JSON.parse(stdout);
-  } catch {
-    throw new Error(`Docker returned invalid inspect data for ${containerId}`);
-  }
-  if (!Array.isArray(parsed) || parsed.length !== 1 || !parsed[0]?.NetworkSettings) {
-    throw new Error(`Docker returned incomplete inspect data for ${containerId}`);
-  }
-  return parsed[0];
-}
-
-/**
- * Resolve a host-gateway URL to the one container that owns the configured
- * published port. The published port intentionally remains loopback-only on
- * the host; smoke traffic instead crosses a dedicated internal Docker network.
- */
-export async function prepareSmokeUrl(config, environment, runCommand = command) {
-  const configuredUrl = environment === "staging" ? config.stagingUrl : config.productionUrl;
-  const configuredPort = environment === "staging" ? config.stagingPort : config.productionPort;
-  const target = new URL(configuredUrl);
-  if (target.hostname !== "host.docker.internal") return configuredUrl;
-  if (target.protocol !== "http:") throw new Error("host.docker.internal smoke URL must use HTTP");
-  const publishedPort = Number(target.port || 80);
-  if (publishedPort !== configuredPort) {
-    throw new Error(`smoke URL port ${publishedPort} does not match the configured deploy port ${configuredPort}`);
-  }
-
-  const dockerEnv = executorEnvironment(config, environment);
-  const listed = await runCommand("docker", [
-    "ps", "--filter", "status=running", "--filter", `publish=${publishedPort}`, "--format", "{{.ID}}",
-  ], { timeout: 30_000, env: dockerEnv });
-  const containerIds = listed.stdout.split(/\s+/).filter(Boolean);
-  if (containerIds.length !== 1 || !/^[0-9a-f]{12,64}$/i.test(containerIds[0])) {
-    throw new Error(`expected exactly one running container publishing TCP port ${publishedPort}; found ${containerIds.length}`);
-  }
-  const containerId = containerIds[0];
-  const inspect = async () => parseDockerInspect((await runCommand(
-    "docker", ["inspect", containerId], { timeout: 30_000, env: dockerEnv },
-  )).stdout, containerId);
-  let container = await inspect();
-  const matchingPorts = Object.entries(container.NetworkSettings.Ports ?? {})
-    .filter(([key, bindings]) => key.endsWith("/tcp") && Array.isArray(bindings)
-      && bindings.some((binding) => Number(binding?.HostPort) === publishedPort))
-    .map(([key]) => Number(key.split("/")[0]))
-    .filter((port) => Number.isInteger(port) && port > 0 && port <= 65_535);
-  if (matchingPorts.length !== 1) {
-    throw new Error(`could not resolve one container TCP port for published port ${publishedPort}`);
-  }
-
-  const targetNetwork = config.targetNetwork || "pigo-release-targets";
-  if (!container.NetworkSettings.Networks?.[targetNetwork]) {
-    await runCommand("docker", ["network", "connect", targetNetwork, containerId], { timeout: 30_000, env: dockerEnv });
-    container = await inspect();
-  }
-  const address = container.NetworkSettings.Networks?.[targetNetwork]?.IPAddress;
-  if (typeof address !== "string" || !/^\d{1,3}(?:\.\d{1,3}){3}$/.test(address)) {
-    throw new Error(`container did not receive an IPv4 address on ${targetNetwork}`);
-  }
-  return `http://${address}:${matchingPorts[0]}${target.pathname === "/" ? "" : target.pathname}${target.search}`;
-}
-
-export async function imageDigest(image) {
-  const result = await command("docker", ["image", "inspect", image, "--format", "{{.Id}}"], { timeout: 30_000, env: executorEnvironment({
-    stagingUrl: "", productionUrl: "", stagingPort: 0, productionPort: 0,
-  }, "staging") });
-  if (!result.stdout.startsWith("sha256:")) throw new Error("deployed image digest is unavailable");
-  return result.stdout;
-}
-
 export async function resolveApplicationTarget(config, payload, options = {}) {
   const workspaceRoot = await realpath(config.workspaceRoot);
   const requestedRepository = path.isAbsolute(payload.repository)
@@ -402,22 +331,6 @@ export async function resolveApplicationTarget(config, payload, options = {}) {
   const appDirectory = await realpath(path.join(repository, config.appPath));
   if (!pathWithin(repository, appDirectory)) throw new Error("application path escapes the repository");
   return { repository, appDirectory };
-}
-
-export async function resolveRunTarget(config, payload, options = {}) {
-  const target = await resolveApplicationTarget(config, payload, options);
-  const { appDirectory } = target;
-  const opsDirectory = await realpath(path.join(appDirectory, "ops"));
-  if (!pathWithin(appDirectory, opsDirectory)) throw new Error("ops path escapes the application directory");
-  const deployScript = await realpath(path.join(opsDirectory, "deploy.sh"));
-  const smokeScript = await realpath(path.join(opsDirectory, "smoke.sh"));
-  if (!pathWithin(opsDirectory, deployScript) || !pathWithin(opsDirectory, smokeScript)) {
-    throw new Error("deployment script escapes the fixed ops directory");
-  }
-  const [deployStats, smokeStats] = await Promise.all([stat(deployScript), stat(smokeScript)]);
-  if (!deployStats.isFile() || (deployStats.mode & 0o111) === 0) throw new Error("ops/deploy.sh is not executable");
-  if (!smokeStats.isFile() || (smokeStats.mode & 0o111) === 0) throw new Error("ops/smoke.sh is not executable");
-  return { ...target, deployScript, smokeScript };
 }
 
 async function releaseGatewayRequest(config, body) {

@@ -357,3 +357,21 @@ test("automated release gateway never executes repository ops scripts or Compose
   assert.match(source, /"--security-opt", "no-new-privileges:true"/);
   assert.match(source, /"--read-only"/);
 });
+
+test("outer executor contains no direct Docker command path", async () => {
+  const directory = path.dirname(fileURLToPath(import.meta.url));
+  const executor = await readFile(path.join(directory, "server.mjs"), "utf8");
+  assert.doesNotMatch(executor, /(?:command|runCommand)\("docker"/);
+});
+
+test("outer executor contains no Docker inspection or network mutation path", async () => {
+  const directory = path.dirname(fileURLToPath(import.meta.url));
+  const executor = await readFile(path.join(directory, "server.mjs"), "utf8");
+  assert.doesNotMatch(executor, /NetworkSettings|docker\.sock|"network", "connect"/);
+});
+
+test("outer executor contains no repository deployment script path", async () => {
+  const directory = path.dirname(fileURLToPath(import.meta.url));
+  const executor = await readFile(path.join(directory, "server.mjs"), "utf8");
+  assert.doesNotMatch(executor, /deployScript|smokeScript|ops\/deploy\.sh|ops\/smoke\.sh/);
+});
