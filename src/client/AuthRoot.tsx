@@ -1,5 +1,5 @@
 import { lazy, Suspense, useEffect, useState } from "react";
-import { App } from "./App";
+import { AppLoader } from "./AppLoader";
 import { AuthConfigurationError, AuthLoadingScreen } from "./AuthScreens";
 import { useT } from "./i18n";
 
@@ -40,7 +40,7 @@ export function AuthRoot() {
     return <AuthConfigurationError message={message} />;
   }
   if (!config) return <AuthLoadingScreen />;
-  if (config.mode !== "clerk") return <App />;
+  if (config.mode !== "clerk") return <AppLoader />;
 
   return (
     <Suspense fallback={<AuthLoadingScreen />}>

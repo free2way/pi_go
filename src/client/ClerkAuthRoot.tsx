@@ -2,7 +2,7 @@ import { ClerkFailed, ClerkLoaded, ClerkLoading, ClerkProvider, SignIn, SignUp, 
 import { enUS, zhCN } from "@clerk/localizations";
 import { useEffect, useState } from "react";
 import { Bot, ShieldCheck } from "lucide-react";
-import { App } from "./App";
+import { AppLoader } from "./AppLoader";
 import { setAuthTokenProvider } from "./api";
 import { AuthConfigurationError, AuthLoadingScreen } from "./AuthScreens";
 import { useT } from "./i18n";
@@ -85,7 +85,7 @@ function ClerkSessionGate() {
   if (!isLoaded) return <AuthLoadingScreen />;
   if (!isSignedIn) return <SignInPortal />;
   if (!apiReady) return <AuthLoadingScreen label={t("auth.establishingSession")} />;
-  return <App onSignOut={() => void clerk.signOut({ redirectUrl: "/" })} />;
+  return <AppLoader onSignOut={() => void clerk.signOut({ redirectUrl: "/" })} />;
 }
 
 export function ClerkAuthRoot({ config }: { config: { publishableKey: string; proxyUrl: string } }) {
