@@ -105,6 +105,12 @@ jobs:
           PI_DATABASE_URL: postgresql://pigo_ci:ci-local-only@127.0.0.1:5432/pigo_ci
         run: npm run test:pg:concurrency
 
+      - name: Exercise isolated backup restore safety
+        env:
+          PI_RESTORE_DRILL_CONTAINER: ${{ job.services.postgres.id }}
+          PI_RESTORE_DRILL_PG_USER: pigo_ci
+        run: node scripts/restore-drill.mjs
+
   browser-smoke:
     name: Browser smoke evidence
     runs-on: ubuntu-24.04
