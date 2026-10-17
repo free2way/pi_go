@@ -34,8 +34,11 @@ test("Pi is current, uses pinned pnpm, and final images do not retain npm", () =
 
 test("OCI vulnerability scanning remains fail closed for unfixed findings", () => {
   const workflow = read(".github/workflows/oci-supply-chain.yml");
-  assert.equal((workflow.match(/severity-cutoff: high/gu) ?? []).length, 5);
-  assert.equal((workflow.match(/only-fixed: false/gu) ?? []).length, 5);
+  assert.equal((workflow.match(/severity-cutoff: high/gu) ?? []).length, 10);
+  assert.equal((workflow.match(/only-fixed: false/gu) ?? []).length, 10);
+  assert.match(workflow, /name: Enforce candidate vulnerability gate/u);
+  assert.match(workflow, /steps\.validate_scan_runtime\.outcome != 'success'/u);
+  assert.match(workflow, /name: oci-validation-vulnerability-\$\{\{ github\.sha \}\}/u);
   assert.match(workflow, /name: Enforce vulnerability gate/u);
   assert.match(workflow, /steps\.scan_runtime\.outcome != 'success'/u);
 });
