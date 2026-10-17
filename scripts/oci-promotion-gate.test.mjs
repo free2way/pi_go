@@ -224,3 +224,62 @@ test("production rejects missing or wrong staging attestation identity", async (
     fetchImpl: async () => jsonResponse({ status: "ok", authMode: "cloudflare" }),
   }), /runtime image is missing trusted/);
 });
+
+test("advisory attestation mode records warnings without weakening immutable promotion gates", async () => {
+  const bundle = fixture();
+  const stagingEvidence = await recordPromotionEvidence({
+    environment: "staging",
+    bundle,
+    inspectRuntime: dockerFixture(bundle),
+    healthUrl: "https://staging.example.com/api/health",
+    expectedAuthMode: "cloudflare",
+    expectedAttestationPolicy: POLICY,
+    attestationMode: "advisory",
+    verifyAttestations: async () => { throw new Error("verification tool is unavailable"); },
+    fetchImpl: async () => jsonResponse({ status: "ok", authMode: "cloudflare" }),
+  });
+
+  assert.deepEqual(stagingEvidence.attestation, { mode: "advisory", status: "warning" });
+  assert.equal(stagingEvidence.attestations.runtime.verified, false);
+  assert.equal(stagingEvidence.attestations.runtime.status, "warning");
+  assert.match(stagingEvidence.attestations.runtime.warning, /verification tool is unavailable/);
+  assert.throws(() => authorizeProduction(bundle, stagingEvidence, POLICY), /missing trusted/);
+  assert.equal(authorizeProduction(bundle, stagingEvidence, POLICY, "advisory"), bundle.deploymentEnvText);
+
+  assert.throws(() => authorizeProduction(bundle, {
+    ...stagingEvidence,
+    attestations: {
+      ...stagingEvidence.attestations,
+      web: { ...stagingEvidence.attestations.web, reference: `ghcr.io/acme/pigo-web@sha256:${"9".repeat(64)}` },
+    },
+  }, POLICY, "advisory"), /web image is missing trusted/);
+
+  const productionEvidence = await recordPromotionEvidence({
+    environment: "production",
+    bundle,
+    stagingEvidence,
+    inspectRuntime: dockerFixture(bundle),
+    healthUrl: "https://production.example.com/api/health",
+    expectedAuthMode: "cloudflare",
+    expectedAttestationPolicy: POLICY,
+    attestationMode: "advisory",
+    verifyAttestations: async () => ({}),
+    fetchImpl: async () => jsonResponse({ status: "ok", authMode: "cloudflare" }),
+  });
+  assert.equal(productionEvidence.status, "succeeded");
+  assert.deepEqual(productionEvidence.attestation, { mode: "advisory", status: "warning" });
+});
+
+test("rejects unknown attestation modes", async () => {
+  const bundle = fixture();
+  await assert.rejects(() => recordPromotionEvidence({
+    environment: "staging",
+    bundle,
+    inspectRuntime: dockerFixture(bundle),
+    healthUrl: "https://staging.example.com/api/health",
+    expectedAuthMode: "cloudflare",
+    expectedAttestationPolicy: POLICY,
+    attestationMode: "disabled",
+    fetchImpl: async () => jsonResponse({ status: "ok", authMode: "cloudflare" }),
+  }), /attestation mode must be enforce or advisory/);
+});

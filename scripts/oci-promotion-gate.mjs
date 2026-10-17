@@ -8,6 +8,7 @@ import { parseArgs } from "./oci-manifest.mjs";
 import { renderDeploymentEnv, validateDeploymentManifest } from "./oci-deployment-env.mjs";
 
 const AUTH_MODES = new Set(["development", "cloudflare", "clerk"]);
+const ATTESTATION_MODES = new Set(["enforce", "advisory"]);
 
 function sha256(text) {
   return createHash("sha256").update(text).digest("hex");
@@ -17,6 +18,12 @@ function required(value, label) {
   const text = String(value ?? "").trim();
   if (!text) throw new Error(`${label} is required`);
   return text;
+}
+
+function normalizeAttestationMode(value = "enforce") {
+  const mode = String(value ?? "enforce").trim().toLowerCase();
+  if (!ATTESTATION_MODES.has(mode)) throw new Error("attestation mode must be enforce or advisory");
+  return mode;
 }
 
 export function validatePromotionBundle({ manifestText, deploymentEnvText, expectedCommit }) {
@@ -47,17 +54,38 @@ function attestationPolicy({ repository, signerWorkflow }) {
   return { repository: normalizedRepository, signerWorkflow: normalizedWorkflow };
 }
 
-export function validateAttestationEvidence(bundle, evidence, expectedPolicy) {
+export function validateAttestationEvidence(bundle, evidence, expectedPolicy, modeValue = "enforce") {
   const policy = attestationPolicy(expectedPolicy);
+  const mode = normalizeAttestationMode(modeValue);
   for (const [component, image] of Object.entries(bundle.images)) {
     const item = evidence?.[component];
-    if (!item || item.verified !== true || item.reference !== image.reference
+    if (!item || item.reference !== image.reference
       || item.repository !== policy.repository || item.signerWorkflow !== policy.signerWorkflow
       || item.sourceDigest !== bundle.commit) {
       throw new Error(`${component} image is missing trusted build attestation evidence`);
     }
+    if (mode === "enforce" && item.verified !== true) {
+      throw new Error(`${component} image is missing trusted build attestation evidence`);
+    }
+    if (mode === "advisory" && item.verified !== true
+      && (item.status !== "warning" || typeof item.warning !== "string" || !item.warning)) {
+      throw new Error(`${component} image is missing auditable attestation warning evidence`);
+    }
   }
   return evidence;
+}
+
+function advisoryAttestationEvidence(bundle, policy, error) {
+  const warning = error instanceof Error ? error.message : "attestation verification was unavailable";
+  return Object.fromEntries(Object.entries(bundle.images).map(([component, image]) => [component, {
+    verified: false,
+    status: "warning",
+    warning,
+    reference: image.reference,
+    repository: policy.repository,
+    signerWorkflow: policy.signerWorkflow,
+    sourceDigest: bundle.commit,
+  }]));
 }
 
 export function verifyGitHubAttestations(bundle, expectedPolicy, execute = (args) => execFileSync("gh", args, {
@@ -94,7 +122,8 @@ export function verifyGitHubAttestations(bundle, expectedPolicy, execute = (args
   return validateAttestationEvidence(bundle, evidence, policy);
 }
 
-export function authorizeProduction(bundle, stagingEvidence, expectedAttestationPolicy) {
+export function authorizeProduction(bundle, stagingEvidence, expectedAttestationPolicy, attestationMode = "enforce") {
+  const mode = normalizeAttestationMode(attestationMode);
   if (!stagingEvidence || stagingEvidence.schemaVersion !== 3 || stagingEvidence.environment !== "staging" || stagingEvidence.status !== "succeeded") {
     throw new Error("production requires successful staging evidence");
   }
@@ -107,7 +136,7 @@ export function authorizeProduction(bundle, stagingEvidence, expectedAttestation
     }
   }
   validateRuntimeEvidence(bundle, stagingEvidence.runtime);
-  validateAttestationEvidence(bundle, stagingEvidence.attestations, expectedAttestationPolicy);
+  validateAttestationEvidence(bundle, stagingEvidence.attestations, expectedAttestationPolicy, mode);
   return bundle.deploymentEnvText;
 }
 
@@ -171,6 +200,7 @@ export async function recordPromotionEvidence({
   healthUrl,
   expectedAuthMode,
   expectedAttestationPolicy,
+  attestationMode = "enforce",
   stagingEvidence,
   containers,
   inspectRuntime = inspectDockerRuntime,
@@ -182,7 +212,8 @@ export async function recordPromotionEvidence({
   if (!AUTH_MODES.has(expectedAuthMode)) throw new Error("expected auth mode is invalid");
   if (environment === "production" && expectedAuthMode === "development") throw new Error("production cannot use development authentication");
   const policy = attestationPolicy(expectedAttestationPolicy);
-  if (environment === "production") authorizeProduction(bundle, stagingEvidence, policy);
+  const normalizedAttestationMode = normalizeAttestationMode(attestationMode);
+  if (environment === "production") authorizeProduction(bundle, stagingEvidence, policy, normalizedAttestationMode);
 
   let health;
   try {
@@ -202,7 +233,20 @@ export async function recordPromotionEvidence({
     }
   }
 
-  const attestations = validateAttestationEvidence(bundle, await verifyAttestations(bundle, policy), policy);
+  let attestations;
+  let attestationStatus = "verified";
+  try {
+    attestations = validateAttestationEvidence(bundle, await verifyAttestations(bundle, policy), policy);
+  } catch (error) {
+    if (normalizedAttestationMode === "enforce") throw error;
+    attestationStatus = "warning";
+    attestations = validateAttestationEvidence(
+      bundle,
+      advisoryAttestationEvidence(bundle, policy, error),
+      policy,
+      normalizedAttestationMode,
+    );
+  }
   const runtime = validateRuntimeEvidence(bundle, await inspectRuntime(bundle, containers));
   return {
     schemaVersion: 3,
@@ -211,6 +255,7 @@ export async function recordPromotionEvidence({
     commit: bundle.commit,
     manifestSha256: bundle.manifestSha256,
     images: Object.fromEntries(Object.entries(bundle.images).map(([component, image]) => [component, image.reference])),
+    attestation: { mode: normalizedAttestationMode, status: attestationStatus },
     attestations,
     runtime,
     health: { status: "ok", authMode: expectedAuthMode, checkedAt: now().toISOString() },
@@ -243,9 +288,13 @@ async function main() {
     repository: options["attestation-repository"],
     signerWorkflow: options["attestation-signer-workflow"],
   };
+  const attestationMode = normalizeAttestationMode(options["attestation-mode"]);
 
   if (command === "authorize") {
-    const output = writeExclusive(options.output, authorizeProduction(bundle, stagingEvidence, expectedAttestationPolicy));
+    const output = writeExclusive(options.output, authorizeProduction(bundle, stagingEvidence, expectedAttestationPolicy, attestationMode));
+    if (attestationMode === "advisory" && Object.values(stagingEvidence?.attestations ?? {}).some((item) => item?.verified !== true)) {
+      console.warn(`[oci-promotion] WARNING: production authorized with advisory attestation evidence for ${bundle.commit}`);
+    }
     console.log(`[oci-promotion] production authorized for ${bundle.commit}; wrote ${output}`);
     return;
   }
@@ -255,11 +304,15 @@ async function main() {
     healthUrl: options["health-url"],
     expectedAuthMode: required(options["expected-auth-mode"], "expected-auth-mode"),
     expectedAttestationPolicy,
+    attestationMode,
     stagingEvidence,
     containers: JSON.parse(readFileSync(resolve(required(options.containers, "containers (JSON file mapping runtime/web/worker/executor to container names)")), "utf8")),
   });
   const output = writeExclusive(options.output, `${JSON.stringify(evidence, null, 2)}\n`);
-  console.log(`[oci-promotion] recorded verified ${evidence.environment} evidence for ${bundle.commit} at ${output}`);
+  if (evidence.attestation.status === "warning") {
+    console.warn(`[oci-promotion] WARNING: recorded ${evidence.environment} evidence with advisory attestation status for ${bundle.commit}`);
+  }
+  console.log(`[oci-promotion] recorded ${evidence.environment} evidence for ${bundle.commit} at ${output}`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
