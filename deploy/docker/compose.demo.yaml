@@ -126,6 +126,8 @@ services:
       # `cmd:sh -c 'cat > /app/data/last-release.json'` to make the release step
       # auditable without touching anything outside the demo volume.
       PI_POST_MERGE_DEPLOY_HOOK: ${PI_POST_MERGE_DEPLOY_HOOK:-}
+      PI_POST_MERGE_DEPLOY_TOKEN: ${PI_POST_MERGE_DEPLOY_TOKEN:-}
+      PI_RELEASE_CALLBACK_ORIGIN: ${PI_RELEASE_CALLBACK_ORIGIN:-}
       # Decision plane / Jev (docs/26). Opt-in and empty by default, so the demo
       # stack behaves exactly as before unless deploy/docker/demo.env sets these.
       # TYPESAFE_API_KEY is a secret: it is never given a value here and must come

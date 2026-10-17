@@ -143,6 +143,8 @@ test("configuration fails closed for missing origin, weak token and invalid port
   assert.equal(loadConfig(valid).port, 3300);
   assert.equal(loadConfig(valid).targetNetwork, "pigo-release-targets");
   assert.equal(loadConfig(valid).releaseGatewayUrl, "http://release-gateway:3310");
+  assert.deepEqual([...loadConfig(valid).allowedEnvironments], ["staging", "production"]);
+  assert.deepEqual([...loadConfig({ ...valid, PIGO_EXECUTOR_ALLOWED_ENVIRONMENTS: "staging" }).allowedEnvironments], ["staging"]);
   assert.equal(loadConfig(valid).stagingPublicUrl, "");
   assert.equal(loadConfig({ ...valid, PIGO_EXECUTOR_STAGING_PUBLIC_URL: "https://staging.example.com/app" }).stagingPublicUrl, "https://staging.example.com/app");
   assert.throws(() => loadConfig({ ...valid, PIGO_EXECUTOR_CALLBACK_ORIGIN: "" }), /CALLBACK_ORIGIN is required/);
@@ -151,6 +153,8 @@ test("configuration fails closed for missing origin, weak token and invalid port
   assert.throws(() => loadConfig({ ...valid, PIGO_RELEASE_GATEWAY_URL: "https://release-gateway.example" }), /HTTP origin/);
   assert.throws(() => loadConfig({ ...valid, PORT: "70000" }), /integer TCP port/);
   assert.throws(() => loadConfig({ ...valid, PIGO_EXECUTOR_TARGET_NETWORK: "unsafe/network" }), /TARGET_NETWORK is invalid/);
+  assert.throws(() => loadConfig({ ...valid, PIGO_EXECUTOR_ALLOWED_ENVIRONMENTS: "staging,qa" }), /ALLOWED_ENVIRONMENTS/);
+  assert.throws(() => loadConfig({ ...valid, PIGO_EXECUTOR_ALLOWED_ENVIRONMENTS: "," }), /ALLOWED_ENVIRONMENTS/);
   assert.throws(() => loadConfig({ ...valid, PIGO_EXECUTOR_STAGING_PUBLIC_URL: "http://host.docker.internal:18080" }), /user's browser/);
 });
 
@@ -497,6 +501,7 @@ test("HTTP delivery is signed, asynchronous and idempotent", async () => {
       dataFile: path.join(directory, "executions.json"),
       callbackPublicOrigin: "https://pigo.example.com",
       callbackInternalOrigin: "http://127.0.0.1:3100",
+      allowedEnvironments: new Set(["staging"]),
       imageRepository: "local/order-status-app",
       stagingUrl: "http://127.0.0.1:18080",
       productionUrl: "http://127.0.0.1:18081",
@@ -544,6 +549,13 @@ test("HTTP delivery is signed, asynchronous and idempotent", async () => {
   };
   try {
     assert.equal((await deliver(payload, "Bearer wrong")).status, 401);
+    assert.equal((await deliver({
+      ...payload,
+      environment: "production",
+      deliveryId: "release-publish:rel_1:production",
+      expectedImageDigest: digest,
+    })).status, 400);
+    assert.equal(callbackCount, 0);
     assert.equal((await deliver(payload)).status, 202);
     for (let attempt = 0; callbackCount === 0 && attempt < 50; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 10));

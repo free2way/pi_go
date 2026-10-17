@@ -16,7 +16,7 @@ import { AlertManager, createAlertSink } from "./alerts.js";
 import { Authenticator, normalizePublicOrigin } from "./auth.js";
 import { ExpiringLruCache } from "./expiring-lru-cache.js";
 import { CredentialVault } from "./credential-vault.js";
-import { ReleaseSettingsStore, releaseSettingsStatus } from "./release-settings.js";
+import { normalizeReleaseCallbackOrigin, ReleaseSettingsStore, releaseSettingsStatus } from "./release-settings.js";
 import { ScmSettingsStore } from "./scm-settings.js";
 import { createDb, createPool, newId, runMigrations } from "./db.js";
 import { baseDemoRun, runDemo } from "./demo-runner.js";
@@ -100,6 +100,10 @@ const authMode = process.env.PI_AUTH_MODE || "development";
 const configuredPublicOrigin = process.env.PI_PUBLIC_ORIGIN?.trim() || "";
 const publicOrigin = configuredPublicOrigin
   ? normalizePublicOrigin(configuredPublicOrigin, { production: process.env.NODE_ENV === "production" })
+  : "";
+const configuredReleaseCallbackOrigin = process.env.PI_RELEASE_CALLBACK_ORIGIN?.trim() || "";
+const releaseCallbackOrigin = configuredReleaseCallbackOrigin
+  ? normalizeReleaseCallbackOrigin(configuredReleaseCallbackOrigin)
   : "";
 const vaultSecret = process.env.PI_VAULT_SECRET;
 if (!vaultSecret) throw new Error("PI_VAULT_SECRET is required");
@@ -814,7 +818,7 @@ function effectiveReleaseConfig() {
   return {
     deployPlan: planPostMergeDeploy(webhookUrl),
     webhookToken: saved?.webhookToken ?? process.env.PI_POST_MERGE_DEPLOY_TOKEN ?? "",
-    callbackOrigin: saved?.publicOrigin ?? publicOrigin,
+    callbackOrigin: saved?.publicOrigin ?? (releaseCallbackOrigin || publicOrigin),
     source: saved ? "web" as const : webhookUrl ? "environment" as const : "none" as const,
   };
 }
@@ -831,7 +835,7 @@ function releaseSettingsProjection() {
       environment: {
         webhookUrl: environmentWebhook?.url,
         webhookToken: process.env.PI_POST_MERGE_DEPLOY_TOKEN,
-        publicOrigin,
+        publicOrigin: releaseCallbackOrigin || publicOrigin,
       },
     });
   }

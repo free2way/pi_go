@@ -548,6 +548,13 @@ export function loadConfig(environment = process.env) {
   const callbackInternalOrigin = environment.PIGO_EXECUTOR_CALLBACK_INTERNAL_ORIGIN
     ? new URL(environment.PIGO_EXECUTOR_CALLBACK_INTERNAL_ORIGIN).origin
     : "";
+  const allowedEnvironments = new Set((environment.PIGO_EXECUTOR_ALLOWED_ENVIRONMENTS || "staging,production")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean));
+  if (allowedEnvironments.size === 0 || [...allowedEnvironments].some((value) => !["staging", "production"].includes(value))) {
+    throw new Error("PIGO_EXECUTOR_ALLOWED_ENVIRONMENTS must contain staging and/or production");
+  }
   const port = Number(environment.PORT || 3300);
   const stagingPort = Number(environment.PIGO_EXECUTOR_STAGING_PORT || 18080);
   const productionPort = Number(environment.PIGO_EXECUTOR_PRODUCTION_PORT || 18081);
@@ -588,6 +595,7 @@ export function loadConfig(environment = process.env) {
     dataFile: environment.PIGO_EXECUTOR_DATA_FILE || "/data/executions.json",
     callbackPublicOrigin,
     callbackInternalOrigin,
+    allowedEnvironments,
     imageRepository,
     targetNetwork,
     releaseGatewayToken,
@@ -603,6 +611,7 @@ export function loadConfig(environment = process.env) {
 
 export async function createExecutor(options = {}) {
   const config = options.config ?? loadConfig();
+  const allowedEnvironments = config.allowedEnvironments ?? new Set(["staging", "production"]);
   const store = options.store ?? new JsonStateStore(config.dataFile);
   await store.init();
   let jobs = Promise.resolve();
@@ -681,6 +690,9 @@ export async function createExecutor(options = {}) {
       let payload;
       try {
         payload = validatePayload(decoded, deliveryId);
+        if (!allowedEnvironments.has(payload.environment)) {
+          throw new Error(`environment ${payload.environment} is not allowed by this executor`);
+        }
         callbackTarget(payload.callbackUrl, config.callbackPublicOrigin, config.callbackInternalOrigin);
       } catch (error) {
         console.warn(JSON.stringify({
