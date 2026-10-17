@@ -23,6 +23,27 @@ type ReleaseSettingsFile = { version: 1; value: EncryptedValue; updatedAt: strin
 
 const AAD = Buffer.from("pigo:release-settings:v1");
 
+/**
+ * Operator-only callback origins may use a private HTTP service name. Unlike
+ * the browser-facing PI_PUBLIC_ORIGIN, this value is never accepted from an API
+ * request and is only used to build Executor callbacks on a trusted network.
+ */
+export function normalizeReleaseCallbackOrigin(value: string) {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("PI_RELEASE_CALLBACK_ORIGIN must be a valid URL origin");
+  }
+  if (!["http:", "https:"].includes(url.protocol)) {
+    throw new Error("PI_RELEASE_CALLBACK_ORIGIN must use HTTP or HTTPS");
+  }
+  if (url.username || url.password || url.search || url.hash || (url.pathname && url.pathname !== "/")) {
+    throw new Error("PI_RELEASE_CALLBACK_ORIGIN must contain only scheme and host");
+  }
+  return url.origin;
+}
+
 /** Global release configuration. The complete payload is encrypted at rest. */
 export class ReleaseSettingsStore {
   private readonly key: Buffer;

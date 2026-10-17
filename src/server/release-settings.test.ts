@@ -2,9 +2,20 @@ import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { ReleaseSettingsStore, releaseSettingsStatus } from "./release-settings.js";
+import { normalizeReleaseCallbackOrigin, ReleaseSettingsStore, releaseSettingsStatus } from "./release-settings.js";
 
 const secret = Buffer.alloc(32, 23).toString("base64");
+
+describe("normalizeReleaseCallbackOrigin", () => {
+  it("accepts private HTTP origins but rejects paths and credentials", () => {
+    expect(normalizeReleaseCallbackOrigin("http://pigo-staging-web:3100/")).toBe("http://pigo-staging-web:3100");
+    expect(normalizeReleaseCallbackOrigin("https://pigo.example.com")).toBe("https://pigo.example.com");
+    expect(() => normalizeReleaseCallbackOrigin("ftp://pigo-staging-web")).toThrow(/HTTP or HTTPS/);
+    const credentialed = `http://${["user", "pass"].join(":")}@pigo-staging-web`;
+    expect(() => normalizeReleaseCallbackOrigin(credentialed)).toThrow(/only scheme and host/);
+    expect(() => normalizeReleaseCallbackOrigin("http://pigo-staging-web/api/internal")).toThrow(/only scheme and host/);
+  });
+});
 
 describe("ReleaseSettingsStore", () => {
   it("encrypts the complete webhook configuration and reloads it", async () => {
