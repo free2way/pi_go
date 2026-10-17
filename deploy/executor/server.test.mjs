@@ -47,6 +47,11 @@ test("run payload accepts safe workspace-relative repositories and requires a fu
   assert.throws(() => validatePayload({ ...payload, repository: "../outside" }, payload.deliveryId), /safe relative workspace path/);
   assert.throws(() => validatePayload({ ...payload, repository: "nested\\outside" }, payload.deliveryId), /safe relative workspace path/);
   assert.throws(() => validatePayload(payload, "different"), /header\/body mismatch/);
+  assert.equal(validatePayload({ ...payload, callbackUrl: "http://pigo-staging-web:3100/api/internal/runs/run_1/release-result" }, payload.deliveryId).callbackUrl,
+    "http://pigo-staging-web:3100/api/internal/runs/run_1/release-result");
+  assert.throws(() => validatePayload({ ...payload, callbackUrl: "ftp://pigo-staging-web/api/internal/x" }, payload.deliveryId), /HTTP or HTTPS/);
+  const credentialedCallback = `http://${["user", "pass"].join(":")}@pigo-staging-web/api/internal/x`;
+  assert.throws(() => validatePayload({ ...payload, callbackUrl: credentialedCallback }, payload.deliveryId), /without credentials/);
 });
 
 test("release payload keeps environment-scoped idempotency identity", () => {
@@ -126,6 +131,19 @@ test("callback target allowlists origin and internal API path before rewriting",
   );
   assert.throws(() => callbackTarget("https://evil.example/api/internal/x", "https://pigo.example.com", ""), /origin/);
   assert.throws(() => callbackTarget("https://pigo.example.com/api/config/status", "https://pigo.example.com", ""), /path/);
+  assert.equal(
+    callbackTarget(
+      "http://pigo-staging-web:3100/api/internal/runs/run_1/release-result",
+      "http://pigo-staging-web:3100",
+      "",
+    ),
+    "http://pigo-staging-web:3100/api/internal/runs/run_1/release-result",
+  );
+  assert.throws(() => callbackTarget(
+    "http://pigo.example.com/api/internal/x",
+    "https://pigo.example.com",
+    "",
+  ), /origin/);
 });
 
 test("workspace containment rejects siblings and prefix tricks", () => {
@@ -145,9 +163,12 @@ test("configuration fails closed for missing origin, weak token and invalid port
   assert.equal(loadConfig(valid).releaseGatewayUrl, "http://release-gateway:3310");
   assert.deepEqual([...loadConfig(valid).allowedEnvironments], ["staging", "production"]);
   assert.deepEqual([...loadConfig({ ...valid, PIGO_EXECUTOR_ALLOWED_ENVIRONMENTS: "staging" }).allowedEnvironments], ["staging"]);
+  assert.equal(loadConfig({ ...valid, PIGO_EXECUTOR_CALLBACK_ORIGIN: "http://pigo-staging-web:3100" }).callbackPublicOrigin, "http://pigo-staging-web:3100");
   assert.equal(loadConfig(valid).stagingPublicUrl, "");
   assert.equal(loadConfig({ ...valid, PIGO_EXECUTOR_STAGING_PUBLIC_URL: "https://staging.example.com/app" }).stagingPublicUrl, "https://staging.example.com/app");
   assert.throws(() => loadConfig({ ...valid, PIGO_EXECUTOR_CALLBACK_ORIGIN: "" }), /CALLBACK_ORIGIN is required/);
+  assert.throws(() => loadConfig({ ...valid, PIGO_EXECUTOR_CALLBACK_ORIGIN: "ftp://pigo-staging-web" }), /HTTP or HTTPS/);
+  assert.throws(() => loadConfig({ ...valid, PIGO_EXECUTOR_CALLBACK_ORIGIN: "http://pigo-staging-web/api/internal" }), /only scheme and host/);
   assert.throws(() => loadConfig({ ...valid, PIGO_EXECUTOR_TOKEN: "too-short" }), /at least 32/);
   assert.throws(() => loadConfig({ ...valid, PIGO_RELEASE_GATEWAY_TOKEN: "too-short" }), /at least 32/);
   assert.throws(() => loadConfig({ ...valid, PIGO_RELEASE_GATEWAY_URL: "https://release-gateway.example" }), /HTTP origin/);

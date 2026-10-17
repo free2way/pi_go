@@ -43,7 +43,15 @@ export function validatePayload(value, expectedDeliveryId) {
   if (!Number.isInteger(attempt) || attempt < 1 || attempt > 10_000) throw new Error("invalid attempt");
   const callbackUrl = requiredText(value.callbackUrl, "callbackUrl", 2_000);
   const parsedCallback = new URL(callbackUrl);
-  if (parsedCallback.protocol !== "https:") throw new Error("callbackUrl must use HTTPS");
+  // The callback origin is supplied by the operator on both PiGO and the
+  // executor. Staging may deliberately use a private HTTP service origin; the
+  // exact-origin and internal-path checks in `callbackTarget` still run before
+  // any delivery is claimed. Keep the untrusted payload limited to web schemes
+  // and reject URL credentials here, then let the operator allowlist decide
+  // whether HTTP is acceptable for this executor instance.
+  if (!["http:", "https:"].includes(parsedCallback.protocol) || parsedCallback.username || parsedCallback.password) {
+    throw new Error("callbackUrl must use HTTP or HTTPS without credentials");
+  }
   const expectedImageDigest = typeof value.expectedImageDigest === "string" ? value.expectedImageDigest.trim().toLowerCase() : "";
   if (environment === "production" && !/^sha256:[a-f0-9]{64}$/.test(expectedImageDigest)) {
     throw new Error("production requires expectedImageDigest from staging");
@@ -544,7 +552,15 @@ export function loadConfig(environment = process.env) {
   const appPath = environment.PIGO_EXECUTOR_APP_PATH?.trim() || "apps/order-status-app";
   if (path.isAbsolute(appPath) || appPath.split(/[\\/]/).includes("..")) throw new Error("PIGO_EXECUTOR_APP_PATH must be a safe relative path");
   if (!environment.PIGO_EXECUTOR_CALLBACK_ORIGIN) throw new Error("PIGO_EXECUTOR_CALLBACK_ORIGIN is required");
-  const callbackPublicOrigin = new URL(environment.PIGO_EXECUTOR_CALLBACK_ORIGIN).origin;
+  const callbackOriginUrl = new URL(environment.PIGO_EXECUTOR_CALLBACK_ORIGIN);
+  if (!["http:", "https:"].includes(callbackOriginUrl.protocol)) {
+    throw new Error("PIGO_EXECUTOR_CALLBACK_ORIGIN must use HTTP or HTTPS");
+  }
+  if (callbackOriginUrl.username || callbackOriginUrl.password || callbackOriginUrl.search || callbackOriginUrl.hash
+    || (callbackOriginUrl.pathname && callbackOriginUrl.pathname !== "/")) {
+    throw new Error("PIGO_EXECUTOR_CALLBACK_ORIGIN must contain only scheme and host");
+  }
+  const callbackPublicOrigin = callbackOriginUrl.origin;
   const callbackInternalOrigin = environment.PIGO_EXECUTOR_CALLBACK_INTERNAL_ORIGIN
     ? new URL(environment.PIGO_EXECUTOR_CALLBACK_INTERNAL_ORIGIN).origin
     : "";
