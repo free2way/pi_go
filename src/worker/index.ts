@@ -30,6 +30,7 @@ import {
   hostPathFor,
   parseSandboxAllowDegraded,
   resolveSandboxMode,
+  prepareSandboxStateDirectory,
   SandboxContainerRegistry,
   SandboxUnavailableError,
   sandboxStateDirectory,
@@ -210,6 +211,7 @@ const workerId = process.env.PI_WORKER_ID || `worker-${process.pid}`;
 // SEC-004 / AT-SEC-007:每次 Agent 调用与检查命令都在独立容器中执行，只挂载本次
 // 运行的 worktree（及其仓库 .git 元数据）、只读模型定义与本次运行的 Pi 状态目录。
 const sandboxImage = process.env.PI_SANDBOX_IMAGE || "local/pigo-sandbox:0.1.0";
+const sandboxUser = process.env.PI_SANDBOX_USER || "node";
 /** Network used for agent calls (provider egress). Checks always run with none. */
 const agentNetwork = process.env.PI_SANDBOX_NETWORK || "pi-agent-network";
 const hostWorkspaceRoot = process.env.PI_HOST_WORKSPACE_ROOT || workspaceRoot;
@@ -365,13 +367,13 @@ async function runInSandbox(input: SandboxRunInput): Promise<CommandResult> {
   // Kept next to (never inside) the worktree so sandbox state cannot leak into
   // the diff or the committed tree.
   const runStateDir = sandboxStateDirectory(input.worktree, input.statePath);
-  // The state directory (and its agent subdirectory) must exist and be owned by
-  // the container user before the container starts: the bind for the read-only
-  // model definition would otherwise create it as root and Pi could not write
-  // its session/credential store.
-  await mkdir(path.join(runStateDir, "agent"), { recursive: true });
+  // The nested model mountpoint must exist too. Otherwise Docker creates it as
+  // root below the state bind and the non-root worker cannot later delete the
+  // run state directory.
+  await prepareSandboxStateDirectory(runStateDir);
   const spec = buildContainerSpec({
     image: imageForSandbox,
+    user: sandboxUser,
     worktree: input.worktree,
     hostWorktreePath: hostPathFor(input.worktree, workspaceRoot, hostWorkspaceRoot),
     readOnly: input.readOnly,
@@ -960,7 +962,8 @@ async function workspaceScmGit(relativePath: string) {
       args,
       env,
       timeoutMs: 120_000,
-      maxOutput,
+      maxOutput: 4 * 1024 * 1024,
+      failOnOutputLimit: true,
     }),
   };
 }
@@ -3173,7 +3176,7 @@ process.stdout.write(`[sandbox] mode=${sandboxMode}${sandboxReason ? ` (${sandbo
 if (sandboxMode === "unavailable") {
   process.stderr.write(
     "[sandbox] 容器沙箱不可用：已启用 fail-closed，worker 将拒绝执行任何 Agent。"
-    + "请修复 Docker daemon / PI_DOCKER_SOCKET / 沙箱镜像后重启；"
+    + "请修复 Sandbox Gateway / Docker runtime / 沙箱镜像后重启；"
     + "仅在明确接受关闭隔离时，才可设置 PI_SANDBOX_ALLOW_DEGRADED=1 允许降级执行。\n",
   );
 }

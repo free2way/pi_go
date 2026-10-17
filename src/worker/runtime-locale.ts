@@ -232,6 +232,6 @@ export function runFailureText(kind: string, message: string, stage: "followup" 
 
 /** Terminal catch-all: the sandbox-unavailable summary (fail-closed refusal). */
 export const SANDBOX_UNAVAILABLE_SUMMARY: LocalizedText = {
-  zh: "容器沙箱不可用，已按 fail-closed 拒绝执行；请修复 Docker/PI_DOCKER_SOCKET 或显式设置 PI_SANDBOX_ALLOW_DEGRADED=1",
-  en: "The container sandbox is unavailable, so execution was refused (fail-closed); fix Docker/PI_DOCKER_SOCKET or explicitly set PI_SANDBOX_ALLOW_DEGRADED=1",
+  zh: "容器沙箱不可用，已按 fail-closed 拒绝执行；请修复 Sandbox Gateway/Docker runtime，或显式设置 PI_SANDBOX_ALLOW_DEGRADED=1",
+  en: "The container sandbox is unavailable, so execution was refused (fail-closed); fix the Sandbox Gateway/Docker runtime or explicitly set PI_SANDBOX_ALLOW_DEGRADED=1",
 };

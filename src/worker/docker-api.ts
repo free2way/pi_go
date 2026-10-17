@@ -1,13 +1,38 @@
 import http from "node:http";
 
 /**
- * Minimal Docker Engine API client over the unix socket (SEC-004 / AT-SEC-007).
- * Only the handful of calls the worker needs are implemented, so the worker
- * never shells out and never passes user input through a shell.
+ * Minimal Docker Engine API client (SEC-004 / AT-SEC-007). Standard deployments
+ * use the authenticated policy gateway; direct unix-socket transport remains a
+ * local-development compatibility path. Only the handful of calls the worker
+ * needs are implemented, with no shell interpolation.
  */
 export interface DockerApiOptions {
   socketPath?: string;
+  gatewayUrl?: string;
+  gatewayToken?: string;
+  gatewayRequired?: boolean;
   apiVersion?: string;
+}
+
+export function buildDockerRequestOptions(input: {
+  socketPath: string;
+  gateway?: URL;
+  gatewayToken?: string;
+  apiVersion: string;
+  pathName: string;
+  method: string;
+  headers?: Record<string, string>;
+}): http.RequestOptions {
+  const path = `/${input.apiVersion}${input.pathName}`;
+  if (!input.gateway) return { socketPath: input.socketPath, path, method: input.method, headers: input.headers ?? {} };
+  return {
+    protocol: input.gateway.protocol,
+    hostname: input.gateway.hostname,
+    port: input.gateway.port,
+    path,
+    method: input.method,
+    headers: { ...(input.headers ?? {}), Authorization: `Bearer ${input.gatewayToken}` },
+  };
 }
 
 export interface ContainerCreateSpec {
@@ -33,22 +58,46 @@ export interface ContainerCreateSpec {
 
 export class DockerApi {
   private readonly socketPath: string;
+  private readonly gateway?: URL;
+  private readonly gatewayToken?: string;
   private readonly apiVersion: string;
 
   constructor(options: DockerApiOptions = {}) {
     this.socketPath = options.socketPath ?? process.env.PI_DOCKER_SOCKET ?? "/var/run/docker.sock";
+    const configuredGateway = options.gatewayUrl ?? process.env.PI_DOCKER_GATEWAY_URL;
+    const gatewayRequired = options.gatewayRequired ?? process.env.PI_DOCKER_GATEWAY_REQUIRED === "1";
+    if (configuredGateway) {
+      const gateway = new URL(configuredGateway);
+      if (gateway.protocol !== "http:" || gateway.username || gateway.password || (gateway.pathname !== "/" && gateway.pathname !== "")) {
+        throw new Error("PI_DOCKER_GATEWAY_URL must be an HTTP origin without credentials or a path");
+      }
+      this.gateway = gateway;
+      this.gatewayToken = options.gatewayToken ?? process.env.PI_DOCKER_GATEWAY_TOKEN;
+      if (!this.gatewayToken) throw new Error("PI_DOCKER_GATEWAY_TOKEN is required when PI_DOCKER_GATEWAY_URL is set");
+    }
+    if (gatewayRequired && !this.gateway) throw new Error("PI_DOCKER_GATEWAY_URL is required by PI_DOCKER_GATEWAY_REQUIRED=1");
     this.apiVersion = options.apiVersion ?? process.env.PI_DOCKER_API_VERSION ?? "v1.43";
+  }
+
+  private requestOptions(pathName: string, method: string, headers: Record<string, string> = {}): http.RequestOptions {
+    return buildDockerRequestOptions({
+      socketPath: this.socketPath,
+      ...(this.gateway ? { gateway: this.gateway } : {}),
+      ...(this.gatewayToken ? { gatewayToken: this.gatewayToken } : {}),
+      apiVersion: this.apiVersion,
+      pathName,
+      method,
+      headers,
+    });
   }
 
   private request<T>(method: string, pathName: string, body?: unknown): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       const payload = body === undefined ? undefined : JSON.stringify(body);
-      const request = http.request({
-        socketPath: this.socketPath,
-        path: `/${this.apiVersion}${pathName}`,
-        method,
-        headers: payload ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) } : {},
-      }, (response) => {
+      const headers: Record<string, string> = payload
+        ? { "Content-Type": "application/json", "Content-Length": String(Buffer.byteLength(payload)) }
+        : {};
+      const request = http.request(this.requestOptions(pathName, method, headers), (response) => {
         let text = "";
         response.setEncoding("utf8");
         response.on("data", (chunk) => { text += chunk; });
@@ -78,7 +127,7 @@ export class DockerApi {
   /** `/_ping` answers with plain "OK", not JSON (Docker API convention). */
   async ping() {
     return new Promise<boolean>((resolve, reject) => {
-      const request = http.request({ socketPath: this.socketPath, path: `/${this.apiVersion}/_ping`, method: "GET" }, (response) => {
+      const request = http.request(this.requestOptions("/_ping", "GET"), (response) => {
         let text = "";
         response.setEncoding("utf8");
         response.on("data", (chunk) => { text += chunk; });
@@ -120,11 +169,7 @@ export class DockerApi {
   /** Streams stdout/stderr lines until the container exits (or the signal aborts). */
   logsFollow(id: string, onLine: (line: string, stream: "stdout" | "stderr") => void, signal?: AbortSignal): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      const request = http.request({
-        socketPath: this.socketPath,
-        path: `/${this.apiVersion}/containers/${id}/logs?follow=1&stdout=1&stderr=1`,
-        method: "GET",
-      }, (response) => {
+      const request = http.request(this.requestOptions(`/containers/${id}/logs?follow=1&stdout=1&stderr=1`, "GET"), (response) => {
         let buffer = "";
         response.setEncoding("utf8");
         response.on("data", (chunk: string) => {

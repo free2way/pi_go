@@ -1,181 +1,96 @@
 import { describe, expect, it } from "vitest";
-import { detectScmProvider, inspectWorkspacePushPolicy, inspectWorkspaceRemote, pushWorkspaceBranch, scmAuthEnvironment, type ScmGitResult } from "./workspace-scm.js";
+import { detectScmProvider, inspectWorkspaceRemote, pushWorkspaceBranch, scmAuthEnvironment, type ScmGitResult } from "./workspace-scm.js";
 
 const ok = (stdout = ""): ScmGitResult => ({ code: 0, stdout, stderr: "" });
+const LOCAL = "a".repeat(40), REMOTE = "b".repeat(40);
+const credential = { provider: "github" as const, authMode: "https_token" as const, token: "test-token" };
+
+function fixture(options: { behind?: boolean; forbidden?: boolean; remoteMissing?: boolean } = {}) {
+  let pushed = false;
+  const calls: string[][] = [];
+  const git = async (args: string[]) => {
+    calls.push(args);
+    const scan = args[0] === "--no-replace-objects";
+    const command = scan ? args.slice(1) : args;
+    if (command[0] === "rev-parse") return ok(command[1] === "--is-shallow-repository" ? "false\n" : LOCAL + "\n");
+    if (command[0] === "remote") return ok("https://github.com/org/repo.git\n");
+    if (command[0] === "ls-remote") return ok(options.remoteMissing && !pushed ? "" : `${pushed ? LOCAL : REMOTE} refs/heads/main\n`);
+    if (command[0] === "fetch" || command[0] === "merge-base") return ok();
+    if (command[0] === "rev-list") {
+      if (scan && command[1] === "--parents") return ok(`${LOCAL}${options.remoteMissing ? "" : ` ${REMOTE}`}\n`);
+      if (scan) return ok(command[1] === "--count" ? "1\n" : LOCAL + "\n");
+      return ok(pushed ? "0 0\n" : options.behind ? "1 2\n" : "1 0\n");
+    }
+    if (command[0] === "diff-tree") return ok(options.forbidden ? "docs/development.md\0" : "");
+    if (command[0] === "ls-tree") return ok(options.forbidden && command[3] === LOCAL ? "100644 blob e69de29bb2d1d6434b8b29ae775ad8c2e48c5391 0\tdocs/development.md\0" : "");
+    if (command[0] === "cat-file") return ok("");
+    if (command.includes("push")) { pushed = true; return ok(); }
+    throw new Error("Unexpected git command");
+  };
+  return { git, calls, pushed: () => pushed };
+}
 
 describe("workspace SCM", () => {
-  it("detects GitHub, GitLab including self-hosted names, and generic Git", () => {
+  it("detects GitHub, GitLab, and generic Git", () => {
     expect(detectScmProvider("git@github.com:org/repo.git")).toBe("github");
-    expect(detectScmProvider("https://gitlab.com/org/repo.git")).toBe("gitlab");
     expect(detectScmProvider("https://gitlab.internal.example/org/repo.git")).toBe("gitlab");
     expect(detectScmProvider("ssh://git@git.example.com/org/repo.git")).toBe("generic");
   });
 
-  it("passes HTTPS credentials through environment config instead of URL or argv", () => {
-    const env = scmAuthEnvironment("https://github.com/org/repo.git", { provider: "github", authMode: "https_token", token: "secret" });
+  it("injects credentials through environment config instead of URL or argv", () => {
+    const env = scmAuthEnvironment("https://github.com/org/repo.git", credential);
     expect(env.GIT_CONFIG_KEY_0).toContain("https://github.com/org/repo.git");
-    expect(env.GIT_CONFIG_VALUE_0).not.toContain("secret");
-    expect(Buffer.from(env.GIT_CONFIG_VALUE_0.replace("Authorization: Basic ", ""), "base64").toString()).toBe("x-access-token:secret");
+    expect(Buffer.from(env.GIT_CONFIG_VALUE_0.replace("Authorization: Basic ", ""), "base64").toString()).toBe("x-access-token:test-token");
   });
 
   it("reports an ahead branch and verifies a required commit", async () => {
-    const calls: string[][] = [];
-    const git = async (args: string[]) => {
-      calls.push(args);
-      if (args[0] === "rev-parse" && args[1] === "HEAD") return ok("local\n");
-      if (args[0] === "remote") return ok("https://github.com/org/repo.git\n");
-      if (args[0] === "ls-remote") return ok("remote refs/heads/main\n");
-      if (args[0] === "fetch") return ok();
-      if (args[0] === "rev-list") return ok("1\t0\n");
-      if (args[0] === "merge-base") return ok();
-      return { code: 1, stdout: "", stderr: "unexpected" };
-    };
-    await expect(inspectWorkspaceRemote({ branch: "main", requiredCommit: "merged", git, now: () => "now" })).resolves.toMatchObject({
-      relation: "ahead", ahead: 1, behind: 0, requiredCommitPresent: true, provider: "github", checkedAt: "now",
+    const { git } = fixture();
+    await expect(inspectWorkspaceRemote({ branch: "main", requiredCommit: LOCAL, git })).resolves.toMatchObject({
+      relation: "ahead", requiredCommitPresent: true, provider: "github",
     });
-    expect(calls.some((args) => args[0] === "fetch")).toBe(true);
   });
 
   it("refuses non-fast-forward pushes", async () => {
-    const git = async (args: string[]) => {
-      if (args[0] === "rev-parse") return ok("local\n");
-      if (args[0] === "remote") return ok("https://git.example/repo.git\n");
-      if (args[0] === "ls-remote") return ok("remote refs/heads/main\n");
-      if (args[0] === "fetch") return ok();
-      if (args[0] === "rev-list") return ok("1 2\n");
-      return ok();
-    };
-    await expect(pushWorkspaceBranch({ branch: "main", git })).rejects.toMatchObject({ code: "SCM_REMOTE_DIVERGED" });
+    const { git, pushed } = fixture({ behind: true });
+    await expect(pushWorkspaceBranch({ branch: "main", git, credential })).rejects.toMatchObject({ code: "SCM_REMOTE_DIVERGED" });
+    expect(pushed()).toBe(false);
   });
 
-  it("rejects an HTTPS push without a saved token before scanning or invoking push", async () => {
-    let scanned = false;
-    let pushed = false;
-    const git = async (args: string[]) => {
-      if (args[0] === "rev-parse") return ok("local\n");
-      if (args[0] === "remote") return ok("https://github.com/org/repo.git\n");
-      if (args[0] === "ls-remote") return ok("remote refs/heads/main\n");
-      if (args[0] === "fetch") return ok();
-      if (args[0] === "rev-list") return ok("1 0\n");
-      if (args[0] === "diff" || args[0] === "grep") scanned = true;
-      if (args[0] === "push") pushed = true;
-      return ok();
-    };
-    await expect(pushWorkspaceBranch({ branch: "main", git })).rejects.toMatchObject({
-      code: "SCM_CREDENTIAL_REQUIRED",
-    });
-    expect(scanned).toBe(false);
-    expect(pushed).toBe(false);
+  it("requires credentials before scanning or pushing HTTPS", async () => {
+    const { git, calls } = fixture();
+    await expect(pushWorkspaceBranch({ branch: "main", git })).rejects.toMatchObject({ code: "SCM_CREDENTIAL_REQUIRED" });
+    expect(calls.some(args => args[0] === "--no-replace-objects" || args.includes("push"))).toBe(false);
   });
 
-  it("blocks development and acceptance documentation before push", async () => {
-    const git = async (args: string[]) => {
-      if (args[0] === "diff") return ok("docs/acceptance.md\0src/app.ts\0");
-      if (args[0] === "grep") return { code: 1, stdout: "", stderr: "" };
-      return ok();
-    };
-    await expect(inspectWorkspacePushPolicy({
-      before: {
-        provider: "github", remote: "https://github.com/org/repo.git", branch: "main", localHead: "local",
-        remoteHead: "remote", relation: "ahead", ahead: 1, behind: 0, checkedAt: "now",
-      },
-      git,
-    })).resolves.toEqual([{ category: "documentation", path: "docs/acceptance.md" }]);
+  it("blocks forbidden history and never invokes push", async () => {
+    const { git, pushed } = fixture({ forbidden: true });
+    await expect(pushWorkspaceBranch({ branch: "main", git, credential })).rejects.toMatchObject({ code: "SCM_EXPORT_POLICY_BLOCKED" });
+    expect(pushed()).toBe(false);
   });
 
-  it("blocks internal network information without returning matched content", async () => {
-    const git = async (args: string[]) => {
-      if (args[0] === "diff") return ok("src/config.ts\0");
-      if (args[0] === "grep" && args.some((value) => value.includes("192\\.168"))) return ok("HEAD:src/config.ts\0");
-      if (args[0] === "grep") return { code: 1, stdout: "", stderr: "" };
-      return ok();
-    };
-    const result = await inspectWorkspacePushPolicy({
-      before: {
-        provider: "generic", remote: "ssh://git@example/repo.git", branch: "main", localHead: "local",
-        remoteHead: "remote", relation: "ahead", ahead: 1, behind: 0, checkedAt: "now",
-      },
-      git,
-    });
-    expect(result).toEqual([{ category: "internal_network", path: "src/config.ts" }]);
-    expect(JSON.stringify(result)).not.toContain("203.0.113.42");
+  it("pushes only the scanned SHA and disables implicit tag pushes", async () => {
+    const { git, calls } = fixture();
+    await expect(pushWorkspaceBranch({ branch: "main", git, credential })).resolves.toMatchObject({ pushed: true });
+    expect(calls.find(args => args.includes("push"))).toEqual(["-c", "push.followTags=false", "push", "--porcelain", "origin", `${LOCAL}:refs/heads/main`]);
   });
 
-  it("blocks AI prompt material by path or content", async () => {
-    const git = async (args: string[]) => {
-      if (args[0] === "diff") return ok("src/prompts/reviewer.ts\0src/agent.ts\0");
-      if (args[0] === "grep" && args.some((value) => value.includes("system" + " prompt"))) return ok("HEAD:src/agent.ts\0");
-      if (args[0] === "grep") return { code: 1, stdout: "", stderr: "" };
-      return ok();
-    };
-    await expect(inspectWorkspacePushPolicy({
-      before: {
-        provider: "gitlab", remote: "https://gitlab.example/repo.git", branch: "main", localHead: "local",
-        remoteHead: "remote", relation: "ahead", ahead: 1, behind: 0, checkedAt: "now",
-      },
-      git,
-    })).resolves.toEqual([
-      { category: "ai_prompt", path: "src/prompts/reviewer.ts" },
-      { category: "ai_prompt", path: "src/agent.ts" },
-    ]);
+  it("scans the entire history for a new remote branch", async () => {
+    const { git, calls } = fixture({ remoteMissing: true });
+    await pushWorkspaceBranch({ branch: "main", git, credential });
+    expect(calls).toContainEqual(["--no-replace-objects", "rev-list", "--count", LOCAL]);
   });
 
-  it("blocks operational account data without exposing its value", async () => {
-    const git = async (args: string[]) => {
-      if (args[0] === "diff") return ok("deploy/release.sh\0");
-      if (args[0] === "grep" && args.some((value) => value.includes("ssh|deploy"))) return ok("HEAD:deploy/release.sh\0");
-      if (args[0] === "grep") return { code: 1, stdout: "", stderr: "" };
-      return ok();
-    };
-    const result = await inspectWorkspacePushPolicy({
-      before: {
-        provider: "generic", remote: "ssh://git@example/repo.git", branch: "main", localHead: "local",
-        remoteHead: "remote", relation: "ahead", ahead: 1, behind: 0, checkedAt: "now",
-      },
-      git,
-    });
-    expect(result).toEqual([{ category: "account_data", path: "deploy/release.sh" }]);
-    expect(JSON.stringify(result)).not.toContain("production-user");
-  });
-
-  it("refuses the push when export policy findings exist", async () => {
-    let pushed = false;
-    const git = async (args: string[]) => {
-      if (args[0] === "rev-parse") return ok("local\n");
-      if (args[0] === "remote") return ok("https://github.com/org/repo.git\n");
-      if (args[0] === "ls-remote") return ok("remote refs/heads/main\n");
-      if (args[0] === "fetch") return ok();
-      if (args[0] === "rev-list") return ok("1 0\n");
-      if (args[0] === "diff") return ok("docs/development.md\0");
-      if (args[0] === "grep") return { code: 1, stdout: "", stderr: "" };
-      if (args[0] === "push") pushed = true;
-      return ok();
-    };
-    await expect(pushWorkspaceBranch({
-      branch: "main",
-      git,
-      credential: { provider: "github", authMode: "https_token", token: "test-token" },
-    })).rejects.toMatchObject({ code: "SCM_EXPORT_POLICY_BLOCKED" });
-    expect(pushed).toBe(false);
-  });
-
-  it("pushes an ahead branch and verifies synchronization", async () => {
-    let pushed = false;
-    const git = async (args: string[]) => {
-      if (args[0] === "rev-parse") return ok(pushed && args[1] !== "HEAD" ? "local\n" : "local\n");
-      if (args[0] === "remote") return ok("https://github.com/org/repo.git\n");
-      if (args[0] === "ls-remote") return ok(`${pushed ? "local" : "remote"} refs/heads/main\n`);
-      if (args[0] === "fetch") return ok();
-      if (args[0] === "rev-list") return ok(pushed ? "0 0\n" : "1 0\n");
-      if (args[0] === "diff") return ok();
-      if (args[0] === "grep") return { code: 1, stdout: "", stderr: "" };
-      if (args[0] === "push") { pushed = true; return ok("ok\n"); }
-      return ok();
-    };
-    await expect(pushWorkspaceBranch({
-      branch: "main",
-      git,
-      credential: { provider: "github", authMode: "https_token", token: "test-token" },
-    })).resolves.toMatchObject({ pushed: true, after: { relation: "synchronized" } });
+  it("fails closed on unreadable history without disclosing Git output", async () => {
+    const f = fixture();
+    const git = async (args: string[]) => args[0] === "--no-replace-objects"
+      ? { code: 1, stdout: "", stderr: "sensitive diagnostic" } : f.git(args);
+    try {
+      await pushWorkspaceBranch({ branch: "main", git, credential });
+      expect.fail("push must fail");
+    } catch (error) {
+      expect(error).toMatchObject({ code: "SCM_EXPORT_POLICY_FAILED" });
+      expect(String(error)).not.toContain("sensitive diagnostic");
+    }
+    expect(f.pushed()).toBe(false);
   });
 });

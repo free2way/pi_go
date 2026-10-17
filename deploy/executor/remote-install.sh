@@ -6,7 +6,7 @@ REMOTE_DIR="${1:-}"
 BUNDLE="${2:-}"
 INCOMING_ENV="${3:--}"
 REPLACE_ENV="${4:-0}"
-IMAGE="local/pigo-release-executor:0.4.0"
+IMAGE="local/pigo-release-executor:0.5.0"
 CONTAINER="pigo-release-executor"
 
 if [[ ! "$REMOTE_DIR" =~ ^/[A-Za-z0-9._/-]+$ || "$REMOTE_DIR" == "/" ]]; then
@@ -34,19 +34,27 @@ cleanup() {
 trap cleanup EXIT
 
 command -v docker >/dev/null || { echo "docker is required" >&2; exit 2; }
+command -v openssl >/dev/null || { echo "openssl is required" >&2; exit 2; }
+# Installation always manages the outer Executor/Gateway services with the
+# system daemon. The Gateway's execution daemon is selected separately by its
+# socket bind, so a user's current Docker context cannot redirect this script.
+export DOCKER_HOST=unix:///var/run/docker.sock
 docker compose version >/dev/null
 gzip -t "$BUNDLE"
 
 mkdir -p "$REMOTE_DIR"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 ROLLBACK_IMAGE=""
+SOURCE_BACKUP=""
 if docker image inspect "$IMAGE" >/dev/null 2>&1; then
   ROLLBACK_IMAGE="local/pigo-release-executor:rollback-$TIMESTAMP"
   docker tag "$IMAGE" "$ROLLBACK_IMAGE"
 fi
 if [[ -f "$REMOTE_DIR/server.mjs" ]]; then
-  tar -czf "$REMOTE_DIR/source-backup-$TIMESTAMP.tar.gz" -C "$REMOTE_DIR" \
-    Dockerfile compose.yaml server.mjs executor.env.example remote-install.sh 2>/dev/null || true
+  SOURCE_BACKUP="$REMOTE_DIR/source-backup-$TIMESTAMP.tar.gz"
+  BACKUP_FILES=(Dockerfile compose.yaml server.mjs executor.env.example remote-install.sh)
+  [[ ! -f "$REMOTE_DIR/release-gateway.mjs" ]] || BACKUP_FILES+=(release-gateway.mjs)
+  tar -czf "$SOURCE_BACKUP" -C "$REMOTE_DIR" "${BACKUP_FILES[@]}"
 fi
 
 tar -xzf "$BUNDLE" -C "$REMOTE_DIR"
@@ -59,9 +67,21 @@ if [[ ! -f "$REMOTE_DIR/.env" ]]; then
 fi
 chmod 600 "$REMOTE_DIR/.env"
 
-# Docker group ids vary by host. Keep this mechanical value current without
-# reading or printing any other entry in the protected environment file.
-DOCKER_GID="$(stat -c %g /var/run/docker.sock)"
+# Upgrade existing installations without copying or printing a new credential.
+# This secret is intentionally distinct from the public webhook token.
+if ! grep -q '^PIGO_RELEASE_GATEWAY_TOKEN=.' "$REMOTE_DIR/.env"; then
+  printf '\nPIGO_RELEASE_GATEWAY_TOKEN=%s\n' "$(openssl rand -hex 32)" >> "$REMOTE_DIR/.env"
+fi
+
+# Docker group ids vary by socket. Keep this mechanical value current without
+# reading or printing any secret from the protected environment file.
+RELEASE_DOCKER_SOCKET="$(sed -n 's/^PIGO_RELEASE_DOCKER_SOCKET=//p' "$REMOTE_DIR/.env" | tail -n 1)"
+RELEASE_DOCKER_SOCKET="${RELEASE_DOCKER_SOCKET:-/var/run/docker.sock}"
+if [[ ! "$RELEASE_DOCKER_SOCKET" =~ ^/[A-Za-z0-9._/-]+\.sock$ || ! -S "$RELEASE_DOCKER_SOCKET" ]]; then
+  echo "configured release Docker socket is not a valid local socket" >&2
+  exit 6
+fi
+DOCKER_GID="$(stat -c %g "$RELEASE_DOCKER_SOCKET")"
 if grep -q '^DOCKER_GID=' "$REMOTE_DIR/.env"; then
   sed -i "s/^DOCKER_GID=.*/DOCKER_GID=$DOCKER_GID/" "$REMOTE_DIR/.env"
 else
@@ -70,21 +90,28 @@ fi
 
 cd "$REMOTE_DIR"
 docker compose --env-file .env config --quiet
-docker compose --env-file .env build executor
-docker compose --env-file .env up -d --force-recreate executor
+docker compose --env-file .env build executor release-gateway
+docker compose --env-file .env up -d --force-recreate release-gateway executor
 
 HEALTH=""
 for _ in $(seq 1 30); do
   HEALTH="$(curl -fsS http://127.0.0.1:3300/healthz 2>/dev/null || true)"
-  grep -q '"status":"ok"' <<<"$HEALTH" && break
+  GATEWAY_HEALTH="$(docker exec pigo-release-executor node -e \
+    "fetch('http://release-gateway:3310/healthz').then(async r=>{if(!r.ok)process.exit(1);process.stdout.write(await r.text())}).catch(()=>process.exit(1))" \
+    2>/dev/null || true)"
+  grep -q '"status":"ok"' <<<"$HEALTH" && grep -q '"status":"ok"' <<<"$GATEWAY_HEALTH" && break
   sleep 2
 done
-if ! grep -q '"status":"ok"' <<<"$HEALTH"; then
+if ! grep -q '"status":"ok"' <<<"$HEALTH" || ! grep -q '"status":"ok"' <<<"$GATEWAY_HEALTH"; then
   docker logs --tail 80 "$CONTAINER" >&2 || true
+  docker logs --tail 80 pigo-release-gateway >&2 || true
   if [[ -n "$ROLLBACK_IMAGE" ]]; then
-    docker compose --env-file .env stop executor || true
+    docker compose --env-file .env stop executor release-gateway || true
     docker tag "$ROLLBACK_IMAGE" "$IMAGE"
-    docker compose --env-file .env up -d --force-recreate executor || true
+    if [[ -n "$SOURCE_BACKUP" && -f "$SOURCE_BACKUP" ]]; then
+      tar -xzf "$SOURCE_BACKUP" -C "$REMOTE_DIR"
+    fi
+    docker compose --env-file .env up -d --force-recreate || true
     echo "health verification failed; previous image restored" >&2
   fi
   exit 7
@@ -100,5 +127,6 @@ fi
 
 docker ps --filter "name=^/${CONTAINER}$" --format 'executor: {{.Names}} {{.Image}} {{.Status}}'
 echo "health: ok"
+echo "release gateway health: ok"
 echo "authentication rejection: ok"
 echo "PIGO_EXECUTOR_DEPLOY_VERIFIED"

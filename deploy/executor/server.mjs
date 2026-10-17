@@ -6,7 +6,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const SERVICE = "pigo-release-executor";
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 const BODY_LIMIT = 128 * 1024;
 const LOG_LIMIT = 64 * 1024;
 const COMMAND_TIMEOUT_MS = 15 * 60_000;
@@ -137,7 +137,7 @@ function appendTail(current, chunk) {
   return combined.length <= LOG_LIMIT ? combined : combined.slice(-LOG_LIMIT);
 }
 
-function command(file, args, options = {}) {
+export function command(file, args, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(file, args, {
       cwd: options.cwd,
@@ -179,10 +179,12 @@ export class JsonStateStore {
   constructor(file) {
     this.file = file;
     this.value = { version: 1, deliveries: {}, latestByEnvironment: {} };
+    this.recoveredCallbacks = [];
     this.queue = Promise.resolve();
   }
 
   async init() {
+    this.recoveredCallbacks = [];
     await mkdir(path.dirname(this.file), { recursive: true });
     try {
       const value = JSON.parse(await readFile(this.file, "utf8"));
@@ -190,13 +192,42 @@ export class JsonStateStore {
       this.value = value;
       const recoveredAt = new Date().toISOString();
       let recovered = false;
-      for (const delivery of Object.values(this.value.deliveries)) {
-        if (delivery.status !== "pending") continue;
-        delivery.status = "failed";
-        delivery.callbackStatus = "failed";
-        delivery.detail = "executor restarted before deployment completed; submit a new attempt";
-        delivery.finishedAt = recoveredAt;
-        recovered = true;
+      for (const [key, delivery] of Object.entries(this.value.deliveries)) {
+        if (delivery.status === "pending") {
+          delivery.status = "failed";
+          delivery.callbackStatus = "pending";
+          delivery.detail = "executor restarted before deployment completed; submit a new attempt";
+          delivery.finishedAt = recoveredAt;
+          recovered = true;
+        }
+        if ((delivery.status !== "failed" && delivery.status !== "succeeded") || delivery.callbackStatus !== "pending") continue;
+        if (typeof delivery.callbackUrl !== "string" || !delivery.callbackUrl
+          || typeof delivery.deliveryId !== "string" || !Number.isInteger(delivery.attempt)) {
+          // Legacy state did not persist callbackUrl. Keep it retryable without
+          // inventing a callback target or weakening the callback allowlist.
+          delivery.callbackStatus = "failed";
+          recovered = true;
+          continue;
+        }
+        this.recoveredCallbacks.push({
+          key,
+          payload: {
+            deliveryId: delivery.deliveryId,
+            attempt: delivery.attempt,
+            callbackUrl: delivery.callbackUrl,
+          },
+          outcome: {
+            status: delivery.status,
+            detail: String(delivery.detail ?? "deployment result recovered after executor restart"),
+            ...(delivery.deploymentId ? { deploymentId: delivery.deploymentId } : {}),
+            ...(delivery.url ? { url: delivery.url } : {}),
+            ...(delivery.commit ? { commit: delivery.commit } : {}),
+            ...(delivery.image ? { image: delivery.image } : {}),
+            ...(delivery.imageDigest ? { imageDigest: delivery.imageDigest } : {}),
+            ...(delivery.rolledBackFromCommit ? { rolledBackFromCommit: delivery.rolledBackFromCommit } : {}),
+            ...(delivery.rolledBackFromDigest ? { rolledBackFromDigest: delivery.rolledBackFromDigest } : {}),
+          },
+        });
       }
       await chmod(this.file, 0o600);
       if (recovered) await this.persist();
@@ -220,6 +251,10 @@ export class JsonStateStore {
     return this.value.deliveries[key];
   }
 
+  takeRecoveredCallbacks() {
+    return this.recoveredCallbacks.splice(0);
+  }
+
   latest(environment) {
     const key = this.value.latestByEnvironment[environment];
     return key ? this.value.deliveries[key] : undefined;
@@ -236,7 +271,7 @@ export class JsonStateStore {
       .sort((left, right) => String(right.finishedAt).localeCompare(String(left.finishedAt)))[0];
   }
 
-  successfulDeploymentForCommits(environment, commits) {
+  successfulDeploymentsForCommits(environment, commits) {
     const allowed = new Set(commits);
     return Object.values(this.value.deliveries)
       .filter((item) => item.event === "run.release_requested"
@@ -244,7 +279,7 @@ export class JsonStateStore {
         && item.status === "succeeded"
         && allowed.has(item.commit)
         && item.imageDigest)
-      .sort((left, right) => String(right.finishedAt).localeCompare(String(left.finishedAt)))[0];
+      .sort((left, right) => String(right.finishedAt).localeCompare(String(left.finishedAt)));
   }
 
   summary() {
@@ -264,7 +299,7 @@ export class JsonStateStore {
   }
 }
 
-function executorEnvironment(config, environment) {
+export function executorEnvironment(config, environment) {
   return {
     PATH: process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     HOME: "/tmp",
@@ -275,78 +310,7 @@ function executorEnvironment(config, environment) {
   };
 }
 
-function parseDockerInspect(stdout, containerId) {
-  let parsed;
-  try {
-    parsed = JSON.parse(stdout);
-  } catch {
-    throw new Error(`Docker returned invalid inspect data for ${containerId}`);
-  }
-  if (!Array.isArray(parsed) || parsed.length !== 1 || !parsed[0]?.NetworkSettings) {
-    throw new Error(`Docker returned incomplete inspect data for ${containerId}`);
-  }
-  return parsed[0];
-}
-
-/**
- * Resolve a host-gateway URL to the one container that owns the configured
- * published port. The published port intentionally remains loopback-only on
- * the host; smoke traffic instead crosses a dedicated internal Docker network.
- */
-export async function prepareSmokeUrl(config, environment, runCommand = command) {
-  const configuredUrl = environment === "staging" ? config.stagingUrl : config.productionUrl;
-  const configuredPort = environment === "staging" ? config.stagingPort : config.productionPort;
-  const target = new URL(configuredUrl);
-  if (target.hostname !== "host.docker.internal") return configuredUrl;
-  if (target.protocol !== "http:") throw new Error("host.docker.internal smoke URL must use HTTP");
-  const publishedPort = Number(target.port || 80);
-  if (publishedPort !== configuredPort) {
-    throw new Error(`smoke URL port ${publishedPort} does not match the configured deploy port ${configuredPort}`);
-  }
-
-  const dockerEnv = executorEnvironment(config, environment);
-  const listed = await runCommand("docker", [
-    "ps", "--filter", "status=running", "--filter", `publish=${publishedPort}`, "--format", "{{.ID}}",
-  ], { timeout: 30_000, env: dockerEnv });
-  const containerIds = listed.stdout.split(/\s+/).filter(Boolean);
-  if (containerIds.length !== 1 || !/^[0-9a-f]{12,64}$/i.test(containerIds[0])) {
-    throw new Error(`expected exactly one running container publishing TCP port ${publishedPort}; found ${containerIds.length}`);
-  }
-  const containerId = containerIds[0];
-  const inspect = async () => parseDockerInspect((await runCommand(
-    "docker", ["inspect", containerId], { timeout: 30_000, env: dockerEnv },
-  )).stdout, containerId);
-  let container = await inspect();
-  const matchingPorts = Object.entries(container.NetworkSettings.Ports ?? {})
-    .filter(([key, bindings]) => key.endsWith("/tcp") && Array.isArray(bindings)
-      && bindings.some((binding) => Number(binding?.HostPort) === publishedPort))
-    .map(([key]) => Number(key.split("/")[0]))
-    .filter((port) => Number.isInteger(port) && port > 0 && port <= 65_535);
-  if (matchingPorts.length !== 1) {
-    throw new Error(`could not resolve one container TCP port for published port ${publishedPort}`);
-  }
-
-  const targetNetwork = config.targetNetwork || "pigo-release-targets";
-  if (!container.NetworkSettings.Networks?.[targetNetwork]) {
-    await runCommand("docker", ["network", "connect", targetNetwork, containerId], { timeout: 30_000, env: dockerEnv });
-    container = await inspect();
-  }
-  const address = container.NetworkSettings.Networks?.[targetNetwork]?.IPAddress;
-  if (typeof address !== "string" || !/^\d{1,3}(?:\.\d{1,3}){3}$/.test(address)) {
-    throw new Error(`container did not receive an IPv4 address on ${targetNetwork}`);
-  }
-  return `http://${address}:${matchingPorts[0]}${target.pathname === "/" ? "" : target.pathname}${target.search}`;
-}
-
-async function imageDigest(image) {
-  const result = await command("docker", ["image", "inspect", image, "--format", "{{.Id}}"], { timeout: 30_000, env: executorEnvironment({
-    stagingUrl: "", productionUrl: "", stagingPort: 0, productionPort: 0,
-  }, "staging") });
-  if (!result.stdout.startsWith("sha256:")) throw new Error("deployed image digest is unavailable");
-  return result.stdout;
-}
-
-async function resolveRunTarget(config, payload, options = {}) {
+export async function resolveApplicationTarget(config, payload, options = {}) {
   const workspaceRoot = await realpath(config.workspaceRoot);
   const requestedRepository = path.isAbsolute(payload.repository)
     ? payload.repository
@@ -366,22 +330,32 @@ async function resolveRunTarget(config, payload, options = {}) {
   if ((await git(["status", "--porcelain"])).stdout) throw new Error("workspace is dirty; deployment refused");
   const appDirectory = await realpath(path.join(repository, config.appPath));
   if (!pathWithin(repository, appDirectory)) throw new Error("application path escapes the repository");
-  const opsDirectory = await realpath(path.join(appDirectory, "ops"));
-  if (!pathWithin(appDirectory, opsDirectory)) throw new Error("ops path escapes the application directory");
-  const deployScript = await realpath(path.join(opsDirectory, "deploy.sh"));
-  const smokeScript = await realpath(path.join(opsDirectory, "smoke.sh"));
-  if (!pathWithin(opsDirectory, deployScript) || !pathWithin(opsDirectory, smokeScript)) {
-    throw new Error("deployment script escapes the fixed ops directory");
-  }
-  const [deployStats, smokeStats] = await Promise.all([stat(deployScript), stat(smokeScript)]);
-  if (!deployStats.isFile() || (deployStats.mode & 0o111) === 0) throw new Error("ops/deploy.sh is not executable");
-  if (!smokeStats.isFile() || (smokeStats.mode & 0o111) === 0) throw new Error("ops/smoke.sh is not executable");
-  return { repository, appDirectory, deployScript, smokeScript };
+  return { repository, appDirectory };
 }
 
-async function runDeploy(config, store, payload, reportProgress = async () => undefined) {
+async function releaseGatewayRequest(config, body) {
+  const response = await (config.fetchImpl ?? fetch)(`${config.releaseGatewayUrl}/v1/deploy`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${config.releaseGatewayToken}`,
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(COMMAND_TIMEOUT_MS),
+  });
+  const raw = await response.text();
+  let decoded;
+  try { decoded = raw ? JSON.parse(raw) : {}; } catch { throw new Error("release gateway returned invalid JSON"); }
+  if (!response.ok) throw new Error(`release gateway rejected deployment: ${String(decoded.error || `HTTP ${response.status}`).slice(0, 300)}`);
+  if (!decoded || typeof decoded !== "object" || !/^sha256:[a-f0-9]{64}$/.test(decoded.imageDigest ?? "")) {
+    throw new Error("release gateway returned incomplete deployment evidence");
+  }
+  return decoded;
+}
+
+export async function runDeploy(config, store, payload, reportProgress = async () => undefined) {
   await reportProgress("validating", "workspace and reviewed commit validation started");
-  const target = await resolveRunTarget(config, payload);
+  const target = await resolveApplicationTarget(config, payload);
   const image = `${config.imageRepository}:${payload.commit}`;
   let staging;
   if (payload.environment === "production") {
@@ -392,27 +366,20 @@ async function runDeploy(config, store, payload, reportProgress = async () => un
     if (payload.expectedImageDigest !== staging.imageDigest) {
       throw new Error("requested production digest does not match the successful staging deployment");
     }
-    const before = await imageDigest(image);
-    if (before !== staging.imageDigest) throw new Error("staging image digest no longer matches the local immutable image");
   }
-  const env = {
-    ...executorEnvironment(config, payload.environment),
-    PIGO_DEPLOY_IMAGE: image,
-    // Compatibility alias for the currently reviewed order-status app contract.
-    // The value is still executor-owned; callers cannot select an image.
-    ORDER_STATUS_IMAGE: image,
-    PIGO_DEPLOY_REPOSITORY: target.repository,
-    PIGO_DEPLOY_COMMIT: payload.commit,
-    ...(staging?.imageDigest ? { PIGO_DEPLOY_IMAGE_ID: staging.imageDigest } : {}),
-  };
-  await reportProgress("deploying", "fixed deployment script started");
-  await command(target.deployScript, [payload.environment, payload.commit], { cwd: target.appDirectory, env });
-  await reportProgress("networking", "private smoke network is being prepared");
-  const smokeUrl = await prepareSmokeUrl(config, payload.environment);
-  await reportProgress("smoke", "readiness and functional smoke checks started");
-  await command(target.smokeScript, [], { cwd: target.appDirectory, env: { ...env, APP_BASE_URL: smokeUrl } });
-  await reportProgress("verifying", "immutable image digest verification started");
-  const digest = await imageDigest(image);
+  await reportProgress("deploying", "isolated release gateway deployment and smoke checks started");
+  const deployed = await releaseGatewayRequest(config, {
+    event: "deploy",
+    environment: payload.environment,
+    repository: target.repository,
+    commit: payload.commit,
+    ...(staging?.imageDigest ? { expectedImageDigest: staging.imageDigest } : {}),
+  });
+  await reportProgress("verifying", "isolated release gateway evidence verification started");
+  if (deployed.image !== image || deployed.repository !== target.repository || deployed.commit !== payload.commit) {
+    throw new Error("release gateway evidence does not match the requested deployment");
+  }
+  const digest = deployed.imageDigest;
   if (payload.environment === "production") {
     if (digest !== staging.imageDigest || digest !== payload.expectedImageDigest) {
       throw new Error("production deployment changed the staged image digest");
@@ -433,7 +400,7 @@ async function runDeploy(config, store, payload, reportProgress = async () => un
 
 export async function runRollback(config, store, payload, reportProgress = async () => undefined) {
   await reportProgress("validating", "immutable rollback target validation started");
-  const target = await resolveRunTarget(config, payload, { requireHead: false });
+  const target = await resolveApplicationTarget(config, payload, { requireHead: false });
   const previous = store.latest("production");
   if (!previous || previous.status !== "succeeded" || !previous.imageDigest || !previous.commit) {
     throw new Error("current production deployment evidence is unavailable");
@@ -446,24 +413,19 @@ export async function runRollback(config, store, payload, reportProgress = async
   if (previous.imageDigest === historical.imageDigest) throw new Error("rollback target is already active in production");
 
   const image = `${config.imageRepository}:${payload.commit}`;
-  const before = await imageDigest(image);
-  if (before !== historical.imageDigest) throw new Error("rollback image digest no longer matches historical production evidence");
-  const env = {
-    ...executorEnvironment(config, "production"),
-    PIGO_DEPLOY_IMAGE: image,
-    ORDER_STATUS_IMAGE: image,
-    PIGO_DEPLOY_REPOSITORY: target.repository,
-    PIGO_DEPLOY_COMMIT: payload.commit,
-    PIGO_DEPLOY_IMAGE_ID: historical.imageDigest,
-  };
-  await reportProgress("deploying", "fixed deployment script started for historical image");
-  await command(target.deployScript, ["production", payload.commit], { cwd: target.appDirectory, env });
-  await reportProgress("networking", "private smoke network is being prepared");
-  const smokeUrl = await prepareSmokeUrl(config, "production");
-  await reportProgress("smoke", "post-rollback smoke checks started");
-  await command(target.smokeScript, [], { cwd: target.appDirectory, env: { ...env, APP_BASE_URL: smokeUrl } });
-  await reportProgress("verifying", "rollback image digest verification started");
-  const digest = await imageDigest(image);
+  await reportProgress("deploying", "isolated release gateway rollback and smoke checks started");
+  const deployed = await releaseGatewayRequest(config, {
+    event: "rollback",
+    environment: "production",
+    repository: target.repository,
+    commit: payload.commit,
+    expectedImageDigest: historical.imageDigest,
+  });
+  await reportProgress("verifying", "isolated release gateway rollback evidence verification started");
+  if (deployed.image !== image || deployed.repository !== target.repository || deployed.commit !== payload.commit) {
+    throw new Error("release gateway evidence does not match the requested rollback");
+  }
+  const digest = deployed.imageDigest;
   if (digest !== historical.imageDigest || digest !== payload.expectedImageDigest) {
     throw new Error("rollback changed the historical image digest");
   }
@@ -480,8 +442,17 @@ export async function runRollback(config, store, payload, reportProgress = async
   };
 }
 
-async function runReleaseRegistration(store, payload) {
-  const deployed = store.successfulDeploymentForCommits(payload.environment, payload.commits);
+export async function runReleaseRegistration(config, store, payload, containsCommit = deploymentContainsCommit) {
+  const candidates = store.successfulDeploymentsForCommits(payload.environment, payload.commits);
+  let deployed;
+  for (const candidate of candidates) {
+    if (payload.environment === "production" && candidate.imageDigest !== payload.expectedImageDigest) continue;
+    let includesAll = true;
+    for (const commit of payload.commits) {
+      if (!await containsCommit(config, candidate, commit)) { includesAll = false; break; }
+    }
+    if (includesAll) { deployed = candidate; break; }
+  }
   if (!deployed) throw new Error(`no successful ${payload.environment} deployment matches the reviewed release commits`);
   if (payload.environment === "production" && deployed.imageDigest !== payload.expectedImageDigest) {
     throw new Error("production release does not match the staged image digest");
@@ -494,6 +465,20 @@ async function runReleaseRegistration(store, payload) {
     image: deployed.image,
     imageDigest: deployed.imageDigest,
   };
+}
+
+async function deploymentContainsCommit(config, deployment, commit) {
+  if (!/^[a-f0-9]{40}$/.test(commit) || !/^[a-f0-9]{40}$/.test(deployment.commit ?? "")) return false;
+  const root = await realpath(config.workspaceRoot);
+  const repository = await realpath(deployment.repository);
+  if (!pathWithin(root, repository)) throw new Error("release repository is outside the workspace allowlist");
+  try {
+    await command("git", ["--no-replace-objects", "-c", `safe.directory=${repository}`, "-C", repository,
+      "merge-base", "--is-ancestor", commit, deployment.commit], {
+      timeout: 30_000, env: executorEnvironment(config, deployment.environment),
+    });
+    return true;
+  } catch { return false; }
 }
 
 export async function postCallback(config, payload, outcome) {
@@ -575,6 +560,12 @@ export function loadConfig(environment = process.env) {
   if (!/^[a-z0-9][a-z0-9._/-]*$/i.test(imageRepository)) throw new Error("PIGO_EXECUTOR_IMAGE_REPOSITORY is invalid");
   const targetNetwork = environment.PIGO_EXECUTOR_TARGET_NETWORK || "pigo-release-targets";
   if (!/^[a-z0-9][a-z0-9_.-]*$/i.test(targetNetwork)) throw new Error("PIGO_EXECUTOR_TARGET_NETWORK is invalid");
+  const releaseGatewayToken = environment.PIGO_RELEASE_GATEWAY_TOKEN?.trim() ?? "";
+  if (releaseGatewayToken.length < 32) throw new Error("PIGO_RELEASE_GATEWAY_TOKEN must contain at least 32 characters");
+  const releaseGateway = new URL(environment.PIGO_RELEASE_GATEWAY_URL || "http://release-gateway:3310");
+  if (releaseGateway.protocol !== "http:" || releaseGateway.username || releaseGateway.password || releaseGateway.pathname !== "/") {
+    throw new Error("PIGO_RELEASE_GATEWAY_URL must be an HTTP origin without credentials or a path");
+  }
   const publicUrl = (name) => {
     const raw = environment[name]?.trim() || "";
     if (!raw) return "";
@@ -599,6 +590,8 @@ export function loadConfig(environment = process.env) {
     callbackInternalOrigin,
     imageRepository,
     targetNetwork,
+    releaseGatewayToken,
+    releaseGatewayUrl: releaseGateway.origin,
     stagingUrl: environment.PIGO_EXECUTOR_STAGING_URL || "http://127.0.0.1:18080",
     productionUrl: environment.PIGO_EXECUTOR_PRODUCTION_URL || "http://127.0.0.1:18081",
     stagingPublicUrl: publicUrl("PIGO_EXECUTOR_STAGING_PUBLIC_URL"),
@@ -628,7 +621,7 @@ export async function createExecutor(options = {}) {
         ? await runDeploy(config, store, payload, reportProgress)
         : payload.event === "run.rollback_requested"
           ? await runRollback(config, store, payload, reportProgress)
-          : await runReleaseRegistration(store, payload);
+          : await runReleaseRegistration(config, store, payload);
       outcome = { status: "succeeded", ...result };
     } catch (error) {
       outcome = { status: "failed", detail: (error instanceof Error ? error.message : "deployment failed").slice(0, 500) };
@@ -654,6 +647,12 @@ export async function createExecutor(options = {}) {
       console.error(JSON.stringify({ level: "error", event: "callback.retry_failed", deliveryId: payload.deliveryId, attempt: payload.attempt, message: error.message }));
       await store.mutate((state) => { state.deliveries[key].callbackStatus = "failed"; });
     }
+  }
+
+  for (const recovered of store.takeRecoveredCallbacks?.() ?? []) {
+    jobs = jobs.then(() => retryCallback(recovered.payload, recovered.key, recovered.outcome)).catch((error) => {
+      console.error(JSON.stringify({ level: "error", event: "recovery.callback_unhandled", deliveryId: recovered.payload.deliveryId, message: error.message }));
+    });
   }
 
   const server = http.createServer(async (request, reply) => {
@@ -710,6 +709,7 @@ export async function createExecutor(options = {}) {
           environment: payload.environment,
           deliveryId: payload.deliveryId,
           attempt: payload.attempt,
+          callbackUrl: payload.callbackUrl,
           fingerprint,
           status: "pending",
           callbackStatus: "pending",

@@ -5,6 +5,7 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -24,6 +25,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
 
       - name: Configure Node.js
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
@@ -56,6 +59,8 @@ jobs:
         run: npm run scan:secrets
 
       - name: Scan repository deployment policy
+        env:
+          PIGO_EXPORT_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
         run: npm run scan:repository-policy
 
       - name: Build production artifacts
@@ -99,6 +104,12 @@ jobs:
         env:
           PI_DATABASE_URL: postgresql://pigo_ci:ci-local-only@127.0.0.1:5432/pigo_ci
         run: npm run test:pg:concurrency
+
+      - name: Exercise isolated backup restore safety
+        env:
+          PI_RESTORE_DRILL_CONTAINER: ${{ job.services.postgres.id }}
+          PI_RESTORE_DRILL_PG_USER: pigo_ci
+        run: node scripts/restore-drill.mjs
 
   browser-smoke:
     name: Browser smoke evidence

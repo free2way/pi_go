@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import {
   awaitSandboxExit,
   buildContainerSpec,
@@ -11,6 +14,7 @@ import {
   isContainerGoneError,
   MAX_SANDBOX_TEARDOWN_PASSES,
   parseSandboxAllowDegraded,
+  prepareSandboxStateDirectory,
   resolveSandboxMode,
   SANDBOX_TEARDOWN_MARGIN_MS,
   SandboxClosingError,
@@ -82,6 +86,12 @@ describe("buildContainerSpec", () => {
     expect(spec.Labels["pigo.sandbox"]).toBe("1");
   });
 
+  it("maps sandbox root scratch ownership for a rootless Docker daemon", () => {
+    const spec = buildContainerSpec({ ...base, user: "0:0" });
+    expect(spec.User).toBe("0:0");
+    expect(spec.HostConfig.Tmpfs?.["/home/node/.cache"]).toContain("uid=0,gid=0");
+  });
+
   it("passes only the supplied environment (SEC-003/010)", () => {
     const spec = buildContainerSpec({ ...base, env: { DEEPSEEK_API_KEY: "role-key", PATH: "/usr/bin" } });
     expect(spec.Env).toEqual(["DEEPSEEK_API_KEY=role-key", "PATH=/usr/bin"]);
@@ -110,6 +120,22 @@ describe("sandboxStateDirectory", () => {
     expect(sandboxStateDirectory(worktree, "/workspace/runs/run-1.state/subagents/api"))
       .toBe("/workspace/runs/run-1.state/subagents/api");
     expect(() => sandboxStateDirectory(worktree, `${worktree}/.pi`)).toThrow(/outside worktree/);
+  });
+});
+
+describe("prepareSandboxStateDirectory", () => {
+  it("pre-creates a worker-owned model mountpoint and remains removable", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "pigo-sandbox-state-"));
+    const state = path.join(root, "run.state");
+    try {
+      await prepareSandboxStateDirectory(state);
+      expect(await readFile(path.join(state, "agent", "models.json"), "utf8")).toBe("");
+      expect((await stat(path.join(state, "agent", "models.json"))).mode & 0o777).toBe(0o600);
+      await rm(state, { recursive: true });
+      await expect(stat(state)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 

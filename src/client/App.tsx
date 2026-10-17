@@ -60,7 +60,7 @@ import {
   XCircle,
   Zap,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { DEFAULT_LOCALE, intlLocale, localizeError, type Locale } from "../shared/i18n";
 import { useT, type TFunction } from "./i18n";
 import { roleCostDisplay, roleCostLabel, roleDisplayName, totalUnpricedCalls } from "./budget-roles-view";
@@ -85,27 +85,28 @@ import {
   decisionGateKeys,
   decisionRemainingGroupKey,
 } from "./decision-brief-view";
-import { AgilePage } from "./AgilePage";
-import { DecisionsPanel } from "./DecisionsPanel";
-import { HistoryPage } from "./HistoryPage";
 import { requirementSummary, runStateKey } from "./requirement-history";
 import { batchCleanupConfirmMessage, cleanupFinishedConfirmMessage, cleanupStorageDetailLines, summarizeCleanupStorage } from "./run-cleanup-view";
 import { MAX_BUFFERED_EVENTS, deferredNonBlockingNotice, mergeRunEvents, shouldAcceptRun } from "./run-events";
 import { createRunSelectionGuard, eventsForRun, isRunSelected, pickSelectedRun } from "./run-selection";
 import { reworkBranchDetailsFromSummaries, resolveReworkRounds, resolveRoundStatuses, roundStatusKey } from "./rounds-view";
 import { reworkBranchLayout, reworkBranchPath, type ReworkSide } from "./rework-layout";
-import { ModelsPage } from "./ModelsPage";
 import { mergeOptionState } from "./merge-option";
 import { buildRoleModelOptions, modelOptionText, preferredModelId, roleUncovered } from "./model-options";
 import { isModelSelectableForRole } from "../shared/model-select";
-import { AccountsPage } from "./AccountsPage";
-import { SystemStatusPage } from "./SystemStatusPage";
-import { WorkspacesPage } from "./WorkspacesPage";
-import { ReleaseSettingsPage } from "./ReleaseSettingsPage";
 import { browserDeploymentUrl, RELEASE_PROGRESS_STAGES, releaseProgressEventStage, releaseProgressStepState, type ReleaseProgressStage } from "./release-progress";
 import { ReleaseEvidence } from "./ReleaseEvidence";
 import { RequirementAssistant } from "./RequirementAssistant";
 import { PiAssistant } from "./PiAssistant";
+
+const AccountsPage = lazy(() => import("./AccountsPage").then((module) => ({ default: module.AccountsPage })));
+const AgilePage = lazy(() => import("./AgilePage").then((module) => ({ default: module.AgilePage })));
+const DecisionsPanel = lazy(() => import("./DecisionsPanel").then((module) => ({ default: module.DecisionsPanel })));
+const HistoryPage = lazy(() => import("./HistoryPage").then((module) => ({ default: module.HistoryPage })));
+const ModelsPage = lazy(() => import("./ModelsPage").then((module) => ({ default: module.ModelsPage })));
+const ReleaseSettingsPage = lazy(() => import("./ReleaseSettingsPage").then((module) => ({ default: module.ReleaseSettingsPage })));
+const SystemStatusPage = lazy(() => import("./SystemStatusPage").then((module) => ({ default: module.SystemStatusPage })));
+const WorkspacesPage = lazy(() => import("./WorkspacesPage").then((module) => ({ default: module.WorkspacesPage })));
 
 /**
  * 侧栏「最近任务」只列最近的 N 个（需求）：完整列表在「需求历史」页
@@ -2120,21 +2121,22 @@ export function App({ onSignOut }: { onSignOut?: () => void } = {}) {
           </div>
         </header>
 
-        {view === "system" ? (
-          <SystemStatusPage isAdmin={Boolean(user?.isAdmin)} />
-        ) : view === "release-settings" ? (
-          <ReleaseSettingsPage onChanged={() => { void api.config().then(setConfig); }} />
-        ) : view === "models" ? (
-          <ModelsPage config={config} onChanged={() => { void api.config().then(setConfig); }} />
-        ) : view === "workspaces" ? (
-          <WorkspacesPage config={config} runs={runs} isAdmin={Boolean(user?.isAdmin)} onOpenCredentials={() => setView("models")} />
-        ) : view === "history" ? (
-          <HistoryPage runs={runs} onOpenRun={(id) => { setSelectedId(id); setView("run"); setSidebarOpen(false); }} />
-        ) : view === "agile" ? (
-          <AgilePage config={config} onOpenRun={(id) => { setSelectedId(id); setView("run"); setSidebarOpen(false); }} />
-        ) : view === "accounts" ? (
-          <AccountsPage user={user} />
-        ) : !activeRun ? (
+        <Suspense fallback={<section className="run-loading"><LoaderCircle className="spin" size={22} /><span>{t("run.loading")}</span></section>}>
+          {view === "system" ? (
+            <SystemStatusPage isAdmin={Boolean(user?.isAdmin)} />
+          ) : view === "release-settings" ? (
+            <ReleaseSettingsPage onChanged={() => { void api.config().then(setConfig); }} />
+          ) : view === "models" ? (
+            <ModelsPage config={config} onChanged={() => { void api.config().then(setConfig); }} />
+          ) : view === "workspaces" ? (
+            <WorkspacesPage config={config} runs={runs} isAdmin={Boolean(user?.isAdmin)} onOpenCredentials={() => setView("models")} />
+          ) : view === "history" ? (
+            <HistoryPage runs={runs} onOpenRun={(id) => { setSelectedId(id); setView("run"); setSidebarOpen(false); }} />
+          ) : view === "agile" ? (
+            <AgilePage config={config} onOpenRun={(id) => { setSelectedId(id); setView("run"); setSidebarOpen(false); }} />
+          ) : view === "accounts" ? (
+            <AccountsPage user={user} />
+          ) : !activeRun ? (
           selectedId ? (
             <section className="run-loading">
               <LoaderCircle className="spin" size={22} />
@@ -2269,7 +2271,8 @@ export function App({ onSignOut }: { onSignOut?: () => void } = {}) {
               onJumpToRound={jumpToTopology}
             />
           </div>
-        )}
+          )}
+        </Suspense>
       </main>
       <PiAssistant page={view} run={view === "run" ? activeRun : undefined} />
       <CreateRunDialog open={createOpen} onClose={() => setCreateOpen(false)} onCreated={handleCreated} config={config} recentRuns={runs} onGoWorkspaces={() => { setCreateOpen(false); setView("workspaces"); }} />
