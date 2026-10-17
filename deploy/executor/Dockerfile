@@ -11,9 +11,11 @@ RUN git init \
   && git checkout --detach FETCH_HEAD
 RUN CGO_ENABLED=0 TARGET=/out VERSION=29.9.0 ./scripts/build/binary
 
-FROM node:22.23.3-alpine
+FROM node:22.23.3-alpine3.24
 
-RUN apk add --no-cache bash curl git \
+RUN apk upgrade --no-cache \
+  && apk add --no-cache bash curl git \
+  && rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx \
   && mkdir -p /data \
   && chown node:node /data
 

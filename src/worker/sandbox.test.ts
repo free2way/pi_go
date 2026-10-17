@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -131,8 +131,28 @@ describe("prepareSandboxStateDirectory", () => {
       await prepareSandboxStateDirectory(state);
       expect(await readFile(path.join(state, "agent", "models.json"), "utf8")).toBe("");
       expect((await stat(path.join(state, "agent", "models.json"))).mode & 0o777).toBe(0o600);
+      expect(JSON.parse(await readFile(path.join(state, "agent", "settings.json"), "utf8"))).toEqual({
+        npmCommand: ["pnpm"],
+      });
+      expect((await stat(path.join(state, "agent", "settings.json"))).mode & 0o777).toBe(0o600);
       await rm(state, { recursive: true });
       await expect(stat(state)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not overwrite an operator-owned Pi package-manager setting", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "pigo-sandbox-settings-"));
+    const state = path.join(root, "run.state");
+    const agent = path.join(state, "agent");
+    try {
+      await mkdir(agent, { recursive: true });
+      await writeFile(path.join(agent, "settings.json"), '{"npmCommand":["custom-pm"]}\n', { mode: 0o600 });
+      await prepareSandboxStateDirectory(state);
+      expect(JSON.parse(await readFile(path.join(agent, "settings.json"), "utf8"))).toEqual({
+        npmCommand: ["custom-pm"],
+      });
     } finally {
       await rm(root, { recursive: true, force: true });
     }
