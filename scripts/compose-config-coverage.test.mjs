@@ -25,7 +25,7 @@ test("real compose.yaml forwards every curated critical variable", () => {
 test("curated list covers the v0.22 features named by the review", () => {
   const web = new Set(CRITICAL_ENV.web);
   const worker = new Set(CRITICAL_ENV.worker);
-  for (const name of ["PI_MODEL_CATALOG_JSON", "PI_MERGE_REQUEST_URL", "PI_MERGE_REQUEST_TOKEN", "PI_POST_MERGE_DEPLOY_HOOK", "PI_POST_MERGE_DEPLOY_TOKEN", "PI_WEB_VERSION", "PI_WORKER_VERSION", "PI_ROLLBACK_TAGS", "PI_DEPLOY_LOG"]) {
+  for (const name of ["PI_MODEL_CATALOG_JSON", "PI_MERGE_REQUEST_URL", "PI_MERGE_REQUEST_TOKEN", "PI_POST_MERGE_DEPLOY_HOOK", "PI_POST_MERGE_DEPLOY_TOKEN", "PI_STAGING_DEPLOY_HOOK", "PI_STAGING_DEPLOY_TOKEN", "PI_PRODUCTION_DEPLOY_HOOK", "PI_PRODUCTION_DEPLOY_TOKEN", "PI_WEB_VERSION", "PI_WORKER_VERSION", "PI_ROLLBACK_TAGS", "PI_DEPLOY_LOG"]) {
     assert.ok(web.has(name), `web must cover ${name}`);
   }
   for (const name of ["PI_PLUGIN_ALLOWLIST", "PI_PLUGIN_REQUESTS", "PI_PLUGIN_REQUIRE_PIN", "PI_PLUGIN_REGISTRY"]) {
