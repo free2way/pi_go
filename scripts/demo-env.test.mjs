@@ -436,6 +436,18 @@ test("compose.demo.yaml allows the worker to reach the demo web service by name"
   assert.ok(!/PI_WEB_CALLBACK_URL: http:\/\/web:3100/.test(codeLines));
 });
 
+test("compose.demo.yaml gives every long-running application service finite resource limits", () => {
+  for (const service of ["demo-web", "demo-sandbox-gateway", "demo-worker"]) {
+    const start = composeText.indexOf(`  ${service}:`);
+    const remainder = composeText.slice(start + service.length + 3);
+    const nextServiceOffset = remainder.search(/\n  [a-z][a-z0-9-]+:\n/u);
+    const block = composeText.slice(start, nextServiceOffset < 0 ? undefined : start + service.length + 3 + nextServiceOffset);
+    assert.match(block, /\n    pids_limit: [1-9]\d*/u, `${service} must have a PID limit`);
+    assert.match(block, /\n    mem_limit: [1-9]/u, `${service} must have a memory limit`);
+    assert.match(block, /\n    cpus: (?:0\.[1-9]\d*|[1-9]\d*(?:\.\d+)?)/u, `${service} must have a CPU limit`);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Seed idempotency (pure decision logic).
 // ---------------------------------------------------------------------------

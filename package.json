@@ -27,6 +27,7 @@
     "validate:compose": "node deploy/docker/validate-compose.mjs",
     "plan:oci-deployment": "node scripts/oci-deployment-env.mjs",
     "gate:oci-promotion": "node scripts/oci-promotion-gate.mjs",
+    "audit:containers": "node scripts/container-security-audit.mjs",
     "check:clerk": "node scripts/clerk-config-check.mjs",
     "test:pg:concurrency": "node scripts/pg-concurrency-check.mjs",
     "lint": "eslint .",
