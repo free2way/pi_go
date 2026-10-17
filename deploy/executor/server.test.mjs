@@ -257,6 +257,7 @@ test("run deployments emit authenticated, attempt-scoped progress callbacks", as
   await postProgress(config, payload, "smoke", "functional checks started");
   assert.equal(observed.url, "http://web:3100/api/internal/runs/run_1/release-result");
   assert.equal(observed.options.headers.Authorization, `Bearer ${token}`);
+  assert.equal(observed.options.redirect, "error");
   assert.deepEqual(JSON.parse(observed.options.body), {
     deliveryId: payload.deliveryId,
     attempt: 3,
@@ -270,14 +271,16 @@ test("run deployments emit authenticated, attempt-scoped progress callbacks", as
   assert.equal(observed, undefined);
 });
 
-test("successful callbacks carry immutable deployment evidence", async () => {
+test("successful callbacks carry immutable deployment evidence and reject redirects", async () => {
   let body;
+  let redirect;
   await postCallback({
     token,
     callbackPublicOrigin: "https://pigo.example.com",
     callbackInternalOrigin: "http://web:3100",
     fetchImpl: async (_url, options) => {
       body = JSON.parse(options.body);
+      redirect = options.redirect;
       return { ok: true, status: 200 };
     },
   }, {
@@ -302,6 +305,7 @@ test("successful callbacks carry immutable deployment evidence", async () => {
     image: "local/app:immutable",
     imageDigest: digest,
   });
+  assert.equal(redirect, "error");
 });
 
 test("rollback callbacks carry the previous and restored digests", async () => {
