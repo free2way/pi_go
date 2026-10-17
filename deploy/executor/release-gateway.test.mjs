@@ -347,6 +347,24 @@ test("compose keeps Docker socket only on the internal release gateway", async (
   assert.doesNotMatch(gateway, /ports:/);
 });
 
+test("staging compose uses an isolated release gateway with the same workspace", async () => {
+  const directory = path.dirname(fileURLToPath(import.meta.url));
+  const compose = await readFile(path.join(directory, "compose.staging.yaml"), "utf8");
+  const gatewayStart = compose.indexOf("\n  release-gateway:\n");
+  const executor = compose.slice(compose.indexOf("  executor:"), gatewayStart);
+  const gateway = compose.slice(gatewayStart, compose.indexOf("\nvolumes:"));
+
+  assert.notEqual(gatewayStart, -1);
+  assert.match(executor, /depends_on:\s+release-gateway:\s+condition: service_healthy/u);
+  assert.match(executor, /PIGO_RELEASE_GATEWAY_URL: http:\/\/pigo-release-gateway-staging:3310/u);
+  assert.match(gateway, /container_name: pigo-release-gateway-staging/u);
+  assert.match(gateway, /\$\{PIGO_HOST_WORKSPACE_ROOT:\?Set the exact host workspace root\}:\/workspace:ro/u);
+  assert.match(gateway, /\$\{PIGO_RELEASE_DOCKER_SOCKET:-\/var\/run\/docker\.sock\}:\/var\/run\/docker\.sock/u);
+  assert.match(gateway, /PIGO_EXECUTOR_STAGING_PORT: \$\{PIGO_EXECUTOR_STAGING_PORT:-18080\}/u);
+  assert.doesNotMatch(gateway, /PIGO_EXECUTOR_PRODUCTION_PORT/u);
+  assert.doesNotMatch(gateway, /ports:/u);
+});
+
 test("automated release gateway never executes repository ops scripts or Compose", async () => {
   const directory = path.dirname(fileURLToPath(import.meta.url));
   const source = await readFile(path.join(directory, "release-gateway.mjs"), "utf8");
