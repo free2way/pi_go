@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseArgs } from "./oci-manifest.mjs";
+import { OCI_COMPONENTS, parseArgs } from "./oci-manifest.mjs";
 import { renderDeploymentEnv, validateDeploymentManifest } from "./oci-deployment-env.mjs";
 
 const AUTH_MODES = new Set(["development", "cloudflare", "clerk"]);
@@ -141,6 +141,29 @@ export function authorizeProduction(bundle, stagingEvidence, expectedAttestation
 }
 
 const RUNNING_COMPONENTS = ["runtime", "web", "worker", "executor"];
+const DOCKER_HOST_PATTERN = /^unix:\/\/\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.sock$/u;
+
+/** Promotion evidence may inspect components on different local Docker daemons.
+ * Only local Unix sockets are accepted: a promotion file must never turn this
+ * gate into a network Docker client or carry daemon credentials.
+ */
+export function validateDockerHosts(value = {}) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("docker hosts must be a JSON object");
+  }
+  const allowed = new Set(OCI_COMPONENTS);
+  const normalized = {};
+  for (const [component, dockerHost] of Object.entries(value)) {
+    if (!allowed.has(component)) throw new Error(`docker host component ${component} is invalid`);
+    const pathSegments = typeof dockerHost === "string" ? dockerHost.slice("unix:///".length).split("/") : [];
+    if (typeof dockerHost !== "string" || !DOCKER_HOST_PATTERN.test(dockerHost)
+      || pathSegments.some((segment) => segment === "." || segment === "..")) {
+      throw new Error(`docker host for ${component} must be an absolute local Unix socket URL`);
+    }
+    normalized[component] = dockerHost;
+  }
+  return normalized;
+}
 
 export function validateRuntimeEvidence(bundle, evidence) {
   for (const [component, image] of Object.entries(bundle.images)) {
@@ -157,12 +180,16 @@ export function validateRuntimeEvidence(bundle, evidence) {
 /** Inspect the deployment Docker daemon, not values copied out of the manifest.
  * Sandbox is an on-demand image; all other components must be running.
  */
-export function inspectDockerRuntime(bundle, containers, docker = (args) => JSON.parse(execFileSync("docker", args, {
-  encoding: "utf8", timeout: 30_000, maxBuffer: 4 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"],
-}))) {
+export function inspectDockerRuntime(bundle, containers, docker = (args, dockerHost) => JSON.parse(execFileSync(
+  "docker",
+  dockerHost ? ["--host", dockerHost, ...args] : args,
+  { encoding: "utf8", timeout: 30_000, maxBuffer: 4 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] },
+)), dockerHosts = {}) {
+  const hosts = validateDockerHosts(dockerHosts);
   const evidence = {};
   for (const [component, image] of Object.entries(bundle.images)) {
-    const [actual] = docker(["image", "inspect", image.reference]);
+    const dockerHost = hosts[component];
+    const [actual] = docker(["image", "inspect", image.reference], dockerHost);
     if (!actual?.RepoDigests?.includes(image.reference) || actual.Config?.Labels?.["org.opencontainers.image.revision"] !== bundle.commit) {
       throw new Error(`actual ${component} image digest/revision does not match the immutable manifest`);
     }
@@ -170,7 +197,7 @@ export function inspectDockerRuntime(bundle, containers, docker = (args) => JSON
     if (RUNNING_COMPONENTS.includes(component)) {
       const container = containers?.[component];
       if (typeof container !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$/u.test(container)) throw new Error(`container for ${component} is required`);
-      const [running] = docker(["container", "inspect", container]);
+      const [running] = docker(["container", "inspect", container], dockerHost);
       item.containerImageId = running?.Image;
       item.running = running?.State?.Running === true;
       if (running?.Config?.Image !== image.reference) throw new Error(`${component} container is not pinned to the expected digest`);
@@ -203,6 +230,7 @@ export async function recordPromotionEvidence({
   attestationMode = "enforce",
   stagingEvidence,
   containers,
+  dockerHosts = {},
   inspectRuntime = inspectDockerRuntime,
   verifyAttestations = verifyGitHubAttestations,
   fetchImpl = fetch,
@@ -213,6 +241,7 @@ export async function recordPromotionEvidence({
   if (environment === "production" && expectedAuthMode === "development") throw new Error("production cannot use development authentication");
   const policy = attestationPolicy(expectedAttestationPolicy);
   const normalizedAttestationMode = normalizeAttestationMode(attestationMode);
+  const validatedDockerHosts = validateDockerHosts(dockerHosts);
   if (environment === "production") authorizeProduction(bundle, stagingEvidence, policy, normalizedAttestationMode);
 
   let health;
@@ -247,7 +276,7 @@ export async function recordPromotionEvidence({
       normalizedAttestationMode,
     );
   }
-  const runtime = validateRuntimeEvidence(bundle, await inspectRuntime(bundle, containers));
+  const runtime = validateRuntimeEvidence(bundle, await inspectRuntime(bundle, containers, undefined, validatedDockerHosts));
   return {
     schemaVersion: 3,
     environment,
@@ -307,6 +336,9 @@ async function main() {
     attestationMode,
     stagingEvidence,
     containers: JSON.parse(readFileSync(resolve(required(options.containers, "containers (JSON file mapping runtime/web/worker/executor to container names)")), "utf8")),
+    dockerHosts: options["docker-hosts"]
+      ? JSON.parse(readFileSync(resolve(options["docker-hosts"]), "utf8"))
+      : {},
   });
   const output = writeExclusive(options.output, `${JSON.stringify(evidence, null, 2)}\n`);
   if (evidence.attestation.status === "warning") {

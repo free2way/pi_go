@@ -48,6 +48,7 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    read_only: true
     pids_limit: 512
     mem_limit: 4g
     cpus: 2.0
