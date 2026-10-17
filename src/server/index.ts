@@ -17,6 +17,7 @@ import { Authenticator, normalizePublicOrigin } from "./auth.js";
 import { ExpiringLruCache } from "./expiring-lru-cache.js";
 import { CredentialVault } from "./credential-vault.js";
 import { normalizeReleaseCallbackOrigin, ReleaseSettingsStore, releaseSettingsStatus } from "./release-settings.js";
+import { releaseCallbackTokens, resolveReleaseRoute, type ReleaseEnvironment } from "./release-routing.js";
 import { ScmSettingsStore } from "./scm-settings.js";
 import { createDb, createPool, newId, runMigrations } from "./db.js";
 import { baseDemoRun, runDemo } from "./demo-runner.js";
@@ -812,20 +813,26 @@ async function requireAccountAdmin(request: FastifyRequest, reply: FastifyReply)
   return user;
 }
 
-function effectiveReleaseConfig() {
+function effectiveReleaseConfig(environment: ReleaseEnvironment) {
   const saved = releaseSettings.get();
-  const webhookUrl = saved?.webhookUrl ?? process.env.PI_POST_MERGE_DEPLOY_HOOK;
+  const route = resolveReleaseRoute({ environment, ...(saved ? { saved } : {}), variables: process.env });
   return {
-    deployPlan: planPostMergeDeploy(webhookUrl),
-    webhookToken: saved?.webhookToken ?? process.env.PI_POST_MERGE_DEPLOY_TOKEN ?? "",
+    deployPlan: planPostMergeDeploy(route.webhookUrl),
+    webhookToken: route.webhookToken,
     callbackOrigin: saved?.publicOrigin ?? (releaseCallbackOrigin || publicOrigin),
-    source: saved ? "web" as const : webhookUrl ? "environment" as const : "none" as const,
+    source: route.source,
+    environmentSpecific: route.environmentSpecific,
   };
+}
+
+function releaseCallbackAuthorized(authorization: string | undefined) {
+  return releaseCallbackTokens(releaseSettings.get(), process.env)
+    .some((token) => safeSecretMatch(authorization, token)) || safeTokenMatch(authorization);
 }
 
 function releaseSettingsProjection() {
   const saved = releaseSettings.get();
-  const effective = effectiveReleaseConfig();
+  const effective = effectiveReleaseConfig("staging");
   const environmentWebhook = effective.deployPlan.configured && effective.deployPlan.kind === "webhook"
     ? effective.deployPlan
     : undefined;
@@ -834,7 +841,7 @@ function releaseSettingsProjection() {
       ...(saved ? { saved } : {}),
       environment: {
         webhookUrl: environmentWebhook?.url,
-        webhookToken: process.env.PI_POST_MERGE_DEPLOY_TOKEN,
+        webhookToken: effective.webhookToken,
         publicOrigin: releaseCallbackOrigin || publicOrigin,
       },
     });
@@ -1110,7 +1117,7 @@ app.post("/api/assistant/ask", async (request, reply) => {
 app.get("/api/config/status", async (request): Promise<ConfigStatus & { decisionEngine: DecisionEngineStatus }> => {
   const credentials = vault.status(vaultKeyFor(request));
   const configured = new Set(credentials.providers.map((item) => item.provider));
-  const releaseRuntime = effectiveReleaseConfig();
+  const releaseRuntime = effectiveReleaseConfig("staging");
   const releasePlan = releaseRuntime.deployPlan;
   // AUD-09 / AT-MODEL-006/007: execution availability is decoupled from the
   // default provider/credential pairing. As long as at least one provider is
@@ -1903,7 +1910,7 @@ app.post<{ Params: { id: string } }>("/api/agile/releases/:id/publish", { bodyLi
     }
 
     const now = new Date().toISOString();
-    const releaseRuntime = effectiveReleaseConfig();
+    const releaseRuntime = effectiveReleaseConfig(parsed.data.environment!);
     const deployPlan = releaseRuntime.deployPlan;
     if (deployPlan.configured && deployPlan.kind === "webhook" && !releaseRuntime.webhookToken) {
       return reply.code(409).send({ error: "Webhook 发布必须在发布设置或环境变量中配置 Token", code: "RELEASE_AUTH_NOT_CONFIGURED" });
@@ -1963,7 +1970,7 @@ app.post<{ Params: { id: string } }>("/api/agile/releases/:id/publish", { bodyLi
  * the current attempt stays idempotent (`{ ok: true }`, no write).
  */
 app.post<{ Params: { id: string } }>("/api/internal/agile/releases/:id/release-result", async (request, reply) => {
-  const authorized = safeSecretMatch(request.headers.authorization, effectiveReleaseConfig().webhookToken) || safeTokenMatch(request.headers.authorization);
+  const authorized = releaseCallbackAuthorized(request.headers.authorization);
   if (!authorized) return reply.code(401).send({ error: "Unauthorized" });
   const parsed = releaseDeployResultSchema.safeParse(request.body ?? {});
   if (!parsed.success) return reply.code(400).send({ error: "Invalid release result", details: parsed.error.issues });
@@ -2930,7 +2937,7 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/publish", { bodyLimit: 1024 
     }
   }
 
-  const releaseRuntime = effectiveReleaseConfig();
+  const releaseRuntime = effectiveReleaseConfig(parsed.data.environment);
   const deployPlan = releaseRuntime.deployPlan;
   if (!deployPlan.configured) return reply.code(409).send({ error: deployPlan.reason, code: "RELEASE_NOT_CONFIGURED" });
   if (deployPlan.kind === "unsupported") return reply.code(409).send({ error: deployPlan.reason, code: "RELEASE_CONFIG_INVALID" });
@@ -3037,7 +3044,7 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/rollback", { bodyLimit: 1024
   const user = auth.user(request);
   if (!(await identities.isAdmin(user.id))) return reply.code(403).send({ error: "仅管理员可以回滚 production", code: "ADMIN_REQUIRED" });
 
-  const releaseRuntime = effectiveReleaseConfig();
+  const releaseRuntime = effectiveReleaseConfig("production");
   const deployPlan = releaseRuntime.deployPlan;
   if (!deployPlan.configured) return reply.code(409).send({ error: deployPlan.reason, code: "RELEASE_NOT_CONFIGURED" });
   if (deployPlan.kind !== "webhook") return reply.code(409).send({ error: "受控回滚只支持 Webhook Executor", code: "ROLLBACK_EXECUTOR_REQUIRED" });
@@ -3119,7 +3126,7 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/rollback", { bodyLimit: 1024
 
 /** Authenticated progress/final callback for production rollback attempts. */
 app.post<{ Params: { id: string } }>("/api/internal/runs/:id/rollback-result", async (request, reply) => {
-  const authorized = safeSecretMatch(request.headers.authorization, effectiveReleaseConfig().webhookToken) || safeTokenMatch(request.headers.authorization);
+  const authorized = releaseCallbackAuthorized(request.headers.authorization);
   if (!authorized) return reply.code(401).send({ error: "Unauthorized" });
   const parsed = rollbackResultSchema.safeParse(request.body ?? {});
   if (!parsed.success) return reply.code(400).send({ error: "Invalid rollback result", details: parsed.error.issues });
@@ -3189,7 +3196,7 @@ app.post<{ Params: { id: string } }>("/api/internal/runs/:id/rollback-result", a
 
 /** Authenticated final-status callback for asynchronous (HTTP 202) publishers. */
 app.post<{ Params: { id: string } }>("/api/internal/runs/:id/release-result", async (request, reply) => {
-  const authorized = safeSecretMatch(request.headers.authorization, effectiveReleaseConfig().webhookToken) || safeTokenMatch(request.headers.authorization);
+  const authorized = releaseCallbackAuthorized(request.headers.authorization);
   if (!authorized) return reply.code(401).send({ error: "Unauthorized" });
   const parsed = releaseResultSchema.safeParse(request.body ?? {});
   if (!parsed.success) return reply.code(400).send({ error: "Invalid release result", details: parsed.error.issues });
