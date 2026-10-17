@@ -1,4 +1,4 @@
-import { mkdir, open } from "node:fs/promises";
+import { mkdir, open, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { ContainerCreateSpec } from "./docker-api.js";
 
@@ -136,6 +136,18 @@ export function sandboxStateDirectory(worktree: string, override?: string): stri
 export async function prepareSandboxStateDirectory(stateDirectory: string): Promise<void> {
   const agentDirectory = path.join(stateDirectory, "agent");
   await mkdir(agentDirectory, { recursive: true });
+  // Pi's package manager supports pnpm natively. Seed only new per-run state so
+  // npm can stay absent from the final image without disabling allowlisted Pi
+  // extension/package installation. Never overwrite an operator-owned setting.
+  try {
+    await writeFile(
+      path.join(agentDirectory, "settings.json"),
+      `${JSON.stringify({ npmCommand: ["pnpm"] })}\n`,
+      { flag: "wx", mode: 0o600 },
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
   const mountpoint = await open(path.join(agentDirectory, "models.json"), "a", 0o600);
   await mountpoint.close();
 }

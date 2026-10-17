@@ -11,7 +11,9 @@ test("publishing immutable images requires all same-commit quality jobs", () => 
   assert.match(gate, /workflow_call:/u);
   for (const name of ["quality", "postgres-concurrency", "browser-smoke"]) assert.match(gate, new RegExp(`  ${name}:`));
   assert.match(gate, /fetch-depth: 0/u);
-  assert.equal((workflow.match(/severity-cutoff: high/gu) ?? []).length, 5);
-  assert.equal((workflow.match(/only-fixed: false/gu) ?? []).length, 5);
+  assert.equal((workflow.match(/severity-cutoff: high/gu) ?? []).length, 10);
+  assert.equal((workflow.match(/only-fixed: false/gu) ?? []).length, 10);
+  assert.match(workflow, /name: Enforce candidate vulnerability gate/u);
+  assert.match(workflow, /name: Enforce vulnerability gate/u);
   assert.doesNotMatch(workflow, /severity-cutoff: critical|only-fixed: true/u);
 });

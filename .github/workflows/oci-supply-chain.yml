@@ -48,6 +48,84 @@ jobs:
       - name: Verify executor Docker client
         run: docker run --rm --entrypoint docker local/pigo-executor:ci --version
 
+      - name: Prepare validation evidence directory
+        run: mkdir -p validation-vulnerability
+
+      - name: Scan candidate runtime for high and critical vulnerabilities
+        id: validate_scan_runtime
+        continue-on-error: true
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
+        with:
+          image: local/pi-coding-agent:1.0.0
+          fail-build: true
+          severity-cutoff: high
+          only-fixed: false
+          output-format: json
+          output-file: validation-vulnerability/runtime.json
+
+      - name: Scan candidate web for high and critical vulnerabilities
+        id: validate_scan_web
+        continue-on-error: true
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
+        with:
+          image: local/pigo-web:ci
+          fail-build: true
+          severity-cutoff: high
+          only-fixed: false
+          output-format: json
+          output-file: validation-vulnerability/web.json
+
+      - name: Scan candidate worker for high and critical vulnerabilities
+        id: validate_scan_worker
+        continue-on-error: true
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
+        with:
+          image: local/pigo-worker:ci
+          fail-build: true
+          severity-cutoff: high
+          only-fixed: false
+          output-format: json
+          output-file: validation-vulnerability/worker.json
+
+      - name: Scan candidate sandbox for high and critical vulnerabilities
+        id: validate_scan_sandbox
+        continue-on-error: true
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
+        with:
+          image: local/pigo-sandbox:ci
+          fail-build: true
+          severity-cutoff: high
+          only-fixed: false
+          output-format: json
+          output-file: validation-vulnerability/sandbox.json
+
+      - name: Scan candidate executor for high and critical vulnerabilities
+        id: validate_scan_executor
+        continue-on-error: true
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
+        with:
+          image: local/pigo-executor:ci
+          fail-build: true
+          severity-cutoff: high
+          only-fixed: false
+          output-format: json
+          output-file: validation-vulnerability/executor.json
+
+      - name: Upload candidate vulnerability evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: oci-validation-vulnerability-${{ github.sha }}
+          path: validation-vulnerability/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enforce candidate vulnerability gate
+        if: ${{ steps.validate_scan_runtime.outcome != 'success' || steps.validate_scan_web.outcome != 'success' || steps.validate_scan_worker.outcome != 'success' || steps.validate_scan_sandbox.outcome != 'success' || steps.validate_scan_executor.outcome != 'success' }}
+        run: |
+          echo "One or more candidate image scans found a high or critical vulnerability. Inspect the uploaded JSON evidence."
+          exit 1
+
   publish-images:
     name: Publish immutable OCI evidence
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
