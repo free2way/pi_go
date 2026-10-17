@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { buildOciManifest, OCI_COMPONENTS } from "./oci-manifest.mjs";
 import { renderDeploymentEnv } from "./oci-deployment-env.mjs";
-import { authorizeProduction, recordPromotionEvidence, validatePromotionBundle, inspectDockerRuntime, verifyGitHubAttestations } from "./oci-promotion-gate.mjs";
+import { authorizeProduction, recordPromotionEvidence, validateDockerHosts, validatePromotionBundle, inspectDockerRuntime, verifyGitHubAttestations } from "./oci-promotion-gate.mjs";
 import { createHash } from "node:crypto";
 
 const COMMIT = "1".repeat(40);
@@ -131,6 +131,58 @@ test("runtime checks reject stopped containers, mutable references and mismatche
   assert.throws(dockerFixture(bundle, (args, value) => {
     if (args[0] === "container" && args[2] === "worker") value.Config.Env = [];
   }), /sandbox configuration/);
+});
+
+test("runtime inspection routes each component to its configured local Docker daemon", () => {
+  const bundle = fixture();
+  const containers = Object.fromEntries(["runtime", "web", "worker", "executor"].map((name) => [name, name]));
+  const calls = [];
+  const docker = (args, dockerHost) => {
+    calls.push({ args, dockerHost });
+    const component = args[0] === "image"
+      ? Object.keys(bundle.images).find((name) => bundle.images[name].reference === args[2])
+      : args[2];
+    return [args[0] === "image"
+      ? { Id: DIGEST, RepoDigests: [bundle.images[component].reference], Config: { Labels: { "org.opencontainers.image.revision": COMMIT } } }
+      : { Image: DIGEST, State: { Running: true }, Config: { Image: bundle.images[component].reference, Env: [`PI_SANDBOX_IMAGE=${bundle.images.sandbox.reference}`] } }];
+  };
+
+  inspectDockerRuntime(bundle, containers, docker, { sandbox: "unix:///run/user/1000/docker.sock" });
+
+  assert.equal(calls.find(({ args }) => args[0] === "image" && args[2] === bundle.images.sandbox.reference)?.dockerHost,
+    "unix:///run/user/1000/docker.sock");
+  assert.equal(calls.find(({ args }) => args[0] === "image" && args[2] === bundle.images.runtime.reference)?.dockerHost, undefined);
+  assert.ok(calls.filter(({ args }) => args[0] === "container").every(({ dockerHost }) => dockerHost === undefined));
+});
+
+test("docker daemon mappings reject remote, relative and unknown targets", () => {
+  assert.deepEqual(validateDockerHosts(), {});
+  assert.deepEqual(validateDockerHosts({ sandbox: "unix:///run/user/1000/docker.sock" }), {
+    sandbox: "unix:///run/user/1000/docker.sock",
+  });
+  assert.throws(() => validateDockerHosts({ sandbox: "tcp://docker.example.com:2376" }), /absolute local Unix socket/);
+  assert.throws(() => validateDockerHosts({ sandbox: "unix://relative/docker.sock" }), /absolute local Unix socket/);
+  assert.throws(() => validateDockerHosts({ sandbox: "unix:///run/user/../docker.sock" }), /absolute local Unix socket/);
+  assert.throws(() => validateDockerHosts({ database: "unix:///var/run/docker.sock" }), /component database is invalid/);
+});
+
+test("recording forwards Docker daemon mappings to the runtime inspector", async () => {
+  const bundle = fixture();
+  let received;
+  await recordPromotionEvidence({
+    environment: "staging",
+    bundle,
+    dockerHosts: { sandbox: "unix:///run/user/1000/docker.sock" },
+    inspectRuntime: async (...args) => {
+      received = args[3];
+      return dockerFixture(bundle)();
+    },
+    healthUrl: "https://staging.example.com/api/health",
+    expectedAuthMode: "cloudflare",
+    ...attestationFixture(bundle),
+    fetchImpl: async () => jsonResponse({ status: "ok", authMode: "cloudflare" }),
+  });
+  assert.deepEqual(received, { sandbox: "unix:///run/user/1000/docker.sock" });
 });
 
 test("rejects changed deployment env, redirects, and wrong runtime auth mode", async () => {

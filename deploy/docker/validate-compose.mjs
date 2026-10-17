@@ -39,6 +39,11 @@ const volumes = listItems(worker, "volumes");
 const groupAdd = listItems(worker, "group_add");
 const problems = [];
 
+const runtime = serviceBlock("runtime");
+if (!runtime.some((line) => line.trim() === "read_only: true")) {
+  problems.push("runtime root filesystem must be read-only");
+}
+
 for (const expected of ["/home/node/.pi/agent/models.json", "pigo-worker-state"]) {
   if (!volumes.some((entry) => entry.includes(expected))) problems.push(`worker volumes missing ${expected}`);
 }
@@ -101,4 +106,4 @@ if (problems.length > 0) {
   for (const problem of problems) console.error(` - ${problem}`);
   process.exit(1);
 }
-console.log("compose structure OK (immutable OCI overrides, sandbox gateway isolation, web isolation, config coverage)");
+console.log("compose structure OK (read-only runtime, immutable OCI overrides, sandbox gateway isolation, web isolation, config coverage)");
