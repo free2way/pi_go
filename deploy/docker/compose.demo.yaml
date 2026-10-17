@@ -193,6 +193,7 @@ services:
     read_only: true
     pids_limit: 256
     mem_limit: 768m
+    cpus: 0.75
     tmpfs:
       - /tmp:size=64m,mode=1777
     healthcheck:
