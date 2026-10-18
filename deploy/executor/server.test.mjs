@@ -257,6 +257,7 @@ test("run deployments emit authenticated, attempt-scoped progress callbacks", as
   await postProgress(config, payload, "smoke", "functional checks started");
   assert.equal(observed.url, "http://web:3100/api/internal/runs/run_1/release-result");
   assert.equal(observed.options.headers.Authorization, `Bearer ${token}`);
+  assert.equal(observed.options.redirect, "manual");
   assert.deepEqual(JSON.parse(observed.options.body), {
     deliveryId: payload.deliveryId,
     attempt: 3,
@@ -272,12 +273,14 @@ test("run deployments emit authenticated, attempt-scoped progress callbacks", as
 
 test("successful callbacks carry immutable deployment evidence", async () => {
   let body;
+  let redirect;
   await postCallback({
     token,
     callbackPublicOrigin: "https://pigo.example.com",
     callbackInternalOrigin: "http://web:3100",
     fetchImpl: async (_url, options) => {
       body = JSON.parse(options.body);
+      redirect = options.redirect;
       return { ok: true, status: 200 };
     },
   }, {
@@ -302,6 +305,29 @@ test("successful callbacks carry immutable deployment evidence", async () => {
     image: "local/app:immutable",
     imageDigest: digest,
   });
+  assert.equal(redirect, "manual");
+});
+
+test("callbacks fail closed on redirects without following them", async () => {
+  let calls = 0;
+  await assert.rejects(() => postCallback({
+    token,
+    callbackPublicOrigin: "https://pigo.example.com",
+    callbackInternalOrigin: "http://web:3100",
+    fetchImpl: async (_url, options) => {
+      calls += 1;
+      assert.equal(options.redirect, "manual");
+      return { ok: false, status: 307 };
+    },
+  }, {
+    deliveryId: "release:run_redirect:staging",
+    attempt: 1,
+    callbackUrl: "https://pigo.example.com/api/internal/runs/run_redirect/release-result",
+  }, {
+    status: "succeeded",
+    detail: "staging verified",
+  }), /callback returned HTTP 307/);
+  assert.equal(calls, 1);
 });
 
 test("rollback callbacks carry the previous and restored digests", async () => {
