@@ -510,6 +510,7 @@ export async function postCallback(config, payload, outcome) {
     try {
       const response = await (config.fetchImpl ?? fetch)(url, {
         method: "POST",
+        redirect: "manual",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${config.token}` },
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(10_000),
@@ -533,6 +534,7 @@ export async function postProgress(config, payload, stage, detail) {
   const url = callbackTarget(payload.callbackUrl, config.callbackPublicOrigin, config.callbackInternalOrigin);
   const response = await (config.fetchImpl ?? fetch)(url, {
     method: "POST",
+    redirect: "manual",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${config.token}` },
     body: JSON.stringify({
       deliveryId: payload.deliveryId,
