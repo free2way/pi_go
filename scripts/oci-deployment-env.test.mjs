@@ -67,3 +67,14 @@ test("both Compose entry points accept digest-pinned image overrides", () => {
   }
   assert.match(executorCompose, /\$\{PIGO_EXECUTOR_IMAGE:-/);
 });
+
+test("web gives Node fetch enough time to reach higher-latency Clerk endpoints", () => {
+  const mainCompose = readFileSync(resolve(REPO_ROOT, "deploy/docker/compose.yaml"), "utf8");
+  const exampleEnv = readFileSync(resolve(REPO_ROOT, ".env.example"), "utf8");
+
+  assert.match(
+    mainCompose,
+    /NODE_OPTIONS: \$\{PI_WEB_NODE_OPTIONS:---network-family-autoselection-attempt-timeout=2000\}/,
+  );
+  assert.match(exampleEnv, /^PI_WEB_NODE_OPTIONS=--network-family-autoselection-attempt-timeout=2000$/m);
+});
