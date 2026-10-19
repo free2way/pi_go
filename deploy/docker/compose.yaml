@@ -69,6 +69,11 @@ services:
     restart: unless-stopped
     init: true
     environment:
+      # Some production networks take longer than Node's 250 ms default to
+      # establish a connection to one address returned by dual-stack DNS.
+      # Clerk's same-origin proxy uses fetch/undici, so allow enough time for
+      # its per-address connection attempt before trying the next address.
+      NODE_OPTIONS: ${PI_WEB_NODE_OPTIONS:---network-family-autoselection-attempt-timeout=2000}
       HOST: web
       PORT: 3100
       PI_DATA_FILE: /app/data/runs.json
