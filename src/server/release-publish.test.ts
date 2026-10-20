@@ -284,6 +284,46 @@ describe("planReleaseDeployAttempt", () => {
     });
   });
 
+  it("refuses production when the reviewed commits changed after staging", () => {
+    const staged = release({
+      status: "released",
+      deploy: {
+        status: "ok",
+        environment: "staging",
+        detail: "HTTP 200",
+        at: NOW,
+        imageDigest: DIGEST,
+        expectedCommits: [COMMIT],
+      },
+    });
+    expect(planReleaseDeployAttempt({
+      release: staged,
+      environment: "production",
+      reviewedCommits: ["b".repeat(40)],
+      now: NOW,
+    })).toMatchObject({ kind: "conflict", status: 409, code: "RELEASE_COMMIT_MISMATCH" });
+  });
+
+  it("carries the frozen reviewed commits from staging into production", () => {
+    const staged = release({
+      status: "released",
+      deploy: {
+        status: "ok",
+        environment: "staging",
+        detail: "HTTP 200",
+        at: NOW,
+        imageDigest: DIGEST,
+        expectedCommits: [COMMIT],
+      },
+    });
+    expect(planReleaseDeployAttempt({
+      release: staged,
+      environment: "production",
+      reviewedCommits: [COMMIT.toUpperCase(), COMMIT],
+      now: NOW,
+    })).toMatchObject({ kind: "ready", expectedCommits: [COMMIT], expectedImageDigest: DIGEST });
+  });
+
   it("continues the release-wide attempt sequence when staging was retried before promotion", () => {
     const staged = release({
       status: "released",
@@ -371,6 +411,32 @@ describe("planReleaseDeployCallback (old-attempt isolation)", () => {
       imageDigest: `sha256:${"e".repeat(64)}`,
     });
     expect(plan).toMatchObject({ kind: "reject", code: "RELEASE_DIGEST_MISMATCH", audit: true });
+  });
+
+  it("rejects a success callback whose reviewed commit set differs from the frozen request", () => {
+    const plan = planReleaseDeployCallback({
+      current: pending({ expectedCommits: [COMMIT] }),
+      deliveryId,
+      attempt: 2,
+      status: "succeeded",
+      now: NOW,
+      reviewedCommits: ["b".repeat(40)],
+      ...SUCCESS_EVIDENCE,
+    });
+    expect(plan).toMatchObject({ kind: "reject", code: "RELEASE_COMMIT_MISMATCH", audit: true });
+  });
+
+  it("settles a success callback only when the reviewed commit set matches", () => {
+    const plan = planReleaseDeployCallback({
+      current: pending({ expectedCommits: [COMMIT] }),
+      deliveryId,
+      attempt: 2,
+      status: "succeeded",
+      now: NOW,
+      reviewedCommits: [COMMIT],
+      ...SUCCESS_EVIDENCE,
+    });
+    expect(plan).toMatchObject({ kind: "settle", deploy: { status: "ok", expectedCommits: [COMMIT] } });
   });
 
   it("stays idempotent for a duplicate callback on the current attempt", () => {

@@ -93,7 +93,9 @@ test("release registration requires every story commit in one deployed artifact"
   const store = new JsonStateStore(path.join(directory, "state.json"));
   store.value.deliveries = { deployment };
   const payload = { environment: "staging", commits: [first, last], version: "v1" };
-  assert.equal((await runReleaseRegistration({ workspaceRoot: directory }, store, payload)).commit, last);
+  const registered = await runReleaseRegistration({ workspaceRoot: directory }, store, payload);
+  assert.equal(registered.commit, last);
+  assert.deepEqual(registered.reviewedCommits, [first, last]);
   await assert.rejects(() => runReleaseRegistration({ workspaceRoot: directory }, store, { ...payload, commits: [divergent, last] }), /no successful/);
   store.value.deliveries.deployment.commit = first;
   await assert.rejects(() => runReleaseRegistration({ workspaceRoot: directory }, store, payload), /no successful/);
@@ -306,6 +308,32 @@ test("successful callbacks carry immutable deployment evidence", async () => {
     imageDigest: digest,
   });
   assert.equal(redirect, "manual");
+});
+
+test("agile release callbacks echo the reviewed commit evidence", async () => {
+  let body;
+  await postCallback({
+    token,
+    callbackPublicOrigin: "https://pigo.example.com",
+    callbackInternalOrigin: "http://web:3100",
+    fetchImpl: async (_url, options) => {
+      body = JSON.parse(options.body);
+      return { ok: true, status: 200 };
+    },
+  }, {
+    deliveryId: "release-publish:rel_1:staging",
+    attempt: 1,
+    callbackUrl: "https://pigo.example.com/api/internal/agile/releases/rel_1/release-result",
+  }, {
+    status: "succeeded",
+    detail: "release registered",
+    deploymentId: "deploy_1",
+    commit: "b".repeat(40),
+    image: "local/app:immutable",
+    imageDigest: digest,
+    reviewedCommits: ["a".repeat(40), "b".repeat(40)],
+  });
+  assert.deepEqual(body.reviewedCommits, ["a".repeat(40), "b".repeat(40)]);
 });
 
 test("callbacks fail closed on redirects without following them", async () => {

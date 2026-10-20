@@ -78,9 +78,15 @@ export type ReleaseDeployRun =
 export async function runReleaseDeploy(input: ReleaseDeployInput, deps: ReleaseDeployDeps): Promise<ReleaseDeployRun> {
   const now = input.now;
   const release = input.release;
+  const reviewedCommits = [...new Set(input.stories
+    .map((story) => story.mergedCommit?.trim().toLowerCase() ?? "")
+    .filter((commit) => /^[0-9a-f]{40}$/.test(commit)))].sort();
+  if (reviewedCommits.length === 0) {
+    return { kind: "conflict", status: 409, code: "RELEASE_COMMIT_EVIDENCE_REQUIRED", message: "发布缺少已审核并合并的 commit 证据" };
+  }
 
   // 1. Bounded verification / retry decision from the observed state.
-  const decision = planReleaseDeployAttempt({ release, environment: input.environment, retry: input.retry, now });
+  const decision = planReleaseDeployAttempt({ release, environment: input.environment, reviewedCommits, retry: input.retry, now });
   if (decision.kind === "conflict") {
     return { kind: "conflict", status: decision.status, code: decision.code, message: decision.message };
   }
@@ -105,6 +111,7 @@ export async function runReleaseDeploy(input: ReleaseDeployInput, deps: ReleaseD
     deliveryId,
     attempt: decision.attempt,
     ...(decision.expectedImageDigest ? { expectedImageDigest: decision.expectedImageDigest } : {}),
+    ...(decision.expectedCommits ? { expectedCommits: decision.expectedCommits } : {}),
   };
   // 2. Claim + record the in-flight attempt in one atomic write, BEFORE the hook.
   const started = await deps.start({
@@ -114,7 +121,10 @@ export async function runReleaseDeploy(input: ReleaseDeployInput, deps: ReleaseD
     releasedBy: input.releasedBy,
     releasedAt,
     note: input.note,
-    deploy: hookExecutable ? pendingDeploy : shapeReleaseDeployOutcome(input.deployPlan, undefined, now, { environment: input.environment }),
+    deploy: hookExecutable ? pendingDeploy : shapeReleaseDeployOutcome(input.deployPlan, undefined, now, {
+      environment: input.environment,
+      expectedCommits: reviewedCommits,
+    }),
     stories: input.stories,
   });
   if (!started.claimed) {
@@ -150,6 +160,7 @@ export async function runReleaseDeploy(input: ReleaseDeployInput, deps: ReleaseD
     attempt: decision.attempt,
     environment: input.environment,
     ...(decision.expectedImageDigest ? { expectedImageDigest: decision.expectedImageDigest } : {}),
+    ...(decision.expectedCommits ? { expectedCommits: decision.expectedCommits } : {}),
   });
   // A 202 stays pending; only a real result is settled (CAS-guarded).
   if (deploy.status === "pending") return { kind: "published", release: await deps.read(), deploy };
