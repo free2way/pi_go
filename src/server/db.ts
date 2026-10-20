@@ -14,6 +14,7 @@ export type PoolLike = Queryable & {
 
 export type Db = Queryable & {
   withTransaction: <T>(fn: (tx: Db) => Promise<T>) => Promise<T>;
+  withMigrationLock?: <T>(fn: (db: Db) => Promise<T>) => Promise<T>;
 };
 
 export function createPool(databaseUrl: string) {
@@ -21,7 +22,8 @@ export function createPool(databaseUrl: string) {
 }
 
 /** Wraps a pg-compatible pool (or pg-mem in tests) with a transaction helper. */
-export function createDb(pool: PoolLike): Db {
+export function createDb(pool: PoolLike, options: { advisoryMigrationLock?: boolean } = {}): Db {
+  const advisoryMigrationLock = options.advisoryMigrationLock !== false;
   const withTransaction = async <T>(fn: (tx: Db) => Promise<T>): Promise<T> => {
     const client = await pool.connect();
     try {
@@ -29,6 +31,7 @@ export function createDb(pool: PoolLike): Db {
       const tx: Db = {
         query: (text, params) => client.query(text, params),
         withTransaction: (nested) => nested(tx),
+        withMigrationLock: (nested) => nested(tx),
       };
       const result = await fn(tx);
       await client.query("COMMIT");
@@ -40,10 +43,21 @@ export function createDb(pool: PoolLike): Db {
       client.release();
     }
   };
-  return {
+  const db: Db = {
     query: (text, params) => pool.query(text, params),
     withTransaction,
+    withMigrationLock: (fn) => {
+      if (!advisoryMigrationLock) return fn(db);
+      return withTransaction(async (tx) => {
+        // "PIGO" / "MIGR" as two stable signed int32 advisory-lock keys.
+        // The transaction-scoped lock serializes both the initial schema table
+        // creation and every later migration during rolling startup.
+        await tx.query("SELECT pg_advisory_xact_lock($1, $2)", [0x5049474f, 0x4d494752]);
+        return fn(tx);
+      });
+    },
   };
+  return db;
 }
 
 type Migration = {
@@ -563,35 +577,38 @@ export const databaseMigrations: Migration[] = [
 ];
 
 export async function runMigrations(db: Db) {
-  // EXISTS-check via information_schema first: pg-mem cannot re-run
-  // CREATE TABLE IF NOT EXISTS when the table already exists.
-  const hasMigrationsTable = (await db.query(
-    "SELECT table_name FROM information_schema.tables WHERE table_name = 'schema_migrations'",
-  )).rows.length > 0;
-  if (!hasMigrationsTable) {
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS schema_migrations (
-        id INTEGER PRIMARY KEY,
-        name TEXT NOT NULL,
-        applied_at TEXT NOT NULL
-      );
-    `);
-  }
-  const applied = new Set(
-    (await db.query("SELECT id FROM schema_migrations")).rows.map((row) => Number(row.id)),
-  );
-  for (const migration of databaseMigrations) {
-    if (applied.has(migration.id)) continue;
-    await db.withTransaction(async (tx) => {
-      await tx.query(migration.sql);
-      await tx.query("INSERT INTO schema_migrations (id, name, applied_at) VALUES ($1, $2, $3)", [
-        migration.id,
-        migration.name,
-        new Date().toISOString(),
-      ]);
-    });
-  }
-  await backfillFindingStableKeys(db);
+  const withMigrationLock = db.withMigrationLock ?? (<T>(fn: (lockedDb: Db) => Promise<T>) => fn(db));
+  await withMigrationLock(async (lockedDb) => {
+    // EXISTS-check via information_schema first: pg-mem cannot re-run
+    // CREATE TABLE IF NOT EXISTS when the table already exists.
+    const hasMigrationsTable = (await lockedDb.query(
+      "SELECT table_name FROM information_schema.tables WHERE table_name = 'schema_migrations'",
+    )).rows.length > 0;
+    if (!hasMigrationsTable) {
+      await lockedDb.query(`
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          id INTEGER PRIMARY KEY,
+          name TEXT NOT NULL,
+          applied_at TEXT NOT NULL
+        );
+      `);
+    }
+    const applied = new Set(
+      (await lockedDb.query("SELECT id FROM schema_migrations")).rows.map((row) => Number(row.id)),
+    );
+    for (const migration of databaseMigrations) {
+      if (applied.has(migration.id)) continue;
+      await lockedDb.withTransaction(async (tx) => {
+        await tx.query(migration.sql);
+        await tx.query("INSERT INTO schema_migrations (id, name, applied_at) VALUES ($1, $2, $3)", [
+          migration.id,
+          migration.name,
+          new Date().toISOString(),
+        ]);
+      });
+    }
+    await backfillFindingStableKeys(lockedDb);
+  });
 }
 
 /**
