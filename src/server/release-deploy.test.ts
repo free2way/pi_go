@@ -17,13 +17,15 @@ import type { PostMergeDeployPlan } from "./run-merge.js";
 
 const WEBHOOK: PostMergeDeployPlan = { configured: true, kind: "webhook", url: "https://deploy.example/hook" };
 const DIGEST = `sha256:${"d".repeat(64)}`;
+const COMMIT = "a".repeat(40);
 
 async function seed(db: Db) {
   const service = new AgileService(db);
   const project = await service.createProject("user_a", { name: "结账", key: "PAY" });
   const story = await service.createStory("user_a", { projectId: project.id, title: "支付", status: "done" });
   const release = await service.createRelease("user_a", { projectId: project.id, name: "结账发布", version: "v1.0.0", storyIds: [story.id] });
-  const stories = await service.collectReleaseStories(["user_a"], release);
+  const stories = (await service.collectReleaseStories(["user_a"], release))
+    .map((item) => ({ ...item, mergedCommit: COMMIT }));
   return { service, release, stories };
 }
 
@@ -56,6 +58,21 @@ function input(release: AgileRelease, stories: Awaited<ReturnType<AgileService["
 }
 
 describe("runReleaseDeploy (audit P1)", () => {
+  it("fails closed before claim or transport when merged commit evidence is absent", async () => {
+    const db = await createTestDb();
+    const { service, release, stories } = await seed(db);
+    const executions: Array<{ deliveryId: string }> = [];
+    const d = deps(service, release.id, executions, { configured: true, kind: "webhook", status: "triggered", detail: "HTTP 202", httpStatus: 202 });
+
+    const result = await runReleaseDeploy(input(
+      release,
+      stories.map((story) => ({ ...story, mergedCommit: null })),
+    ), d);
+    expect(result).toMatchObject({ kind: "conflict", status: 409, code: "RELEASE_COMMIT_EVIDENCE_REQUIRED" });
+    expect(executions).toHaveLength(0);
+    expect((await service.getRelease([], release.id, true)).deploy).toBeNull();
+  });
+
   it("fires two concurrent confirms and executes the deploy exactly once", async () => {
     const db = await createTestDb();
     const { service, release, stories } = await seed(db);
@@ -146,6 +163,41 @@ describe("runReleaseDeploy (audit P1)", () => {
       { attempt: 1, deliveryId: `release-publish:${release.id}:staging` },
       { attempt: 2, deliveryId: `release-publish:${release.id}:production` },
     ]);
+  });
+
+  it("blocks production before transport when the reviewed commit set changed after staging", async () => {
+    const db = await createTestDb();
+    const { service, release, stories } = await seed(db);
+    const executions: Array<{ deliveryId: string }> = [];
+    const d = deps(service, release.id, executions, { configured: true, kind: "webhook", status: "triggered", detail: "HTTP 202", httpStatus: 202 });
+
+    const staged = await runReleaseDeploy(input(release, stories), d);
+    expect(staged).toMatchObject({ kind: "published", deploy: { expectedCommits: [COMMIT] } });
+    await service.settleReleaseDeployResult({
+      releaseId: release.id,
+      action: "release.deploy_succeeded",
+      actorId: "deploy-system",
+      now: "2026-01-02T00:00:30.000Z",
+      deploy: {
+        ...(staged.kind === "published" ? staged.deploy : {}),
+        status: "ok",
+        detail: "staging verified",
+        at: "2026-01-02T00:00:30.000Z",
+        finishedAt: "2026-01-02T00:00:30.000Z",
+        commit: COMMIT,
+        image: "local/app:immutable",
+        imageDigest: DIGEST,
+      },
+    });
+
+    const changedStories = stories.map((story) => ({ ...story, mergedCommit: "b".repeat(40) }));
+    const promoted = await runReleaseDeploy(input(
+      await service.getRelease([], release.id, true),
+      changedStories,
+      { environment: "production", now: "2026-01-02T00:01:00.000Z" },
+    ), d);
+    expect(promoted).toMatchObject({ kind: "conflict", code: "RELEASE_COMMIT_MISMATCH" });
+    expect(executions).toHaveLength(1);
   });
 
   it("records a failed deploy and retries it as a new attempt with the same delivery id", async () => {

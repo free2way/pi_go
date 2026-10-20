@@ -151,10 +151,10 @@ import { E2E_LIVE_ACCEPTANCE, configStatus, expect, missingRealRunsReason, openR
  *   (`tracker.complete(stages.development(round))` precedes `checks.started` in
  *   src/worker/index.ts). A no-op run alone finishes in ~12s, too fast to kill.
  *
- * Demo-environment recipe (see tests/e2e/README.md for the full contract): with
- * `PI_E2E_BASE_URL=http://192.168.2.235:3101`, `PI_E2E_DEV_EMAIL=bobo.2000@gmail.com`
- * and `NO_PROXY=localhost,127.0.0.1,192.168.2.235` (the deployment is on the LAN),
- * set `PI_E2E_CRASH_COMMAND='bash /tmp/pigo-kill-worker.sh'`. That helper SIGKILLs
+ * Demo-environment recipe (kept environment-agnostic): set `PI_E2E_BASE_URL`
+ * to the isolated deployment, `PI_E2E_DEV_EMAIL` to an authorized test admin,
+ * configure `NO_PROXY` for that deployment when needed, and set
+ * `PI_E2E_CRASH_COMMAND='bash /tmp/pigo-kill-worker.sh'`. That helper SIGKILLs
  * only `pigo-demo-worker` and explicitly starts it again (on this Docker daemon
  * `docker kill` alone does not trigger the `restart: unless-stopped` policy), and
  * reads `PIGO_SSH_PW` from the operator's environment — never committed.
@@ -740,7 +740,7 @@ test.describe("E2E-01 单 Agent 完整闭环", () => {
     const me = (await meResponse.json()) as { id: string; email: string; isAdmin?: boolean };
     test.skip(
       !me.isAdmin,
-      `E2E-01b 需要管理员身份执行人工合并：当前身份 ${me.email} 不是管理员（POST /api/runs/:id/merge 将返回 403 ADMIN_REQUIRED；POST /api/runs/:id/publish 同理）。请用管理员账号运行本场景（demo 部署为 bobo.2000@gmail.com）。`,
+      `E2E-01b 需要管理员身份执行人工合并：当前身份不是管理员（POST /api/runs/:id/merge 将返回 403 ADMIN_REQUIRED；POST /api/runs/:id/publish 同理）。请通过 PI_E2E_DEV_EMAIL 指定部署中已授权的测试管理员身份。`,
     );
 
     // Register the fixture on demand (E2E-08 pattern): the fixture is NOT registered

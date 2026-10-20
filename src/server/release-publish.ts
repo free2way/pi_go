@@ -74,7 +74,7 @@ export function isReleasePublishTerminal(release: Pick<AgileRelease, "status" | 
 }
 
 export type ReleaseDeployDecision =
-  | { kind: "ready"; deliveryId: string; attempt: number; expectedImageDigest?: string; expired?: ReleaseDeployRecord }
+  | { kind: "ready"; deliveryId: string; attempt: number; expectedImageDigest?: string; expectedCommits?: string[]; expired?: ReleaseDeployRecord }
   | { kind: "conflict"; status: 409; code: string; message: string };
 
 const IMAGE_DIGEST = /^sha256:[a-f0-9]{64}$/;
@@ -96,6 +96,7 @@ const IMAGE_DIGEST = /^sha256:[a-f0-9]{64}$/;
 export function planReleaseDeployAttempt(input: {
   release: Pick<AgileRelease, "id" | "status" | "deploy">;
   environment: ReleaseEnvironment;
+  reviewedCommits?: string[];
   retry?: boolean;
   now: string;
   staleAfterMs?: number;
@@ -103,6 +104,15 @@ export function planReleaseDeployAttempt(input: {
   const deploy = input.release.deploy ?? null;
   const retry = input.retry === true;
   const deliveryId = releaseDeployDeliveryId(input.release.id, input.environment);
+  const reviewedCommits = input.reviewedCommits
+    ? [...new Set(input.reviewedCommits.map((commit) => commit.trim().toLowerCase()))].sort()
+    : undefined;
+  const recordedCommits = deploy?.expectedCommits
+    ? [...new Set(deploy.expectedCommits.map((commit) => commit.trim().toLowerCase()))].sort()
+    : undefined;
+  const commitEvidenceMatches = reviewedCommits === undefined
+    || (recordedCommits !== undefined && reviewedCommits.length === recordedCommits.length
+      && reviewedCommits.every((commit, index) => commit === recordedCommits[index]));
   if (!deploy) {
     if (input.environment === "production") {
       return { kind: "conflict", status: 409, code: "RELEASE_STAGING_REQUIRED", message: "production 发布前必须先完成 staging 发布" };
@@ -110,11 +120,14 @@ export function planReleaseDeployAttempt(input: {
     if (input.release.status === "released") {
       return { kind: "conflict", status: 409, code: "RELEASE_RELEASED", message: "发布已发布，不可重复发布" };
     }
-    return { kind: "ready", deliveryId, attempt: 1 };
+    return { kind: "ready", deliveryId, attempt: 1, ...(reviewedCommits ? { expectedCommits: reviewedCommits } : {}) };
   }
   const promotion = deploy.status === "ok" && deploy.environment === "staging" && input.environment === "production";
   if (promotion && !IMAGE_DIGEST.test(deploy.imageDigest ?? "")) {
     return { kind: "conflict", status: 409, code: "RELEASE_PROMOTION_EVIDENCE_REQUIRED", message: "staging 发布缺少不可变镜像摘要，请重新发布 staging 后再晋级" };
+  }
+  if (promotion && !commitEvidenceMatches) {
+    return { kind: "conflict", status: 409, code: "RELEASE_COMMIT_MISMATCH", message: "当前审核提交与 staging 发布证据不一致，请重新发布 staging 后再晋级" };
   }
   const targetChanged = Boolean(deploy.environment && deploy.environment !== input.environment);
   if (targetChanged && !promotion) {
@@ -125,7 +138,13 @@ export function planReleaseDeployAttempt(input: {
   // `agile_release_deploy_claims` enforces UNIQUE(release_id, attempt), so the
   // sequence is release-wide rather than per environment. Reusing attempt 1
   // for production after a successful staging claim would violate that key.
-  if (promotion) return { kind: "ready", deliveryId, attempt: nextAttempt, expectedImageDigest: deploy.imageDigest! };
+  if (promotion) return {
+    kind: "ready",
+    deliveryId,
+    attempt: nextAttempt,
+    expectedImageDigest: deploy.imageDigest!,
+    ...(reviewedCommits ? { expectedCommits: reviewedCommits } : {}),
+  };
   if (deploy.status === "ok" || deploy.status === "not_configured" || deploy.status === "unsupported") {
     return { kind: "conflict", status: 409, code: "RELEASE_RELEASED", message: "发布已发布，不可重复发布" };
   }
@@ -137,10 +156,14 @@ export function planReleaseDeployAttempt(input: {
     if (!retry) {
       return { kind: "conflict", status: 409, code: "RELEASE_RETRY_REQUIRED", message: "上次部署失败，请明确选择重试部署" };
     }
+    if (!commitEvidenceMatches) {
+      return { kind: "conflict", status: 409, code: "RELEASE_COMMIT_MISMATCH", message: "当前审核提交与失败部署尝试不一致，请重新从 staging 发布" };
+    }
     return {
       kind: "ready",
       deliveryId: retryDeliveryId,
       attempt: nextAttempt,
+      ...(reviewedCommits ? { expectedCommits: reviewedCommits } : {}),
       ...(input.environment === "production" ? { expectedImageDigest: deploy.expectedImageDigest! } : {}),
     };
   }
@@ -169,6 +192,7 @@ export function planReleaseDeployAttempt(input: {
     deliveryId: retryDeliveryId,
     attempt: nextAttempt,
     expired,
+    ...(reviewedCommits ? { expectedCommits: reviewedCommits } : {}),
     ...(input.environment === "production" ? { expectedImageDigest: deploy.expectedImageDigest! } : {}),
   };
 }
@@ -427,7 +451,7 @@ export type ReleaseDeployCallbackPlan =
   | {
       kind: "reject";
       status: 409;
-      code: "RELEASE_DELIVERY_MISMATCH" | "RELEASE_ATTEMPT_STALE" | "RELEASE_ALREADY_FINAL" | "RELEASE_DIGEST_MISMATCH";
+      code: "RELEASE_DELIVERY_MISMATCH" | "RELEASE_ATTEMPT_STALE" | "RELEASE_ALREADY_FINAL" | "RELEASE_DIGEST_MISMATCH" | "RELEASE_COMMIT_MISMATCH";
       message: string;
       /** Whether the caller must append an audit row for this rejection. */
       audit: boolean;
@@ -445,6 +469,7 @@ export function planReleaseDeployCallback(input: {
   commit?: string;
   image?: string;
   imageDigest?: string;
+  reviewedCommits?: string[];
   now: string;
 }): ReleaseDeployCallbackPlan {
   const current = input.current;
@@ -470,6 +495,13 @@ export function planReleaseDeployCallback(input: {
   if (input.status === "succeeded" && current.expectedImageDigest
     && input.imageDigest !== current.expectedImageDigest) {
     return { kind: "reject", status: 409, code: "RELEASE_DIGEST_MISMATCH", message: "Production image digest does not match the staged digest", audit: true };
+  }
+  if (input.status === "succeeded" && current.expectedCommits) {
+    const expected = [...new Set(current.expectedCommits.map((commit) => commit.trim().toLowerCase()))].sort();
+    const reported = [...new Set((input.reviewedCommits ?? []).map((commit) => commit.trim().toLowerCase()))].sort();
+    if (expected.length !== reported.length || expected.some((commit, index) => commit !== reported[index])) {
+      return { kind: "reject", status: 409, code: "RELEASE_COMMIT_MISMATCH", message: "Release callback reviewed commits do not match the requested commits", audit: true };
+    }
   }
   if (current.status !== "pending") {
     return { kind: "reject", status: 409, code: "RELEASE_ALREADY_FINAL", message: `Release deploy is already ${current.status}`, audit: false };
@@ -500,13 +532,14 @@ export function shapeReleaseDeployOutcome(
   plan: PostMergeDeployPlan,
   execution: ReleaseExecutionOutcome | undefined,
   at: string,
-  identity: { deliveryId?: string; attempt?: number; environment?: ReleaseEnvironment; expectedImageDigest?: string } = {},
+  identity: { deliveryId?: string; attempt?: number; environment?: ReleaseEnvironment; expectedImageDigest?: string; expectedCommits?: string[] } = {},
 ): ReleaseDeployRecord {
   const id = {
     ...(identity.deliveryId ? { deliveryId: identity.deliveryId } : {}),
     ...(identity.attempt === undefined ? {} : { attempt: identity.attempt }),
     ...(identity.environment ? { environment: identity.environment } : {}),
     ...(identity.expectedImageDigest ? { expectedImageDigest: identity.expectedImageDigest } : {}),
+    ...(identity.expectedCommits ? { expectedCommits: identity.expectedCommits } : {}),
   };
   if (!plan.configured) return { status: "not_configured", detail: plan.reason, at, ...id };
   if (plan.kind === "unsupported") return { status: "unsupported", detail: plan.reason, at, ...id };

@@ -1987,7 +1987,12 @@ app.post<{ Params: { id: string } }>("/api/internal/agile/releases/:id/release-r
       deploymentId: parsed.data.deploymentId,
       url: parsed.data.url,
       ...(parsed.data.status === "succeeded"
-        ? { commit: parsed.data.commit, image: parsed.data.image, imageDigest: parsed.data.imageDigest }
+        ? {
+            commit: parsed.data.commit,
+            image: parsed.data.image,
+            imageDigest: parsed.data.imageDigest,
+            reviewedCommits: parsed.data.reviewedCommits,
+          }
         : {}),
       now: new Date().toISOString(),
     });
@@ -2719,6 +2724,7 @@ const releaseDeployResultSchema = z.discriminatedUnion("status", [
     commit: z.string().regex(/^[0-9a-f]{40}$/),
     image: z.string().trim().min(1).max(500),
     imageDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+    reviewedCommits: z.array(z.string().regex(/^[0-9a-f]{40}$/)).min(1).max(200),
   }).strict(),
   z.object({
     deliveryId: z.string().trim().min(8).max(120),

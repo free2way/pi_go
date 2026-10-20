@@ -127,6 +127,8 @@ export interface ReleaseDeployRecord {
   imageDigest?: string;
   /** Staging digest that a production attempt is required to reuse. */
   expectedImageDigest?: string;
+  /** Reviewed merge commits frozen when this deploy attempt was created. */
+  expectedCommits?: string[];
 }
 
 /**

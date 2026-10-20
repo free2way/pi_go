@@ -472,6 +472,7 @@ export async function runReleaseRegistration(config, store, payload, containsCom
     commit: deployed.commit,
     image: deployed.image,
     imageDigest: deployed.imageDigest,
+    reviewedCommits: payload.commits,
   };
 }
 
@@ -501,6 +502,7 @@ export async function postCallback(config, payload, outcome) {
     ...(outcome.commit ? { commit: outcome.commit } : {}),
     ...(outcome.image ? { image: outcome.image } : {}),
     ...(outcome.imageDigest ? { imageDigest: outcome.imageDigest } : {}),
+    ...(outcome.reviewedCommits ? { reviewedCommits: outcome.reviewedCommits } : {}),
     ...(outcome.rolledBackFromCommit ? { rolledBackFromCommit: outcome.rolledBackFromCommit } : {}),
     ...(outcome.rolledBackFromDigest ? { rolledBackFromDigest: outcome.rolledBackFromDigest } : {}),
   };
