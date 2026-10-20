@@ -1066,7 +1066,10 @@ test.describe("E2E-01 单 Agent 完整闭环", () => {
       // `run.release` with status succeeded|triggered|failed.
       // ---------------------------------------------------------------------
       const publishResponse = await request.post(`/api/runs/${runId}/publish`, {
-        data: { environment: "demo", confirm: true },
+        // The release API deliberately exposes only the promotion environments.
+        // Keep the acceptance run pinned to staging so it can never promote a
+        // fixture commit to production, while still exercising the real hook.
+        data: { environment: "staging", confirm: true },
       });
       if (publishResponse.status() === 200) {
         const published = (await publishResponse.json()) as AcceptanceRun;
@@ -1076,7 +1079,7 @@ test.describe("E2E-01 单 Agent 完整闭环", () => {
           `已配置发布钩子时 run.release.status 必须是 succeeded/triggered/failed，实际 ${String(published.release?.status)}`,
         ).toContain(published.release!.status);
         expect(published.release!.commit, "发布记录必须指向被合并的 commit").toBe(merge.commit);
-        expect(published.release!.environment, "发布记录必须指向请求的环境").toBe("demo");
+        expect(published.release!.environment, "发布记录必须指向请求的环境").toBe("staging");
         const releaseEvents = await getRunEvents(request, runId);
         expect(
           releaseEvents.filter((event) => event.type === "run.release_started"),
