@@ -59,7 +59,8 @@ import { E2E_WORKSPACE_PATH, expect, test } from "./fixtures";
  *                                 默认 fixture-small-auth。测试自行注册、结束时注销。
  *   PI_E2E_STORY_TIMEOUT_MS       （可选）等待运行到达终态的时长，默认 900000（15 分钟）。
  *   PI_E2E_STORY_SETTLE_MS        （可选）终态后等待决策证据落盘的时长，默认 60000。
- *   PI_E2E_STORY_ENVIRONMENT       （可选）发布环境名，默认 demo。
+ *   PI_E2E_STORY_ENVIRONMENT       （可选）发布环境名，默认 staging；仅允许
+ *                                   staging/production。
  *   PI_E2E_STORY_REVIEWER_PROVIDER（可选）优先为 reviewer 钉住的 provider。
  */
 
@@ -487,7 +488,11 @@ test.describe("Story 全链路：从创建任务到部署交付（opt-in 手动�
       const configured = Number(envValue("PI_E2E_STORY_SETTLE_MS") ?? 60_000);
       return Number.isFinite(configured) && configured > 0 ? configured : 60_000;
     })();
-    const environment = envValue("PI_E2E_STORY_ENVIRONMENT") ?? "demo";
+    const environment = envValue("PI_E2E_STORY_ENVIRONMENT") ?? "staging";
+    expect(
+      ["staging", "production"],
+      `PI_E2E_STORY_ENVIRONMENT=${environment} 不是发布 API 支持的环境`,
+    ).toContain(environment);
     const preferredReviewerProvider = envValue("PI_E2E_STORY_REVIEWER_PROVIDER");
     const explicitWorkspaceId = envValue("PI_E2E_WORKSPACE_ID");
     const fixtureRelative = envValue("PI_E2E_STORY_WORKSPACE") ?? E2E_WORKSPACE_PATH ?? DEFAULT_STORY_FIXTURE;
