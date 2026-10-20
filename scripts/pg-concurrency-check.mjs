@@ -69,9 +69,10 @@ const dbModuleUrl = new URL("../dist/server/db.js", import.meta.url);
 let PostgresRunStore;
 let createDb;
 let runMigrations;
+let databaseMigrations;
 try {
   ({ PostgresRunStore } = await import(storeModuleUrl.href));
-  ({ createDb, runMigrations } = await import(dbModuleUrl.href));
+  ({ createDb, runMigrations, databaseMigrations } = await import(dbModuleUrl.href));
 } catch (error) {
   console.error("[pg-concurrency-check] Could not load the built store and migration runner from dist/server.");
   console.error("  Run `npm run build` first so dist/ is up to date.");
@@ -82,7 +83,9 @@ try {
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const pool = new Pool({ connectionString: databaseUrl, max: 10, connectionTimeoutMillis: 10_000 });
+const migrationPeerPool = new Pool({ connectionString: databaseUrl, max: 2, connectionTimeoutMillis: 10_000 });
 const db = createDb(pool);
+const migrationPeerDb = createDb(migrationPeerPool);
 
 const runId = `run_pgcheck_${randomBytes(8).toString("hex")}`;
 const ownerId = `owner_pgcheck_${randomBytes(8).toString("hex")}`;
@@ -179,8 +182,20 @@ let holder;
 let exitCode = 1;
 try {
   // ---------------------------------------------------------------- setup
-  await runMigrations(db);
+  // A rolling deploy can start two Web containers against the same schema.
+  // Both startup paths must succeed while applying every migration only once.
+  await Promise.all([runMigrations(db), runMigrations(migrationPeerDb)]);
   console.log("[pg-concurrency-check] production schema ready");
+  const migrationRows = await pool.query(
+    "SELECT COUNT(*)::int AS count, COUNT(DISTINCT id)::int AS unique_count FROM schema_migrations",
+  );
+  const migrationCount = Number(migrationRows.rows[0]?.count);
+  const uniqueMigrationCount = Number(migrationRows.rows[0]?.unique_count);
+  assert(
+    "two startup paths apply each migration exactly once",
+    migrationCount === databaseMigrations.length && uniqueMigrationCount === databaseMigrations.length,
+    `count=${migrationCount}, unique=${uniqueMigrationCount}`,
+  );
   const storeA = new PostgresRunStore(db);
   const storeB = new PostgresRunStore(db);
 
@@ -337,6 +352,7 @@ try {
   if (holder) holder.release();
   await cleanup();
   exitCode = printReport() ? 0 : 1;
+  await migrationPeerPool.end().catch(() => undefined);
   await pool.end().catch(() => undefined);
 }
 
