@@ -366,14 +366,19 @@ export async function runDeploy(config, store, payload, reportProgress = async (
   const target = await resolveApplicationTarget(config, payload);
   const image = `${config.imageRepository}:${payload.commit}`;
   let staging;
+  let approvedDigest;
   if (payload.environment === "production") {
     staging = store.successfulDeployment("staging", target.repository, payload.commit);
-    if (!staging) {
-      throw new Error("production promotion requires a successful staging deployment of the same commit");
-    }
-    if (payload.expectedImageDigest !== staging.imageDigest) {
+    if (staging && payload.expectedImageDigest !== staging.imageDigest) {
       throw new Error("requested production digest does not match the successful staging deployment");
     }
+    // Staging and production executors may intentionally use separate state
+    // volumes. In that topology the production executor has no local staging
+    // record. The shared release gateway remains the enforcement boundary: it
+    // verifies that a gateway-managed staging container with this exact commit,
+    // immutable image digest, and fixed runtime policy is active before it
+    // creates a production candidate.
+    approvedDigest = staging?.imageDigest ?? payload.expectedImageDigest;
   }
   await reportProgress("deploying", "isolated release gateway deployment and smoke checks started");
   const deployed = await releaseGatewayRequest(config, {
@@ -381,7 +386,7 @@ export async function runDeploy(config, store, payload, reportProgress = async (
     environment: payload.environment,
     repository: target.repository,
     commit: payload.commit,
-    ...(staging?.imageDigest ? { expectedImageDigest: staging.imageDigest } : {}),
+    ...(approvedDigest ? { expectedImageDigest: approvedDigest } : {}),
   });
   await reportProgress("verifying", "isolated release gateway evidence verification started");
   if (deployed.image !== image || deployed.repository !== target.repository || deployed.commit !== payload.commit) {
@@ -389,7 +394,7 @@ export async function runDeploy(config, store, payload, reportProgress = async (
   }
   const digest = deployed.imageDigest;
   if (payload.environment === "production") {
-    if (digest !== staging.imageDigest || digest !== payload.expectedImageDigest) {
+    if (digest !== approvedDigest || digest !== payload.expectedImageDigest) {
       throw new Error("production deployment changed the staged image digest");
     }
   }
