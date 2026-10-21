@@ -239,6 +239,62 @@ test("run deployment delegates the fixed reviewed target to the isolated release
   assert.equal(result.imageDigest, digest);
 });
 
+test("production promotion delegates active staging proof when executor state is isolated", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "pigo-executor-isolated-promotion-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const repository = path.join(root, "project-a");
+  const app = path.join(repository, "app");
+  await mkdir(app, { recursive: true });
+  await writeFile(path.join(app, "Dockerfile"), "FROM scratch\n");
+  const git = (args) => execFileSync("git", ["-c", "core.hooksPath=/dev/null", ...args], {
+    cwd: repository, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+  git(["init", "-b", "main"]);
+  git(["config", "user.name", "Test"]);
+  git(["config", "user.email", ["test", "example.invalid"].join("@")]);
+  git(["add", "."]);
+  git(["commit", "-m", "fixture"]);
+  const commit = git(["rev-parse", "HEAD"]);
+  const image = `local/app:${commit}`;
+  let requested;
+  const config = {
+    workspaceRoot: root,
+    appPath: "app",
+    imageRepository: "local/app",
+    releaseGatewayUrl: "http://release-gateway:3310",
+    releaseGatewayToken: `${token}-gateway`,
+    productionPublicUrl: "",
+    fetchImpl: async (_url, options) => {
+      requested = JSON.parse(options.body);
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          status: "succeeded", event: "deploy", environment: "production",
+          repository: requested.repository, commit, image, imageDigest: digest,
+        }),
+      };
+    },
+  };
+  const store = new JsonStateStore(path.join(root, "state.json"));
+  const result = await runDeploy(config, store, {
+    event: "run.release_requested", environment: "production", repository, commit,
+    expectedImageDigest: digest,
+  });
+  assert.equal(store.successfulDeployment("staging", repository, commit), undefined);
+  assert.equal(requested.expectedImageDigest, digest);
+  assert.equal(result.imageDigest, digest);
+
+  store.value.deliveries.staleStaging = {
+    event: "run.release_requested", environment: "staging", status: "succeeded",
+    repository: requested.repository, commit, imageDigest: `sha256:${"e".repeat(64)}`,
+  };
+  await assert.rejects(() => runDeploy(config, store, {
+    event: "run.release_requested", environment: "production", repository, commit,
+    expectedImageDigest: digest,
+  }), /does not match the successful staging deployment/);
+});
+
 test("run deployments emit authenticated, attempt-scoped progress callbacks", async () => {
   let observed;
   const config = {

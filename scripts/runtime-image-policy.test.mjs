@@ -42,3 +42,14 @@ test("OCI vulnerability scanning remains fail closed for unfixed findings", () =
   assert.match(workflow, /name: Enforce vulnerability gate/u);
   assert.match(workflow, /steps\.scan_runtime\.outcome != 'success'/u);
 });
+
+test("curl and libcurl use the fixed package version in every git-capable runtime", () => {
+  const runtime = read("deploy/docker/Dockerfile");
+  const executor = read("deploy/executor/Dockerfile");
+  for (const dockerfile of [runtime, executor]) {
+    assert.match(dockerfile, /^ARG CURL_VERSION=8\.23\.0-r0$/mu);
+    assert.match(dockerfile, /@curlfix https:\/\/dl-cdn\.alpinelinux\.org\/alpine\/edge\/main/u);
+    assert.match(dockerfile, /"curl@curlfix=\$\{CURL_VERSION\}"/u);
+    assert.match(dockerfile, /"libcurl@curlfix=\$\{CURL_VERSION\}"/u);
+  }
+});

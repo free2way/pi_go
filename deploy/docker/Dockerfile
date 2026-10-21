@@ -2,12 +2,15 @@ FROM node:22.23.3-alpine3.24
 
 ARG PI_VERSION=1.3.0
 ARG PNPM_VERSION=12.14.0
+ARG CURL_VERSION=8.23.0-r0
 
 RUN apk upgrade --no-cache \
+    && echo "@curlfix https://dl-cdn.alpinelinux.org/alpine/edge/main" >> /etc/apk/repositories \
     && apk add --no-cache \
         ca-certificates \
-        curl \
+        "curl@curlfix=${CURL_VERSION}" \
         git \
+        "libcurl@curlfix=${CURL_VERSION}" \
         openssh-client \
         ripgrep \
     && npm install -g --ignore-scripts \
