@@ -38,6 +38,8 @@ describe("run cleanup path validation", () => {
   it("matches only entries owned by the run", () => {
     expect(isRunDirectoryEntry(RUN_ID, RUN_ID)).toBe(true);
     expect(isRunDirectoryEntry(RUN_ID, `${RUN_ID}.state`)).toBe(true);
+    expect(isRunDirectoryEntry(RUN_ID, `${RUN_ID}.subagent-state`)).toBe(true);
+    expect(isRunDirectoryEntry(RUN_ID, `${RUN_ID}.subagent-state-other`)).toBe(false);
     expect(isRunDirectoryEntry(RUN_ID, `${RUN_ID}.check-state-aB0123`)).toBe(true);
     expect(isRunDirectoryEntry(RUN_ID, `${RUN_ID}.check-state-other`)).toBe(false);
     expect(isRunDirectoryEntry(RUN_ID, `${RUN_ID}.check-state-aB0123-other`)).toBe(false);
@@ -60,6 +62,8 @@ describe("removeRunDirectory", () => {
     await writeFile(path.join(worktree, "subagents", "task-1", "file.txt"), "subagent");
     await mkdir(path.join(ownerDir, `${RUN_ID}.state`, "agent"), { recursive: true });
     await writeFile(path.join(ownerDir, `${RUN_ID}.state`, "agent", "session.json"), "{}");
+    await mkdir(path.join(ownerDir, `${RUN_ID}.subagent-state`, "task-1"), { recursive: true });
+    await writeFile(path.join(ownerDir, `${RUN_ID}.subagent-state`, "task-1", "session.json"), "{}");
     await mkdir(path.join(ownerDir, `${RUN_ID}.reviewer-r1`), { recursive: true });
     await writeFile(path.join(ownerDir, `${RUN_ID}.reviewer-r1`, "README.md"), "snapshot");
     await mkdir(path.join(ownerDir, `${RUN_ID}.reviewer-r1.state`), { recursive: true });
@@ -83,12 +87,14 @@ describe("removeRunDirectory", () => {
       [
         path.join(OWNER_ID, RUN_ID),
         path.join(OWNER_ID, `${RUN_ID}.state`),
+        path.join(OWNER_ID, `${RUN_ID}.subagent-state`),
         path.join(OWNER_ID, `${RUN_ID}.reviewer-r1`),
         path.join(OWNER_ID, `${RUN_ID}.reviewer-r1.state`),
       ].sort(),
     );
     expect(await exists(worktree)).toBe(false);
     expect(await exists(path.join(ownerDir, `${RUN_ID}.state`))).toBe(false);
+    expect(await exists(path.join(ownerDir, `${RUN_ID}.subagent-state`))).toBe(false);
     expect(await exists(path.join(ownerDir, `${RUN_ID}.reviewer-r1`))).toBe(false);
     expect(await exists(path.join(ownerDir, `${RUN_ID}.reviewer-r1.state`))).toBe(false);
     expect(await exists(path.join(otherRun, "keep"))).toBe(true);
@@ -125,7 +131,7 @@ describe("removeRunDirectory", () => {
     const { runsRoot, worktree } = await fixture();
     const result = await removeRunDirectory({ runsRoot, ownerId: OWNER_ID, runId: RUN_ID, dryRun: true });
     expect(result).toMatchObject({ dryRun: true, removed: true });
-    expect(result.paths.length).toBe(4);
+    expect(result.paths.length).toBe(5);
     expect(result.bytes).toBeGreaterThan(0);
     expect(await exists(path.join(worktree, "index.ts"))).toBe(true);
   });

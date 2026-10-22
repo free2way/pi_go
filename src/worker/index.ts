@@ -50,6 +50,7 @@ import { RunCleanupPathError, planRunDirectoryRemoval, removeRunDirectory } from
 import { runGuardedMerge, type GuardedMergeResult, type MergeGuardGitExec } from "./merge-guard.js";
 import { WorkspaceLockManager, workspaceKeyFor } from "./workspace-lock.js";
 import { PiRunError, failureOutputForEvent } from "./agent-failure.js";
+import { migrateLegacySubAgentState, subAgentStateDirectory } from "./subagent-state.js";
 import { captureFailedSubAgentWorktree } from "./subagent-artifacts.js";
 import { planRecovery, recoveryResumePhase, recoveryUpdateState } from "./run-recovery.js";
 import {
@@ -1488,9 +1489,8 @@ async function runSubAgent(input: {
       budget: input.budget,
       role: "sub-agent",
       sessions: input.sessions,
-      // Keep Pi state under the run's sibling state tree. `${worktree}.state`
-      // would be inside the main run repository for nested sub-agent worktrees.
-      statePath: path.join(`${input.project}.state`, "subagents", input.task.id),
+      // A sibling root keeps child auth/session files out of the main agent's mount.
+      statePath: subAgentStateDirectory(input.project, input.task.id),
     });
     const changed = await git(worktree, ["status", "--porcelain"], input.signal);
     let commit: string | undefined;
@@ -2282,6 +2282,9 @@ async function executeJob(input: JobInput, controller: AbortController) {
         await postUpdate(run.id, { patch: { baseSha: prepared.baseSha } });
       }
     }
+
+    // Isolate legacy child sessions before planner/developer/reviewer mounts exist.
+    await migrateLegacySubAgentState(worktree);
 
     // AT-PI-006: project-local plugin resources stay unloaded (the `--no-*`
     // flags disable discovery); report them so an unapproved extension is
