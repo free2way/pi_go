@@ -43,10 +43,12 @@ export function boundedTail(text: string | undefined, maxBytes = defaultFailureT
 export function failureOutputForEvent(
   error: unknown,
   maxBytes = defaultFailureTailBytes,
+  redact: (text: string) => string = (text) => text,
 ): { exitCode: number; stdout?: string; stderr?: string } | undefined {
   if (!(error instanceof PiRunError)) return undefined;
-  const stdout = boundedTail(error.stdout, maxBytes).trim();
-  const stderr = boundedTail(error.stderr, maxBytes).trim();
+  // Redact the complete stream before the byte bound can cut a credential.
+  const stdout = boundedTail(redact(error.stdout), maxBytes).trim();
+  const stderr = boundedTail(redact(error.stderr), maxBytes).trim();
   return {
     exitCode: error.code,
     ...(stdout ? { stdout } : {}),
