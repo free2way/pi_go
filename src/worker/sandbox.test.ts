@@ -118,8 +118,8 @@ describe("hostPathFor", () => {
 describe("sandboxStateDirectory", () => {
   it("keeps explicit sub-agent state outside its code worktree", () => {
     const worktree = "/workspace/runs/run-1/subagents/api";
-    expect(sandboxStateDirectory(worktree, "/workspace/runs/run-1.state/subagents/api"))
-      .toBe("/workspace/runs/run-1.state/subagents/api");
+    expect(sandboxStateDirectory(worktree, "/workspace/runs/run-1.subagent-state/api"))
+      .toBe("/workspace/runs/run-1.subagent-state/api");
     expect(() => sandboxStateDirectory(worktree, `${worktree}/.pi`)).toThrow(/outside worktree/);
   });
 });
