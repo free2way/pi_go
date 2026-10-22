@@ -32,7 +32,8 @@ import { RateLimiter } from "./rate-limit.js";
 import { PostgresRunStore } from "./run-store-pg.js";
 import { saveInternalRunArtifact } from "./artifact-api.js";
 import { type ApprovePlan, approveEventMeta, planApprove } from "./approve.js";
-import { conflictReplyFor } from "./request-errors.js";
+import { conflictReplyFor, isStorageFailure, requestErrorReply } from "./request-errors.js";
+import { diagnosticSecrets, redactDiagnosticText } from "../shared/diagnostics.js";
 import { appendHumanNote } from "./run-notes.js";
 import { resumeDeadlinePatch } from "./run-deadline-base.js";
 import { parseRunSearch, searchRuns } from "./run-search.js";
@@ -80,6 +81,18 @@ const app = Fastify({
     },
   },
   bodyLimit: 64 * 1024,
+});
+
+// Register before plugins/routes so their contexts inherit this handler.
+app.setErrorHandler((error, _request, reply) => {
+  const result = requestErrorReply(error);
+  const { message } = result;
+  if (result.storage) {
+    alerts.raise({ key: "storage_failure", severity: "critical", message: "存储写入失败，任务未完成", details: { error: message.slice(0, 200) } });
+    return reply.code(result.status).send(result.body);
+  }
+  if (result.status >= 500) app.log.error({ error: message }, "request failed");
+  return reply.code(result.status).send(result.body);
 });
 
 // 响应压缩：JS/CSS/JSON 未压缩时要传 ~700 KB（实测首屏 702 KB JS），压缩后约 1/4。
@@ -1310,18 +1323,16 @@ function workspacesDisabled(reply: FastifyReply) {
   return reply.code(503).send({ error: "Workspaces are disabled", code: "WORKSPACES_DISABLED" });
 }
 
-function isStorageFailure(message: string) {
-  return /ECONNREFUSED|Connection terminated|connection is closed|connection timeout|ETIMEDOUT|terminating connection|57P0|no space left on device|ENOSPC|STORAGE_UNAVAILABLE/i.test(message);
-}
-
 /** Maps a WorkspaceError / storage failure to an HTTP status + body (shared by
  * the workspace routes and the run-preflight, which must not touch `reply`). */
 function classifyWorkspaceError(error: unknown): { status: number; body: Record<string, unknown> } {
-  if (error instanceof WorkspaceError) return { status: error.status, body: { error: error.message, code: error.code } };
-  const message = (error as Error)?.message ?? String(error);
+  const secrets = diagnosticSecrets();
+  if (error instanceof WorkspaceError) return { status: error.status, body: { error: redactDiagnosticText(error.message, secrets), code: redactDiagnosticText(error.code, secrets) } };
+  const raw = String((error as Error)?.message ?? error);
+  const message = redactDiagnosticText(raw, secrets);
   // AT-REL-005: a database outage is reported as storage degradation, not as a
   // confusing workspace error.
-  if (isStorageFailure(message)) {
+  if (isStorageFailure(raw)) {
     alerts.raise({ key: "storage_failure", severity: "critical", message: "存储不可用：工作区操作无法完成", details: { error: message.slice(0, 200) } });
     return { status: 503, body: { error: `存储不可用：${message.slice(0, 200)}`, code: "STORAGE_UNAVAILABLE" } };
   }
@@ -4030,20 +4041,6 @@ for (const signal of ["SIGTERM", "SIGINT"] as const) {
     void pool.end().finally(() => process.exit(0));
   });
 }
-
-// AT-REL-007 / AT-REL-005: storage failures are surfaced as explicit 503s
-// instead of generic 500s, and raise an alert.
-app.setErrorHandler((error, _request, reply) => {
-  const message = String((error as Error).message || "");
-  const storageFailure = /ECONNREFUSED|Connection terminated|connection is closed|ETIMEDOUT|terminating connection|57P0|STORAGE_UNAVAILABLE|no space left on device|ENOSPC/i.test(message);
-  if (storageFailure) {
-    alerts.raise({ key: "storage_failure", severity: "critical", message: "存储写入失败，任务未完成", details: { error: message.slice(0, 200) } });
-    return reply.code(503).send({ error: `存储不可用：${message.slice(0, 200)}`, code: "STORAGE_UNAVAILABLE" });
-  }
-  const status = (error as { statusCode?: number }).statusCode ?? 500;
-  if (status >= 500) app.log.error({ error: message }, "request failed");
-  return reply.code(status).send({ error: status >= 500 ? "Internal error" : message });
-});
 
 // REL-002: jobs left unfinished by a stopped worker are re-queued and (when the
 // worker is back) pushed again, so a run never stalls silently.

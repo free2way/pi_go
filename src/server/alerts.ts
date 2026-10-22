@@ -1,3 +1,5 @@
+import { diagnosticSecrets, redactDiagnosticText, redactDiagnosticValue } from "../shared/diagnostics.js";
+
 export type AlertSeverity = "warning" | "critical";
 
 export interface Alert {
@@ -47,18 +49,27 @@ export function createAlertSink(options: {
   log: (level: "warn" | "error", payload: Record<string, unknown>, message: string) => void;
   webhookUrl?: string;
   fetchImpl?: typeof fetch;
+  environment?: NodeJS.ProcessEnv;
 }): AlertSink {
   const doFetch = options.fetchImpl ?? fetch;
+  const secrets = diagnosticSecrets(options.environment);
   return (alert) => {
-    options.log(alert.severity === "critical" ? "error" : "warn", { alert: alert.key, ...alert.details }, alert.message);
+    const safe = {
+      severity: alert.severity,
+      key: redactDiagnosticText(alert.key, secrets),
+      message: redactDiagnosticText(alert.message, secrets),
+      ...(alert.details ? { details: redactDiagnosticValue(alert.details, secrets) as Record<string, unknown> } : {}),
+    };
+    options.log(safe.severity === "critical" ? "error" : "warn", { ...safe.details, alert: safe.key }, safe.message);
     if (!options.webhookUrl) return;
     void doFetch(options.webhookUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...alert, at: new Date().toISOString() }),
+      body: JSON.stringify({ ...safe, at: new Date().toISOString() }),
       signal: AbortSignal.timeout(10_000),
     }).catch((error) => {
-      options.log("warn", { alert: alert.key, error: (error as Error).message }, "alert webhook delivery failed");
+      const message = error instanceof Error ? error.message : String(error);
+      options.log("warn", { alert: safe.key, error: redactDiagnosticText(message, secrets) }, "alert webhook delivery failed");
     });
   };
 }
