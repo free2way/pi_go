@@ -4,6 +4,51 @@ import type { CheckResult } from "../shared/types.js";
 import { runChecks, throwIfCancelled, type CheckIO } from "./checks.js";
 
 describe("runChecks", () => {
+  it.each([0, 1])("redacts every persisted result and chat while retaining exit %i", async (code) => {
+    const known = "synthetic-job-canary/+";
+    const command = `echo '${known}'`;
+    const recorded: unknown[] = [];
+    const executed: string[] = [];
+    const outcome = await runChecks({
+      commands: [command], secrets: [known], signal: new AbortController().signal,
+      execute: async (raw) => {
+        executed.push(raw);
+        const url = new URL("postgresql://db.example.invalid/app");
+        url.username = "x";
+        url.password = ["DUMMY", "db", "canary"].join("_");
+        return { code, stdout: `Bearer DUMMY_header_canary\n${known}`, stderr: url.href };
+      },
+      started: async (...args) => { recorded.push(args); },
+      finished: async (...args) => { recorded.push(args); },
+      chat: async (payload) => { recorded.push(payload); },
+    });
+    expect(executed).toEqual([command]);
+    const serialized = JSON.stringify([recorded, outcome]);
+    for (const canary of [known, "DUMMY_header_canary", "DUMMY_db_canary"]) expect(serialized).not.toContain(canary);
+    expect(serialized).toContain("[redacted]");
+    expect(outcome.passed).toBe(code === 0);
+    expect(outcome.results[0].exitCode).toBe(code);
+  });
+
+  it("redacts before tail clipping so a boundary cannot retain a credential suffix", async () => {
+    const canary = "DUMMY-boundary-canary";
+    const outcome = await runChecks({
+      commands: ["npm test"], secrets: [canary], signal: new AbortController().signal,
+      execute: async () => ({ code: 1, stdout: `${"x".repeat(30)}${canary}${"y".repeat(11_990)}`, stderr: "" }),
+      started: async () => undefined, finished: async () => undefined, chat: async () => undefined,
+    });
+    expect(outcome.results[0].output).not.toContain("canary");
+    expect(outcome.results[0].output!.length).toBeLessThanOrEqual(12_000);
+  });
+
+  it("redacts execution errors before they escape the suite", async () => {
+    await expect(runChecks({
+      commands: ["npm test"], secrets: ["synthetic-job-canary"], signal: new AbortController().signal,
+      execute: async () => { throw new Error("synthetic-job-canary Bearer DUMMY_error_canary"); },
+      started: async () => undefined, finished: async () => undefined, chat: async () => undefined,
+    })).rejects.toThrow("[redacted] Bearer [redacted]");
+  });
+
   it("stops when cancelled during a check without reporting failure or chat", async () => {
     const controller = new AbortController();
     const started: CheckResult[][] = [];

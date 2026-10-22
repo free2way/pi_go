@@ -1,5 +1,6 @@
 import { checkChatMessage, type ChatPayload } from "../shared/chat.js";
 import type { CheckResult } from "../shared/types.js";
+import { redactCheckText } from "./check-redaction.js";
 
 export interface CommandResult {
   code: number;
@@ -10,6 +11,8 @@ export interface CommandResult {
 export interface CheckIO {
   commands: string[];
   signal: AbortSignal;
+  /** Current job and platform secrets; used only for diagnostic redaction. */
+  secrets?: readonly string[];
   /** Runs a single check command; resolves with its exit result. */
   execute: (command: string, signal: AbortSignal) => Promise<CommandResult>;
   /** Persists the in-progress check list and appends the start activity event. */
@@ -36,14 +39,22 @@ export async function runChecks(io: CheckIO): Promise<{ passed: boolean; results
     throwIfCancelled(io.signal);
     const checkCommand = io.commands[index];
     const startedAt = Date.now();
-    const current: CheckResult = { id: `check-${index + 1}`, name: `Check ${index + 1}`, command: checkCommand, status: "running" };
-    await io.started([...results, current], checkCommand);
-    const result = await io.execute(checkCommand, io.signal);
+    const safeCommand = redactCheckText(checkCommand, io.secrets);
+    const current: CheckResult = { id: `check-${index + 1}`, name: `Check ${index + 1}`, command: safeCommand, status: "running" };
+    await io.started([...results, current], safeCommand);
+    let result: CommandResult;
+    try {
+      // Execute the original command, never the redacted display projection.
+      result = await io.execute(checkCommand, io.signal);
+    } catch (error) {
+      throwIfCancelled(io.signal);
+      throw new Error(redactCheckText(error instanceof Error ? error.message : String(error), io.secrets));
+    }
     // `command` resolves with code 130 on abort instead of rejecting, so the
     // cancellation must be checked explicitly before recording a result.
     throwIfCancelled(io.signal);
     const durationMs = Date.now() - startedAt;
-    const output = `${result.stdout}\n${result.stderr}`.trim().slice(-12_000);
+    const output = redactCheckText(`${result.stdout}\n${result.stderr}`, io.secrets).trim().slice(-12_000);
     results.push({
       ...current,
       status: result.code === 0 ? "passed" : "failed",
@@ -53,8 +64,8 @@ export async function runChecks(io: CheckIO): Promise<{ passed: boolean; results
       exitCode: result.code,
       output,
     });
-    await io.finished([...results], checkCommand, result.code === 0);
-    await io.chat(checkChatMessage({ command: checkCommand, passed: result.code === 0, durationMs, output }));
+    await io.finished([...results], safeCommand, result.code === 0);
+    await io.chat(checkChatMessage({ command: safeCommand, passed: result.code === 0, durationMs, output }));
     if (result.code !== 0) return { passed: false, results };
   }
   return { passed: true, results };
