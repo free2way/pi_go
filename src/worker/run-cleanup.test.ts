@@ -38,6 +38,9 @@ describe("run cleanup path validation", () => {
   it("matches only entries owned by the run", () => {
     expect(isRunDirectoryEntry(RUN_ID, RUN_ID)).toBe(true);
     expect(isRunDirectoryEntry(RUN_ID, `${RUN_ID}.state`)).toBe(true);
+    expect(isRunDirectoryEntry(RUN_ID, `${RUN_ID}.check-state-aB0123`)).toBe(true);
+    expect(isRunDirectoryEntry(RUN_ID, `${RUN_ID}.check-state-other`)).toBe(false);
+    expect(isRunDirectoryEntry(RUN_ID, `${RUN_ID}.check-state-aB0123-other`)).toBe(false);
     expect(isRunDirectoryEntry(RUN_ID, `${RUN_ID}.reviewer-r1`)).toBe(true);
     expect(isRunDirectoryEntry(RUN_ID, `${RUN_ID}.reviewer-r12.state`)).toBe(true);
     expect(isRunDirectoryEntry(RUN_ID, `${RUN_ID}.reviewer-x`)).toBe(false);
@@ -97,6 +100,19 @@ describe("removeRunDirectory", () => {
     await removeRunDirectory({ runsRoot, ownerId: OWNER_ID, runId: RUN_ID });
     const again = await removeRunDirectory({ runsRoot, ownerId: OWNER_ID, runId: RUN_ID });
     expect(again).toMatchObject({ removed: false, paths: [], bytes: 0 });
+  });
+
+  it("removes abandoned check state without deleting a similarly named directory", async () => {
+    const { runsRoot, ownerDir } = await fixture();
+    const abandoned = path.join(ownerDir, `${RUN_ID}.check-state-aB0123`);
+    const unrelated = `${abandoned}-other`;
+    await mkdir(abandoned);
+    await writeFile(path.join(abandoned, "canary"), "synthetic");
+    await mkdir(unrelated);
+    await writeFile(path.join(unrelated, "keep"), "keep");
+    await removeRunDirectory({ runsRoot, ownerId: OWNER_ID, runId: RUN_ID });
+    expect(await exists(abandoned)).toBe(false);
+    expect(await readFile(path.join(unrelated, "keep"), "utf8")).toBe("keep");
   });
 
   it("is a no-op when the runs root or owner directory does not exist", async () => {

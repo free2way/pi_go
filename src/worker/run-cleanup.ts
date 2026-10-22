@@ -60,6 +60,7 @@ export function planRunDirectoryRemoval(runsRoot: string, ownerId: string, runId
 /** True for every on-disk entry owned by a run inside `<runsRoot>/<owner>`. */
 export function isRunDirectoryEntry(runId: string, entry: string): boolean {
   if (entry === runId || entry === `${runId}.state`) return true;
+  if (new RegExp(`^${escapeRegExp(runId)}\\.check-state-[A-Za-z0-9]{6}$`).test(entry)) return true;
   return new RegExp(`^${escapeRegExp(runId)}\\.reviewer-r\\d+(?:\\.state)?$`).test(entry);
 }
 

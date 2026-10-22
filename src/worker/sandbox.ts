@@ -1,4 +1,4 @@
-import { mkdir, open, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { ContainerCreateSpec } from "./docker-api.js";
 
@@ -150,6 +150,25 @@ export async function prepareSandboxStateDirectory(stateDirectory: string): Prom
   }
   const mountpoint = await open(path.join(agentDirectory, "models.json"), "a", 0o600);
   await mountpoint.close();
+}
+
+export async function withSandboxStateDirectory<T>(
+  input: { worktree: string; statePath?: string; ephemeral?: boolean },
+  execute: (stateDirectory: string) => Promise<T>,
+): Promise<T> {
+  if (input.ephemeral && input.statePath !== undefined) {
+    throw new Error("Ephemeral sandbox state cannot reuse an explicit state path");
+  }
+  const state = input.ephemeral
+    ? await mkdtemp(`${path.resolve(input.worktree)}.check-state-`)
+    : sandboxStateDirectory(input.worktree, input.statePath);
+  try {
+    await prepareSandboxStateDirectory(state);
+    return await execute(state);
+  } finally {
+    // Repository checks must not inherit or retain an agent's auth/session files.
+    if (input.ephemeral) await rm(state, { recursive: true, force: true });
+  }
 }
 
 export type SandboxMode = "container" | "process" | "unavailable";

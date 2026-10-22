@@ -30,10 +30,9 @@ import {
   hostPathFor,
   parseSandboxAllowDegraded,
   resolveSandboxMode,
-  prepareSandboxStateDirectory,
   SandboxContainerRegistry,
   SandboxUnavailableError,
-  sandboxStateDirectory,
+  withSandboxStateDirectory,
   SANDBOX_KILLED_EXIT_CODE,
   type SandboxMode,
 } from "./sandbox.js";
@@ -360,17 +359,19 @@ interface SandboxRunInput {
   readOnly?: boolean;
   /** Optional Pi state location; must be outside `worktree`. */
   statePath?: string;
+  ephemeralState?: boolean;
 }
 
 /** Runs one invocation inside its own container and always cleans it up. */
 async function runInSandbox(input: SandboxRunInput): Promise<CommandResult> {
-  // Kept next to (never inside) the worktree so sandbox state cannot leak into
-  // the diff or the committed tree.
-  const runStateDir = sandboxStateDirectory(input.worktree, input.statePath);
-  // The nested model mountpoint must exist too. Otherwise Docker creates it as
-  // root below the state bind and the non-root worker cannot later delete the
-  // run state directory.
-  await prepareSandboxStateDirectory(runStateDir);
+  return withSandboxStateDirectory({
+    worktree: input.worktree,
+    statePath: input.statePath,
+    ephemeral: input.ephemeralState,
+  }, (stateDirectory) => runInSandboxWithState(input, stateDirectory));
+}
+
+async function runInSandboxWithState(input: SandboxRunInput, runStateDir: string): Promise<CommandResult> {
   const spec = buildContainerSpec({
     image: imageForSandbox,
     user: sandboxUser,
@@ -439,9 +440,7 @@ async function runInSandbox(input: SandboxRunInput): Promise<CommandResult> {
     input.signal.removeEventListener("abort", onAbort);
     await docker.removeContainer(containerId).catch(() => undefined);
     forgetContainer();
-    // AUD-07: the per-run Pi state directory is intentionally kept so the next
-    // call (repair round, retry review, recovery) can resume the same session.
-    // It is removed together with the run directory during explicit cleanup.
+    // The outer state owner retains agent sessions but removes disposable check state.
   }
 }
 
@@ -1749,6 +1748,7 @@ async function runChecks(run: Run, worktree: string, commands: string[], signal:
             timeoutMs: 600_000,
             signal: execSignal,
             label: "check",
+            ephemeralState: true,
           })
         : await command("/bin/sh", ["-lc", checkCommand], {
             cwd: worktree,
