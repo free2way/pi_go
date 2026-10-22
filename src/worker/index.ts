@@ -1726,12 +1726,18 @@ async function orchestrateSubAgents(input: {
   return integrationNotes;
 }
 
-async function runChecks(run: Run, worktree: string, commands: string[], signal: AbortSignal) {
+async function runChecks(run: Run, worktree: string, commands: string[], signal: AbortSignal, credentials: JobInput["credentials"]) {
   // Delegates to the extracted suite so check execution, cancellation handling
   // and the structured `checks` chat entries are unit-tested in one place.
   return runCheckSuite({
     commands,
     signal,
+    secrets: [
+      ...Object.values(credentials),
+      ...Object.entries(process.env)
+        .filter(([name]) => scrubEnvironment({ [name]: process.env[name] })[name] === undefined)
+        .map(([, value]) => value ?? ""),
+    ],
     execute: async (checkCommand, execSignal) => {
       // P1 (fail-closed): checks execute untrusted repository commands, so they
       // must never silently fall back to an in-process shell.
@@ -1993,7 +1999,7 @@ async function executeRetryReview(input: {
   // snapshot whose required checks passed. Re-run them here instead of trusting
   // a previous round or manual edits.
   await update(run, "checking", "checks", "checks.started", "重新审核前先复验当前代码快照", { summary: "正在复验检查命令" });
-  const checked = await runChecks(run, input.worktree, input.checks, input.controller.signal);
+  const checked = await runChecks(run, input.worktree, input.checks, input.controller.signal, input.credentials);
   const checkSnapshot = await snapshotHash(input.worktree, input.controller.signal);
   await postUpdate(run.id, { patch: { checks: checked.results, checkSnapshot, checkPassed: checked.passed } });
   if (!checked.passed) {
@@ -2411,7 +2417,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
         // reuse them, re-run instead of trusting a stale verdict.
         await postUpdate(run.id, { event: { round, source: "checks", type: "checks.checkpoint_stale", message: `第 ${round} 轮检查点与当前内容不匹配，重新执行检查命令` } });
       }
-      const checked = storedChecks ?? await runChecks(run, worktree, input.checks, controller.signal);
+      const checked = storedChecks ?? await runChecks(run, worktree, input.checks, controller.signal, input.credentials);
       if (!storedChecks) await tracker.complete(stages.checks(round), { ...checked, round, snapshotHash: checkSnapshot });
       if (!checked.passed) {
         feedback = `The deterministic checks failed. Fix these failures:\n${checked.results.filter((item) => item.status === "failed").map((item) => `${item.command}\n${item.output}`).join("\n\n")}`;
