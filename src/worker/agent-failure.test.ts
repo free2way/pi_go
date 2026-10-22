@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { PiRunError, boundedTail, failureOutputForEvent } from "./agent-failure.js";
+import { redactWorkerDiagnostic } from "./diagnostic-redaction.js";
 
 describe("boundedTail", () => {
   it("keeps short output untouched and the tail of long output", () => {
@@ -36,5 +37,19 @@ describe("failureOutputForEvent", () => {
 
   it("returns undefined for errors without captured process output", () => {
     expect(failureOutputForEvent(new Error("provider 429"))).toBeUndefined();
+  });
+
+  it("redacts full streams before the byte bound and retains the original error", () => {
+    const credential = "DUMMY_BOUNDARY_CREDENTIAL";
+    const original = "prefix " + credential + "suffix";
+    const error = new PiRunError("failure", { code: 137, stdout: original, stderr: "Bearer DUMMY_bearer" });
+    const captured = failureOutputForEvent(error, 16, (text) => redactWorkerDiagnostic(text, [credential], {}));
+    expect(captured?.exitCode).toBe(137);
+    expect(captured?.stdout).toContain("[redacted]");
+    expect(captured?.stdout).not.toContain("CREDENTIAL");
+    expect(captured?.stderr).not.toContain("DUMMY_bearer");
+    expect(Buffer.byteLength(captured?.stdout ?? "")).toBeLessThanOrEqual(16);
+    expect(Buffer.byteLength(captured?.stderr ?? "")).toBeLessThanOrEqual(16);
+    expect(error.stdout).toBe(original);
   });
 });

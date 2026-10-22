@@ -50,6 +50,7 @@ import { RunCleanupPathError, planRunDirectoryRemoval, removeRunDirectory } from
 import { runGuardedMerge, type GuardedMergeResult, type MergeGuardGitExec } from "./merge-guard.js";
 import { WorkspaceLockManager, workspaceKeyFor } from "./workspace-lock.js";
 import { PiRunError, failureOutputForEvent } from "./agent-failure.js";
+import { redactWorkerDiagnostic } from "./diagnostic-redaction.js";
 import { migrateLegacySubAgentState, subAgentStateDirectory } from "./subagent-state.js";
 import { captureFailedSubAgentWorktree } from "./subagent-artifacts.js";
 import { planRecovery, recoveryResumePhase, recoveryUpdateState } from "./run-recovery.js";
@@ -1240,9 +1241,7 @@ async function runPiWithRetry(
     onActivity: input.onActivity,
     invoke: async (sessionId) => {
       let modelCalls = 0;
-      const safeProviderMessage = (message: string) => input.apiKey
-        ? message.replaceAll(input.apiKey, "[redacted]")
-        : message;
+      const safeProviderMessage = (message: string) => redactWorkerDiagnostic(message, [input.apiKey]);
       // NEW-08/AUD-10: every provider attempt (including failed retries) is
       // reserved and accounted; the hard model-call limit stops the retry loop.
       const outcome = await runProviderOperation(() => {
@@ -1362,7 +1361,7 @@ async function planDevelopment(run: Run, worktree: string, credentials: JobInput
     return parseDevelopmentPlan(redactJobSecrets(result.text, credentials), maxSubagents);
   } catch (error) {
     if (error instanceof BudgetExceededError) throw error;
-    const safeMessage = redactJobSecrets((error as Error).message, credentials);
+    const safeMessage = redactWorkerDiagnostic((error as Error).message, Object.values(credentials));
     await postUpdate(run.id, { event: { round: run.round, source: "system", type: "planner.fallback", message: `任务拆分失败，安全回退到单 Agent：${safeMessage}` } });
     return fallbackPlan(run.task);
   }
@@ -1513,18 +1512,18 @@ async function runSubAgent(input: {
     });
     return { task: input.task, branch, worktree, commit };
   } catch (error) {
-    const safeMessage = redactJobSecrets((error as Error).message, input.credentials);
+    const safeMessage = redactWorkerDiagnostic((error as Error).message, Object.values(input.credentials));
     input.task.status = "failed";
     input.task.summary = safeMessage.slice(0, 1_000);
     input.task.durationMs = Date.now() - startedAt;
     // GAP-05 / AT-AGENT-008: keep a bounded, redacted tail of the failed call's
     // output as a run event so the failure stays diagnosable after the
     // sub-agent worktree is force-removed.
-    const captured = failureOutputForEvent(error);
+    const captured = failureOutputForEvent(error, undefined, (text) => redactWorkerDiagnostic(text, Object.values(input.credentials)));
     if (captured) {
       const meta: Record<string, unknown> = { taskId: input.task.id, codename: input.task.name, exitCode: captured.exitCode };
-      if (captured.stdout) meta.stdoutTail = redactJobSecrets(captured.stdout, input.credentials);
-      if (captured.stderr) meta.stderrTail = redactJobSecrets(captured.stderr, input.credentials);
+      if (captured.stdout) meta.stdoutTail = captured.stdout;
+      if (captured.stderr) meta.stderrTail = captured.stderr;
       await postUpdate(input.run.id, {
         event: {
           round: input.run.round,
@@ -1907,7 +1906,7 @@ async function performReview(input: {
     }, { runId: input.run.id, round: input.round, label: "审核 Agent", role: "reviewer", budget: input.budget, sessions: input.sessions });
   } catch (providerError) {
     if (providerError instanceof BudgetExceededError) throw providerError;
-    const reason = redactJobSecrets((providerError as Error).message, input.credentials).slice(0, 500);
+    const reason = redactWorkerDiagnostic((providerError as Error).message, Object.values(input.credentials)).slice(0, 500);
     const kind = classifyProviderError(reason);
     const locale = runLocale(input.run);
     const failure = guardText(reviewProviderErrorText(kind, reason), locale);
@@ -1923,7 +1922,7 @@ async function performReview(input: {
   try {
     return { stopped: false, review: parseReview(redactJobSecrets(firstReview.text, input.credentials), input.round) };
   } catch (protocolError) {
-    const reason = redactJobSecrets((protocolError as Error).message, input.credentials).slice(0, 200);
+    const reason = redactWorkerDiagnostic((protocolError as Error).message, Object.values(input.credentials)).slice(0, 200);
     await postUpdate(input.run.id, { event: { round: input.round, source: "reviewer", type: "review.retry", message: `审核输出无法解析（${reason}），已要求 Reviewer 重新输出` } });
     let retryReview: { text: string; usage: UsageTotals };
     try {
@@ -1949,7 +1948,7 @@ async function performReview(input: {
       }, { runId: input.run.id, round: input.round, label: "审核 Agent（协议重试）", role: "reviewer", retry: true, budget: input.budget, sessions: input.sessions });
     } catch (providerError) {
       if (providerError instanceof BudgetExceededError) throw providerError;
-      const providerReason = redactJobSecrets((providerError as Error).message, input.credentials).slice(0, 500);
+      const providerReason = redactWorkerDiagnostic((providerError as Error).message, Object.values(input.credentials)).slice(0, 500);
       const kind = classifyProviderError(providerReason);
       const failure = guardText(reviewProviderErrorText(kind, providerReason), runLocale(input.run));
       await update(input.run, "needs_human", "reviewer", "review.provider_error", failure.message, {
@@ -1968,7 +1967,7 @@ async function performReview(input: {
       await update(input.run, "needs_human", "reviewer", "review.invalid_protocol", invalidProtocol.message, {
         usage: toRunUsage(input.usage),
         durationMs: Date.now() - input.started,
-        summary: providerErrorSummary("protocol", `审核输出无法解析：${redactJobSecrets((retryError as Error).message, input.credentials).slice(0, 300)}`, locale).slice(0, 500),
+        summary: providerErrorSummary("protocol", `审核输出无法解析：${redactWorkerDiagnostic((retryError as Error).message, Object.values(input.credentials)).slice(0, 300)}`, locale).slice(0, 500),
       }, { meta: invalidProtocol.meta });
       return { stopped: true };
     }
@@ -2658,7 +2657,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
     // provider/storage problem (its reason may contain ECONNREFUSED etc.) and
     // never parked: the run fails with the actionable sandbox message.
     const sandboxUnavailable = !cancelled && error instanceof SandboxUnavailableError;
-    const safeMessage = redactJobSecrets((error as Error).message, input.credentials).slice(0, 2_000);
+    const safeMessage = redactWorkerDiagnostic((error as Error).message, Object.values(input.credentials)).slice(0, 2_000);
     const followup = Boolean(input.resume || input.retryReview);
     const kind = cancelled || sandboxUnavailable ? undefined : classifyProviderError(safeMessage);
     // AT-REL-006/007: classified provider and storage failures are parked for a
