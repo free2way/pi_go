@@ -22,6 +22,7 @@ import {
   sandboxTeardownBudgetMs,
   SandboxUnavailableError,
   sandboxStateDirectory,
+  withSandboxStateDirectory,
   type SandboxContainerHandle,
 } from "./sandbox.js";
 
@@ -156,6 +157,77 @@ describe("prepareSandboxStateDirectory", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("withSandboxStateDirectory", () => {
+  async function fixture() {
+    const root = await mkdtemp(path.join(os.tmpdir(), "pigo-check-state-"));
+    const worktree = path.join(root, "run");
+    await mkdir(worktree);
+    return { root, worktree };
+  }
+
+  it("gives concurrent checks fresh state outside the worktree and agent state", async () => {
+    const { root, worktree } = await fixture();
+    const developerState = sandboxStateDirectory(worktree);
+    const states: string[] = [];
+    try {
+      await prepareSandboxStateDirectory(developerState);
+      await writeFile(path.join(developerState, "agent", "auth.json"), "synthetic-developer");
+      await Promise.all([1, 2].map(() => withSandboxStateDirectory({ worktree, ephemeral: true }, async (state) => {
+        states.push(state);
+        expect(state.startsWith(`${worktree}.check-state-`)).toBe(true);
+        expect(state.startsWith(`${developerState}/`)).toBe(false);
+        expect((await stat(state)).mode & 0o777).toBe(0o700);
+        await expect(stat(path.join(state, "agent", "auth.json"))).rejects.toMatchObject({ code: "ENOENT" });
+        await writeFile(path.join(state, "agent", "auth.json"), "synthetic-check");
+        expect(await readFile(path.join(state, "agent", "models.json"), "utf8")).toBe("");
+        return "passed";
+      })));
+      expect(new Set(states).size).toBe(2);
+      for (const state of states) await expect(stat(state)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readFile(path.join(developerState, "agent", "auth.json"), "utf8")).toBe("synthetic-developer");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["create failed", "cancelled"])("cleans check state when execution is %s", async (message) => {
+    const { root, worktree } = await fixture();
+    let allocated = "";
+    const error = new Error(message);
+    try {
+      await expect(withSandboxStateDirectory({ worktree, ephemeral: true }, async (state) => {
+        allocated = state;
+        throw error;
+      })).rejects.toBe(error);
+      await expect(stat(allocated)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("retains persistent agent state across retries", async () => {
+    const { root, worktree } = await fixture();
+    try {
+      await withSandboxStateDirectory({ worktree }, async (state) => {
+        expect(state).toBe(`${worktree}.state`);
+        await writeFile(path.join(state, "agent", "session.json"), "session");
+      });
+      await withSandboxStateDirectory({ worktree }, async (state) => {
+        expect(await readFile(path.join(state, "agent", "session.json"), "utf8")).toBe("session");
+        throw new Error("retry");
+      }).catch(() => undefined);
+      expect(await readFile(path.join(`${worktree}.state`, "agent", "session.json"), "utf8")).toBe("session");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses an explicit state path for an ephemeral invocation", async () => {
+    await expect(withSandboxStateDirectory({ worktree: "/unused", statePath: "/unused.state", ephemeral: true }, async () => undefined))
+      .rejects.toThrow(/cannot reuse/);
   });
 });
 
