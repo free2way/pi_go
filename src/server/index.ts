@@ -34,6 +34,7 @@ import { saveInternalRunArtifact } from "./artifact-api.js";
 import { type ApprovePlan, approveEventMeta, planApprove } from "./approve.js";
 import { conflictReplyFor, isStorageFailure, requestErrorReply } from "./request-errors.js";
 import { diagnosticSecrets, redactDiagnosticText } from "../shared/diagnostics.js";
+import { releaseDiagnosticDetailSchema } from "./release-diagnostics.js";
 import { appendHumanNote } from "./run-notes.js";
 import { resumeDeadlinePatch } from "./run-deadline-base.js";
 import { parseRunSearch, searchRuns } from "./run-search.js";
@@ -2657,6 +2658,7 @@ async function acceptanceSnapshotFor(run: Run, input: {
 }
 
 const completedMergeSchema = z.object({ confirm: z.literal(true), note: z.string().trim().max(2_000).optional() });
+const releaseDetailSchema = releaseDiagnosticDetailSchema(() => releaseCallbackTokens(releaseSettings.get(), process.env));
 const releaseSchema = z.object({
   environment: z.enum(["staging", "production"]),
   confirm: z.literal(true),
@@ -2673,13 +2675,13 @@ const releaseResultSchema = z.discriminatedUnion("status", [
     attempt: z.number().int().min(1).optional(),
     status: z.literal("progress"),
     stage: z.enum(["validating", "deploying", "networking", "smoke", "verifying"]),
-    detail: z.string().trim().max(500).optional(),
+    detail: releaseDetailSchema,
   }).strict(),
   z.object({
     deliveryId: z.string().trim().min(8).max(120),
     attempt: z.number().int().min(1).optional(),
     status: z.literal("succeeded"),
-    detail: z.string().trim().max(500).optional(),
+    detail: releaseDetailSchema,
     deploymentId: z.string().trim().max(200).optional(),
     url: z.string().url().max(1_000).optional(),
     commit: z.string().regex(/^[0-9a-f]{40}$/),
@@ -2690,7 +2692,7 @@ const releaseResultSchema = z.discriminatedUnion("status", [
     deliveryId: z.string().trim().min(8).max(120),
     attempt: z.number().int().min(1).optional(),
     status: z.literal("failed"),
-    detail: z.string().trim().max(500).optional(),
+    detail: releaseDetailSchema,
     deploymentId: z.string().trim().max(200).optional(),
     url: z.string().url().max(1_000).optional(),
   }).strict(),
@@ -2701,13 +2703,13 @@ const rollbackResultSchema = z.discriminatedUnion("status", [
     attempt: z.number().int().min(1),
     status: z.literal("progress"),
     stage: z.enum(["validating", "deploying", "networking", "smoke", "verifying"]),
-    detail: z.string().trim().max(500).optional(),
+    detail: releaseDetailSchema,
   }).strict(),
   z.object({
     deliveryId: z.string().trim().min(8).max(120),
     attempt: z.number().int().min(1),
     status: z.literal("succeeded"),
-    detail: z.string().trim().max(500).optional(),
+    detail: releaseDetailSchema,
     deploymentId: z.string().trim().max(200).optional(),
     url: z.string().url().max(1_000).optional(),
     commit: z.string().regex(/^[0-9a-f]{40}$/),
@@ -2720,7 +2722,7 @@ const rollbackResultSchema = z.discriminatedUnion("status", [
     deliveryId: z.string().trim().min(8).max(120),
     attempt: z.number().int().min(1),
     status: z.literal("failed"),
-    detail: z.string().trim().max(500).optional(),
+    detail: releaseDetailSchema,
   }).strict(),
 ]);
 /** Final-status callback for an asynchronous agile release deploy. */
@@ -2729,7 +2731,7 @@ const releaseDeployResultSchema = z.discriminatedUnion("status", [
     deliveryId: z.string().trim().min(8).max(120),
     attempt: z.number().int().min(1).optional(),
     status: z.literal("succeeded"),
-    detail: z.string().trim().max(500).optional(),
+    detail: releaseDetailSchema,
     deploymentId: z.string().trim().max(200).optional(),
     url: z.string().url().max(1_000).optional(),
     commit: z.string().regex(/^[0-9a-f]{40}$/),
@@ -2741,7 +2743,7 @@ const releaseDeployResultSchema = z.discriminatedUnion("status", [
     deliveryId: z.string().trim().min(8).max(120),
     attempt: z.number().int().min(1).optional(),
     status: z.literal("failed"),
-    detail: z.string().trim().max(500).optional(),
+    detail: releaseDetailSchema,
     deploymentId: z.string().trim().max(200).optional(),
     url: z.string().url().max(1_000).optional(),
   }).strict(),

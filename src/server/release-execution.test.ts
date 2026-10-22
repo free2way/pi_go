@@ -1,8 +1,12 @@
 import { createHmac } from "node:crypto";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { describe, expect, it } from "vitest";
 import { executeRelease } from "./release-execution.js";
 
 describe("executeRelease webhook", () => {
+  const fake = (label: string) => ["DUMMY", label].join("_");
+
   it("sends authentication, HMAC and a stable delivery id", async () => {
     let requestInit: RequestInit | undefined;
     const fetchImpl: typeof fetch = async (_input, init) => {
@@ -61,5 +65,51 @@ describe("executeRelease webhook", () => {
       httpStatus: 400,
       detail: "HTTP 400: repository must be a safe workspace path",
     });
+  });
+
+  it("redacts rejection credentials and the configured token before truncating diagnostics", async () => {
+    const token = `${fake("opaque")}/+ long secret`;
+    const echoed = ["upstream refused", token, encodeURIComponent(token), `Bearer ${fake("authorization")}`,
+      "https://" + ["user", fake("url")].join(":") + "@deploy.example.invalid/", `https://deploy.example.invalid/?token=${fake("query")}`].join(" ");
+    const result = await executeRelease(
+      { configured: true, kind: "webhook", url: "https://deploy.example.invalid/hook" }, {},
+      { deliveryId: "release_1", webhookToken: token, fetchImpl: async () => new Response(JSON.stringify({ error: echoed }), { status: 400 }) },
+    );
+    expect(result.status).toBe("failed");
+    expect(result.httpStatus).toBe(400);
+    expect(result.detail).toContain("upstream refused");
+    expect(result.detail).toContain("[redacted");
+    expect(result.detail).not.toContain("DUMMY");
+
+    const boundary = await executeRelease(
+      { configured: true, kind: "webhook", url: "https://deploy.example.invalid/hook" }, {},
+      { deliveryId: "release_1", webhookToken: token, fetchImpl: async () => new Response(JSON.stringify({ error: "x".repeat(285) + token }), { status: 400 }) },
+    );
+    expect(boundary.detail).not.toContain("DUMMY");
+  });
+
+  it.each([307, 308])("refuses HTTP %i without forwarding the signed request or reporting target success", async (status) => {
+    const servers: Server[] = [];
+    const listen = async (server: Server) => {
+      servers.push(server);
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", resolve);
+      });
+      return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    };
+    let targetHits = 0;
+    let hookHits = 0;
+    try {
+      const target = await listen(createServer((_request, response) => { targetHits += 1; response.writeHead(200).end(); }));
+      const hook = await listen(createServer((_request, response) => { hookHits += 1; response.writeHead(status, { location: target }).end(); }));
+      const result = await executeRelease({ configured: true, kind: "webhook", url: hook },
+        { runId: "run_1", commit: "a".repeat(40) }, { deliveryId: "release_1", webhookToken: fake("hook") });
+      expect(result).toMatchObject({ status: "failed", httpStatus: status, detail: `HTTP ${status}` });
+      expect(hookHits).toBe(1);
+      expect(targetHits).toBe(0);
+    } finally {
+      await Promise.all(servers.map((server) => new Promise<void>((resolve) => { server.closeAllConnections(); server.close(() => resolve()); })));
+    }
   });
 });
