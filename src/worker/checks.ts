@@ -48,7 +48,14 @@ export async function runChecks(io: CheckIO): Promise<{ passed: boolean; results
       result = await io.execute(checkCommand, io.signal);
     } catch (error) {
       throwIfCancelled(io.signal);
-      throw new Error(redactCheckText(error instanceof Error ? error.message : String(error), io.secrets));
+      const safeError = new Error(redactCheckText(error instanceof Error ? error.message : String(error), io.secrets));
+      if (error instanceof Error) {
+        // Keep instanceof-based failure routing without retaining raw causes,
+        // captured output or the original stack's unsanitized message.
+        Object.setPrototypeOf(safeError, Object.getPrototypeOf(error));
+        safeError.name = error.name;
+      }
+      throw safeError;
     }
     // `command` resolves with code 130 on abort instead of rejecting, so the
     // cancellation must be checked explicitly before recording a result.

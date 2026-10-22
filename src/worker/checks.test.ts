@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { ChatPayload } from "../shared/chat.js";
 import type { CheckResult } from "../shared/types.js";
 import { runChecks, throwIfCancelled, type CheckIO } from "./checks.js";
+import { SandboxUnavailableError } from "./sandbox.js";
 
 describe("runChecks", () => {
   it.each([0, 1])("redacts every persisted result and chat while retaining exit %i", async (code) => {
@@ -47,6 +48,22 @@ describe("runChecks", () => {
       execute: async () => { throw new Error("synthetic-job-canary Bearer DUMMY_error_canary"); },
       started: async () => undefined, finished: async () => undefined, chat: async () => undefined,
     })).rejects.toThrow("[redacted] Bearer [redacted]");
+  });
+
+  it("retains sandbox-unavailable classification without an unsafe stack or cause", async () => {
+    const canary = "DUMMY_failure_canary";
+    let failure: unknown;
+    try {
+      await runChecks({
+        commands: ["npm test"], secrets: [canary], signal: new AbortController().signal,
+        execute: async () => { throw new SandboxUnavailableError(canary); },
+        started: async () => undefined, finished: async () => undefined, chat: async () => undefined,
+      });
+    } catch (error) { failure = error; }
+    expect(failure).toBeInstanceOf(SandboxUnavailableError);
+    expect((failure as Error).message).toContain("[redacted]");
+    expect((failure as Error).stack).not.toContain(canary);
+    expect((failure as Error).cause).toBeUndefined();
   });
 
   it("stops when cancelled during a check without reporting failure or chat", async () => {

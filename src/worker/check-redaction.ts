@@ -8,7 +8,7 @@ export function redactCheckText(text: string, secrets: readonly string[] = []): 
   for (const value of values) safe = safe.replaceAll(value, "[redacted]");
   return safe
     .replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s/<>"']*@[^\s<>"']+/gi, "[redacted-url]")
-    .replace(/\b(Bearer|Basic)\s+[^\s,"'<>\[\]\}]+/gi, "$1 [redacted]")
+    .replace(/\b(Bearer|Basic)\s+[^\s,"'<>[\]}]+/gi, "$1 [redacted]")
     .replace(/([?&](?:access_token|api_key|token|password|secret|signature)=)[^&#\s"'<>]+/gi, "$1[redacted]")
-    .replace(/\b([\w-]*(?:api[_-]?key|token|password|passwd|secret|credential)[\w-]*["']?\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;\}\]\[]+)/gi, "$1[redacted]");
+    .replace(/\b([\w-]*(?:api[_-]?key|token|password|passwd|secret|credential)[\w-]*["']?\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}\][]+)/gi, "$1[redacted]");
 }
