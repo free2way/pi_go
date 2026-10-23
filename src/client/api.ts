@@ -1,4 +1,5 @@
 import type { ProviderCreditUpdate, ProviderCreditUpdateResponse, ProviderCreditsResponse } from "../shared/provider-credits-api";
+import type { BackupEntry, BackupOverview } from "../shared/backups";
 import type { AgileMetricsResponse, ReleaseRetrospective, ReleaseSummary } from "../shared/agile-metrics";
 import type { DecisionBrief } from "../shared/decision-brief";
 import type { DecisionAuditProjection } from "../shared/decision-audit";
@@ -163,6 +164,10 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  backups: () => request<BackupOverview>("/api/admin/backups"),
+  createBackup: () => request<BackupEntry>("/api/admin/backups", { method: "POST", body: JSON.stringify({ confirm: true }) }),
+  deleteBackup: (id: string) => request<{ ok: true }>(`/api/admin/backups/${encodeURIComponent(id)}/delete`, { method: "POST", body: JSON.stringify({ confirm: true }) }),
+  restoreBackup: (id: string) => request<{ ok: true }>(`/api/admin/backups/${encodeURIComponent(id)}/restore`, { method: "POST", body: JSON.stringify({ confirm: true }) }),
   config: () => request<ConfigStatus>("/api/config/status"),
   me: () => request<CurrentUser>("/api/me"),
   credentialStatus: () => request<CredentialStatus>("/api/credentials/status"),

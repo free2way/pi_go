@@ -100,6 +100,7 @@ import { RequirementAssistant } from "./RequirementAssistant";
 import { PiAssistant } from "./PiAssistant";
 
 const AccountsPage = lazy(() => import("./AccountsPage").then((module) => ({ default: module.AccountsPage })));
+const BackupsPage = lazy(() => import("./BackupsPage").then((module) => ({ default: module.BackupsPage })));
 const AgilePage = lazy(() => import("./AgilePage").then((module) => ({ default: module.AgilePage })));
 const DecisionsPanel = lazy(() => import("./DecisionsPanel").then((module) => ({ default: module.DecisionsPanel })));
 const HistoryPage = lazy(() => import("./HistoryPage").then((module) => ({ default: module.HistoryPage })));
@@ -1762,7 +1763,7 @@ export function App({ onSignOut }: { onSignOut?: () => void } = {}) {
   // Item-1: which rework branch's detail panel is open; Item-2: the chat round filter.
   const [reworkRound, setReworkRound] = useState<number | null>(null);
   const [chatRoundFilter, setChatRoundFilter] = useState<number | null>(null);
-  const [view, setView] = useState<"run" | "agile" | "workspaces" | "models" | "history" | "system" | "release-settings" | "accounts">("run");
+  const [view, setView] = useState<"run" | "agile" | "workspaces" | "models" | "history" | "system" | "release-settings" | "accounts" | "backups">("run");
   const [createOpen, setCreateOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -2037,6 +2038,7 @@ export function App({ onSignOut }: { onSignOut?: () => void } = {}) {
           {user?.isAdmin && <button type="button" className={view === "release-settings" ? "active" : ""} onClick={() => setView("release-settings")}><Webhook size={16} />{t("nav.releaseSettings")}</button>}
           {/* 账户管理: admin-only; non-admins never see the entry (direct navigation shows the explicit 仅管理员可见 state). */}
           {user?.isAdmin && <button type="button" className={view === "accounts" ? "active" : ""} onClick={() => setView("accounts")}><Users size={16} />{t("nav.accounts")}</button>}
+          {user?.isAdmin && <button type="button" className={view === "backups" ? "active" : ""} onClick={() => setView("backups")}><History size={16} />{t("nav.backups")}</button>}
           </nav>
           {config && <div className="providers-card" id="models">
             <div className="providers-title"><span>AGENT ROUTING</span><Zap size={13} /></div>
@@ -2089,7 +2091,7 @@ export function App({ onSignOut }: { onSignOut?: () => void } = {}) {
         <header className="topbar">
           <button className="icon-button mobile-only" onClick={() => setSidebarOpen(true)}><Menu size={19} /></button>
           <div className="breadcrumb">
-            {view === "workspaces"
+            {view === "backups" ? <><span>BACKUPS</span><ChevronRight size={13} /><strong>{t("nav.backups")}</strong></> : view === "workspaces"
               ? <><span>WORKSPACES</span><ChevronRight size={13} /><strong>{t("nav.workspaces")}</strong></>
               : view === "models"
                 ? <><span>MODELS</span><ChevronRight size={13} /><strong>{t("nav.models")}</strong></>
@@ -2134,6 +2136,8 @@ export function App({ onSignOut }: { onSignOut?: () => void } = {}) {
             <HistoryPage runs={runs} onOpenRun={(id) => { setSelectedId(id); setView("run"); setSidebarOpen(false); }} />
           ) : view === "agile" ? (
             <AgilePage config={config} onOpenRun={(id) => { setSelectedId(id); setView("run"); setSidebarOpen(false); }} />
+          ) : view === "backups" ? (
+            <BackupsPage isAdmin={Boolean(user?.isAdmin)} />
           ) : view === "accounts" ? (
             <AccountsPage user={user} />
           ) : !activeRun ? (

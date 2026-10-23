@@ -11,7 +11,8 @@ export type PiAssistantPage =
   | "history"
   | "system"
   | "release-settings"
-  | "accounts";
+  | "accounts"
+  | "backups";
 
 export interface PiAssistantRunContext {
   id: string;

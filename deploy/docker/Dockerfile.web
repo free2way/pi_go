@@ -12,7 +12,7 @@ ENV NODE_ENV=production
 # Refresh packages in the final stage. npm is used only to materialize the
 # locked production dependency tree; the server never invokes npm at runtime,
 # so remove the bundled package manager and its transitive tooling afterwards.
-RUN apk upgrade --no-cache
+RUN apk upgrade --no-cache && apk add --no-cache postgresql18-client
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts \
     && npm cache clean --force \

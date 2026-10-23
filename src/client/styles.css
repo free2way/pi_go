@@ -1226,3 +1226,16 @@ button.agile-metrics-row:hover strong { color: #c3d274; }
   .pi-assistant-context { grid-template-columns: auto minmax(0,1fr); }
   .pi-assistant-context em { display: none; }
 }
+/* Administrator-only application backup management. */
+.backups-page { max-width: 1180px; width: 100%; padding: 32px; margin: 0 auto; }
+.backup-heading, .backup-actions, .backup-entry { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.backup-heading { flex-wrap: wrap; }
+.backup-heading h1 { margin: 8px 0; }
+.backup-warning { padding: 16px; border: 1px solid #ba8e35; border-radius: 10px; background: #a7791710; line-height: 1.7; }
+.backup-list { display: grid; gap: 12px; margin: 24px 0; }
+.backup-entry { padding: 18px; border: 1px solid var(--line, #242a31); border-radius: 10px; background: var(--surface, #0d1014); }
+.backup-entry > div { display: grid; gap: 7px; min-width: 0; overflow-wrap: anywhere; }
+.backup-entry small { opacity: .7; }
+.backup-protected { display: flex; align-items: center; gap: 6px; color: var(--green, #73d6a2); font-size: 12px; }
+.backup-audit { padding-left: 20px; line-height: 1.8; font-size: 12px; overflow-wrap: anywhere; }
+@media (max-width: 700px) { .backups-page { padding: 16px; } .backup-entry { align-items: flex-start; flex-wrap: wrap; } }
