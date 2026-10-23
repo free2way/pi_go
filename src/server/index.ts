@@ -12,6 +12,8 @@ import { buildStoryRunInput, STORY_STATUS_LABELS, type RunBudget, type StoryDeta
 import { resolveRequestLocale, type Locale } from "../shared/i18n.js";
 import type { ConfigStatus, CurrentUser, ModelCatalogResponse, ReviewScope, Run, RunEvent, RunReleaseRecord, RunRollbackRecord, Workspace } from "../shared/types.js";
 import { AccountError, AccountService, accountAdminGate } from "./accounts.js";
+import { BackupManager, dumpBackup } from "./backups.js";
+import { registerBackupRoutes } from "./backup-routes.js";
 import { AlertManager, createAlertSink } from "./alerts.js";
 import { syncStorageAlerts, type WorkspaceStorageStatus } from "./storage-alerts.js";
 import { Authenticator, normalizePublicOrigin } from "./auth.js";
@@ -285,7 +287,7 @@ const runStateSchema = z.enum(["queued", "preparing", "developing", "checking", 
 const piAssistantAskSchema = z.object({
   message: z.string().trim().min(1).max(2_000),
   context: z.object({
-    page: z.enum(["run", "agile", "workspaces", "models", "history", "system", "release-settings", "accounts"]),
+    page: z.enum(["run", "agile", "workspaces", "models", "history", "system", "release-settings", "accounts", "backups"]),
     run: z.object({
       id: z.string().trim().min(1).max(80),
       title: z.string().trim().max(200),
@@ -813,6 +815,19 @@ async function requireAccountAdmin(request: FastifyRequest, reply: FastifyReply)
   }
   return user;
 }
+
+const backups = new BackupManager({
+  root: path.join(path.dirname(dataFile), "backups"),
+  dump: (destination) => dumpBackup(process.env.PI_DATABASE_URL || "", destination),
+  sources: { "credentials.vault.json": vaultFile, "release-settings.json": releaseSettingsFile, "scm-settings.json": scmSettingsFile },
+});
+registerBackupRoutes(app, {
+  manager: backups,
+  admin: async (request) => {
+    const actor = auth.user(request);
+    return await identities.isAdmin(actor.id) ? actor.id : undefined;
+  },
+});
 
 function effectiveReleaseConfig(environment: ReleaseEnvironment) {
   const saved = releaseSettings.get();
