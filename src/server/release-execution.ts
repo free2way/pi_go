@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { createHmac } from "node:crypto";
 import type { PostMergeDeployPlan } from "./run-merge.js";
+import { redactReleaseDiagnostic } from "./release-diagnostics.js";
 
 export interface ReleaseExecutionOutcome {
   configured: boolean;
@@ -10,7 +11,7 @@ export interface ReleaseExecutionOutcome {
   httpStatus?: number;
 }
 
-async function webhookFailureDetail(response: Response) {
+async function webhookFailureDetail(response: Response, token?: string) {
   let reason = "";
   try {
     const text = (await response.text()).slice(0, 4_096);
@@ -21,7 +22,8 @@ async function webhookFailureDetail(response: Response) {
   } catch {
     // The status remains authoritative when an upstream returns non-JSON text.
   }
-  const safeReason = reason.replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 300);
+  const safeReason = redactReleaseDiagnostic(reason, token ? [token] : [])
+    .replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 300);
   return `HTTP ${response.status}${safeReason ? `: ${safeReason}` : ""}`;
 }
 
@@ -52,6 +54,7 @@ export async function executeRelease(
             : {}),
         },
         body,
+        redirect: "manual",
         signal: AbortSignal.timeout(30_000),
       });
       if (response.status === 202) {
@@ -64,11 +67,12 @@ export async function executeRelease(
         configured: true,
         kind: "webhook",
         status: "failed",
-        detail: await webhookFailureDetail(response),
+        detail: await webhookFailureDetail(response, options.webhookToken),
         httpStatus: response.status,
       };
     } catch (error) {
-      return { configured: true, kind: "webhook", status: "failed", detail: `webhook request failed (${(error as Error).name || "Error"})` };
+      const name = error instanceof Error && ["AbortError", "TimeoutError", "TypeError"].includes(error.name) ? error.name : "Error";
+      return { configured: true, kind: "webhook", status: "failed", detail: `webhook request failed (${name})` };
     }
   }
 
