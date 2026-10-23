@@ -53,6 +53,16 @@ export function createAlertSink(options: {
 }): AlertSink {
   const doFetch = options.fetchImpl ?? fetch;
   const secrets = diagnosticSecrets(options.environment);
+  const environment = options.environment ?? process.env;
+  const configuredEnvironment = environment.PI_DEPLOYMENT_ENVIRONMENT?.trim() || environment.NODE_ENV;
+  const deploymentEnvironment = ["production", "staging", "development", "test"].includes(configuredEnvironment ?? "")
+    ? configuredEnvironment! : "unknown";
+  const version = redactDiagnosticText(environment.PI_WEB_VERSION?.trim() || "unknown", secrets);
+  const labels = {
+    service: "pigo-web",
+    environment: deploymentEnvironment,
+    version: /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(version) ? version : "unknown",
+  };
   return (alert) => {
     const safe = {
       severity: alert.severity,
@@ -60,16 +70,26 @@ export function createAlertSink(options: {
       message: redactDiagnosticText(alert.message, secrets),
       ...(alert.details ? { details: redactDiagnosticValue(alert.details, secrets) as Record<string, unknown> } : {}),
     };
-    options.log(safe.severity === "critical" ? "error" : "warn", { ...safe.details, alert: safe.key }, safe.message);
+    options.log(safe.severity === "critical" ? "error" : "warn", { ...safe.details, ...labels, alert: safe.key }, safe.message);
     if (!options.webhookUrl) return;
-    void doFetch(options.webhookUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...safe, at: new Date().toISOString() }),
-      signal: AbortSignal.timeout(10_000),
-    }).catch((error) => {
+    const failed = (error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
-      options.log("warn", { alert: safe.key, error: redactDiagnosticText(message, secrets) }, "alert webhook delivery failed");
-    });
+      options.log("warn", { ...labels, alert: safe.key, error: redactDiagnosticText(message, secrets) }, "alert webhook delivery failed");
+    };
+    try {
+      void doFetch(options.webhookUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...safe, ...labels, at: new Date().toISOString() }),
+        redirect: "error",
+        signal: AbortSignal.timeout(10_000),
+      }).then((response) => {
+        if (!response.ok) failed(new Error(`HTTP ${response.status}`));
+        // Alert delivery never consumes or logs a receiver's potentially private body.
+        void response.body?.cancel().catch(() => undefined);
+      }).catch(failed);
+    } catch (error) {
+      failed(error);
+    }
   };
 }

@@ -66,6 +66,7 @@ export const CRITICAL_ENV = {
     "PI_JOB_STALE_SECONDS",
     // alerts / pipeline / workspaces
     "PI_ALERT_WEBHOOK",
+    "PI_DEPLOYMENT_ENVIRONMENT",
     "PI_ALERT_COOLDOWN_SECONDS",
     "PI_PIPELINE_VERSION",
     "PI_WORKSPACES_ENABLED",
