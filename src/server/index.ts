@@ -16,7 +16,7 @@ import { BackupManager, dumpBackup } from "./backups.js";
 import { registerBackupRoutes } from "./backup-routes.js";
 import { AlertManager, createAlertSink } from "./alerts.js";
 import { syncStorageAlerts, type WorkspaceStorageStatus } from "./storage-alerts.js";
-import { syncQueueAlerts } from "./queue-alerts.js";
+import { readQueueObservation, syncQueueAlerts } from "./queue-alerts.js";
 import { Authenticator, normalizePublicOrigin } from "./auth.js";
 import { ExpiringLruCache } from "./expiring-lru-cache.js";
 import { CredentialVault } from "./credential-vault.js";
@@ -748,10 +748,9 @@ app.get("/api/health/detail", async (request, reply) => {
   }
   if (jobQueue) {
     try {
-      const jobs = await jobQueue.listPendingJobs({ staleAfterMs: JOB_STALE_MS, limit: 50 });
-      const stale = jobs.filter((job) => job.state === "claimed").length;
-      health.queue = { pending: jobs.length, reclaimedFromDeadWorker: stale };
-      syncQueueAlerts(alerts, jobs, JOB_STALE_MS);
+      const queue = await readQueueObservation(db, JOB_STALE_MS);
+      health.queue = { pending: queue.pending, reclaimedFromDeadWorker: queue.stale };
+      syncQueueAlerts(alerts, queue, JOB_STALE_MS);
     } catch (error) {
       health.queue = { status: "unavailable", error: (error as Error).message.slice(0, 200) };
     }
@@ -4045,8 +4044,8 @@ const jobRecoveryTimer = setInterval(() => {
     await requeueStaleJobs();
     await expireStaleReleaseDeploys();
     if (jobQueue) {
-      const jobs = await jobQueue.listPendingJobs({ staleAfterMs: JOB_STALE_MS, limit: 50 });
-      syncQueueAlerts(alerts, jobs, JOB_STALE_MS);
+      const queue = await readQueueObservation(db, JOB_STALE_MS);
+      syncQueueAlerts(alerts, queue, JOB_STALE_MS);
     }
   })().catch((error) => {
     app.log.warn({ error: redactDiagnosticText(error instanceof Error ? error.message : String(error), diagnosticSecrets()) }, "queue alert observation failed");
