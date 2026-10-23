@@ -6,6 +6,7 @@ import type {
   WorkspaceRemoteStatus,
 } from "../shared/types.js";
 import { inspectExportHistory, type ExportFinding } from "../shared/repository-export-policy.mjs";
+import { redactWorkerDiagnostic } from "./diagnostic-redaction.js";
 
 export interface WorkspaceScmCredentialInput {
   provider?: ScmProvider;
@@ -34,16 +35,16 @@ export async function inspectWorkspacePushPolicy(input: {
   }
 }
 
-export function redactRemoteUrl(value: string): string {
+export function redactRemoteUrl(value: string, secrets: readonly string[] = []): string {
   try {
     const parsed = new URL(value);
-    if (parsed.username || parsed.password) {
-      parsed.username = parsed.username ? "***" : "";
-      parsed.password = "";
-    }
-    return parsed.toString();
+    const hadCredentials = Boolean(parsed.username || parsed.password);
+    parsed.username = "";
+    parsed.password = "";
+    const safe = redactWorkerDiagnostic(parsed.toString(), secrets);
+    return hadCredentials ? safe.replace(`${parsed.protocol}//`, `${parsed.protocol}//***@`) : safe;
   } catch {
-    return value.replace(/\/\/[^@/\s]*@/g, "//***@");
+    return redactWorkerDiagnostic(value.replace(/\/\/[^@/\s]*@/g, "//***@"), secrets);
   }
 }
 
@@ -108,9 +109,8 @@ function safeBranch(branch: string): string {
 }
 
 function failure(result: ScmGitResult, fallback: string, token?: string | null) {
-  let detail = `${result.stderr}\n${result.stdout}`.trim() || fallback;
-  if (token) detail = detail.replaceAll(token, "***");
-  return detail.replace(/\/\/[^@/\s]*@/g, "//***@").slice(0, 800);
+  const detail = `${result.stderr}\n${result.stdout}`.trim() || fallback;
+  return redactWorkerDiagnostic(detail, token ? [token] : []).slice(0, 800);
 }
 
 function relation(ahead: number, behind: number): WorkspaceRemoteRelation {
@@ -129,7 +129,7 @@ export async function inspectWorkspaceRemote(input: {
 }): Promise<WorkspaceRemoteStatus> {
   const branch = safeBranch(input.branch);
   const localResult = await input.git(["rev-parse", "HEAD"]);
-  if (localResult.code !== 0) throw new WorkspaceScmError("SCM_LOCAL_HEAD_FAILED", failure(localResult, "Unable to read local HEAD"));
+  if (localResult.code !== 0) throw new WorkspaceScmError("SCM_LOCAL_HEAD_FAILED", failure(localResult, "Unable to read local HEAD", input.credential?.token));
   const localHead = localResult.stdout.trim();
   const remoteResult = await input.git(["remote", "get-url", "origin"]);
   if (remoteResult.code !== 0 || !remoteResult.stdout.trim()) {
@@ -140,7 +140,7 @@ export async function inspectWorkspaceRemote(input: {
     };
   }
   const rawRemote = remoteResult.stdout.trim();
-  const remote = redactRemoteUrl(rawRemote);
+  const remote = redactRemoteUrl(rawRemote, input.credential?.token ? [input.credential.token] : []);
   const provider = input.credential?.provider ?? detectScmProvider(rawRemote);
   const env = scmAuthEnvironment(rawRemote, { ...input.credential, provider });
   const remoteRef = `refs/pigo/remotes/origin/${branch}`;
@@ -157,7 +157,7 @@ export async function inspectWorkspaceRemote(input: {
   const fetched = await input.git(["fetch", "--quiet", "--no-tags", "origin", `+refs/heads/${branch}:${remoteRef}`], env);
   if (fetched.code !== 0) throw new WorkspaceScmError("SCM_FETCH_FAILED", failure(fetched, "Unable to fetch origin", input.credential?.token));
   const counts = await input.git(["rev-list", "--left-right", "--count", `${localHead}...${remoteRef}`]);
-  if (counts.code !== 0) throw new WorkspaceScmError("SCM_COMPARE_FAILED", failure(counts, "Unable to compare local and remote branches"));
+  if (counts.code !== 0) throw new WorkspaceScmError("SCM_COMPARE_FAILED", failure(counts, "Unable to compare local and remote branches", input.credential?.token));
   const [ahead = 0, behind = 0] = counts.stdout.trim().split(/\s+/).map((value) => Number(value));
   let requiredCommitPresent: boolean | undefined;
   if (input.requiredCommit) {

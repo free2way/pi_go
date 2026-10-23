@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { WorkspaceVerifyResult } from "../shared/types.js";
@@ -262,6 +262,44 @@ describe("workspace service", () => {
     expect(overview.settings).toMatchObject({ provider: "github", tokenConfigured: true });
     expect(overview.attempts[0]).toMatchObject({ status: "succeeded", localHead: "abc", remoteHead: "abc" });
     expect(JSON.stringify(overview)).not.toContain("github-secret");
+  });
+
+  it.each(["check", "push"])("redacts legacy Worker %s failures before exposing or auditing them", async (operation) => {
+    const db = await createTestDb();
+    const directory = await mkdtemp(path.join(os.tmpdir(), "pigo-scm-diagnostics-"));
+    try {
+      const saved = "DUMMY_SCM_" + 'opaque" value';
+      const marker = "DUMMY_BEARER_" + "private-value";
+      const settings = new ScmSettingsStore(path.join(directory, "scm.json"), Buffer.alloc(32, 3).toString("base64"));
+      await settings.init();
+      let received = "";
+      const service = new WorkspaceService(db, (async (route: string, init?: RequestInit) => {
+        if (route === "/workspaces/verify") return verifyOk();
+        received = JSON.parse(String(init?.body)).credential.token;
+        throw Object.assign(new Error(`controlled SCM failure: Bearer ${marker} ${saved} ${encodeURIComponent(saved)}`), { code: "SCM_REMOTE_UNREACHABLE", status: 409 });
+      }) as WorkerCall, settings);
+      const workspace = await service.register("owner", "pi_go");
+      await service.saveScmSettings(["owner"], workspace.id, { provider: "generic", authMode: "https_token", token: saved });
+      const action = operation === "push" ? service.push(["owner"], workspace.id, "owner") : service.remoteStatus(["owner"], workspace.id);
+      const failure = await action.catch((e: WorkspaceError) => e) as WorkspaceError;
+      expect(failure).toMatchObject({ code: "SCM_REMOTE_UNREACHABLE", status: 409 });
+      expect(failure.message).toContain("controlled SCM failure");
+      expect(received).toBe(saved);
+      const overview = await service.scmOverview(["owner"], workspace.id);
+      const persisted = await db.query("SELECT detail FROM workspace_scm_sync_attempts WHERE workspace_id=$1", [workspace.id]);
+      for (const text of [failure.message, JSON.stringify(overview), JSON.stringify(persisted.rows)]) {
+        for (const value of [saved, encodeURIComponent(saved), marker]) expect(text).not.toContain(value);
+      }
+      if (operation === "push") expect(overview.attempts[0]).toMatchObject({ status: "failed", detail: expect.stringContaining("[redacted]") });
+      else expect(overview.attempts).toHaveLength(0);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("redacts credential query parameters in persisted repository display URLs", () => {
+    const marker = "DUMMY_QUERY_" + "private-value";
+    expect(redactGitUrl(`https://repo.example.invalid/repo?token=${marker}`)).not.toContain(marker);
   });
 
   it("defaults an HTTPS GitHub workspace to token authentication", async () => {

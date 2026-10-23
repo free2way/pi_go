@@ -1,5 +1,7 @@
-import { describe, expect, it } from "vitest";
-import { detectScmProvider, inspectWorkspaceRemote, pushWorkspaceBranch, scmAuthEnvironment, type ScmGitResult } from "./workspace-scm.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { detectScmProvider, inspectWorkspaceRemote, pushWorkspaceBranch, redactRemoteUrl, scmAuthEnvironment, type ScmGitResult } from "./workspace-scm.js";
+
+afterEach(() => vi.unstubAllEnvs());
 
 const ok = (stdout = ""): ScmGitResult => ({ code: 0, stdout, stderr: "" });
 const LOCAL = "a".repeat(40), REMOTE = "b".repeat(40);
@@ -31,6 +33,51 @@ function fixture(options: { behind?: boolean; forbidden?: boolean; remoteMissing
 }
 
 describe("workspace SCM", () => {
+  it.each([
+    ["rev-parse", "SCM_LOCAL_HEAD_FAILED"],
+    ["ls-remote", "SCM_REMOTE_UNREACHABLE"],
+    ["fetch", "SCM_FETCH_FAILED"],
+    ["rev-list", "SCM_COMPARE_FAILED"],
+  ])("redacts complete %s diagnostics before truncation without changing the error code", async (command, code) => {
+    const saved = "DUMMY_SCM_" + 'opaque" value';
+    const platform = "DUMMY_PLATFORM_" + "private-value";
+    vi.stubEnv("PI_INTERNAL_TOKEN", platform);
+    const markers = ["DUMMY_BEARER", "DUMMY_BASIC", "DUMMY_DATABASE", "DUMMY_QUERY"];
+    const uri = ["postgresql:", "//fixture:", markers[2], "@db.example.invalid/test"].join("");
+    const detail = `controlled SCM failure: Bearer ${markers[0]} Basic ${markers[1]} ${uri} https://repo.example.invalid/?token=${markers[3]} ${saved} ${encodeURIComponent(saved)} ${JSON.stringify(saved).slice(1, -1)} ${platform}`;
+    const f = fixture();
+    try {
+      await inspectWorkspaceRemote({ branch: "main", credential: { ...credential, token: saved }, git: async args => args[0] === command ? { code: 1, stdout: "", stderr: detail + "x".repeat(900) } : f.git(args) });
+      expect.fail("SCM must fail");
+    } catch (error) {
+      expect(error).toMatchObject({ code });
+      const message = (error as Error).message;
+      expect(message).toContain("controlled SCM failure");
+      expect(message).toContain("[redacted");
+      expect(message.length).toBeLessThanOrEqual(800);
+      for (const value of [...markers, saved, encodeURIComponent(saved), JSON.stringify(saved).slice(1, -1), platform]) expect(message).not.toContain(value);
+    }
+  });
+
+  it("redacts remote display values without modifying the actual Git origin or auth scope", async () => {
+    const marker = "DUMMY_REMOTE_" + "private-value";
+    const remote = `https://repo.example.invalid/repo.git?token=${marker}`;
+    expect(redactRemoteUrl(remote)).not.toContain(marker);
+    const scpRemote = ["git", "@", "repo.example.invalid:repo.git?token=", marker].join("");
+    expect(redactRemoteUrl(scpRemote)).not.toContain(marker);
+    expect(redactRemoteUrl(`https://repo.example.invalid/${marker}/repo.git`, [marker])).not.toContain(marker);
+    const f = fixture();
+    const seen: string[][] = [];
+    const result = await inspectWorkspaceRemote({ branch: "main", git: async (args) => {
+      seen.push(args);
+      return args[0] === "remote" ? ok(remote) : f.git(args);
+    } });
+    expect(result.remote).toContain("[redacted]");
+    expect(result.remote).not.toContain(marker);
+    expect(seen.find(args => args[0] === "fetch")).toEqual(["fetch", "--quiet", "--no-tags", "origin", "+refs/heads/main:refs/pigo/remotes/origin/main"]);
+    expect(scmAuthEnvironment(remote, credential).GIT_CONFIG_KEY_0).toBe("http.https://repo.example.invalid/repo.git.extraHeader");
+  });
+
   it("detects GitHub, GitLab, and generic Git", () => {
     expect(detectScmProvider("git@github.com:org/repo.git")).toBe("github");
     expect(detectScmProvider("https://gitlab.internal.example/org/repo.git")).toBe("gitlab");
