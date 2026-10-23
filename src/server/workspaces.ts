@@ -12,6 +12,7 @@ import type {
 } from "../shared/types.js";
 import { newId, type Db } from "./db.js";
 import { ScmSettingsStore, scmSettingsStatus } from "./scm-settings.js";
+import { diagnosticSecrets, redactDiagnosticText } from "../shared/diagnostics.js";
 
 export type WorkerCall = <T>(pathName: string, init?: RequestInit) => Promise<T>;
 
@@ -46,7 +47,7 @@ export class WorkspaceError extends Error {
   }
 }
 
-function workspaceWorkerFailure(error: unknown, fallbackCode: string, fallbackStatus: number): WorkspaceError {
+function workspaceWorkerFailure(error: unknown, fallbackCode: string, fallbackStatus: number, secrets: readonly string[] = []): WorkspaceError {
   const typed = error as Error & { code?: string; status?: number };
   if (typed.name === "TimeoutError" || /aborted due to timeout/i.test(typed.message ?? "")) {
     return new WorkspaceError(
@@ -55,7 +56,7 @@ function workspaceWorkerFailure(error: unknown, fallbackCode: string, fallbackSt
       504,
     );
   }
-  return new WorkspaceError(typed.code ?? fallbackCode, typed.message, typed.status ?? fallbackStatus);
+  return new WorkspaceError(typed.code ?? fallbackCode, redactDiagnosticText(typed.message, [...diagnosticSecrets(), ...secrets]), typed.status ?? fallbackStatus);
 }
 
 type WorkspaceRow = {
@@ -105,13 +106,13 @@ function toWorkspace(row: WorkspaceRow, permission: WorkspacePermission = "write
 export function redactGitUrl(url: string) {
   try {
     const parsed = new URL(url);
-    if (parsed.username || parsed.password) {
-      parsed.username = parsed.username ? "***" : "";
-      parsed.password = "";
-    }
-    return parsed.toString();
+    const hadCredentials = Boolean(parsed.username || parsed.password);
+    parsed.username = "";
+    parsed.password = "";
+    const safe = redactDiagnosticText(parsed.toString(), diagnosticSecrets());
+    return hadCredentials ? safe.replace(`${parsed.protocol}//`, `${parsed.protocol}//***@`) : safe;
   } catch {
-    return url.replace(/\/\/[^@/]*@/, "//***@");
+    return redactDiagnosticText(url.replace(/\/\/[^@/]*@/, "//***@"), diagnosticSecrets());
   }
 }
 
@@ -312,7 +313,7 @@ export class WorkspaceService {
         }),
       });
     } catch (error) {
-      throw workspaceWorkerFailure(error, "SCM_REMOTE_FAILED", 503);
+      throw workspaceWorkerFailure(error, "SCM_REMOTE_FAILED", 503, credential?.token ? [credential.token] : []);
     }
   }
 
@@ -336,7 +337,7 @@ export class WorkspaceService {
       });
       return result;
     } catch (error) {
-      const failure = workspaceWorkerFailure(error, "SCM_PUSH_FAILED", 503);
+      const failure = workspaceWorkerFailure(error, "SCM_PUSH_FAILED", 503, credential?.token ? [credential.token] : []);
       await this.recordScmAttempt({
         id: newId("scm"), workspaceId: id, actorId, operation: "push", status: "failed",
         localHead: access.row.git_head, remoteHead: null, detail: failure.message.slice(0, 800), createdAt,
