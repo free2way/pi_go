@@ -16,6 +16,7 @@ import { BackupManager, dumpBackup } from "./backups.js";
 import { registerBackupRoutes } from "./backup-routes.js";
 import { AlertManager, createAlertSink } from "./alerts.js";
 import { syncStorageAlerts, type WorkspaceStorageStatus } from "./storage-alerts.js";
+import { readQueueObservation, syncQueueAlerts } from "./queue-alerts.js";
 import { Authenticator, normalizePublicOrigin } from "./auth.js";
 import { ExpiringLruCache } from "./expiring-lru-cache.js";
 import { CredentialVault } from "./credential-vault.js";
@@ -747,12 +748,9 @@ app.get("/api/health/detail", async (request, reply) => {
   }
   if (jobQueue) {
     try {
-      const jobs = await jobQueue.listPendingJobs({ staleAfterMs: JOB_STALE_MS, limit: 50 });
-      const stale = jobs.filter((job) => job.state === "claimed").length;
-      health.queue = { pending: jobs.length, reclaimedFromDeadWorker: stale };
-      if (jobs.length > 0 && stale > 0) {
-        alerts.raise({ key: "queue_stale", severity: "warning", message: "存在因 Worker 中断而未完成的任务，正在等待重领", details: { count: stale } });
-      }
+      const queue = await readQueueObservation(db, JOB_STALE_MS);
+      health.queue = { pending: queue.pending, reclaimedFromDeadWorker: queue.stale };
+      syncQueueAlerts(alerts, queue, JOB_STALE_MS);
     } catch (error) {
       health.queue = { status: "unavailable", error: (error as Error).message.slice(0, 200) };
     }
@@ -4038,9 +4036,20 @@ await requeueStaleJobs();
 // AUD-P1: asynchronous release deploys that never called back are failed after
 // the bounded timeout, which is what makes an explicit retry possible.
 await expireStaleReleaseDeploys();
+let jobRecoveryInFlight = false;
 const jobRecoveryTimer = setInterval(() => {
-  void requeueStaleJobs();
-  void expireStaleReleaseDeploys();
+  if (jobRecoveryInFlight) return;
+  jobRecoveryInFlight = true;
+  void (async () => {
+    await requeueStaleJobs();
+    await expireStaleReleaseDeploys();
+    if (jobQueue) {
+      const queue = await readQueueObservation(db, JOB_STALE_MS);
+      syncQueueAlerts(alerts, queue, JOB_STALE_MS);
+    }
+  })().catch((error) => {
+    app.log.warn({ error: redactDiagnosticText(error instanceof Error ? error.message : String(error), diagnosticSecrets()) }, "queue alert observation failed");
+  }).finally(() => { jobRecoveryInFlight = false; });
 }, 60_000);
 jobRecoveryTimer.unref?.();
 

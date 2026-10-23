@@ -25,6 +25,32 @@ describe("AlertManager", () => {
 });
 
 describe("createAlertSink", () => {
+  it("includes trusted service, deployment environment and version in both channels", () => {
+    const log = vi.fn();
+    const fetchImpl = vi.fn().mockResolvedValue(new Response("{}"));
+    const sink = createAlertSink({ log, fetchImpl: fetchImpl as unknown as typeof fetch, webhookUrl: "https://alerts.example.invalid/hook", environment: { PI_DEPLOYMENT_ENVIRONMENT: "staging", PI_WEB_VERSION: "abc1234", NODE_ENV: "production" } });
+    sink({ key: "queue_stale", severity: "warning", message: "stale jobs", details: { service: "untrusted", environment: "untrusted", version: "untrusted", count: 2 } });
+    const labels = { service: "pigo-web", environment: "staging", version: "abc1234" };
+    expect(log.mock.calls[0][1]).toMatchObject(labels);
+    expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toMatchObject(labels);
+  });
+
+  it("does not silently accept a rejected webhook response", async () => {
+    const log = vi.fn();
+    const fetchImpl = vi.fn().mockResolvedValue(new Response("private receiver body", { status: 503 }));
+    const sink = createAlertSink({ log, fetchImpl: fetchImpl as unknown as typeof fetch, webhookUrl: "https://alerts.example.invalid/hook", environment: {} });
+    sink({ key: "queue_stale", severity: "warning", message: "stale jobs" });
+    await vi.waitFor(() => expect(log).toHaveBeenCalledTimes(2));
+    expect(log.mock.calls[1][1]).toMatchObject({ alert: "queue_stale", error: "HTTP 503" });
+    expect(JSON.stringify(log.mock.calls)).not.toContain("private receiver body");
+  });
+
+  it("forbids webhook redirect forwarding", () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response("{}"));
+    createAlertSink({ log: vi.fn(), fetchImpl: fetchImpl as unknown as typeof fetch, webhookUrl: "https://alerts.example.invalid/hook", environment: {} })({ key: "db_down", severity: "critical", message: "down" });
+    expect(fetchImpl.mock.calls[0][1].redirect).toBe("error");
+  });
+
   it("logs every alert and posts to the webhook when configured", async () => {
     const log = vi.fn();
     const fetchImpl = vi.fn().mockResolvedValue(new Response("{}", { status: 200 }));
@@ -71,7 +97,31 @@ describe("createAlertSink", () => {
     await vi.waitFor(() => expect(log).toHaveBeenCalledTimes(2));
     expect(fetchImpl.mock.calls[0][0]).toBe(endpoint);
     expect(JSON.stringify(log.mock.calls)).not.toContain("DUMMY");
-    expect(log.mock.calls[1]).toEqual(["warn", { alert: "db_down", error: "delivery failed [redacted] Bearer [redacted]" }, "alert webhook delivery failed"]);
+    expect(log.mock.calls[1]).toEqual(["warn", expect.objectContaining({ alert: "db_down", error: "delivery failed [redacted] Bearer [redacted]" }), "alert webhook delivery failed"]);
+  });
+
+  it("uses safe defaults for unknown or sensitive deployment labels", () => {
+    const log = vi.fn();
+    const secret = ["DUMMY", "LABEL"].join("_");
+    createAlertSink({ log, environment: { PI_DEPLOYMENT_ENVIRONMENT: "https://operator.example.invalid/private", PI_WEB_VERSION: secret, PI_INTERNAL_TOKEN: secret } })({ key: "down", severity: "warning", message: "down" });
+    expect(log.mock.calls[0][1]).toMatchObject({ service: "pigo-web", environment: "unknown", version: "unknown" });
+    expect(JSON.stringify(log.mock.calls)).not.toContain("DUMMY");
+    expect(JSON.stringify(log.mock.calls)).not.toContain("operator.example.invalid");
+  });
+
+  it("falls back to NODE_ENV only when a deployment environment is not specified", () => {
+    const log = vi.fn();
+    createAlertSink({ log, environment: { NODE_ENV: "test" } })({ key: "down", severity: "warning", message: "down" });
+    expect(log.mock.calls[0][1]).toMatchObject({ environment: "test", version: "unknown" });
+  });
+
+  it("contains a synchronous delivery error without failing the application operation", () => {
+    const log = vi.fn();
+    const fetchImpl = vi.fn(() => { throw new Error("Bearer DUMMY_sync"); });
+    const sink = createAlertSink({ log, fetchImpl: fetchImpl as unknown as typeof fetch, webhookUrl: "https://alerts.example.invalid/hook", environment: {} });
+    expect(() => sink({ key: "down", severity: "critical", message: "down" })).not.toThrow();
+    expect(log).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(log.mock.calls)).not.toContain("DUMMY_sync");
   });
 
   it("keeps cooldown identity and clear/re-raise behavior with redacted delivery", () => {
