@@ -17,8 +17,13 @@ export type Db = Queryable & {
   withMigrationLock?: <T>(fn: (db: Db) => Promise<T>) => Promise<T>;
 };
 
-export function createPool(databaseUrl: string) {
-  return new Pool({ connectionString: databaseUrl, max: 10, connectionTimeoutMillis: 10_000 });
+export function createPool(databaseUrl: string, onIdleError?: () => void) {
+  const pool = new Pool({ connectionString: databaseUrl, max: 10, connectionTimeoutMillis: 10_000 });
+  // pg removes the broken idle client before emitting this event. Without a
+  // listener, EventEmitter terminates Web before health/alerts can degrade.
+  // Never pass the error/client to a logger: both can contain connection data.
+  pool.on("error", () => onIdleError?.());
+  return pool;
 }
 
 /** Wraps a pg-compatible pool (or pg-mem in tests) with a transaction helper. */

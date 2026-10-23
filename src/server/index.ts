@@ -17,6 +17,7 @@ import { registerBackupRoutes } from "./backup-routes.js";
 import { AlertManager, createAlertSink } from "./alerts.js";
 import { syncStorageAlerts, type WorkspaceStorageStatus } from "./storage-alerts.js";
 import { readQueueObservation, syncQueueAlerts } from "./queue-alerts.js";
+import { createInfrastructureAlertSweeper } from "./infrastructure-alerts.js";
 import { Authenticator, normalizePublicOrigin } from "./auth.js";
 import { ExpiringLruCache } from "./expiring-lru-cache.js";
 import { CredentialVault } from "./credential-vault.js";
@@ -195,7 +196,9 @@ try {
 
 const databaseUrl = process.env.PI_DATABASE_URL;
 if (!databaseUrl) throw new Error("PI_DATABASE_URL is required (postgresql://user:password@host:5432/database)");
-const pool = createPool(databaseUrl);
+const pool = createPool(databaseUrl, () => {
+  app.log.warn({ code: "DATABASE_IDLE_CONNECTION_ERROR" }, "Database idle connection lost; health monitor will reconcile");
+});
 const db = createDb(pool);
 await runMigrations(db);
 
@@ -4052,6 +4055,20 @@ const jobRecoveryTimer = setInterval(() => {
   }).finally(() => { jobRecoveryInFlight = false; });
 }, 60_000);
 jobRecoveryTimer.unref?.();
+
+// A healthy queue or an open health page must not be a prerequisite for
+// detecting database, Worker or disk failures. Independent bounded observers
+// keep one unavailable dependency from suppressing another's alert.
+const infrastructureAlerts = createInfrastructureAlertSweeper({
+  alerts,
+  database: () => pingDatabase(),
+  worker: () => workerRequest("/health", undefined, 2_500),
+  storage: () => workerRequest("/health/storage", undefined, 2_500),
+});
+infrastructureAlerts.start();
+for (const signal of ["SIGTERM", "SIGINT"] as const) {
+  process.once(signal, () => infrastructureAlerts.stop());
+}
 
 // docs/26 §16.1 / AT-JEV L2 gate: the decision-plane metrics sweep. It runs in
 // the web process (the only process that owns `decision_evaluations`) and only

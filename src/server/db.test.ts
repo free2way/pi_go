@@ -1,8 +1,23 @@
-import { describe, expect, it } from "vitest";
-import { backfillFindingStableKeys, databaseMigrations, newId, runMigrations } from "./db.js";
+import { describe, expect, it, vi } from "vitest";
+import { backfillFindingStableKeys, createPool, databaseMigrations, newId, runMigrations } from "./db.js";
 import { createTestDb } from "./test-db.js";
 
 describe("database", () => {
+  it("handles idle-connection errors without throwing or exposing the client/error", async () => {
+    const warn = vi.fn();
+    const pool = createPool("postgresql://example.invalid/fixture", warn);
+    const error = new Error("DUMMY_PRIVATE_DATABASE_ERROR");
+    expect(() => pool.emit("error", error, { privateField: "DUMMY_PRIVATE_CLIENT" })).not.toThrow();
+    expect(warn).toHaveBeenCalledWith();
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("DUMMY");
+    await pool.end();
+  });
+
+  it("always registers an idle-error handler even without a logger", async () => {
+    const pool = createPool("postgresql://example.invalid/fixture");
+    expect(() => pool.emit("error", new Error("DUMMY_PRIVATE"))).not.toThrow();
+    await pool.end();
+  });
   it("applies migrations exactly once", async () => {
     const db = await createTestDb();
     const applied = (await db.query("SELECT id FROM schema_migrations ORDER BY id")).rows.map((row) => Number(row.id));
