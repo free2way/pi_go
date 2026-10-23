@@ -13,6 +13,7 @@ import { resolveRequestLocale, type Locale } from "../shared/i18n.js";
 import type { ConfigStatus, CurrentUser, ModelCatalogResponse, ReviewScope, Run, RunEvent, RunReleaseRecord, RunRollbackRecord, Workspace } from "../shared/types.js";
 import { AccountError, AccountService, accountAdminGate } from "./accounts.js";
 import { AlertManager, createAlertSink } from "./alerts.js";
+import { syncStorageAlerts, type WorkspaceStorageStatus } from "./storage-alerts.js";
 import { Authenticator, normalizePublicOrigin } from "./auth.js";
 import { ExpiringLruCache } from "./expiring-lru-cache.js";
 import { CredentialVault } from "./credential-vault.js";
@@ -729,13 +730,6 @@ app.get("/api/health", async (_request, reply) => {
   }
 });
 
-interface StorageStatus {
-  state: "ok" | "low" | "critical";
-  freeBytes: number;
-  totalBytes: number;
-  freePercent: number;
-}
-
 /** REL-006: one place to inspect database, queue, worker and disk health. */
 app.get("/api/health/detail", async (request, reply) => {
   const internal = safeTokenMatch(request.headers.authorization);
@@ -764,16 +758,9 @@ app.get("/api/health/detail", async (request, reply) => {
   const worker = await workerRequest<{ activeJobs: number }>("/health").then((value) => value).catch(() => undefined);
   if (worker) {
     alerts.clear("worker_unreachable");
-    const storage = await workerRequest<StorageStatus>("/health/storage").catch(() => undefined);
+    const storage = await workerRequest<WorkspaceStorageStatus>("/health/storage").catch(() => undefined);
     health.worker = { status: "ok", activeJobs: worker.activeJobs, storage: storage ?? null };
-    if (storage && storage.state !== "ok") {
-      alerts.raise({
-        key: `disk_${storage.state}`,
-        severity: storage.state === "critical" ? "critical" : "warning",
-        message: storage.state === "critical" ? "工作区磁盘空间严重不足，已停止接收新任务" : "工作区磁盘空间偏低",
-        details: { freeBytes: storage.freeBytes, freePercent: storage.freePercent },
-      });
-    }
+    syncStorageAlerts(alerts, storage);
   } else {
     health.worker = { status: "unreachable" };
     alerts.raise({ key: "worker_unreachable", severity: "critical", message: "无法连接 Worker，任务执行暂停", details: { workerUrl } });
@@ -2379,14 +2366,9 @@ async function startRealRun(
   if (!realRunsEnabled || !internalToken) return { ok: false, status: 503, body: { error: "Real agent execution is disabled", code: "REAL_RUNNER_NOT_AVAILABLE" } };
 
   // AT-REL-010: stop accepting new work when the workspace disk is critical.
-  const storage = await workerRequest<StorageStatus>("/health/storage").catch(() => undefined);
+  const storage = await workerRequest<WorkspaceStorageStatus>("/health/storage").catch(() => undefined);
+  syncStorageAlerts(alerts, storage);
   if (storage && storage.state === "critical") {
-    alerts.raise({
-      key: "disk_critical",
-      severity: "critical",
-      message: "工作区磁盘空间严重不足，已停止接收新任务",
-      details: { freeBytes: storage.freeBytes, freePercent: storage.freePercent },
-    });
     return {
       ok: false,
       status: 507,
@@ -2396,15 +2378,6 @@ async function startRealRun(
       },
     };
   }
-  if (storage && storage.state === "low") {
-    alerts.raise({
-      key: "disk_low",
-      severity: "warning",
-      message: "工作区磁盘空间偏低，请清理后继续",
-      details: { freeBytes: storage.freeBytes, freePercent: storage.freePercent },
-    });
-  }
-
   // AUD-08 / AT-MODEL-008 + AUD-09 / AT-MODEL-007: preflight the exact
   // provider/model combination for every role the run will use (planner and
   // developer share the developer selection; reviewer has its own) before
