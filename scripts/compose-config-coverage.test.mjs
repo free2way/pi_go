@@ -22,6 +22,18 @@ test("real compose.yaml forwards every curated critical variable", () => {
   assert.deepEqual(problems, [], `compose config coverage problems:\n${problems.join("\n")}`);
 });
 
+test("both Web stacks forward Feishu options without exposing them to Worker", () => {
+  const demo = readFileSync(new URL("../deploy/docker/compose.demo.yaml", import.meta.url), "utf8");
+  const names = ["PI_ALERT_WEBHOOK", "PI_ALERT_WEBHOOK_PROVIDER", "PI_ALERT_FEISHU_SIGNING_SECRET"];
+  for (const [text, web, worker] of [[composeText, "web", "worker"], [demo, "demo-web", "demo-worker"]]) {
+    const lines = text.split("\n"), webKeys = environmentKeys(serviceBlock(lines, web)), workerKeys = environmentKeys(serviceBlock(lines, worker));
+    for (const name of names) {
+      assert.ok(webKeys.includes(name), `${web}: missing ${name}`);
+      assert.ok(!workerKeys.includes(name), `${worker}: must not receive ${name}`);
+    }
+  }
+});
+
 test("curated list covers the v0.22 features named by the review", () => {
   const web = new Set(CRITICAL_ENV.web);
   const worker = new Set(CRITICAL_ENV.worker);

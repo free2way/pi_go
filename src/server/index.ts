@@ -35,7 +35,7 @@ import { createProviderProbe, providerProbeDisabled } from "./provider-probe.js"
 import { verifyPendingCredentials } from "./credential-verification.js";
 import { RateLimiter } from "./rate-limit.js";
 import { PostgresRunStore } from "./run-store-pg.js";
-import { saveInternalRunArtifact } from "./artifact-api.js";
+import { redactArtifactDiagnostic, saveInternalRunArtifact } from "./artifact-api.js";
 import { type ApprovePlan, approveEventMeta, planApprove } from "./approve.js";
 import { conflictReplyFor, isStorageFailure, requestErrorReply } from "./request-errors.js";
 import { diagnosticSecrets, redactDiagnosticText } from "../shared/diagnostics.js";
@@ -2204,6 +2204,11 @@ app.get<{ Params: { id: string; artifactId: string } }>("/api/runs/:id/artifacts
     return reply.code(413).send({ error: `制品过大（${bytes} 字节），超过下载上限 ${ARTIFACT_DOWNLOAD_MAX_BYTES} 字节`, code: "ARTIFACT_TOO_LARGE" });
   }
   const kind = artifact?.kind ?? "patch";
+  // Do not silently alter a historical body or advertise its old SHA for new
+  // bytes. Require regeneration instead; the stored record is left untouched.
+  if (redactArtifactDiagnostic(kind, content, run.worktree) !== content) {
+    return reply.code(409).send({ error: "Diagnostic artifact requires secure regeneration", code: "ARTIFACT_DIAGNOSTICS_UNSAFE" });
+  }
   const contentType = kind === "patch" ? "text/x-patch; charset=utf-8" : "application/octet-stream";
   const extension = kind === "patch" ? "patch" : "txt";
   reply.header("Content-Type", contentType);
