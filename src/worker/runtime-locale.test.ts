@@ -6,6 +6,7 @@ import {
   guardText,
   MAX_ROUNDS_TEXT,
   REVIEW_INPUT_BUDGET_TEXT,
+  PI_INPUT_TRANSPORT_TEXT,
   localizedPair,
   runFailureText,
   runLocale,
@@ -15,6 +16,11 @@ import {
 } from "./runtime-locale.js";
 
 describe("worker runtime locale (docs/24-i18n.md §9)", () => {
+  it("localizes a pre-provider transport refusal without raw input", () => {
+    expect(guardText(PI_INPUT_TRANSPORT_TEXT, "zh").message).toContain("已停止模型调用");
+    expect(guardText(PI_INPUT_TRANSPORT_TEXT, "en").message).toContain("model invocation stopped");
+    expect(guardText(PI_INPUT_TRANSPORT_TEXT, "zh").meta.messageEn).toBe(PI_INPUT_TRANSPORT_TEXT.en);
+  });
   it("localizes review-input budget stops without including diff content", () => {
     expect(guardText(REVIEW_INPUT_BUDGET_TEXT, "zh").message).toContain("已停止模型调用");
     expect(guardText(REVIEW_INPUT_BUDGET_TEXT, "en").message).toContain("model invocation stopped");

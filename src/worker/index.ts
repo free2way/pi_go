@@ -21,7 +21,8 @@ import { apiKeyEnvName, classifyProviderError, providerErrorSummary } from "./pr
 import { sleep } from "./provider-retry.js";
 import { parseReview, type ReviewResult } from "./review-protocol.js";
 import { convergenceGuardEnabled, convergenceStop, reviewStallRounds } from "./review-convergence.js";
-import { buildReviewDiff, ReviewInputBudgetError } from "./review-input.js";
+import { buildReviewDiff, reviewInputLimits, ReviewInputBudgetError } from "./review-input.js";
+import { assertPiCliInput, PiInputTransportError, reviewTransportLimits } from "./pi-cli-input.js";
 import { blockingFindings, deferredFindings, deferredMessage, isDeferral, resolveReviewScope, shouldAcceptRound } from "./review-scope.js";
 import {
   awaitSandboxExit,
@@ -71,6 +72,7 @@ import {
   INVALID_PROTOCOL_TEXT,
   MAX_ROUNDS_TEXT,
   REVIEW_INPUT_BUDGET_TEXT,
+  PI_INPUT_TRANSPORT_TEXT,
   reviewProviderErrorText,
   runFailureText,
   runLocale,
@@ -1074,6 +1076,7 @@ async function runPi(input: {
   /** Empty string disables every Pi tool for pure structured generation. */
   tools?: string;
 }) {
+  assertPiCliInput(input.prompt);
   const args = [
     "--mode", "json",
     "--no-approve",
@@ -1232,6 +1235,8 @@ async function runPiWithRetry(
   input: Parameters<typeof runPi>[0],
   context: { runId: string; round: number; label: string; role: PiSessionRole; sessionKey?: string; retry?: boolean; budget?: RunBudgetContext; sessions?: SessionAccumulator },
 ) {
+  // Local validation is outside retry/session/budget accounting.
+  assertPiCliInput(input.prompt);
   const budget = context.budget;
   const plan = planPiSession({ role: context.role, run: context.runId, round: context.round, retry: context.retry, key: context.sessionKey, reuse: sessionReuse });
   // Sprint 2: the CLI session manager wraps the existing invocation (same
@@ -1361,7 +1366,7 @@ async function planDevelopment(run: Run, worktree: string, credentials: JobInput
     addUsage(usage, result.usage);
     return parseDevelopmentPlan(redactJobSecrets(result.text, credentials), maxSubagents);
   } catch (error) {
-    if (error instanceof BudgetExceededError) throw error;
+    if (error instanceof BudgetExceededError || error instanceof PiInputTransportError) throw error;
     const safeMessage = redactWorkerDiagnostic((error as Error).message, Object.values(credentials));
     await postUpdate(run.id, { event: { round: run.round, source: "system", type: "planner.fallback", message: `任务拆分失败，安全回退到单 Agent：${safeMessage}` } });
     return fallbackPlan(run.task);
@@ -1853,20 +1858,7 @@ async function performReview(input: {
   // is budget-trimmed (lockfiles/build outputs excluded, per-file and total byte
   // caps) and always carries a manifest of everything excluded or trimmed, so the
   // reviewer sees what it is NOT being shown instead of silently losing context.
-  let reviewInput: ReturnType<typeof buildReviewDiff>;
-  try {
-    reviewInput = buildReviewDiff(input.diff);
-  } catch (error) {
-    if (!(error instanceof ReviewInputBudgetError)) throw error;
-    const stopped = guardText(REVIEW_INPUT_BUDGET_TEXT, runLocale(input.run));
-    await update(input.run, "needs_human", "reviewer", "review.input_budget_exceeded", stopped.message, {
-      usage: toRunUsage(input.usage),
-      durationMs: Date.now() - input.started,
-      summary: stopped.message,
-    }, { meta: { ...stopped.meta, originalDiffBytes: Buffer.byteLength(input.diff) } });
-    return { stopped: true };
-  }
-  const reviewPrompt = [
+  const reviewPrefix = [
     "You are an independent read-only code reviewer. Do not modify files.",
     `Original task: ${input.run.task}`,
     "Review the diff below for correctness, missing requirements, security, regressions, and test quality.",
@@ -1880,8 +1872,25 @@ async function performReview(input: {
     // own response is the run's visible output (summary + findings), so its
     // language follows the run's locale.
     localeInstruction(runLocale(input.run)),
-    `Diff:\n${reviewInput.text}`,
-  ].join("\n\n");
+  ].join("\n\n") + "\n\nDiff:\n";
+  let reviewInput: ReturnType<typeof buildReviewDiff>;
+  let reviewPrompt: string;
+  try {
+    const limits = reviewTransportLimits(reviewPrefix, reviewInputLimits());
+    reviewInput = buildReviewDiff(input.diff, limits);
+    reviewPrompt = reviewPrefix + reviewInput.text;
+    assertPiCliInput(reviewPrompt);
+  } catch (error) {
+    if (!(error instanceof ReviewInputBudgetError) && !(error instanceof PiInputTransportError)) throw error;
+    const transport = error instanceof PiInputTransportError;
+    const stopped = guardText(transport ? PI_INPUT_TRANSPORT_TEXT : REVIEW_INPUT_BUDGET_TEXT, runLocale(input.run));
+    await update(input.run, "needs_human", "reviewer", transport ? "pi.input_transport_blocked" : "review.input_budget_exceeded", stopped.message, {
+      usage: toRunUsage(input.usage),
+      durationMs: Date.now() - input.started,
+      summary: stopped.message,
+    }, { meta: { ...stopped.meta, originalDiffBytes: Buffer.byteLength(input.diff), ...(transport ? { reason: error.reason, inputBytes: error.bytes, transportLimit: error.limit } : {}) } });
+    return { stopped: true };
+  }
   await postUpdate(input.run.id, {
     event: {
       round: input.round,
@@ -1918,7 +1927,7 @@ async function performReview(input: {
       onActivity: (message) => postUpdate(input.run.id, { event: { round: input.round, source: "reviewer", type: "agent.activity", message } }),
     }, { runId: input.run.id, round: input.round, label: "审核 Agent", role: "reviewer", budget: input.budget, sessions: input.sessions });
   } catch (providerError) {
-    if (providerError instanceof BudgetExceededError) throw providerError;
+    if (providerError instanceof BudgetExceededError || providerError instanceof PiInputTransportError) throw providerError;
     const reason = redactWorkerDiagnostic((providerError as Error).message, Object.values(input.credentials)).slice(0, 500);
     const kind = classifyProviderError(reason);
     const locale = runLocale(input.run);
@@ -1960,7 +1969,7 @@ async function performReview(input: {
         onActivity: (message) => postUpdate(input.run.id, { event: { round: input.round, source: "reviewer", type: "agent.activity", message } }),
       }, { runId: input.run.id, round: input.round, label: "审核 Agent（协议重试）", role: "reviewer", retry: true, budget: input.budget, sessions: input.sessions });
     } catch (providerError) {
-      if (providerError instanceof BudgetExceededError) throw providerError;
+      if (providerError instanceof BudgetExceededError || providerError instanceof PiInputTransportError) throw providerError;
       const providerReason = redactWorkerDiagnostic((providerError as Error).message, Object.values(input.credentials)).slice(0, 500);
       const kind = classifyProviderError(providerReason);
       const failure = guardText(reviewProviderErrorText(kind, providerReason), runLocale(input.run));
@@ -2670,16 +2679,19 @@ async function executeJob(input: JobInput, controller: AbortController) {
     // provider/storage problem (its reason may contain ECONNREFUSED etc.) and
     // never parked: the run fails with the actionable sandbox message.
     const sandboxUnavailable = !cancelled && error instanceof SandboxUnavailableError;
+    const inputTransport = !cancelled && error instanceof PiInputTransportError ? error : undefined;
     const safeMessage = redactWorkerDiagnostic((error as Error).message, Object.values(input.credentials)).slice(0, 2_000);
     const followup = Boolean(input.resume || input.retryReview);
     const kind = cancelled || sandboxUnavailable ? undefined : classifyProviderError(safeMessage);
     // AT-REL-006/007: classified provider and storage failures are parked for a
     // human (bounded retries already happened above); only unclassified errors
     // mark the run permanently failed.
-    const parked = sandboxUnavailable ? false : followup || recovering || (kind !== undefined && kind !== "unknown");
+    const parked = sandboxUnavailable ? false : Boolean(inputTransport) || followup || recovering || (kind !== undefined && kind !== "unknown");
     const state: RunState = cancelled ? "cancelled" : parked ? "needs_human" : "failed";
     const type = cancelled
       ? "run.cancelled"
+      : inputTransport
+        ? "pi.input_transport_blocked"
       : sandboxUnavailable
         ? "run.sandbox_unavailable"
         : kind === "storage"
@@ -2693,6 +2705,8 @@ async function executeJob(input: JobInput, controller: AbortController) {
                 : "run.failed";
     const message = cancelled
       ? guardText(CANCELLED_TEXT, locale).message
+      : inputTransport
+        ? guardText(PI_INPUT_TRANSPORT_TEXT, locale).message
       : sandboxUnavailable
         ? safeMessage
         : kind === "storage"
@@ -2700,6 +2714,8 @@ async function executeJob(input: JobInput, controller: AbortController) {
           : guardText(runFailureText(kind ?? "unknown", safeMessage, followup ? "followup" : recovering ? "recovering" : "run"), locale).message;
     const summaryText: LocalizedText = cancelled
       ? CANCELLED_SUMMARY
+      : inputTransport
+        ? PI_INPUT_TRANSPORT_TEXT
       : sandboxUnavailable
         ? SANDBOX_UNAVAILABLE_SUMMARY
         : { zh: providerErrorSummary(kind ?? "unknown", safeMessage).slice(0, 800), en: providerErrorSummary(kind ?? "unknown", safeMessage, "en").slice(0, 800) };
@@ -2712,7 +2728,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
           summary: guardText(summaryText, locale).message,
           usage: toRunUsage(usage),
           durationMs: Date.now() - started,
-        }, { meta: { locale, messageEn: summaryText.en } });
+        }, { meta: { locale, messageEn: summaryText.en, ...(inputTransport ? { reason: inputTransport.reason, inputBytes: inputTransport.bytes, transportLimit: inputTransport.limit } : {}) } });
         terminalRecorded = true;
         break;
       } catch (writeError) {
@@ -3026,6 +3042,10 @@ const server = createServer(async (request, response) => {
           promptVersion: REQUIREMENT_PROMPT_VERSION,
         });
       } catch (error) {
+        if (error instanceof PiInputTransportError) return json(response, 422, {
+          error: guardText(PI_INPUT_TRANSPORT_TEXT, body.locale === "en" ? "en" : "zh").message,
+          code: error.code,
+        });
         const safe = String((error as Error).message || "Requirement assistant failed")
           .replaceAll(apiKey, "[redacted]")
           .slice(0, 500);
@@ -3083,6 +3103,10 @@ const server = createServer(async (request, response) => {
           promptVersion: PI_ASSISTANT_PROMPT_VERSION,
         });
       } catch (error) {
+        if (error instanceof PiInputTransportError) return json(response, 422, {
+          error: guardText(PI_INPUT_TRANSPORT_TEXT, body.locale === "en" ? "en" : "zh").message,
+          code: error.code,
+        });
         const safe = String((error as Error).message || "Pi assistant failed")
           .replaceAll(apiKey, "[redacted]")
           .slice(0, 500);
