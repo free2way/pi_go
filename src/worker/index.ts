@@ -21,7 +21,7 @@ import { apiKeyEnvName, classifyProviderError, providerErrorSummary } from "./pr
 import { sleep } from "./provider-retry.js";
 import { parseReview, type ReviewResult } from "./review-protocol.js";
 import { convergenceGuardEnabled, convergenceStop, reviewStallRounds } from "./review-convergence.js";
-import { buildReviewDiff } from "./review-input.js";
+import { buildReviewDiff, ReviewInputBudgetError } from "./review-input.js";
 import { blockingFindings, deferredFindings, deferredMessage, isDeferral, resolveReviewScope, shouldAcceptRound } from "./review-scope.js";
 import {
   awaitSandboxExit,
@@ -70,6 +70,7 @@ import {
   guardText,
   INVALID_PROTOCOL_TEXT,
   MAX_ROUNDS_TEXT,
+  REVIEW_INPUT_BUDGET_TEXT,
   reviewProviderErrorText,
   runFailureText,
   runLocale,
@@ -1852,7 +1853,19 @@ async function performReview(input: {
   // is budget-trimmed (lockfiles/build outputs excluded, per-file and total byte
   // caps) and always carries a manifest of everything excluded or trimmed, so the
   // reviewer sees what it is NOT being shown instead of silently losing context.
-  const reviewInput = buildReviewDiff(input.diff);
+  let reviewInput: ReturnType<typeof buildReviewDiff>;
+  try {
+    reviewInput = buildReviewDiff(input.diff);
+  } catch (error) {
+    if (!(error instanceof ReviewInputBudgetError)) throw error;
+    const stopped = guardText(REVIEW_INPUT_BUDGET_TEXT, runLocale(input.run));
+    await update(input.run, "needs_human", "reviewer", "review.input_budget_exceeded", stopped.message, {
+      usage: toRunUsage(input.usage),
+      durationMs: Date.now() - input.started,
+      summary: stopped.message,
+    }, { meta: { ...stopped.meta, originalDiffBytes: Buffer.byteLength(input.diff) } });
+    return { stopped: true };
+  }
   const reviewPrompt = [
     "You are an independent read-only code reviewer. Do not modify files.",
     `Original task: ${input.run.task}`,
