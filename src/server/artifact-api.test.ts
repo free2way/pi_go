@@ -2,7 +2,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { saveInternalRunArtifact } from "./artifact-api.js";
+import { redactArtifactDiagnostic, saveInternalRunArtifact } from "./artifact-api.js";
+import { createHash } from "node:crypto";
 import { baseDemoRun } from "./demo-runner.js";
 import { RunStore } from "./store.js";
 
@@ -23,6 +24,45 @@ afterEach(async () => {
 });
 
 describe("saveInternalRunArtifact (NEW-07)", () => {
+  it("sanitizes diagnostic content before persistence and hashes the exact safe body", async () => {
+    const { store, run } = await testStore();
+    const platform = ["DUMMY", 'platform/+"'].join("_"), file = "/tmp/fixture/internal-config.json";
+    const databaseUrl = new URL("postgresql://db.invalid/a");
+    databaseUrl.username = ["DUMMY", "user"].join("_");
+    databaseUrl.password = ["DUMMY", "db"].join("_");
+    const content = `ordinary failure Bearer DUMMY_bearer ${platform} ${encodeURIComponent(platform)} ${JSON.stringify(platform)} ${file} ${databaseUrl}`;
+    const result = await saveInternalRunArtifact(store, { runId: run.id, artifactId: "diagnostic", kind: "log", content }, { PI_INTERNAL_TOKEN: platform, PI_DATA_FILE: file });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const artifact = await store.getArtifact(run.id, "diagnostic");
+    expect(artifact?.content).toContain("ordinary failure");
+    expect(artifact?.content).toContain("[redacted");
+    expect(artifact?.content).not.toContain("DUMMY");
+    expect(artifact?.content).not.toContain(file);
+    expect(result.artifact.bytes).toBe(Buffer.byteLength(artifact!.content!));
+    expect(result.artifact.sha256).toBe(createHash("sha256").update(artifact!.content!).digest("hex"));
+  });
+
+  it("does not apply diagnostic text rewriting to source patches", () => {
+    const value = ["DUMMY", "platform"].join("_");
+    const patch = `--- a/example.txt\n+++ b/example.txt\n@@ -1 +1 @@\n-old\n+${value} Bearer DUMMY_source\n`;
+    expect(redactArtifactDiagnostic("patch", patch, undefined, { PI_INTERNAL_TOKEN: value })).toBe(patch);
+  });
+
+  it.each(["log", "trace", "text", "unknown-future-kind"])("protects non-patch %s without relying on a diagnostic-kind allowlist", (kind) => {
+    expect(redactArtifactDiagnostic(kind, "failure Bearer DUMMY_echo", undefined, {})).toBe("failure Bearer [redacted]");
+  });
+
+  it("removes configured internal paths and the run worktree, including encoded forms", () => {
+    const worktree = "/workspace/runs/DUMMY_run", file = "/tmp/fixture/DUMMY_file.json";
+    const content = [worktree, encodeURIComponent(worktree), file].join(" ");
+    expect(redactArtifactDiagnostic("log", content, worktree, { PI_DATA_FILE: file })).toBe("[redacted] [redacted] [redacted]");
+  });
+
+  it("keeps normal text and relative repository paths intact", () => {
+    const content = "build failed at src/app.ts:12; expected 2, got 1";
+    expect(redactArtifactDiagnostic("log", content, undefined, { PI_DATA_FILE: "/tmp/fixture/data.json", PI_WORKSPACE_ROOT: "/workspace" })).toBe(content);
+  });
   it("persists a multi-megabyte diff artifact that list/download can serve", async () => {
     const { store, run } = await testStore();
     const content = "x".repeat(3_200_000);

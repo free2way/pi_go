@@ -1,4 +1,5 @@
 import { diagnosticSecrets, redactDiagnosticText, redactDiagnosticValue } from "../shared/diagnostics.js";
+import { feishuAlertPayload, isFeishuWebhook, verifyFeishuResponse } from "./feishu-alert.js";
 
 export type AlertSeverity = "warning" | "critical";
 
@@ -52,8 +53,9 @@ export function createAlertSink(options: {
   environment?: NodeJS.ProcessEnv;
 }): AlertSink {
   const doFetch = options.fetchImpl ?? fetch;
-  const secrets = diagnosticSecrets(options.environment);
   const environment = options.environment ?? process.env;
+  const secrets = [...diagnosticSecrets(environment), options.webhookUrl ?? ""];
+  const provider = environment.PI_ALERT_WEBHOOK_PROVIDER?.trim() || "generic";
   const configuredEnvironment = environment.PI_DEPLOYMENT_ENVIRONMENT?.trim() || environment.NODE_ENV;
   const deploymentEnvironment = ["production", "staging", "development", "test"].includes(configuredEnvironment ?? "")
     ? configuredEnvironment! : "unknown";
@@ -77,16 +79,25 @@ export function createAlertSink(options: {
       options.log("warn", { ...labels, alert: safe.key, error: redactDiagnosticText(message, secrets) }, "alert webhook delivery failed");
     };
     try {
+      if (!["generic", "feishu"].includes(provider)) throw new Error("Unsupported alert webhook provider");
+      if (provider === "feishu" && !isFeishuWebhook(options.webhookUrl)) throw new Error("Invalid Feishu webhook endpoint");
+      const payload = { ...safe, ...labels, at: new Date().toISOString() };
       void doFetch(options.webhookUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...safe, ...labels, at: new Date().toISOString() }),
+        body: JSON.stringify(provider === "feishu"
+          ? feishuAlertPayload(payload, environment.PI_ALERT_FEISHU_SIGNING_SECRET)
+          : payload),
         redirect: "error",
         signal: AbortSignal.timeout(10_000),
-      }).then((response) => {
-        if (!response.ok) failed(new Error(`HTTP ${response.status}`));
-        // Alert delivery never consumes or logs a receiver's potentially private body.
-        void response.body?.cancel().catch(() => undefined);
+      }).then(async (response) => {
+        if (!response.ok) {
+          await response.body?.cancel().catch(() => undefined);
+          throw new Error(`HTTP ${response.status}`);
+        }
+        // Feishu HTTP 200 can still reject a message. Never log its body.
+        if (provider === "feishu") await verifyFeishuResponse(response);
+        else await response.body?.cancel().catch(() => undefined);
       }).catch(failed);
     } catch (error) {
       failed(error);

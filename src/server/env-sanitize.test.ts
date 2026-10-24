@@ -40,7 +40,7 @@ describe("env-sanitize (AUD-14 / AT-SEC-001)", () => {
 
   it("never whitelists credential-bearing keys", () => {
     expect(whitelist).toContain("PI_VERSION");
-    for (const name of ["PI_INTERNAL_TOKEN", "PI_VAULT_SECRET", "PI_DATABASE_URL", "PIGO_POSTGRES_PASSWORD", "PI_ALERT_WEBHOOK"]) {
+    for (const name of ["PI_INTERNAL_TOKEN", "PI_VAULT_SECRET", "PI_DATABASE_URL", "PIGO_POSTGRES_PASSWORD", "PI_ALERT_WEBHOOK", "PI_ALERT_FEISHU_SIGNING_SECRET"]) {
       expect(whitelist).not.toContain(name);
     }
   });
