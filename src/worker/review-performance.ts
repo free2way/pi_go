@@ -28,6 +28,7 @@ export function reviewerRetryMaxElapsedMs(
   const raw = String(value ?? "").trim();
   if (!/^\d+$/.test(raw)) return defaultReviewerRetryMaxElapsedMs;
   const seconds = Number(raw);
+  if (!Number.isSafeInteger(seconds) || !Number.isSafeInteger(seconds * 1_000)) return defaultReviewerRetryMaxElapsedMs;
   // 0 explicitly disables the late-failure guard.
   return seconds === 0 ? Number.POSITIVE_INFINITY : Math.max(1, seconds) * 1_000;
 }

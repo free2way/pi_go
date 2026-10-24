@@ -18,6 +18,8 @@ describe("review performance policy", () => {
     expect(reviewerRetryMaxElapsedMs("90")).toBe(90_000);
     expect(reviewerRetryMaxElapsedMs("0")).toBe(Number.POSITIVE_INFINITY);
     expect(reviewerRetryMaxElapsedMs("1.5")).toBe(defaultReviewerRetryMaxElapsedMs);
+    expect(reviewerRetryMaxElapsedMs("9".repeat(400))).toBe(defaultReviewerRetryMaxElapsedMs);
+    expect(reviewerRetryMaxElapsedMs(String(Number.MAX_SAFE_INTEGER))).toBe(defaultReviewerRetryMaxElapsedMs);
   });
 
   it("stops only late reviewer retries", () => {

@@ -4,6 +4,7 @@ import {
   defaultFileDiffBytes,
   defaultTotalDiffBytes,
   reviewInputLimits,
+  ReviewInputBudgetError,
   splitDiff,
 } from "./review-input.js";
 
@@ -87,8 +88,9 @@ describe("buildReviewDiff", () => {
       return `@@ -${n},2 +${n},3 @@\n ctx${n}\n+added${n}\n-removed${n}`;
     });
     const diff = `${header}\n${hunks.join("\n")}`;
-    // Cap fits the header plus exactly one hunk.
-    const fileDiffBytes = bytes(header) + 1 + bytes(hunks[0]);
+    // The omission marker is part of the per-file budget, not free metadata.
+    const fileDiffBytes = bytes(header) + 1 + bytes(hunks[0]) + 1
+      + bytes("... [trimmed: +5/-5 lines, 5 hunks omitted]");
     const result = buildReviewDiff(diff, { fileDiffBytes, totalDiffBytes: 1_000_000 });
 
     expect(result.trimmed).toBe(true);
@@ -102,6 +104,7 @@ describe("buildReviewDiff", () => {
     expect(result.text).toContain("... [trimmed: +5/-5 lines, 5 hunks omitted]");
     expect(result.text).toContain("ctx1");
     expect(result.text).not.toContain("ctx2");
+    expect(stat.bytes).toBeLessThanOrEqual(fileDiffBytes);
   });
 
   it("detects binary files and never forwards their bytes", () => {
@@ -157,5 +160,60 @@ describe("buildReviewDiff", () => {
   it("parses an empty or preamble-only diff without throwing", () => {
     expect(buildReviewDiff("").text).toBe("");
     expect(splitDiff("").files).toEqual([]);
+  });
+
+  it("budgets preambles and the manifest even when source files fit", () => {
+    const result = buildReviewDiff(`${"前导".repeat(50_000)}\n${textFile("src/a.ts", 1)}`);
+    expect(bytes(result.text)).toBeLessThanOrEqual(defaultTotalDiffBytes);
+    expect(result.trimmed).toBe(true);
+    expect(result.text).toContain("preamble omitted");
+    expect(result.text).toContain("+added1");
+  });
+
+  it("reserves manifest bytes when noise exclusion alone pushes text over budget", () => {
+    const diff = [textFile("src/a.ts", 20), textFile("yarn.lock", 1)].join("\n");
+    const result = buildReviewDiff(diff, { fileDiffBytes: 10_000, totalDiffBytes: 1_100 });
+    expect(bytes(result.text)).toBeLessThanOrEqual(1_100);
+    expect(result.text).toContain("[PiGO review input manifest]");
+  });
+
+  it("fails closed when a complete manifest alone exceeds the total budget", () => {
+    const diff = Array.from({ length: 4_000 }, (_, i) => textFile(`packages/pkg${i}/package-lock.json`, 1)).join("\n");
+    expect(() => buildReviewDiff(diff)).toThrow(ReviewInputBudgetError);
+  });
+
+  it("caps metadata-only blocks as well as hunk blocks", () => {
+    const diff = `${fileHeader("src/a.ts")}\n${"x".repeat(100_000)}`;
+    const result = buildReviewDiff(diff);
+    expect(result.files[0].included).toBe(false);
+    expect(result.files[0].excludedReason).toBe("file-budget");
+    expect(result.text).not.toContain("xxxxx");
+  });
+
+  it("excludes nested build outputs without excluding similarly named source paths", () => {
+    const result = buildReviewDiff([
+      textFile("packages/web/dist/bundle.js", 1),
+      textFile("packages/api/build/index.js", 1),
+      textFile("src/builder/index.ts", 1),
+    ].join("\n"));
+    expect(result.files.map((file) => file.excludedReason)).toEqual(["build-output", "build-output", undefined]);
+  });
+
+  it("rejects unstructured oversized text rather than passing it through", () => {
+    expect(() => buildReviewDiff("x".repeat(250_000))).toThrow(ReviewInputBudgetError);
+  });
+
+  it("handles UTF-8 and tiny budgets without emitting partial diff or oversized metadata", () => {
+    const diff = textFile("src/中文.ts", 3);
+    expect(() => buildReviewDiff(diff, { fileDiffBytes: 100, totalDiffBytes: 10 })).toThrow(ReviewInputBudgetError);
+    const result = buildReviewDiff(diff, { fileDiffBytes: 160, totalDiffBytes: 1_000 });
+    expect(bytes(result.text)).toBeLessThanOrEqual(1_000);
+    expect(result.files[0].bytes).toBeLessThanOrEqual(160);
+    expect(result.text).not.toContain("\uFFFD");
+  });
+
+  it("rejects non-finite and unsafe limits instead of silently disabling caps", () => {
+    expect(reviewInputLimits({ PI_REVIEW_TOTAL_DIFF_BYTES: "9".repeat(400) }).totalDiffBytes).toBe(defaultTotalDiffBytes);
+    expect(() => buildReviewDiff(textFile("src/a.ts", 1), { fileDiffBytes: Infinity, totalDiffBytes: 200_000 })).toThrow(ReviewInputBudgetError);
   });
 });

@@ -5,6 +5,7 @@ import {
   CANCELLED_TEXT,
   guardText,
   MAX_ROUNDS_TEXT,
+  REVIEW_INPUT_BUDGET_TEXT,
   localizedPair,
   runFailureText,
   runLocale,
@@ -14,6 +15,11 @@ import {
 } from "./runtime-locale.js";
 
 describe("worker runtime locale (docs/24-i18n.md §9)", () => {
+  it("localizes review-input budget stops without including diff content", () => {
+    expect(guardText(REVIEW_INPUT_BUDGET_TEXT, "zh").message).toContain("已停止模型调用");
+    expect(guardText(REVIEW_INPUT_BUDGET_TEXT, "en").message).toContain("model invocation stopped");
+    expect(guardText(REVIEW_INPUT_BUDGET_TEXT, "zh").meta.messageEn).toBe(REVIEW_INPUT_BUDGET_TEXT.en);
+  });
   it("reads an unknown/legacy run as Chinese", () => {
     expect(runLocale(undefined)).toBe("zh");
     expect(runLocale({})).toBe("zh");

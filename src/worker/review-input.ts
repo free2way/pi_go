@@ -9,7 +9,15 @@
  * always emits a manifest describing exactly what was excluded or trimmed.
  */
 
-export type ReviewExclusionReason = "lockfile" | "build-output" | "dependency" | "binary" | "total-budget";
+export type ReviewExclusionReason = "lockfile" | "build-output" | "dependency" | "binary" | "file-budget" | "total-budget";
+
+/** Never send unbounded input or silently discard an unrepresentable manifest. */
+export class ReviewInputBudgetError extends Error {
+  constructor() {
+    super("Review input cannot fit its byte budget; split the change or explicitly adjust review limits.");
+    this.name = "ReviewInputBudgetError";
+  }
+}
 
 export interface ReviewFileStat {
   path: string;
@@ -53,7 +61,7 @@ function strictPositiveInt(raw: string | undefined, fallback: number): number {
   const value = String(raw ?? "").trim();
   if (!/^\d+$/.test(value)) return fallback;
   const parsed = Number(value);
-  return parsed > 0 ? parsed : fallback;
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 /**
@@ -180,7 +188,7 @@ export function reviewExclusionReason(path: string, binary: boolean): ReviewExcl
   ) {
     return "lockfile";
   }
-  if (lower.startsWith("dist/") || lower.startsWith("build/")) return "build-output";
+  if (/(^|\/)(dist|build)\//.test(lower)) return "build-output";
   if (lower.startsWith("node_modules/") || lower.includes("/node_modules/")) return "dependency";
   return undefined;
 }
@@ -195,37 +203,44 @@ interface AssembledFile {
 
 /** First hunks that fit the per-file cap, plus an explicit omission marker. */
 function assembleWithinBudget(file: ParsedFile, cap: number): AssembledFile {
-  if (file.hunks.length === 0) {
+  if (file.bytes <= cap) {
     return { text: file.block, trimmed: false, trimmedAdded: 0, trimmedRemoved: 0, trimmedHunks: 0 };
   }
   let text = file.header;
   let currentBytes = byteLength(text);
   let included = 0;
+  let trimmedAdded = file.added;
+  let trimmedRemoved = file.removed;
+  const marker = (added: number, removed: number, hunks: number) =>
+    `... [trimmed: +${added}/-${removed} lines, ${hunks} hunks omitted]`;
+  // Metadata-only or oversized headers cannot be safely cut into a valid diff.
+  if (file.hunks.length === 0 || currentBytes + 1 + byteLength(marker(trimmedAdded, trimmedRemoved, file.hunks.length)) > cap) {
+    return { text: "", trimmed: true, trimmedAdded, trimmedRemoved, trimmedHunks: file.hunks.length };
+  }
   for (const hunk of file.hunks) {
+    const counts = countHunkLines(hunk);
+    const remainingHunks = file.hunks.length - included - 1;
     const candidate = currentBytes + 1 + byteLength(hunk);
-    if (candidate > cap) break;
+    const suffixBytes = remainingHunks > 0
+      ? 1 + byteLength(marker(trimmedAdded - counts.added, trimmedRemoved - counts.removed, remainingHunks))
+      : 0;
+    if (candidate + suffixBytes > cap) break;
     text = `${text}\n${hunk}`;
     currentBytes = candidate;
     included += 1;
+    trimmedAdded -= counts.added;
+    trimmedRemoved -= counts.removed;
   }
   if (included === file.hunks.length) {
     return { text, trimmed: false, trimmedAdded: 0, trimmedRemoved: 0, trimmedHunks: 0 };
   }
-  const omitted = file.hunks.slice(included);
-  let trimmedAdded = 0;
-  let trimmedRemoved = 0;
-  for (const hunk of omitted) {
-    const counts = countHunkLines(hunk);
-    trimmedAdded += counts.added;
-    trimmedRemoved += counts.removed;
-  }
-  const marker = `... [trimmed: +${trimmedAdded}/-${trimmedRemoved} lines, ${omitted.length} hunks omitted]`;
+  const omittedHunks = file.hunks.length - included;
   return {
-    text: `${text}\n${marker}`,
+    text: `${text}\n${marker(trimmedAdded, trimmedRemoved, omittedHunks)}`,
     trimmed: true,
     trimmedAdded,
     trimmedRemoved,
-    trimmedHunks: omitted.length,
+    trimmedHunks: omittedHunks,
   };
 }
 
@@ -234,6 +249,7 @@ function formatManifest(
   originalBytes: number,
   includedBytes: number,
   limits: ReviewInputLimits,
+  omittedPreambleBytes = 0,
 ): string {
   const included = stats.filter((stat) => stat.included).length;
   const excluded = stats.filter((stat) => !stat.included).length;
@@ -243,6 +259,7 @@ function formatManifest(
     "[PiGO review input manifest]",
     `- files: ${stats.length} (included ${included}, excluded ${excluded}, trimmed ${trimmed})`,
   ];
+  if (omittedPreambleBytes > 0) lines.push(`- preamble omitted: ${omittedPreambleBytes} bytes`);
   for (const stat of stats) {
     const flag = stat.included
       ? stat.trimmed
@@ -267,8 +284,12 @@ function formatManifest(
  * When nothing needs cutting, the input is returned byte-identical.
  */
 export function buildReviewDiff(diff: string, limits: ReviewInputLimits = reviewInputLimits()): ReviewInputResult {
+  if (![limits.fileDiffBytes, limits.totalDiffBytes].every((limit) => Number.isSafeInteger(limit) && limit > 0)) {
+    throw new ReviewInputBudgetError();
+  }
   const originalBytes = byteLength(diff);
   const { preamble, files } = splitDiff(diff);
+  if (files.length === 0 && originalBytes > limits.totalDiffBytes) throw new ReviewInputBudgetError();
   const stats: ReviewFileStat[] = [];
   const included: Array<{ order: number; text: string; stat: ReviewFileStat }> = [];
   let changed = false;
@@ -302,26 +323,43 @@ export function buildReviewDiff(diff: string, limits: ReviewInputLimits = review
     stat.bytes = byteLength(assembled.text);
     if (assembled.trimmed) changed = true;
     stats.push(stat);
+    if (assembled.text === "") {
+      stat.included = false;
+      stat.excludedReason = "file-budget";
+      return;
+    }
     included.push({ order, text: assembled.text, stat });
   });
 
-  // Total budget: keep the largest files first (deterministic), then restore the
-  // original order for output. Anything dropped is reported as `total-budget`.
-  // The manifest is metadata appended to the emitted text, so reserve room for it
-  // (plus slack) to keep the whole reviewer input under the total budget.
-  const includedTotal = included.reduce((sum, item) => sum + item.stat.bytes, 0);
-  if (includedTotal > limits.totalDiffBytes) {
-    changed = true;
-    const reserve = byteLength(formatManifest(stats, originalBytes, 0, limits)) + 64;
-    const bodyBudget = Math.max(0, limits.totalDiffBytes - reserve);
+  if (!changed && originalBytes <= limits.totalDiffBytes) {
+    return { text: diff, files: stats, originalBytes, includedBytes: originalBytes, trimmed: false };
+  }
+
+  // Reserve the longest form of every file entry BEFORE selecting body text.
+  // This covers excluded noise, omission markers, separators and preambles too,
+  // not only cases where source-file bytes alone exceed the budget.
+  const worstStats = stats.map((stat) => stat.included
+    ? { ...stat, included: false, excludedReason: "total-budget" as const }
+    : stat);
+  let emittedPreamble = preamble;
+  let omittedPreambleBytes = 0;
+  let reserve = byteLength(formatManifest(worstStats, originalBytes, originalBytes, limits)) + 1;
+  if (byteLength(emittedPreamble) + reserve > limits.totalDiffBytes) {
+    omittedPreambleBytes = byteLength(preamble);
+    emittedPreamble = "";
+    reserve = byteLength(formatManifest(worstStats, originalBytes, originalBytes, limits, omittedPreambleBytes)) + 1;
+  }
+  if (reserve > limits.totalDiffBytes) throw new ReviewInputBudgetError();
+  const bodyBudget = limits.totalDiffBytes - reserve - byteLength(emittedPreamble);
+  {
     const bySize = [...included].sort(
       (a, b) => b.stat.bytes - a.stat.bytes || a.stat.path.localeCompare(b.stat.path),
     );
     let cumulative = 0;
     const keep = new Set<number>();
     for (const item of bySize) {
-      if (cumulative + item.stat.bytes <= bodyBudget) {
-        cumulative += item.stat.bytes;
+      if (cumulative + item.stat.bytes + 1 <= bodyBudget) {
+        cumulative += item.stat.bytes + 1;
         keep.add(item.order);
       }
     }
@@ -333,16 +371,13 @@ export function buildReviewDiff(diff: string, limits: ReviewInputLimits = review
     }
   }
 
-  if (!changed) {
-    return { text: diff, files: stats, originalBytes, includedBytes: originalBytes, trimmed: false };
-  }
-
   const emitted = included
     .filter((item) => item.stat.included)
     .sort((a, b) => a.order - b.order)
     .map((item) => item.text);
-  const body = `${preamble}${emitted.join("\n")}`;
+  const body = `${emittedPreamble}${emitted.join("\n")}`;
   const includedBytes = byteLength(body);
-  const text = `${body}${body.endsWith("\n") || body === "" ? "" : "\n"}${formatManifest(stats, originalBytes, includedBytes, limits)}`;
+  const text = `${body}${body.endsWith("\n") || body === "" ? "" : "\n"}${formatManifest(stats, originalBytes, includedBytes, limits, omittedPreambleBytes)}`;
+  if (byteLength(text) > limits.totalDiffBytes) throw new ReviewInputBudgetError();
   return { text, files: stats, originalBytes, includedBytes, trimmed: true };
 }

@@ -75,6 +75,12 @@ export const SNAPSHOT_FAILED_SUMMARY: LocalizedText = {
   en: "Review snapshot creation failed; handing off to a human",
 };
 
+/** `review.input_budget_exceeded`: stop before spending a provider attempt. */
+export const REVIEW_INPUT_BUDGET_TEXT: LocalizedText = {
+  zh: "审核输入及完整省略清单无法放入字节预算，已停止模型调用并转人工；请拆分变更或明确调整审核预算",
+  en: "Review input and its complete omission manifest cannot fit the byte budget; model invocation stopped for human handling. Split the change or explicitly adjust review limits.",
+};
+
 /** `review.snapshot_diverged` */
 export function snapshotDivergedText(reasons: string): LocalizedText {
   return {
