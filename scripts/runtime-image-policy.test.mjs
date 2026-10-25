@@ -24,12 +24,24 @@ test("Pi is current, uses pinned pnpm, and final images do not retain npm", () =
   const executor = read("deploy/executor/Dockerfile");
 
   assert.match(runtime, /^ARG PI_VERSION=1\.3\.0$/mu);
-  assert.match(runtime, /^ARG PNPM_VERSION=12\.14\.0$/mu);
+  assert.match(runtime, /^ARG PNPM_VERSION=12\.15\.0$/mu);
   assert.match(runtime, /"pnpm@\$\{PNPM_VERSION\}"/u);
   assert.match(runtime, /\{"npmCommand":\["pnpm"\]\}/u);
   for (const dockerfile of [runtime, web, executor]) {
     assert.match(dockerfile, /rm -rf \/usr\/local\/lib\/node_modules\/npm \/usr\/local\/bin\/npm \/usr\/local\/bin\/npx/u);
   }
+});
+
+test("runtime replaces affected Pi HTTP code and pins patched schema validation", () => {
+  const runtime = read("deploy/docker/Dockerfile");
+  assert.match(runtime, /^ARG UNDICI_VERSION=8\.12\.2$/mu);
+  assert.match(runtime, /"undici@\$\{UNDICI_VERSION\}"/u);
+  assert.match(runtime, /cp -a \/usr\/local\/lib\/node_modules\/undici \/usr\/local\/lib\/node_modules\/@earendil-works\/pi-coding-agent\/node_modules\/undici/u);
+  assert.match(runtime, /m\.disableNetConnect\(\)/u);
+  assert.match(runtime, /&& pi --version/u);
+  assert.match(runtime, /&& pnpm --version/u);
+  assert.equal(JSON.parse(read("package.json")).dependencies.zod, "4.6.6");
+  assert.equal(JSON.parse(read("package-lock.json")).packages["node_modules/zod"].version, "4.6.6");
 });
 
 test("OCI vulnerability scanning remains fail closed for unfixed findings", () => {
