@@ -51,7 +51,7 @@ import { RunCleanupPathError, planRunDirectoryRemoval, removeRunDirectory } from
 import { runGuardedMerge, type GuardedMergeResult, type MergeGuardGitExec } from "./merge-guard.js";
 import { WorkspaceLockManager, workspaceKeyFor } from "./workspace-lock.js";
 import { PiRunError, failureOutputForEvent } from "./agent-failure.js";
-import { redactWorkerDiagnostic } from "./diagnostic-redaction.js";
+import { redactWorkerDiagnostic, workerDiagnosticMessage } from "./diagnostic-redaction.js";
 import { migrateLegacySubAgentState, subAgentStateDirectory } from "./subagent-state.js";
 import { captureFailedSubAgentWorktree } from "./subagent-artifacts.js";
 import { planRecovery, recoveryResumePhase, recoveryUpdateState } from "./run-recovery.js";
@@ -117,6 +117,9 @@ const projectsRoot = path.join(workspaceRoot, "projects");
 const runsRoot = path.join(workspaceRoot, "runs");
 const callbackBase = process.env.PI_WEB_CALLBACK_URL || "http://web:3100";
 const internalToken = process.env.PI_INTERNAL_TOKEN || "";
+function diagnosticMessage(error: unknown, credentials: readonly string[] = [], limit = 2_000) {
+  return workerDiagnosticMessage(error, { credentials: [...credentials, callbackBase], privatePaths: [workspaceRoot], limit });
+}
 const maxOutput = 48_000;
 const configuredMaxSubagents = Number(process.env.PI_MAX_SUBAGENTS || 3);
 const maxSubagents = Number.isInteger(configuredMaxSubagents) ? Math.min(4, Math.max(1, configuredMaxSubagents)) : 3;
@@ -181,7 +184,7 @@ async function storageStatus(): Promise<StorageStatus> {
     const state = freeMb <= criticalFreeDiskMb ? "critical" : freeMb <= minFreeDiskMb ? "low" : "ok";
     return { state, freeBytes, totalBytes, freePercent: totalBytes ? Number(((freeBytes / totalBytes) * 100).toFixed(2)) : 0, path: workspaceRoot };
   } catch (error) {
-    console.warn(`[storage] statfs failed: ${(error as Error).message}`);
+    console.warn(`[storage] statfs failed: ${diagnosticMessage(error)}`);
     return { state: "ok", freeBytes: -1, totalBytes: -1, freePercent: -1, path: workspaceRoot };
   }
 }
@@ -526,11 +529,11 @@ type PendingJob = {
 };
 
 /** Keeps a claimed job's heartbeat fresh so only a truly dead worker is reclaimed. */
-function startJobHeartbeat(jobId: string | undefined) {
+function startJobHeartbeat(jobId: string | undefined, credentials: JobInput["credentials"]) {
   if (!jobId) return () => undefined;
-  void jobApi.claim(jobId).catch((error) => console.warn(`[jobs] claim failed: ${(error as Error).message}`));
+  void jobApi.claim(jobId).catch((error) => console.warn(`[jobs] claim failed: ${diagnosticMessage(error, Object.values(credentials))}`));
   const timer = setInterval(() => {
-    void jobApi.heartbeat(jobId).catch((error) => console.warn(`[jobs] heartbeat failed: ${(error as Error).message}`));
+    void jobApi.heartbeat(jobId).catch((error) => console.warn(`[jobs] heartbeat failed: ${diagnosticMessage(error, Object.values(credentials))}`));
   }, 20_000);
   timer.unref?.();
   return () => clearInterval(timer);
@@ -568,8 +571,8 @@ async function dispatchJob(input: JobInput, controller: AbortController) {
         message: `保持排队：${reason}。等待其结束或锁过期（约 ${Math.round(workspaceLockStaleMs / 1000)} 秒）后自动重试。`,
         meta: { workspace: key, holderRunId: holder?.runId, holderWorkerId: holder?.workerId, staleSeconds: Math.round(workspaceLockStaleMs / 1000) },
       },
-    }).catch((error) => console.warn(`[jobs] could not record workspace.locked for ${input.run.id}: ${(error as Error).message}`));
-    console.warn(`[jobs] deferring ${input.run.id}: ${reason}`);
+    }).catch((error) => console.warn(`[jobs] could not record workspace.locked for ${input.run.id}: ${diagnosticMessage(error, Object.values(input.credentials))}`));
+    console.warn(`[jobs] deferring ${input.run.id}: ${diagnosticMessage(reason, Object.values(input.credentials))}`);
     return false;
   }
 
@@ -615,7 +618,7 @@ async function drainDeferredJobs() {
       started += 1;
       void dispatchJob(entry.input, controller).catch((error) => {
         active.delete(runId);
-        console.error(`[jobs] deferred dispatch failed for ${runId}: ${(error as Error).message}`);
+        console.error(`[jobs] deferred dispatch failed for ${runId}: ${diagnosticMessage(error, Object.values(entry.input.credentials))}`);
       });
     }
   } finally {
@@ -625,11 +628,11 @@ async function drainDeferredJobs() {
   return started;
 }
 
-async function loadTracker(runId: string) {
+async function loadTracker(runId: string, credentials: JobInput["credentials"]) {
   try {
     return await new CheckpointTracker(checkpointClient, runId).load();
   } catch (error) {
-    console.warn(`[checkpoints] unavailable for ${runId}: ${(error as Error).message}`);
+    console.warn(`[checkpoints] unavailable for ${runId}: ${diagnosticMessage(error, Object.values(credentials))}`);
     return new CheckpointTracker(memoryCheckpointClient(), runId);
   }
 }
@@ -643,7 +646,11 @@ function redactJobSecrets(message: string, credentials: JobInput["credentials"])
 
 function json(response: ServerResponse, statusCode: number, body: unknown) {
   response.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
-  response.end(JSON.stringify(body));
+  // Only the diagnostic field; success payloads, patches and model JSON remain
+  // byte-for-byte unchanged by generic diagnostic rules.
+  const output = body && typeof body === "object" && "error" in body && typeof body.error === "string"
+    ? { ...body, error: diagnosticMessage(body.error) } : body;
+  response.end(JSON.stringify(output));
 }
 
 // 内部网络（带 token）专用：任务派发载荷会携带完整的 Run 文档，文档随轮次增长
@@ -754,7 +761,9 @@ async function postUpdate(runId: string, input: {
   }
   if (!response.ok) {
     const body = await response.text().catch(() => "");
-    throw new Error(`Callback failed: ${response.status} ${body.slice(0, 200)}`);
+    // Keep the full in-memory diagnostic until the consuming job-aware sink
+    // redacts it. Truncating here can expose an unmatchable credential prefix.
+    throw new Error(`Callback failed: ${response.status} ${body}`);
   }
 }
 
@@ -1021,7 +1030,7 @@ async function cloneWorkspace(url: string, name: string): Promise<WorkspaceVerif
   const result = await runHardenedGit({ cwd: root, args: ["clone", "--quiet", url, target], timeoutMs: 600_000 });
   if (result.code !== 0) {
     await rm(target, { recursive: true, force: true }).catch(() => undefined);
-    const reason = redactCredentials(`${result.stderr}\n${result.stdout}`.trim()).slice(0, 500);
+    const reason = diagnosticMessage(redactCredentials(`${result.stderr}\n${result.stdout}`.trim()), [], 500);
     return { ok: false, code: "CLONE_FAILED", error: reason || "git clone failed" };
   }
   return verifyWorkspace(cleanName);
@@ -1049,7 +1058,7 @@ async function createWorkspace(name: string): Promise<WorkspaceVerifyResult> {
     if (!isGit) await git(prepared.canonicalPath, ["init", "--quiet"]);
   } catch (error) {
     if (prepared.created) await rm(prepared.canonicalPath, { recursive: true, force: true }).catch(() => undefined);
-    return { ok: false, code: "WORKSPACE_INVALID", error: `Failed to initialize workspace repository: ${(error as Error).message}` };
+    return { ok: false, code: "WORKSPACE_INVALID", error: `Failed to initialize workspace repository: ${diagnosticMessage(error)}` };
   }
   return verifyWorkspace(prepared.relativePath);
 }
@@ -1373,7 +1382,7 @@ async function planDevelopment(run: Run, worktree: string, credentials: JobInput
     return parseDevelopmentPlan(redactJobSecrets(result.text, credentials), maxSubagents);
   } catch (error) {
     if (error instanceof BudgetExceededError || error instanceof PiInputTransportError) throw error;
-    const safeMessage = redactWorkerDiagnostic((error as Error).message, Object.values(credentials));
+    const safeMessage = diagnosticMessage(error, Object.values(credentials));
     await postUpdate(run.id, { event: { round: run.round, source: "system", type: "planner.fallback", message: `任务拆分失败，安全回退到单 Agent：${safeMessage}` } });
     return fallbackPlan(run.task);
   }
@@ -1524,7 +1533,7 @@ async function runSubAgent(input: {
     });
     return { task: input.task, branch, worktree, commit };
   } catch (error) {
-    const safeMessage = redactWorkerDiagnostic((error as Error).message, Object.values(input.credentials));
+    const safeMessage = diagnosticMessage(error, Object.values(input.credentials));
     input.task.status = "failed";
     input.task.summary = safeMessage.slice(0, 1_000);
     input.task.durationMs = Date.now() - startedAt;
@@ -1798,6 +1807,7 @@ async function prepareReviewSnapshot(input: {
   worktree: string;
   round: number;
   signal: AbortSignal;
+  credentials: JobInput["credentials"];
 }): Promise<string | undefined> {
   const { run, round } = input;
   const directory = reviewSnapshotDirectory(input.worktree, round);
@@ -1806,7 +1816,7 @@ async function prepareReviewSnapshot(input: {
     materialized = await materializeReviewSnapshot({ worktree: input.worktree, snapshotDir: directory, signal: input.signal });
   } catch (error) {
     await destroyReviewSnapshot(directory);
-    const snapshotFailed = guardText(snapshotFailedText((error as Error).message.slice(0, 300)), runLocale(run));
+    const snapshotFailed = guardText(snapshotFailedText(diagnosticMessage(error, Object.values(input.credentials), 300)), runLocale(run));
     await update(run, "needs_human", "reviewer", "review.snapshot_failed", snapshotFailed.message, {
       summary: guardText(SNAPSHOT_FAILED_SUMMARY, runLocale(run)).message,
     }, { meta: snapshotFailed.meta });
@@ -1934,7 +1944,7 @@ async function performReview(input: {
     }, { runId: input.run.id, round: input.round, label: "审核 Agent", role: "reviewer", budget: input.budget, sessions: input.sessions });
   } catch (providerError) {
     if (providerError instanceof BudgetExceededError || providerError instanceof PiInputTransportError) throw providerError;
-    const reason = redactWorkerDiagnostic((providerError as Error).message, Object.values(input.credentials)).slice(0, 500);
+    const reason = diagnosticMessage(providerError, Object.values(input.credentials), 500);
     const kind = classifyProviderError(reason);
     const locale = runLocale(input.run);
     const failure = guardText(reviewProviderErrorText(kind, reason), locale);
@@ -1950,7 +1960,7 @@ async function performReview(input: {
   try {
     return { stopped: false, review: parseReview(redactJobSecrets(firstReview.text, input.credentials), input.round) };
   } catch (protocolError) {
-    const reason = redactWorkerDiagnostic((protocolError as Error).message, Object.values(input.credentials)).slice(0, 200);
+    const reason = diagnosticMessage(protocolError, Object.values(input.credentials), 200);
     await postUpdate(input.run.id, { event: { round: input.round, source: "reviewer", type: "review.retry", message: `审核输出无法解析（${reason}），已要求 Reviewer 重新输出` } });
     let retryReview: { text: string; usage: UsageTotals };
     try {
@@ -1976,7 +1986,7 @@ async function performReview(input: {
       }, { runId: input.run.id, round: input.round, label: "审核 Agent（协议重试）", role: "reviewer", retry: true, budget: input.budget, sessions: input.sessions });
     } catch (providerError) {
       if (providerError instanceof BudgetExceededError || providerError instanceof PiInputTransportError) throw providerError;
-      const providerReason = redactWorkerDiagnostic((providerError as Error).message, Object.values(input.credentials)).slice(0, 500);
+      const providerReason = diagnosticMessage(providerError, Object.values(input.credentials), 500);
       const kind = classifyProviderError(providerReason);
       const failure = guardText(reviewProviderErrorText(kind, providerReason), runLocale(input.run));
       await update(input.run, "needs_human", "reviewer", "review.provider_error", failure.message, {
@@ -1995,7 +2005,7 @@ async function performReview(input: {
       await update(input.run, "needs_human", "reviewer", "review.invalid_protocol", invalidProtocol.message, {
         usage: toRunUsage(input.usage),
         durationMs: Date.now() - input.started,
-        summary: providerErrorSummary("protocol", `审核输出无法解析：${redactWorkerDiagnostic((retryError as Error).message, Object.values(input.credentials)).slice(0, 300)}`, locale).slice(0, 500),
+        summary: providerErrorSummary("protocol", `审核输出无法解析：${diagnosticMessage(retryError, Object.values(input.credentials), 300)}`, locale).slice(0, 500),
       }, { meta: invalidProtocol.meta });
       return { stopped: true };
     }
@@ -2045,7 +2055,7 @@ async function executeRetryReview(input: {
   // NEW-07: durable full-diff artifact for the retry-review path too.
   const retryDiffArtifact = await persistDiffArtifact(input.worktree, diff, run.round);
   // GAP-03: the reviewer reads an immutable snapshot, never the live worktree.
-  const snapshotPath = await prepareReviewSnapshot({ run, worktree: input.worktree, round: run.round, signal: input.controller.signal });
+  const snapshotPath = await prepareReviewSnapshot({ run, worktree: input.worktree, round: run.round, signal: input.controller.signal, credentials: input.credentials });
   if (!snapshotPath) return;
   await update(run, "reviewing", "reviewer", "review.started", `${run.reviewer.model} 重新审核（人工触发）`, { summary: "Reviewer Agent 正在重新审核" });
   let outcome: ReviewOutcome;
@@ -2154,7 +2164,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
   // Sprint 2: per-session summary, seeded from the run document so a restart
   // resumes the totals instead of resetting them.
   const sessions = new SessionAccumulator(run.sessions);
-  const tracker = await loadTracker(run.id);
+  const tracker = await loadTracker(run.id, input.credentials);
   // COST-002/003: budgets are evaluated before every model call and after each
   // one, with a single 80% warning per dimension.
   const runLimits = run.budget ?? readBudgetLimits();
@@ -2174,7 +2184,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
   // A re-claimed job (worker restart) resumes against the checkpoints already
   // recorded for this run: reuse the worktree and skip finished stages (REL-002/003).
   const recovering = Boolean(!input.resume && !input.retryReview && (input.recovery || tracker.size > 0));
-  const stopHeartbeat = startJobHeartbeat(input.jobId);
+  const stopHeartbeat = startJobHeartbeat(input.jobId, input.credentials);
   let outcomeState: "done" | "failed" | "cancelled" = "done";
   let terminalRecorded = true;
   // AUD-10: one Run level deadline covers model calls, checks and container work.
@@ -2474,7 +2484,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
         }
         // GAP-03: materialize the reviewer's immutable snapshot before announcing
         // the review, so the reviewer never reads the developer's live worktree.
-        const snapshotPath = await prepareReviewSnapshot({ run, worktree, round, signal: controller.signal });
+        const snapshotPath = await prepareReviewSnapshot({ run, worktree, round, signal: controller.signal, credentials: input.credentials });
         if (!snapshotPath) return;
         await update(run, "reviewing", "reviewer", "review.started", `${run.reviewer.model} 开始独立只读审核`, { diff: latestDiff, checkSnapshot, reviewSnapshot, checkPassed: true, checks: checked.results, summary: "Reviewer Agent 正在审核" }, { diffArtifact: reviewDiffArtifact });
         await tracker.start(stages.review(round));
@@ -2647,7 +2657,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
           terminalRecorded = true;
           break;
         } catch (writeError) {
-          console.warn(`[store] deadline terminal update failed (attempt ${attempt}): ${(writeError as Error).message}`);
+          console.warn(`[store] deadline terminal update failed (attempt ${attempt}): ${diagnosticMessage(writeError, Object.values(input.credentials))}`);
           if (attempt < 3) await sleep(1_000 * 2 ** (attempt - 1));
         }
       }
@@ -2675,7 +2685,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
           terminalRecorded = true;
           break;
         } catch (writeError) {
-          console.warn(`[store] budget terminal update failed (attempt ${attempt}): ${(writeError as Error).message}`);
+          console.warn(`[store] budget terminal update failed (attempt ${attempt}): ${diagnosticMessage(writeError, Object.values(input.credentials))}`);
           if (attempt < 3) await sleep(1_000 * 2 ** (attempt - 1));
         }
       }
@@ -2686,7 +2696,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
     // never parked: the run fails with the actionable sandbox message.
     const sandboxUnavailable = !cancelled && error instanceof SandboxUnavailableError;
     const inputTransport = !cancelled && error instanceof PiInputTransportError ? error : undefined;
-    const safeMessage = redactWorkerDiagnostic((error as Error).message, Object.values(input.credentials)).slice(0, 2_000);
+    const safeMessage = diagnosticMessage(error, Object.values(input.credentials));
     const followup = Boolean(input.resume || input.retryReview);
     const kind = cancelled || sandboxUnavailable ? undefined : classifyProviderError(safeMessage);
     // AT-REL-006/007: classified provider and storage failures are parked for a
@@ -2738,7 +2748,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
         terminalRecorded = true;
         break;
       } catch (writeError) {
-        console.warn(`[store] terminal update failed (attempt ${attempt}): ${(writeError as Error).message}`);
+        console.warn(`[store] terminal update failed (attempt ${attempt}): ${diagnosticMessage(writeError, Object.values(input.credentials))}`);
         if (attempt < 3) await sleep(1_000 * 2 ** (attempt - 1));
       }
     }
@@ -2749,7 +2759,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
     deadline.cancel();
     stopHeartbeat();
     if (input.jobId && terminalRecorded) {
-      await jobApi.finish(input.jobId, outcomeState).catch((error) => console.warn(`[jobs] finish failed: ${(error as Error).message}`));
+      await jobApi.finish(input.jobId, outcomeState).catch((error) => console.warn(`[jobs] finish failed: ${diagnosticMessage(error, Object.values(input.credentials))}`));
     } else if (input.jobId) {
       console.warn(`[jobs] keeping ${input.jobId} claimed so it can be retried after the store recovers`);
     }
@@ -2772,7 +2782,7 @@ async function reclaimPendingJobs() {
   try {
     jobs = await jobApi.pending();
   } catch (error) {
-    console.warn(`[jobs] reclaim failed: ${(error as Error).message}`);
+    console.warn(`[jobs] reclaim failed: ${diagnosticMessage(error)}`);
     return 0;
   }
   let started = 0;
@@ -2798,7 +2808,7 @@ async function reclaimPendingJobs() {
       ...(job.retryReview ? { retryReview: true } : {}),
     }, controller).catch((error) => {
       active.delete(job.run.id);
-      console.error(`[jobs] reclaimed job ${job.jobId} failed to start: ${(error as Error).message}`);
+      console.error(`[jobs] reclaimed job ${job.jobId} failed to start: ${diagnosticMessage(error, Object.values(job.credentials))}`);
     });
   }
   if (started > 0) console.warn(`[jobs] reclaimed ${started} unfinished job(s) after restart`);
@@ -2830,7 +2840,7 @@ async function generateRunDiff(input: { ownerId: string; runId: string; baseSha?
     const diff = await collectDiff(plan.worktree, controller.signal, baseRef);
     return { ok: true as const, diff, baseSha: input.baseSha ?? null };
   } catch (error) {
-    return { ok: false as const, status: 500, code: "DIFF_FAILED", error: (error as Error).message.slice(0, 300) };
+    return { ok: false as const, status: 500, code: "DIFF_FAILED", error: diagnosticMessage(error, [], 300) };
   } finally {
     clearTimeout(timer);
   }
@@ -2848,7 +2858,7 @@ async function recordMergeFailure(runId: string, result: Extract<GuardedMergeRes
   const where = originalBranch ?? `detached@${(originalHead ?? "unknown").slice(0, 12)}`;
   const message = result.restored
     ? `合并失败（${result.code}），工作区已恢复到合并前的 ${where}`
-    : `合并失败（${result.code}），工作区恢复未通过校验：${result.restoreError ?? "未知原因"}`;
+    : `合并失败（${result.code}），工作区恢复未通过校验：${diagnosticMessage(result.restoreError ?? "未知原因")}`;
   if (!result.restored) console.error(`[merge] ${runId} ${message}`);
   await postUpdate(runId, {
     event: {
@@ -2862,7 +2872,7 @@ async function recordMergeFailure(runId: string, result: Extract<GuardedMergeRes
         originalBranch,
         originalHead,
         targetBranch: result.targetBranch ?? null,
-        ...(result.restoreError ? { restoreError: result.restoreError } : {}),
+        ...(result.restoreError ? { restoreError: diagnosticMessage(result.restoreError) } : {}),
         ...(result.conflictingPaths?.length ? { conflictingPaths: result.conflictingPaths } : {}),
       },
     },
@@ -2899,7 +2909,7 @@ async function mergeRunBranch(input: {
   try {
     project = await resolveProject(input.repository);
   } catch (error) {
-    return { ok: false as const, status: 400, code: "WORKSPACE_INVALID", error: (error as Error).message };
+    return { ok: false as const, status: 400, code: "WORKSPACE_INVALID", error: diagnosticMessage(error) };
   }
 
   const exec: MergeGuardGitExec = (args, options) => runHardenedGit({ cwd: project, args, timeoutMs: options?.timeoutMs ?? 120_000 });
@@ -2913,7 +2923,7 @@ async function mergeRunBranch(input: {
   });
   if (!result.ok) {
     await recordMergeFailure(input.runId, result).catch((error) => {
-      console.warn(`[merge] could not record run.merge_failed for ${input.runId}: ${(error as Error).message}`);
+      console.warn(`[merge] could not record run.merge_failed for ${input.runId}: ${diagnosticMessage(error)}`);
     });
   }
   return result;
@@ -3052,9 +3062,7 @@ const server = createServer(async (request, response) => {
           error: guardText(PI_INPUT_TRANSPORT_TEXT, body.locale === "en" ? "en" : "zh").message,
           code: error.code,
         });
-        const safe = String((error as Error).message || "Requirement assistant failed")
-          .replaceAll(apiKey, "[redacted]")
-          .slice(0, 500);
+        const safe = diagnosticMessage(error, [apiKey], 500);
         return json(response, 502, { error: safe, code: "REQUIREMENT_ASSISTANT_FAILED" });
       } finally {
         body.apiKey = "";
@@ -3113,9 +3121,7 @@ const server = createServer(async (request, response) => {
           error: guardText(PI_INPUT_TRANSPORT_TEXT, body.locale === "en" ? "en" : "zh").message,
           code: error.code,
         });
-        const safe = String((error as Error).message || "Pi assistant failed")
-          .replaceAll(apiKey, "[redacted]")
-          .slice(0, 500);
+        const safe = diagnosticMessage(error, [apiKey], 500);
         return json(response, 502, { error: safe, code: "PI_ASSISTANT_FAILED" });
       } finally {
         body.apiKey = "";
@@ -3139,7 +3145,7 @@ const server = createServer(async (request, response) => {
       active.set(body.run.id, controller);
       void dispatchJob(body, controller).catch((error) => {
         active.delete(body.run.id);
-        console.error(`[jobs] job ${body.run.id} failed to start: ${(error as Error).message}`);
+        console.error(`[jobs] job ${body.run.id} failed to start: ${diagnosticMessage(error, Object.values(body.credentials))}`);
       });
       return json(response, 202, { accepted: true, runId: body.run.id });
     }
@@ -3209,7 +3215,7 @@ const server = createServer(async (request, response) => {
     }
     return json(response, 404, { error: "Not found" });
   } catch (error) {
-    return json(response, 500, { error: (error as Error).message });
+    return json(response, 500, { error: diagnosticMessage(error) });
   }
 });
 
