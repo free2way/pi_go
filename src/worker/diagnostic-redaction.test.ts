@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { redactWorkerDiagnostic } from "./diagnostic-redaction.js";
+import { redactWorkerDiagnostic, workerDiagnosticMessage } from "./diagnostic-redaction.js";
 import { classifyProviderError, type ProviderErrorKind } from "./provider-errors.js";
 
 describe("worker diagnostic redaction", () => {
@@ -36,5 +36,32 @@ describe("worker diagnostic redaction", () => {
     expect(redactWorkerDiagnostic(message, [], {})).toBe(message);
     const safe = redactWorkerDiagnostic("Bearer DUMMY_canary", [], {});
     expect(redactWorkerDiagnostic(safe, [], {})).toBe(safe);
+  });
+
+  it.each([24, 100, 200, 500, 2_000])("redacts full values before a %s-character cap", (limit) => {
+    const secret = "DUMMY_" + "opaque-credential".repeat(8);
+    const safe = workerDiagnosticMessage(new Error(`${"x".repeat(limit - 10)} ${secret}`), {
+      credentials: [secret], limit, environment: {},
+    });
+    expect(safe.length).toBeLessThanOrEqual(limit);
+    expect(safe).not.toContain(secret.slice(0, 8));
+    expect(safe).toContain("[redacted");
+  });
+
+  it("redacts only explicit private absolute paths and their encoded forms", () => {
+    const root = "/private/fixture space/workspace";
+    const safe = workerDiagnosticMessage(`ENOSPC ${root}/runs ${encodeURIComponent(root)} src/app.ts /healthz`, {
+      privatePaths: [root, "/", "src", ""], environment: {},
+    });
+    expect(safe).toBe("ENOSPC [redacted]/runs [redacted] src/app.ts /healthz");
+  });
+
+  it("does not inspect stack, cause or other error fields", () => {
+    const error = new Error("ordinary failure", { cause: "DUMMY_cause" });
+    error.stack = "DUMMY_stack";
+    expect(workerDiagnosticMessage(error, { environment: {} })).toBe("ordinary failure");
+    expect(workerDiagnosticMessage("string failure", { environment: {} })).toBe("string failure");
+    expect(workerDiagnosticMessage(null, { environment: {} })).toBe("null");
+    expect(workerDiagnosticMessage(error, { limit: -1, environment: {} })).toBe("");
   });
 });
