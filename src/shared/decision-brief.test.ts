@@ -294,6 +294,18 @@ describe("decision brief · acceptance gate", () => {
 });
 
 describe("decision brief · stop reason mapping", () => {
+  it.each([
+    ["pi.input_transport_blocked", "pi_input_transport_blocked"],
+    ["review.input_budget_exceeded", "review_input_budget_exceeded"],
+  ])("uses the latest input stop %s instead of a stale provider failure", (type, code) => {
+    const reason = stopReasonFrom([
+      { type: "review.provider_error", message: "Previous provider failure" },
+      { type, message: "Input stopped before model invocation", meta: { locale: "en", messageEn: "Input stopped before model invocation", inputBytes: 120001, transportLimit: 120000 } },
+      { type: "agent.activity", message: "Cleanup finished" },
+    ]);
+    expect(reason).toMatchObject({ code, message: "Input stopped before model invocation", locale: "en", messageEn: "Input stopped before model invocation", meta: { inputBytes: 120001, transportLimit: 120000 } });
+  });
+
   it("maps max-rounds and strips the heavy findings/diff meta", () => {
     const reason = stopReasonFrom([
       { type: "review.changes_requested", message: "第 1 轮退回" },

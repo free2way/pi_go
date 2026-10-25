@@ -23,6 +23,20 @@ function event(runId: string, type: string, message = type): Omit<RunEvent, "seq
 }
 
 describe("PostgresRunStore", () => {
+  it("rechecks a retried review before reviewing again without reopening terminal runs", async () => {
+    const db = await createTestDb();
+    const store = new PostgresRunStore(db);
+    await store.init();
+    const run = makeRun({ state: "reviewing" });
+    await store.createRun(run, event(run.id, "run.review_retry"));
+    await store.updateRun(run.id, { state: "checking" });
+    expect(store.getRun(run.id)?.state).toBe("checking");
+    await store.updateRun(run.id, { state: "reviewing" });
+    await store.updateRun(run.id, { state: "completed" });
+    await expect(store.updateRun(run.id, { state: "checking" })).rejects.toThrow(/Illegal run state transition/);
+    expect(store.getRun(run.id)?.state).toBe("completed");
+  });
+
   it("allocates monotonic per-run sequence numbers and pages them", async () => {
     const db = await createTestDb();
     const store = new PostgresRunStore(db);

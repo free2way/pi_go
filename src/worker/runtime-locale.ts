@@ -81,6 +81,12 @@ export const REVIEW_INPUT_BUDGET_TEXT: LocalizedText = {
   en: "Review input and its complete omission manifest cannot fit the byte budget; model invocation stopped for human handling. Split the change or explicitly adjust review limits.",
 };
 
+/** `pi.input_transport_blocked`: the local input never consumes a model call. */
+export const PI_INPUT_TRANSPORT_TEXT: LocalizedText = {
+  zh: "完整输入超出 Pi 传输预算或包含无效字符，已停止模型调用并转人工；请拆分或修正输入后重试",
+  en: "Complete input exceeds the Pi transport budget or contains an invalid character; model invocation stopped for human handling. Split or correct the input before retrying.",
+};
+
 /** `review.snapshot_diverged` */
 export function snapshotDivergedText(reasons: string): LocalizedText {
   return {
