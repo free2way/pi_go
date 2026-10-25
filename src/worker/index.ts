@@ -691,7 +691,13 @@ async function uploadFullDiffArtifact(runId: string, diff: string, local: DiffAr
       uploaded: true,
     };
   } catch (error) {
-    const message = `完整 Diff 制品上传失败，保留本地全量制品 ${local.id}（bytes=${local.bytes} sha256=${local.sha256}）：${(error as Error).message.slice(0, 300)}`;
+    // The upload service/network error is untrusted diagnostic text. Redact
+    // before truncating (a long path or credential may straddle the limit),
+    // never rewrite the durable patch itself or conceal the failed upload.
+    const reason = redactWorkerDiagnostic(error instanceof Error ? error.message : String(error), [
+      internalToken, callbackBase, local.path,
+    ]).slice(0, 300);
+    const message = `完整 Diff 制品上传失败，保留本地全量制品 ${local.id}（bytes=${local.bytes} sha256=${local.sha256}）：${reason}`;
     await postUpdate(runId, {
       event: {
         round: options.round ?? 1,
