@@ -25,7 +25,8 @@ const runTransitions: Record<string, ReadonlyArray<string>> = {
   preparing: ["developing", "checking", "reviewing", "cancelled", "failed", "needs_human"],
   developing: ["checking", "reviewing", "cancelled", "failed", "needs_human"],
   checking: ["developing", "reviewing", "cancelled", "failed", "needs_human"],
-  reviewing: ["developing", "completed", "cancelled", "failed", "needs_human"],
+  // A manual retry-review re-runs deterministic checks before a new snapshot.
+  reviewing: ["checking", "developing", "completed", "cancelled", "failed", "needs_human"],
   // GAP-04 / AT-RUN-009: a human may approve the delivered worktree (completed)
   // or reject/terminate it (cancelled).
   needs_human: ["queued", "reviewing", "checking", "developing", "completed", "cancelled", "failed"],
