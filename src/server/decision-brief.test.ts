@@ -104,6 +104,24 @@ async function linkStory(
 }
 
 describe("decision brief aggregation (docs/22 §6)", () => {
+  it.each([
+    ["pi.input_transport_blocked", "pi_input_transport_blocked"],
+    ["review.input_budget_exceeded", "review_input_budget_exceeded"],
+  ])("reads persisted input stop %s and its locale after reloading the store", async (type, code) => {
+    const db = await createTestDb();
+    const store = new PostgresRunStore(db);
+    const run = makeRun();
+    await store.createRun(run, { runId: run.id, round: 1, source: "system", type: "run.created", message: "created", at: at(0) });
+    await event(store, run, { type: "review.provider_error", message: "Previous provider failure" });
+    await event(store, run, { type, message: "输入已停止", meta: { locale: "zh", messageEn: "Input stopped before model invocation", reason: "byte-budget", inputBytes: 120001, transportLimit: 120000 } });
+    const reloadedStore = new PostgresRunStore(db);
+    await reloadedStore.init();
+    const reloaded = reloadedStore.getRun(run.id);
+    expect(reloaded).toBeDefined();
+    const brief = await readDecisionBrief(db, reloaded!, "en");
+    expect(brief.stopReason).toMatchObject({ code, message: "输入已停止", locale: "zh", messageEn: "Input stopped before model invocation", meta: { reason: "byte-budget", inputBytes: 120001, transportLimit: 120000 } });
+  });
+
   it("builds a needs_human-by-max-rounds brief with a persisting blocker", async () => {
     const db = await createTestDb();
     const store = new PostgresRunStore(db);

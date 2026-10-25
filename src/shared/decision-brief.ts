@@ -983,6 +983,8 @@ const STOP_REASON_CODES: Readonly<Record<string, string>> = {
   "checks.blocked_retry_review": "checks_failed",
   "run.deadline_exceeded": "deadline_exceeded",
   "run.budget_exhausted": "budget_exhausted",
+  "pi.input_transport_blocked": "pi_input_transport_blocked",
+  "review.input_budget_exceeded": "review_input_budget_exceeded",
   "review.provider_error": "review_provider_error",
   "review.invalid_protocol": "review_invalid_protocol",
   "review.snapshot_failed": "review_snapshot_failed",
