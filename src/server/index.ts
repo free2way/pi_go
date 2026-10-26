@@ -78,14 +78,10 @@ import { scmWorkerTimeoutMs, WorkspaceError, WorkspaceService } from "./workspac
 import { planRemoteSyncGate, type RemoteCommitEvidence } from "./scm-release-gate.js";
 import type { RequirementRefinement } from "../shared/requirement-assistant.js";
 import type { PiAssistantAnswer } from "../shared/pi-assistant.js";
+import { serverDiagnosticMessage, serverLoggerOptions } from "./server-diagnostics.js";
 
 const app = Fastify({
-  logger: {
-    redact: {
-      paths: ["req.headers.authorization", "req.headers.cookie", "req.headers.cf-access-jwt-assertion", "req.body.token", "developerApiKey", "reviewerApiKey", "credentials", "token"],
-      censor: "[redacted]",
-    },
-  },
+  logger: serverLoggerOptions(),
   bodyLimit: 64 * 1024,
 });
 
@@ -191,7 +187,7 @@ try {
     }
   }
 } catch (error) {
-  app.log.warn({ error: (error as Error).message }, "startup credential verification pass failed");
+  app.log.warn({ error: serverDiagnosticMessage(error) }, "startup credential verification pass failed");
 }
 
 const databaseUrl = process.env.PI_DATABASE_URL;
@@ -221,7 +217,7 @@ if (store instanceof PostgresRunStore && existsSync(dataFile)) {
       }
     }
   } catch (error) {
-    app.log.warn({ error: (error as Error).message }, "legacy runs.json import skipped");
+    app.log.warn({ error: serverDiagnosticMessage(error) }, "legacy runs.json import skipped");
   }
 }
 const alerts = new AlertManager(createAlertSink({
@@ -511,7 +507,7 @@ async function persistTerminalDiffArtifact(run: Run | undefined) {
       createdAt: run.updatedAt,
     });
   } catch (error) {
-    app.log.warn({ runId: run.id, error: (error as Error).message }, "failed to persist diff artifact");
+    app.log.warn({ runId: run.id, error: serverDiagnosticMessage(error) }, "failed to persist diff artifact");
   }
 }
 
@@ -546,7 +542,7 @@ async function resolveRunPatch(run: Run): Promise<RunPatchResolution> {
       body: JSON.stringify({ ownerId: run.ownerId, baseSha: run.baseSha, repository: run.repository }),
     });
   } catch (error) {
-    return { ok: false, status: 503, code: "PATCH_UNAVAILABLE", error: `无法生成补丁：${(error as Error).message}` };
+    return { ok: false, status: 503, code: "PATCH_UNAVAILABLE", error: `无法生成补丁：${serverDiagnosticMessage(error)}` };
   }
   const selection = selectPatch({
     artifact: artifact
@@ -560,7 +556,7 @@ async function resolveRunPatch(run: Run): Promise<RunPatchResolution> {
   if (selection.origin === "worktree") {
     await store
       .saveArtifact({ runId: run.id, artifactId: "diff", kind: "patch", content: selection.content, baseSha: selection.baseSha, createdAt: run.updatedAt })
-      .catch((error) => app.log.warn({ runId: run.id, error: (error as Error).message }, "failed to persist regenerated diff artifact"));
+      .catch((error) => app.log.warn({ runId: run.id, error: serverDiagnosticMessage(error) }, "failed to persist regenerated diff artifact"));
   }
   return { ok: true, selection };
 }
@@ -692,7 +688,7 @@ async function readVaultKey(userId: string, provider: string): Promise<string | 
       const found = vault.get(key, provider);
       if (found !== undefined && found !== "") return found;
     } catch (error) {
-      app.log.warn({ provider, error: (error as Error).message }, "credential vault read failed");
+      app.log.warn({ provider, error: serverDiagnosticMessage(error) }, "credential vault read failed");
     }
   }
   return undefined;
@@ -730,7 +726,7 @@ app.get("/api/health", async (_request, reply) => {
       key: "database_unavailable",
       severity: "critical",
       message: "数据库不可用，Web 已降级：运行/事件读写暂停",
-      details: { error: (error as Error).message.slice(0, 200) },
+      details: { error: serverDiagnosticMessage(error, { limit: 200 }) },
     });
     return reply.code(503).send({ status: "degraded", service: "pigo-web", version: webVersion, db: "unavailable", authMode: auth.authMode, code: "DATABASE_UNAVAILABLE" });
   }
@@ -746,7 +742,7 @@ app.get("/api/health/detail", async (request, reply) => {
     health.database = { status: "ok" };
     alerts.clear("database_unavailable");
   } catch (error) {
-    health.database = { status: "unavailable", error: (error as Error).message.slice(0, 200) };
+    health.database = { status: "unavailable", error: serverDiagnosticMessage(error, { limit: 200 }) };
     alerts.raise({ key: "database_unavailable", severity: "critical", message: "数据库不可用", details: {} });
   }
   if (jobQueue) {
@@ -755,7 +751,7 @@ app.get("/api/health/detail", async (request, reply) => {
       health.queue = { pending: queue.pending, reclaimedFromDeadWorker: queue.stale };
       syncQueueAlerts(alerts, queue, JOB_STALE_MS);
     } catch (error) {
-      health.queue = { status: "unavailable", error: (error as Error).message.slice(0, 200) };
+      health.queue = { status: "unavailable", error: serverDiagnosticMessage(error, { limit: 200 }) };
     }
   }
   const worker = await workerRequest<{ activeJobs: number }>("/health").then((value) => value).catch(() => undefined);
@@ -1070,7 +1066,7 @@ app.post("/api/requirements/refine", async (request, reply) => {
     app.log.warn({
       provider: validation.entry.provider,
       model: validation.entry.model,
-      error: String(failure.message).replaceAll(apiKey, "[redacted]").slice(0, 300),
+      error: serverDiagnosticMessage(failure, { credentials: [apiKey], limit: 300 }),
     }, "requirement assistant failed");
     if (failure.code === "REQUIREMENT_ASSISTANT_BUSY") {
       return reply.code(429).send({ error: "需求助手当前繁忙，请稍后重试", code: failure.code });
@@ -1120,7 +1116,7 @@ app.post("/api/assistant/ask", async (request, reply) => {
       provider: validation.entry.provider,
       model: validation.entry.model,
       page: parsed.data.context.page,
-      error: String(failure.message).replaceAll(apiKey, "[redacted]").slice(0, 300),
+      error: serverDiagnosticMessage(failure, { credentials: [apiKey], limit: 300 }),
     }, "pi assistant failed");
     if (failure.code === "PI_ASSISTANT_BUSY") {
       return reply.code(429).send({ error: "Pi Assistant 当前繁忙，请稍后重试", code: failure.code });
@@ -1181,7 +1177,7 @@ async function readDeploymentStatus(): Promise<DeploymentStatus> {
     logAvailable = true;
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (code !== "ENOENT") logError = (error as Error).message;
+    if (code !== "ENOENT") logError = serverDiagnosticMessage(error, { limit: 200 });
   }
   return buildDeploymentStatus({ env: process.env, records, logPath, logAvailable, logError });
 }
@@ -1211,8 +1207,8 @@ app.get("/api/system/status", async (request) => {
     await pingDatabase(2_000);
     database = { status: "ok" };
   } catch (error) {
-    // Log the raw cause server-side; never echo it (it can carry host details).
-    app.log.warn({ error: (error as Error).message.slice(0, 200) }, "system status database ping failed");
+    // Classify failures through section state; log only a safe bounded cause.
+    app.log.warn({ error: serverDiagnosticMessage(error, { limit: 200 }) }, "system status database ping failed");
   }
 
   const storage = workerHealth?.storage === "ok" || workerHealth?.storage === "low" || workerHealth?.storage === "critical"
@@ -1237,19 +1233,19 @@ app.get("/api/system/status", async (request) => {
     const jobs = await db.query("SELECT state, COUNT(*) AS count, MIN(created_at) AS oldest_at FROM jobs GROUP BY state");
     jobStates = jobs.rows as unknown as StateCountRow[];
   } catch (error) {
-    app.log.warn({ error: (error as Error).message.slice(0, 200) }, "system status job aggregation failed");
+    app.log.warn({ error: serverDiagnosticMessage(error, { limit: 200 }) }, "system status job aggregation failed");
   }
   try {
     const runs = await db.query("SELECT state, COUNT(*) AS count, MIN(created_at) AS oldest_at FROM runs GROUP BY state");
     runStates = runs.rows as unknown as StateCountRow[];
   } catch (error) {
-    app.log.warn({ error: (error as Error).message.slice(0, 200) }, "system status run aggregation failed");
+    app.log.warn({ error: serverDiagnosticMessage(error, { limit: 200 }) }, "system status run aggregation failed");
   }
   try {
     const usage = await db.query(`SELECT document_json FROM runs WHERE updated_at >= $1 LIMIT ${USAGE_RUN_SCAN_LIMIT}`, [utcDayStart(now)]);
     todayRuns = usage.rows as unknown as TodayRunRow[];
   } catch (error) {
-    app.log.warn({ error: (error as Error).message.slice(0, 200) }, "system status usage aggregation failed");
+    app.log.warn({ error: serverDiagnosticMessage(error, { limit: 200 }) }, "system status usage aggregation failed");
   }
   try {
     const events = await db.query(
@@ -1258,7 +1254,7 @@ app.get("/api/system/status", async (request) => {
     );
     failures = events.rows as unknown as FailureEventRow[];
   } catch (error) {
-    app.log.warn({ error: (error as Error).message.slice(0, 200) }, "system status failure aggregation failed");
+    app.log.warn({ error: serverDiagnosticMessage(error, { limit: 200 }) }, "system status failure aggregation failed");
   }
 
   // Only the worker reports its own version over HTTP; fall back to the
@@ -1304,7 +1300,7 @@ app.get("/api/projects", async (request, reply) => {
     const allowed = new Set((await workspaces.list(ownerKeysFor(request))).map((item) => item.rootPath));
     return projects.filter((project) => allowed.has(project.relativePath) || allowed.has(project.relativePath.replace(/^\/+/, "")));
   } catch (error) {
-    return reply.code(503).send({ error: `Worker unavailable: ${(error as Error).message}` });
+    return reply.code(503).send({ error: `Worker unavailable: ${serverDiagnosticMessage(error)}` });
   }
 });
 
@@ -1365,7 +1361,7 @@ async function productionRemoteGate(
       const status = await workspaces.remoteStatus(ownerKeysFor(request), workspaceId, { isAdmin, requiredCommit: commit });
       evidence.push({ workspaceId, commit, status });
     } catch (error) {
-      evidence.push({ workspaceId, commit, error: (error as Error).message.slice(0, 300) });
+      evidence.push({ workspaceId, commit, error: serverDiagnosticMessage(error, { limit: 300 }) });
     }
   }
   return planRemoteSyncGate(evidence);
@@ -1546,7 +1542,7 @@ async function reconcileStoryForRun(runId: string) {
     }
     await agile.reconcileRun(runId);
   } catch (error) {
-    app.log.warn({ error: (error as Error).message, runId }, "story status reconcile failed");
+    app.log.warn({ error: serverDiagnosticMessage(error), runId }, "story status reconcile failed");
   }
 }
 
@@ -2148,7 +2144,7 @@ app.get<{ Params: { id: string } }>("/api/runs/:id", async (request, reply) => {
   // and NEVER let an audit-table problem break the run-detail response: a
   // storage failure degrades to the run without decision usage and a warn.
   return readDecisionUsageSafe(db, run, (error) => {
-    const message = error instanceof Error ? `${error.name}: ${error.message}`.slice(0, 300) : "unknown error";
+    const message = error instanceof Error ? serverDiagnosticMessage(`${error.name}: ${error.message}`, { limit: 300 }) : "unknown error";
     app.log.warn({ error: message }, "decision usage aggregation failed; returning run without decision usage");
   });
 });
@@ -2273,7 +2269,7 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/merge-request", { bodyLimit:
     });
     const body = (await response.json().catch(() => ({}))) as { error?: unknown; url?: unknown; id?: unknown; number?: unknown };
     if (!response.ok) {
-      return reply.code(502).send({ error: `合并请求创建失败：${String(body.error ?? response.status).slice(0, 200)}`, code: "MERGE_REQUEST_FAILED" });
+      return reply.code(502).send({ error: `合并请求创建失败：${serverDiagnosticMessage(body.error ?? response.status, { limit: 200 })}`, code: "MERGE_REQUEST_FAILED" });
     }
     const mergeRequest = {
       url: typeof body.url === "string" ? body.url : null,
@@ -2291,7 +2287,7 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/merge-request", { bodyLimit:
     });
     return { ok: true, mergeRequest };
   } catch (error) {
-    return reply.code(502).send({ error: `合并请求创建失败：${(error as Error).message.slice(0, 200)}`, code: "MERGE_REQUEST_FAILED" });
+    return reply.code(502).send({ error: `合并请求创建失败：${serverDiagnosticMessage(error, { limit: 200 })}`, code: "MERGE_REQUEST_FAILED" });
   }
 });
 
@@ -2331,7 +2327,7 @@ app.get<{ Params: { id: string }; Querystring: { after?: string } }>("/api/runs/
   try {
     await stream.start();
   } catch (error) {
-    app.log.error({ error: (error as Error).message, runId: request.params.id }, "event stream failed");
+    app.log.error({ error: serverDiagnosticMessage(error), runId: request.params.id }, "event stream failed");
     stream.stop();
     reply.raw.end();
   }
@@ -2454,11 +2450,12 @@ async function startRealRun(
     credentials.reviewer = "";
     return { ok: true, created: true, run };
   } catch (error) {
+    const message = serverDiagnosticMessage(error, { credentials: Object.values(credentials) });
     credentials.developer = "";
     credentials.reviewer = "";
-    await store.updateRun(run.id, { state: "failed", summary: (error as Error).message });
-    await store.appendEvent({ runId: run.id, round: 1, source: "system", type: "run.failed", message: `Worker 拒绝任务：${(error as Error).message}`, at: new Date().toISOString() });
-    return { ok: false, status: 503, body: { error: (error as Error).message, runId: run.id }, run };
+    await store.updateRun(run.id, { state: "failed", summary: message });
+    await store.appendEvent({ runId: run.id, round: 1, source: "system", type: "run.failed", message: `Worker 拒绝任务：${message}`, at: new Date().toISOString() });
+    return { ok: false, status: 503, body: { error: message, runId: run.id }, run };
   }
 }
 
@@ -2603,6 +2600,7 @@ async function startContinue(
     credentials.reviewer = "";
     return { ok: true, run: store.getRun(run.id) ?? updated };
   } catch (error) {
+    const message = serverDiagnosticMessage(error, { credentials: Object.values(credentials) });
     credentials.developer = "";
     credentials.reviewer = "";
     await store.updateRun(run.id, { state: "needs_human", summary: "Worker 拒绝任务，保持人工处理" });
@@ -2611,10 +2609,10 @@ async function startContinue(
       round,
       source: "system",
       type: "run.resume_failed",
-      message: `Worker 拒绝任务：${(error as Error).message}`,
+      message: `Worker 拒绝任务：${message}`,
       at: new Date().toISOString(),
     });
-    return { ok: false, status: 503, error: (error as Error).message };
+    return { ok: false, status: 503, error: message };
   }
 }
 
@@ -3455,8 +3453,8 @@ app.post("/api/runs/cleanup", async (request, reply) => {
       await store.deleteRun(run.id);
       deleted.push(run.id);
     } catch (error) {
-      app.log.warn({ runId: run.id, error: (error as Error).message }, "cleanup: failed to delete run");
-      storage.push(keptRunStorageOutcome(run.id, `database deletion failed: ${(error as Error).message}`));
+      app.log.warn({ runId: run.id, error: serverDiagnosticMessage(error) }, "cleanup: failed to delete run");
+      storage.push(keptRunStorageOutcome(run.id, `database deletion failed: ${serverDiagnosticMessage(error)}`));
       continue;
     }
     // Best-effort on-disk cleanup after the records are gone: a worker that is
@@ -3515,7 +3513,7 @@ app.post("/api/runs/batch", { bodyLimit: 1024 * 1024 }, async (request, reply) =
         await store.deleteRun(run.id);
       } catch (error) {
         // Records could not be removed, so the directory was never touched.
-        outcomes.push(batchItemFailure(id, 500, undefined, (error as Error).message, "kept"));
+        outcomes.push(batchItemFailure(id, 500, undefined, serverDiagnosticMessage(error), "kept"));
         continue;
       }
       const storage = parsed.data.deleteRunDirectory
@@ -3567,7 +3565,7 @@ app.post("/api/runs/batch", { bodyLimit: 1024 * 1024 }, async (request, reply) =
       outcomes.push(batchItemSuccess(id, "completed"));
     } catch (error) {
       const conflict = conflictReplyFor(error);
-      outcomes.push(batchItemFailure(id, conflict?.status ?? 500, conflict?.code, conflict?.message ?? (error as Error).message));
+      outcomes.push(batchItemFailure(id, conflict?.status ?? 500, conflict?.code, serverDiagnosticMessage(conflict?.message ?? error)));
     }
   }
   return summarizeBatch(parsed.data.action, outcomes);
@@ -3630,7 +3628,7 @@ async function dispatchJob(
       });
       return { jobId, accepted: false as const };
     }
-    await jobQueue.finishJob(jobId, "failed", message.slice(0, 500));
+    await jobQueue.finishJob(jobId, "failed", serverDiagnosticMessage(error, { credentials: Object.values(credentials), limit: 500 }));
     throw error;
   }
 }
@@ -3650,7 +3648,7 @@ async function requeueStaleJobs() {
       });
     }
   } catch (error) {
-    app.log.error({ error: (error as Error).message }, "stale job requeue failed");
+    app.log.error({ error: serverDiagnosticMessage(error) }, "stale job requeue failed");
   }
 }
 
@@ -3672,7 +3670,7 @@ async function expireStaleReleaseDeploys() {
       });
     }
   } catch (error) {
-    app.log.error({ error: (error as Error).message }, "stale release deploy expiry failed");
+    app.log.error({ error: serverDiagnosticMessage(error) }, "stale release deploy expiry failed");
   }
 }
 
@@ -3747,6 +3745,7 @@ async function dispatchFollowupJob(
     credentials.reviewer = "";
     return reply.code(201).send(store.getRun(run.id, ownerKeysFor(request)));
   } catch (error) {
+    const message = serverDiagnosticMessage(error, { credentials: Object.values(credentials) });
     credentials.developer = "";
     credentials.reviewer = "";
     await store.updateRun(run.id, { state: "needs_human", summary: "Worker 拒绝任务，保持人工处理" });
@@ -3755,10 +3754,10 @@ async function dispatchFollowupJob(
       round,
       source: "system",
       type: options.kind === "resume" ? "run.resume_failed" : "run.review_retry_failed",
-      message: `Worker 拒绝任务：${(error as Error).message}`,
+      message: `Worker 拒绝任务：${message}`,
       at: new Date().toISOString(),
     });
-    return reply.code(503).send({ error: (error as Error).message });
+    return reply.code(503).send({ error: message });
   }
 }
 
