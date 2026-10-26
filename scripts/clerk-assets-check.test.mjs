@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { spawn } from "node:child_process";
-import { mkdtemp, copyFile, rm } from "node:fs/promises";
+import { mkdtemp, copyFile, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { probeClerkAssets } from "./clerk-config-check.mjs";
@@ -149,7 +149,7 @@ for (const invalidAsset of [false, true]) {
       let stdout = "", stderr = "";
       child.stdout.on("data", chunk => { stdout += chunk; });
       child.stderr.on("data", chunk => { stderr += chunk; });
-      const [code] = await once(child, "exit");
+      const [code] = await once(child, "close");
       assert.equal(code, invalidAsset ? 1 : 0);
       assert(![publicKey, secretKey].some(value => (stdout + stderr).includes(value)));
       assert(requests.every(request => request.method === "GET" && request.authorization === undefined));
@@ -169,7 +169,9 @@ test("standalone static checks do not require an installed React SDK", async () 
   try {
     const target = path.join(directory, "check.mjs");
     await copyFile(new URL("./clerk-config-check.mjs", import.meta.url), target);
-    const child = spawn(process.execPath, [target], {
+    // Node resolves the module URL through macOS temp-directory aliases; use
+    // its canonical entry path so this fixture actually runs the CLI guard.
+    const child = spawn(process.execPath, [await realpath(target)], {
       env: { PATH: process.env.PATH, NODE_ENV: "test", PI_AUTH_MODE: "clerk", PI_PUBLIC_ORIGIN: "https://pigo.example.com",
         CLERK_PUBLISHABLE_KEY: ["pk", "test", "DUMMY_".repeat(5)].join("_"), CLERK_SECRET_KEY: ["sk", "test", "DUMMY_".repeat(5)].join("_") },
       stdio: ["ignore", "pipe", "pipe"],
@@ -177,7 +179,7 @@ test("standalone static checks do not require an installed React SDK", async () 
     let stdout = "";
     child.stdout.on("data", chunk => { stdout += chunk; });
     child.stderr.resume();
-    const [code] = await once(child, "exit");
+    const [code] = await once(child, "close");
     assert.equal(code, 0);
     assert.match(stdout, /PASS static configuration/);
   } finally { await rm(directory, { recursive: true, force: true }); }
