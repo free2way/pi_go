@@ -1326,10 +1326,9 @@ function workspacesDisabled(reply: FastifyReply) {
 /** Maps a WorkspaceError / storage failure to an HTTP status + body (shared by
  * the workspace routes and the run-preflight, which must not touch `reply`). */
 function classifyWorkspaceError(error: unknown): { status: number; body: Record<string, unknown> } {
-  const secrets = diagnosticSecrets();
-  if (error instanceof WorkspaceError) return { status: error.status, body: { error: redactDiagnosticText(error.message, secrets), code: redactDiagnosticText(error.code, secrets) } };
+  if (error instanceof WorkspaceError) return { status: error.status, body: { error: serverDiagnosticMessage(error.message), code: serverDiagnosticMessage(error.code) } };
   const raw = String((error as Error)?.message ?? error);
-  const message = redactDiagnosticText(raw, secrets);
+  const message = serverDiagnosticMessage(raw);
   // AT-REL-005: a database outage is reported as storage degradation, not as a
   // confusing workspace error.
   if (isStorageFailure(raw)) {
