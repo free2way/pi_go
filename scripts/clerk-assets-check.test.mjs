@@ -4,6 +4,9 @@ import { createRequire } from "node:module";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { spawn } from "node:child_process";
+import { mkdtemp, copyFile, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { probeClerkAssets } from "./clerk-config-check.mjs";
 
 const sdk = createRequire(import.meta.resolve("@clerk/react"))("@clerk/shared/loadClerkJsScript");
@@ -160,3 +163,22 @@ for (const invalidAsset of [false, true]) {
     } finally { await new Promise(resolve => server.close(resolve)); }
   });
 }
+
+test("standalone static checks do not require an installed React SDK", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "pigo-clerk-static-"));
+  try {
+    const target = path.join(directory, "check.mjs");
+    await copyFile(new URL("./clerk-config-check.mjs", import.meta.url), target);
+    const child = spawn(process.execPath, [target], {
+      env: { PATH: process.env.PATH, NODE_ENV: "test", PI_AUTH_MODE: "clerk", PI_PUBLIC_ORIGIN: "https://pigo.example.com",
+        CLERK_PUBLISHABLE_KEY: ["pk", "test", "DUMMY_".repeat(5)].join("_"), CLERK_SECRET_KEY: ["sk", "test", "DUMMY_".repeat(5)].join("_") },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    child.stdout.on("data", chunk => { stdout += chunk; });
+    child.stderr.resume();
+    const [code] = await once(child, "exit");
+    assert.equal(code, 0);
+    assert.match(stdout, /PASS static configuration/);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});

@@ -3,12 +3,6 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 
-// Resolve from React's dependency context so nested/deduped SDK versions pick
-// the same script paths as ClerkProvider, not an unrelated backend dependency.
-const clerkRequire = createRequire(import.meta.resolve("@clerk/react"));
-const { clerkJSScriptUrl, clerkUIScriptUrl } = clerkRequire("@clerk/shared/loadClerkJsScript");
-const { isValidProxyUrl } = clerkRequire("@clerk/shared/proxy");
-
 function keyTier(value, type) {
   const key = String(value ?? "");
   for (const tier of ["test", "live"]) {
@@ -79,7 +73,7 @@ export async function probeClerkOrigin(origin, expectedPublishableKey, fetchImpl
   if (body?.mode !== "clerk") throw new Error("public auth config is not in Clerk mode");
   if (!expectedPublishableKey || body?.clerk?.publishableKey !== expectedPublishableKey) throw new Error("public auth config exposes a different Clerk instance");
   const proxyValue = body.clerk?.proxyUrl;
-  const proxy = typeof proxyValue === "string" && isValidProxyUrl(proxyValue) ? sameOriginUrl(proxyValue, origin) : undefined;
+  const proxy = sameOriginProxy(proxyValue, origin);
   if (!proxy || proxy.pathname === "/") throw new Error("public auth config has an unsafe or missing Clerk proxy");
   return { status: response.status, mode: body.mode, proxyUrl: proxy.pathname.replace(/\/+$/, "") };
 }
@@ -93,12 +87,24 @@ function sameOriginUrl(value, origin, base = origin) {
   } catch { return undefined; }
 }
 
+function sameOriginProxy(value, origin) {
+  if (typeof value !== "string" || (!value.startsWith("/") && !/^https?:\/\//.test(value))) return undefined;
+  return sameOriginUrl(value, origin);
+}
+
 /** GET-only reachability check. Script bytes are never executed or returned. */
 export async function probeClerkAssets(origin, publishableKey, proxyUrl, fetchImpl = fetch) {
   origin = safePublicOrigin(origin, false);
   if (!origin) throw new Error("asset probe requires a safe origin-only URL");
-  const proxy = typeof proxyUrl === "string" && isValidProxyUrl(proxyUrl) ? sameOriginUrl(proxyUrl, origin) : undefined;
+  const proxy = sameOriginProxy(proxyUrl, origin);
   if (!proxy || proxy.pathname === "/") throw new Error("asset probe requires a same-origin Clerk proxy");
+  // Load only for the optional asset probe: standalone static checks remain
+  // dependency-free. Resolve through React so nested SDK versions match UI.
+  let clerkJSScriptUrl, clerkUIScriptUrl;
+  try {
+    const clerkRequire = createRequire(import.meta.resolve("@clerk/react"));
+    ({ clerkJSScriptUrl, clerkUIScriptUrl } = clerkRequire("@clerk/shared/loadClerkJsScript"));
+  } catch { throw new Error("installed React SDK asset metadata is unavailable"); }
   const options = { publishableKey, proxyUrl: proxy.pathname.replace(/\/+$/, "") };
   const routes = [["Clerk JS", clerkJSScriptUrl(options)], ["Clerk UI", clerkUIScriptUrl(options)]];
   const scripts = [];
