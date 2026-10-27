@@ -10,6 +10,7 @@ import type { ConfigStatus, CredentialStatus, CurrentUser, ModelCatalogResponse,
 import { LOCALE_TAGS, type Locale } from "../shared/i18n";
 import type { RequirementRefineInput, RequirementRefinement } from "../shared/requirement-assistant";
 import type { PiAssistantAnswer, PiAssistantAskInput } from "../shared/pi-assistant";
+import { validatedArtifactBlob } from "./artifact-download";
 
 /**
  * AUD-09 / docs/26 §11: `/api/config/status` augments the shared `ConfigStatus`
@@ -164,6 +165,15 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  downloadDiagnosticArtifact: async (artifact: RunArtifact, signal: AbortSignal) => {
+    const token = await authTokenProvider?.();
+    if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+    const response = await fetch(`/api/runs/${encodeURIComponent(artifact.runId)}/artifacts/${encodeURIComponent(artifact.artifactId)}/download`, {
+      credentials: "same-origin", redirect: "error", signal,
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    return validatedArtifactBlob(response, artifact);
+  },
   backups: () => request<BackupOverview>("/api/admin/backups"),
   createBackup: () => request<BackupEntry>("/api/admin/backups", { method: "POST", body: JSON.stringify({ confirm: true }) }),
   deleteBackup: (id: string) => request<{ ok: true }>(`/api/admin/backups/${encodeURIComponent(id)}/delete`, { method: "POST", body: JSON.stringify({ confirm: true }) }),
