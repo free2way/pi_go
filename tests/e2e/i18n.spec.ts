@@ -97,6 +97,10 @@ test.describe("bilingual UI (中文 / English)", () => {
       await expect(opener).toBeFocused();
       expect(pushes).toHaveLength(countBefore);
       await opener.click();
+      await page.keyboard.press("Shift+Tab");
+      await expect(dialog.getByRole("button", { name: copy.push, exact: true })).toBeFocused();
+      await page.keyboard.press("Tab");
+      await expect(dialog.getByRole("button", { name: copy.cancel, exact: true })).toBeFocused();
       await page.keyboard.press("Tab");
       await expect(dialog.getByRole("button", { name: copy.push, exact: true })).toBeFocused();
       await page.keyboard.press("Tab");

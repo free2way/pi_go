@@ -376,6 +376,16 @@ export function WorkspacesPage({ config, runs, onOpenCredentials, isAdmin }: {
         aria-labelledby="scm-push-title"
         aria-describedby="scm-push-description"
         onClose={() => setScmPushTarget(undefined)}
+        onKeyDown={(event) => {
+          if (event.key !== "Tab") return;
+          const buttons = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>("button:not(:disabled)"));
+          const first = buttons[0];
+          const last = buttons.at(-1);
+          if (first && last && ((event.shiftKey && document.activeElement === first) || (!event.shiftKey && document.activeElement === last))) {
+            event.preventDefault();
+            (event.shiftKey ? last : first).focus();
+          }
+        }}
       >
         {scmPushTarget && <>
           <h2 id="scm-push-title">{t("workspace.scmPushTitle")}</h2>
