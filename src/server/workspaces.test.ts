@@ -351,6 +351,39 @@ describe("workspace service", () => {
     } finally { vi.unstubAllEnvs(); }
   });
 
+  it.each(["plain", "url", "json"])("hides the current SCM credential in historical %s diagnostics for every reader", async (variant) => {
+    const db = await createTestDb();
+    const directory = await mkdtemp(path.join(os.tmpdir(), "pigo-scm-history-context-"));
+    try {
+      const saved = ["DUMMY", 'opaque-scm/+" value'].join("_");
+      const settings = new ScmSettingsStore(path.join(directory, "scm.json"), Buffer.alloc(32, 7).toString("base64"));
+      await settings.init();
+      const service = new WorkspaceService(db, (async (route: string) => {
+        if (route === "/workspaces/verify") return verifyOk();
+        throw new Error("controlled SCM failure");
+      }) as WorkerCall, settings);
+      const workspace = await service.register("owner", "pi_go");
+      await service.saveScmSettings(["owner"], workspace.id, { provider: "generic", authMode: "https_token", token: saved });
+      await service.push(["owner"], workspace.id, "owner").catch(() => undefined);
+      const forms = [saved, encodeURIComponent(saved), JSON.stringify(saved).slice(1, -1)];
+      const legacy = `historical SCM failure ${forms[["plain", "url", "json"].indexOf(variant)]} exit=128`;
+      await db.query("UPDATE workspace_scm_sync_attempts SET detail=$1 WHERE workspace_id=$2", [legacy, workspace.id]);
+      await db.query("INSERT INTO workspace_grants (workspace_id, user_id, permission, granted_by, created_at) VALUES ($1, $2, 'read', $3, $4)", [workspace.id, "reader", "owner", new Date().toISOString()]);
+      // Start with the read-only member: access to history never grants the
+      // right to recover a saved credential from a legacy diagnostic.
+      for (const [reader, options] of [["reader", {}], ["owner", {}], ["admin", { isAdmin: true }]] as const) {
+        const overview = await service.scmOverview([reader], workspace.id, options);
+        const detail = overview.attempts[0].detail!;
+        for (const form of forms) expect(detail).not.toContain(form);
+        expect(detail).toContain("historical SCM failure");
+        expect(detail).toContain("[redacted]");
+        expect(overview.settings.tokenConfigured).toBe(true);
+      }
+      const persisted = await db.query("SELECT detail FROM workspace_scm_sync_attempts WHERE workspace_id=$1", [workspace.id]);
+      expect(persisted.rows[0].detail).toBe(legacy);
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+
   it("redacts credential query parameters in persisted repository display URLs", () => {
     const marker = "DUMMY_QUERY_" + "private-value";
     expect(redactGitUrl(`https://repo.example.invalid/repo?token=${marker}`)).not.toContain(marker);
