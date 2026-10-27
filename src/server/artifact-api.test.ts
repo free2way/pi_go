@@ -1,8 +1,8 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { redactArtifactDiagnostic, saveInternalRunArtifact } from "./artifact-api.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { artifactDiagnosticCredentials, redactArtifactDiagnostic, saveInternalRunArtifact } from "./artifact-api.js";
 import { createHash } from "node:crypto";
 import { baseDemoRun } from "./demo-runner.js";
 import { RunStore } from "./store.js";
@@ -47,6 +47,73 @@ describe("saveInternalRunArtifact (NEW-07)", () => {
     const value = ["DUMMY", "platform"].join("_");
     const patch = `--- a/example.txt\n+++ b/example.txt\n@@ -1 +1 @@\n-old\n+${value} Bearer DUMMY_source\n`;
     expect(redactArtifactDiagnostic("patch", patch, undefined, { PI_INTERNAL_TOKEN: value })).toBe(patch);
+  });
+
+  it.each(["plain", "url", "json"])("redacts the current saved run credential in %s trace content before persistence", async (format) => {
+    const { store, run } = await testStore();
+    const value = ["DUMMY", 'opaque/+" model value'].join("_");
+    const encoded = format === "url" ? encodeURIComponent(value) : format === "json" ? JSON.stringify(value).slice(1, -1) : value;
+    const result = await saveInternalRunArtifact(store, { runId: run.id, artifactId: "trace", kind: "trace", content: `provider failure: ${encoded}` }, {}, async () => [value]);
+    expect(result.ok).toBe(true);
+    const artifact = await store.getArtifact(run.id, "trace");
+    expect(artifact?.content).toBe("provider failure: [redacted]");
+    if (result.ok) expect(result.artifact.sha256).toBe(createHash("sha256").update(artifact!.content!).digest("hex"));
+  });
+
+  it("resolves partial current and legacy credentials only for the run owner's pinned providers", async () => {
+    const { run } = await testStore();
+    const values = new Map([
+      [run.ownerId + ":deepseek", "DUMMY_current"],
+      ["legacy-owner:deepseek", "DUMMY_previous"],
+      ["legacy-owner:openai-proxy", "DUMMY_reviewer"],
+      [run.ownerId + ":unrelated", "DUMMY_other_provider"],
+      ["other-owner:deepseek", "DUMMY_other_owner"],
+    ]);
+    const get = vi.fn((owner: string, provider: string) => values.get(owner + ":" + provider));
+    const legacy = vi.fn(async (owner: string) => owner === run.ownerId ? "legacy-owner" : undefined);
+    const credentials = await artifactDiagnosticCredentials(run, { get }, legacy);
+    expect(new Set(credentials)).toEqual(new Set(["DUMMY_current", "DUMMY_previous", "DUMMY_reviewer"]));
+    expect(legacy).toHaveBeenCalledWith(run.ownerId);
+    expect(get.mock.calls.every(([owner, provider]) => [run.ownerId, "legacy-owner"].includes(owner) && ["deepseek", "openai-proxy"].includes(provider))).toBe(true);
+  });
+
+  it("does not degrade a failed identity or credential lookup into an empty context", async () => {
+    const { run } = await testStore();
+    await expect(artifactDiagnosticCredentials(run, { get: () => undefined }, async () => { throw new Error("identity lookup failed"); })).rejects.toThrow("identity lookup failed");
+    await expect(artifactDiagnosticCredentials(run, { get: () => { throw new Error("decrypt failed"); } }, async () => undefined)).rejects.toThrow("decrypt failed");
+  });
+
+  it("does not persist diagnostic bytes when credential context cannot be loaded", async () => {
+    const { store, run } = await testStore();
+    await expect(saveInternalRunArtifact(store, { runId: run.id, artifactId: "trace", kind: "trace", content: "failure" }, {}, async () => { throw new Error("lookup failed"); })).rejects.toThrow("lookup failed");
+    expect(await store.listArtifacts(run.id)).toEqual([]);
+  });
+
+  it("rejects missing runs and wrong declared owners before reading any credential", async () => {
+    const { store, run } = await testStore();
+    const read = vi.fn(async () => ["DUMMY_private"]);
+    expect(await saveInternalRunArtifact(store, { runId: "missing", artifactId: "trace", kind: "trace", content: "failure" }, {}, read)).toMatchObject({ ok: false, status: 404 });
+    expect(await saveInternalRunArtifact(store, { runId: run.id, ownerId: "other", artifactId: "trace", kind: "trace", content: "failure" }, {}, read)).toMatchObject({ ok: false, status: 403 });
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it("preserves source patch bytes and SHA without depending on vault availability", async () => {
+    const { store, run } = await testStore();
+    const patch = "--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+Bearer DUMMY_source\n";
+    const read = vi.fn(async () => { throw new Error("unavailable"); });
+    const result = await saveInternalRunArtifact(store, { runId: run.id, artifactId: "diff", kind: "patch", content: patch }, {}, read);
+    expect(result.ok).toBe(true);
+    expect(read).not.toHaveBeenCalled();
+    const stored = await store.getArtifact(run.id, "diff");
+    expect(stored?.content).toBe(patch);
+    expect(stored?.sha256).toBe(createHash("sha256").update(patch).digest("hex"));
+  });
+
+  it("detects unsafe historical trace content without rewriting the original value", () => {
+    const value = "DUMMY_saved_model";
+    const original = "old failure " + value;
+    expect(redactArtifactDiagnostic("trace", original, undefined, {}, [value])).toBe("old failure [redacted]");
+    expect(original).toBe("old failure " + value);
   });
 
   it.each(["log", "trace", "text", "unknown-future-kind"])("protects non-patch %s without relying on a diagnostic-kind allowlist", (kind) => {

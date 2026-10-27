@@ -35,7 +35,7 @@ import { createProviderProbe, providerProbeDisabled } from "./provider-probe.js"
 import { verifyPendingCredentials } from "./credential-verification.js";
 import { RateLimiter } from "./rate-limit.js";
 import { PostgresRunStore } from "./run-store-pg.js";
-import { redactArtifactDiagnostic, saveInternalRunArtifact } from "./artifact-api.js";
+import { artifactDiagnosticCredentials, redactArtifactDiagnostic, saveInternalRunArtifact } from "./artifact-api.js";
 import { type ApprovePlan, approveEventMeta, planApprove } from "./approve.js";
 import { conflictReplyFor, isStorageFailure, requestErrorReply } from "./request-errors.js";
 import { diagnosticSecrets, redactDiagnosticText } from "../shared/diagnostics.js";
@@ -697,6 +697,10 @@ async function readVaultKey(userId: string, provider: string): Promise<string | 
 /** Presence-only vault check for the `/api/config/status` decision-engine block. */
 async function hasVaultDecisionKey(userId: string) {
   return Boolean((await readVaultKey(userId, "typesafe")) || (await readVaultKey(userId, "jev")));
+}
+
+function readArtifactCredentials(run: Run) {
+  return artifactDiagnosticCredentials(run, vault, (ownerId) => identities.legacyOwnerFor(ownerId));
 }
 
 /** Bounded liveness ping: a frozen database must not hang the health probe. */
@@ -2201,7 +2205,7 @@ app.get<{ Params: { id: string; artifactId: string } }>("/api/runs/:id/artifacts
   const kind = artifact?.kind ?? "patch";
   // Do not silently alter a historical body or advertise its old SHA for new
   // bytes. Require regeneration instead; the stored record is left untouched.
-  if (redactArtifactDiagnostic(kind, content, run.worktree) !== content) {
+  if (kind !== "patch" && redactArtifactDiagnostic(kind, content, run.worktree, process.env, await readArtifactCredentials(run)) !== content) {
     return reply.code(409).send({ error: "Diagnostic artifact requires secure regeneration", code: "ARTIFACT_DIAGNOSTICS_UNSAFE" });
   }
   const contentType = kind === "patch" ? "text/x-patch; charset=utf-8" : "application/octet-stream";
@@ -3841,7 +3845,7 @@ app.post<{ Params: { id: string } }>("/api/internal/runs/:id/artifacts", { bodyL
   if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
   const parsed = internalArtifactSchema.safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: "Invalid artifact upload", details: parsed.error.issues });
-  const result = await saveInternalRunArtifact(store, { runId: request.params.id, ...parsed.data });
+  const result = await saveInternalRunArtifact(store, { runId: request.params.id, ...parsed.data }, process.env, readArtifactCredentials);
   if (!result.ok) return reply.code(result.status).send({ error: result.error });
   return { ok: true, artifact: result.artifact };
 });
