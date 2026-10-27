@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -294,6 +294,37 @@ describe("workspace service", () => {
       else expect(overview.attempts).toHaveLength(0);
     } finally {
       await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["plain", "encoded", "truncated"])("redacts configured private paths before SCM audit persistence: %s", async (variant) => {
+    const privateFile = "/private/synthetic/scm-diagnostics/store.json";
+    vi.stubEnv("PI_DATA_FILE", privateFile);
+    const raw = new Error(`SCM unavailable ${variant === "truncated" ? "x".repeat(775) : ""}${variant === "encoded" ? encodeURIComponent(privateFile) : privateFile}`);
+    const db = await createTestDb();
+    try {
+      const service = new WorkspaceService(db, (async (route: string) => {
+        if (route === "/workspaces/verify") return verifyOk();
+        throw raw;
+      }) as WorkerCall);
+      const workspace = await service.register("owner", "pi_go");
+      const failure = await service.push(["owner"], workspace.id, "owner").catch((error: WorkspaceError) => error) as WorkspaceError;
+      expect(failure).toMatchObject({ code: "SCM_PUSH_FAILED", status: 503 });
+      const persisted = await db.query("SELECT detail FROM workspace_scm_sync_attempts WHERE workspace_id=$1", [workspace.id]);
+      expect(persisted.rows).toHaveLength(1);
+      const overview = await service.scmOverview(["owner"], workspace.id);
+      expect(overview.attempts[0]).toMatchObject({ status: "failed" });
+      // Assert the durable audit and its read projection before checking the
+      // thrown diagnostic, so HTTP-only redaction cannot mask a stored leak.
+      for (const output of [String(persisted.rows[0].detail), overview.attempts[0].detail!, failure.message]) {
+        expect(output).not.toContain("/private/");
+        expect(output).not.toContain("%2Fprivate%2F");
+        expect(output).toContain("[redact");
+        expect(output).toContain("SCM unavailable");
+      }
+      expect(raw.message).toContain(variant === "encoded" ? encodeURIComponent(privateFile) : privateFile);
+    } finally {
+      vi.unstubAllEnvs();
     }
   });
 

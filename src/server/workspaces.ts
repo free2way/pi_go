@@ -13,6 +13,7 @@ import type {
 import { newId, type Db } from "./db.js";
 import { ScmSettingsStore, scmSettingsStatus } from "./scm-settings.js";
 import { diagnosticSecrets, redactDiagnosticText } from "../shared/diagnostics.js";
+import { serverDiagnosticMessage } from "./server-diagnostics.js";
 
 export type WorkerCall = <T>(pathName: string, init?: RequestInit) => Promise<T>;
 
@@ -56,7 +57,7 @@ function workspaceWorkerFailure(error: unknown, fallbackCode: string, fallbackSt
       504,
     );
   }
-  return new WorkspaceError(typed.code ?? fallbackCode, redactDiagnosticText(typed.message, [...diagnosticSecrets(), ...secrets]), typed.status ?? fallbackStatus);
+  return new WorkspaceError(typed.code ?? fallbackCode, serverDiagnosticMessage(typed.message, { credentials: secrets }), typed.status ?? fallbackStatus);
 }
 
 type WorkspaceRow = {
