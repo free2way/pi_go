@@ -5,7 +5,7 @@
  *  - `RUN_CONFLICT` — a compare-and-swap write lost a race against another
  *    committed writer; the caller should re-read and retry.
  */
-import { diagnosticSecrets, redactDiagnosticText } from "../shared/diagnostics.js";
+import { serverDiagnosticMessage } from "./server-diagnostics.js";
 
 export interface ConflictReply {
   status: 409;
@@ -20,7 +20,7 @@ export function isStorageFailure(message: string): boolean {
 /** Classify the original error, then redact in full before any display limit. */
 export function requestErrorReply(error: unknown, environment: NodeJS.ProcessEnv = process.env) {
   const raw = String((error as { message?: unknown } | null)?.message ?? "");
-  const message = redactDiagnosticText(raw, diagnosticSecrets(environment));
+  const message = serverDiagnosticMessage(raw, { environment });
   const storage = isStorageFailure(raw);
   const status = storage ? 503 : (error as { statusCode?: number } | null)?.statusCode ?? 500;
   return {
