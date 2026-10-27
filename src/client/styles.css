@@ -337,6 +337,9 @@ button { color: inherit; }
 .welcome-orbit > i:nth-of-type(3) { bottom: 8px; right: 28px; background: var(--green); }
 .modal-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 18px; background: rgba(3,5,7,.78); backdrop-filter: blur(7px); }
 .modal { width: min(540px, 100%); border: 1px solid #2b323a; background: #0e1216; border-radius: 13px; padding: 20px; box-shadow: 0 30px 80px rgba(0,0,0,.5); }
+.scm-push-dialog { margin: auto; max-width: calc(100vw - 36px); max-height: calc(100dvh - 36px); overflow-y: auto; color: #dfe3e7; }
+.scm-push-dialog::backdrop { background: rgba(3,5,7,.78); backdrop-filter: blur(7px); }
+.scm-push-dialog p { white-space: pre-line; line-height: 1.65; font-size: 13px; color: #a3adb6; }
 .create-run-modal { max-height: calc(100dvh - 36px); overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
 .create-run-modal .modal-actions { position: sticky; bottom: -20px; z-index: 3; margin: 19px -20px -20px; padding: 12px 20px 20px; border-top: 1px solid #20262d; background: rgba(14,18,22,.98); backdrop-filter: blur(8px); }
 .modal-head { display: flex; justify-content: space-between; align-items: flex-start; }

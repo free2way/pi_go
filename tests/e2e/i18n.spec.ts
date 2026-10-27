@@ -1,4 +1,5 @@
 import type { Locator, Page } from "@playwright/test";
+import type { Workspace, WorkspaceRemoteStatus } from "../../src/shared/types";
 import { E2E_DEV_EMAIL, expect, test, trackPageErrors } from "./fixtures";
 
 /**
@@ -39,6 +40,85 @@ const EN = {
 } as const;
 
 test.describe("bilingual UI (中文 / English)", () => {
+  test("SCM confirmation supports cancellation, keyboard focus and one explicit push in both locales", async ({ page }) => {
+    const pageErrors = trackPageErrors(page);
+    const stamp = "2026-01-01T00:00:00Z";
+    const workspace: Workspace = {
+      id: "dialog-test", ownerId: "fixture", nodeId: "server", name: "confirmation-fixture", type: "server",
+      rootPath: "confirmation-fixture", canonicalPath: "/workspace/projects/confirmation-fixture",
+      repositoryUrl: "https://example.invalid/fixture.git", defaultBranch: "main", defaultChecks: [], status: "active",
+      git: { branch: "main", head: "a".repeat(40), dirty: false, dirtyFiles: [] },
+      lastCheckedAt: stamp, createdAt: stamp, updatedAt: stamp, permission: "write",
+    };
+    const remote: WorkspaceRemoteStatus = {
+      provider: "generic", remote: workspace.repositoryUrl!, branch: "main", localHead: "a".repeat(40),
+      remoteHead: "a".repeat(40), relation: "synchronized", ahead: 0, behind: 0, checkedAt: stamp,
+    };
+    const pushes: unknown[] = [];
+    let releasePush = () => {};
+    // UI contract fixture only. Server permission, scanning and persistence are
+    // verified separately through real HTTP/PostgreSQL acceptance tests.
+    await page.route("**/api/me", async (route) => {
+      const response = await route.fetch();
+      await route.fulfill({ json: { ...await response.json(), isAdmin: true } });
+    });
+    await page.route("**/api/workspaces", (route) => route.fulfill({ json: { workspaces: [workspace] } }));
+    await page.route("**/api/workspaces/dialog-test/scm", (route) => route.fulfill({ json: {
+      settings: { provider: "generic", authMode: "https_token", username: null, tokenConfigured: true, updatedAt: stamp },
+      remote, attempts: [],
+    } }));
+    await page.route("**/api/workspaces/dialog-test/scm/check", (route) => route.fulfill({ json: remote }));
+    await page.route("**/api/workspaces/dialog-test/scm/push", async (route) => {
+      pushes.push(route.request().postDataJSON());
+      await new Promise<void>((resolve) => { releasePush = resolve; });
+      await route.fulfill({ status: 503, json: { error: "Controlled failure [redacted]", code: "SCM_REMOTE_UNREACHABLE" } });
+    });
+    await page.goto("/");
+    await page.getByRole("button", { name: "工作区", exact: true }).click();
+    await page.getByRole("button", { name: "仓库同步", exact: true }).click();
+    for (const copy of [
+      { locale: "zh", title: "确认推送代码", push: "推送到远程", cancel: "取消", failed: "仓库同步失败" },
+      { locale: "en", title: "Confirm code push", push: "Push to remote", cancel: "Cancel", failed: "Repository sync failed" },
+    ]) {
+      await localeSelect(page).selectOption(copy.locale);
+      const opener = page.locator(".ws-scm-actions").getByRole("button", { name: copy.push, exact: true });
+      const dialog = page.getByRole("dialog", { name: copy.title, exact: true });
+      const countBefore = pushes.length;
+      await opener.click();
+      await expect(dialog).toContainText(workspace.name);
+      await expect(dialog.getByRole("button", { name: copy.cancel, exact: true })).toBeFocused();
+      await dialog.getByRole("button", { name: copy.cancel, exact: true }).press("Enter");
+      await expect(dialog).not.toBeVisible();
+      await expect(opener).toBeFocused();
+      expect(pushes).toHaveLength(countBefore);
+      await opener.click();
+      await page.keyboard.press("Escape");
+      await expect(dialog).not.toBeVisible();
+      await expect(opener).toBeFocused();
+      expect(pushes).toHaveLength(countBefore);
+      await opener.click();
+      await page.keyboard.press("Shift+Tab");
+      await expect(dialog.getByRole("button", { name: copy.push, exact: true })).toBeFocused();
+      await page.keyboard.press("Tab");
+      await expect(dialog.getByRole("button", { name: copy.cancel, exact: true })).toBeFocused();
+      await page.keyboard.press("Tab");
+      await expect(dialog.getByRole("button", { name: copy.push, exact: true })).toBeFocused();
+      await page.keyboard.press("Tab");
+      await expect(dialog.getByRole("button", { name: copy.cancel, exact: true })).toBeFocused();
+      await dialog.getByRole("button", { name: copy.push, exact: true }).click({ clickCount: 2 });
+      await expect.poll(() => pushes.length).toBe(countBefore + 1);
+      await expect(dialog).not.toBeVisible();
+      await expect(opener).toBeDisabled();
+      expect(pushes.at(-1)).toEqual({ confirm: true });
+      releasePush();
+      await expect(page.locator(".ws-scm-panel .form-error")).toContainText(copy.failed);
+      await expect(page.locator(".ws-scm-panel .form-error")).toContainText("[redacted]");
+      await expect(opener).toBeEnabled();
+      expect(pushes).toHaveLength(countBefore + 1);
+    }
+    expect(pageErrors).toEqual([]);
+  });
+
   test("topbar language selector lists both locales and defaults to 中文 for a zh-CN browser", async ({ page }) => {
     await page.goto("/");
 
