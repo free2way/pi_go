@@ -328,6 +328,29 @@ describe("workspace service", () => {
     }
   });
 
+  it.each(["plain", "encoded", "truncated"])("safely projects historical SCM audit paths without rewriting evidence: %s", async (variant) => {
+    const privateFile = "/private/synthetic/scm-history/store.json";
+    const db = await createTestDb();
+    vi.stubEnv("PI_DATA_FILE", privateFile);
+    try {
+      const service = new WorkspaceService(db, (async (route: string) => {
+        if (route === "/workspaces/verify") return verifyOk();
+        throw new Error("controlled SCM failure");
+      }) as WorkerCall);
+      const workspace = await service.register("owner", "pi_go");
+      await service.push(["owner"], workspace.id, "owner").catch(() => undefined);
+      const legacy = `SCM historical failure ${variant === "truncated" ? "x".repeat(775) : ""}${variant === "encoded" ? encodeURIComponent(privateFile) : privateFile}`;
+      await db.query("UPDATE workspace_scm_sync_attempts SET detail=$1 WHERE workspace_id=$2", [legacy, workspace.id]);
+      const detail = (await service.scmOverview(["owner"], workspace.id)).attempts[0].detail!;
+      expect(detail).not.toContain("/private/");
+      expect(detail).not.toContain("%2Fprivate%2F");
+      expect(detail).toContain("[redact");
+      expect(detail).toContain("SCM historical failure");
+      const persisted = await db.query("SELECT detail FROM workspace_scm_sync_attempts WHERE workspace_id=$1", [workspace.id]);
+      expect(persisted.rows[0].detail).toBe(legacy);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
   it("redacts credential query parameters in persisted repository display URLs", () => {
     const marker = "DUMMY_QUERY_" + "private-value";
     expect(redactGitUrl(`https://repo.example.invalid/repo?token=${marker}`)).not.toContain(marker);
