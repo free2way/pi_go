@@ -267,7 +267,7 @@ export class WorkspaceService {
         authMode: inferScmAuthMode(access.row.repository_url),
       },
       remote: null,
-      attempts: await this.listScmAttempts(id),
+      attempts: await this.listScmAttempts(id, saved?.token ? [saved.token] : []),
     };
   }
 
@@ -347,7 +347,7 @@ export class WorkspaceService {
     }
   }
 
-  private async listScmAttempts(workspaceId: string): Promise<WorkspaceScmAttempt[]> {
+  private async listScmAttempts(workspaceId: string, credentials: readonly string[] = []): Promise<WorkspaceScmAttempt[]> {
     const rows = (await this.db.query(
       "SELECT * FROM workspace_scm_sync_attempts WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT 10",
       [workspaceId],
@@ -355,7 +355,7 @@ export class WorkspaceService {
     return rows.map((row) => ({
       id: String(row.id), operation: "push", status: String(row.status) as WorkspaceScmAttempt["status"],
       actorId: String(row.actor_id), localHead: row.local_head ? String(row.local_head) : null,
-      remoteHead: row.remote_head ? String(row.remote_head) : null, detail: row.detail ? serverDiagnosticMessage(String(row.detail)) : null,
+      remoteHead: row.remote_head ? String(row.remote_head) : null, detail: row.detail ? serverDiagnosticMessage(String(row.detail), { credentials }) : null,
       createdAt: String(row.created_at),
     }));
   }
