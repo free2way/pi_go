@@ -1,5 +1,7 @@
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import type { Locator, Page } from "@playwright/test";
-import type { Workspace, WorkspaceRemoteStatus } from "../../src/shared/types";
+import type { Run, RunArtifact, Workspace, WorkspaceRemoteStatus } from "../../src/shared/types";
 import { E2E_DEV_EMAIL, expect, test, trackPageErrors } from "./fixtures";
 
 /**
@@ -40,6 +42,69 @@ const EN = {
 } as const;
 
 test.describe("bilingual UI (中文 / English)", () => {
+  test("diagnostics downloads verify bytes and display safe failures in both locales", async ({ page }) => {
+    const pageErrors = trackPageErrors(page);
+    const stamp = "2026-01-01T00:00:00Z";
+    const run: Run = {
+      id: "artifact-ui", ownerId: "fixture", title: "Diagnostic artifact fixture", task: "Synthetic UI contract",
+      repository: "fixture", branch: "fixture", mode: "real", state: "completed", round: 1, maxRounds: 1,
+      createdAt: stamp, updatedAt: stamp, developer: { provider: "deepseek", model: "fixture" },
+      reviewer: { provider: "openai", model: "fixture" }, checks: [], findings: [], diff: "", summary: "Synthetic only",
+      usage: { inputTokens: 0, outputTokens: 0, estimatedCost: 0 }, durationMs: 0, lastSeq: 0,
+    };
+    const body = "Safe trace [redacted] 中文\n";
+    const artifact: RunArtifact = { runId: run.id, artifactId: "trace", kind: "trace", bytes: Buffer.byteLength(body), sha256: createHash("sha256").update(body).digest("hex"), baseSha: null, createdAt: stamp };
+    let status = 200;
+    let returnedBody = body;
+    let listFails = false;
+    await page.route("**/api/runs", (route) => route.fulfill({ json: [run] }));
+    await page.route("**/api/runs/artifact-ui", (route) => route.fulfill({ json: run }));
+    await page.route("**/api/runs/artifact-ui/events", (route) => route.fulfill({ json: [] }));
+    await page.route("**/api/runs/artifact-ui/stream", (route) => route.fulfill({ contentType: "text/event-stream", body: "" }));
+    await page.route("**/api/runs/artifact-ui/artifacts", (route) => route.fulfill(listFails
+      ? { status: 500, json: { error: "DUMMY_private_list_failure" } }
+      : { json: { artifacts: [artifact, { ...artifact, artifactId: "diff", kind: "patch" }] } }));
+    await page.route("**/api/runs/artifact-ui/artifacts/trace/download", (route) => route.fulfill({ status, contentType: status === 200 ? "application/octet-stream" : "application/json", body: status === 200 ? returnedBody : '{"error":"DUMMY_private_proxy_failure"}' }));
+    await page.goto("/");
+    await expect(page.locator(".run-heading h1")).toHaveText(run.title);
+    for (const copy of [
+      { locale: "zh", tab: "诊断制品", download: "下载 trace", refresh: "刷新", unsafe: "已阻止下载", unavailable: "无权访问", integrity: "SHA-256 与列表不一致", loadFailed: "无法读取制品" },
+      { locale: "en", tab: "Diagnostics", download: "Download trace", refresh: "Refresh", unsafe: "failed a safety check", unavailable: "access denied", integrity: "SHA-256 differs", loadFailed: "Unable to load artifacts" },
+    ]) {
+      await localeSelect(page).selectOption(copy.locale);
+      await page.locator(".detail-tabs").getByRole("button", { name: copy.tab, exact: true }).click();
+      const panel = page.getByRole("region", { name: copy.tab, exact: true });
+      await expect(panel.locator("li")).toHaveCount(1);
+      await expect(panel).toContainText(artifact.sha256!.slice(0, 16));
+      const button = panel.getByRole("button", { name: copy.download, exact: true });
+      status = 200; returnedBody = body;
+      const downloadEvent = page.waitForEvent("download");
+      await button.click();
+      const download = await downloadEvent;
+      expect(download.suggestedFilename()).toBe("artifact-ui-trace.txt");
+      expect(await readFile((await download.path())!, "utf8")).toBe(body);
+      let unexpectedDownloads = 0;
+      const unexpected = () => { unexpectedDownloads += 1; };
+      page.on("download", unexpected);
+      for (const scenario of [{ code: 409, message: copy.unsafe }, { code: 404, message: copy.unavailable }, { code: 200, message: copy.integrity }]) {
+        status = scenario.code; returnedBody = body.replace("Safe", "Fake");
+        await button.click();
+        await expect(panel.getByRole("alert")).toContainText(scenario.message);
+        await expect(button).toBeEnabled();
+        await expect(panel).not.toContainText("DUMMY_private");
+      }
+      expect(unexpectedDownloads).toBe(0); page.off("download", unexpected);
+      listFails = true;
+      await panel.getByRole("button", { name: copy.refresh, exact: true }).click();
+      await expect(panel.getByRole("alert")).toContainText(copy.loadFailed);
+      await expect(panel).not.toContainText("DUMMY_private");
+      listFails = false;
+      await panel.getByRole("button", { name: copy.refresh, exact: true }).click();
+      await expect(button).toBeVisible();
+    }
+    expect(pageErrors).toEqual([]);
+  });
+
   test("SCM confirmation supports cancellation, keyboard focus and one explicit push in both locales", async ({ page }) => {
     const pageErrors = trackPageErrors(page);
     const stamp = "2026-01-01T00:00:00Z";

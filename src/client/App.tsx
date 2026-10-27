@@ -72,6 +72,7 @@ import { branchStatus, currentRoundStatus, roundStatuses, roundStatusMeta, type 
 import type { ChatMessage, ConfigStatus, CurrentUser, Finding, ModelCatalogResponse, RoundSummary, Run, RunArtifact, RunEvent, RunMode, RunRoleUsage, RunState, Workspace } from "../shared/types";
 import type { ModelTemplate } from "../shared/agile";
 import { api } from "./api";
+import { ArtifactsPanel } from "./ArtifactsPanel";
 import {
   decisionBriefExpanded,
   decisionBriefHeadingKey,
@@ -115,7 +116,7 @@ const WorkspacesPage = lazy(() => import("./WorkspacesPage").then((module) => ({
  */
 const RECENT_RUNS_LIMIT = 5;
 
-type Tab = "activity" | "agents" | "review" | "diff" | "checks" | "budget" | "decisions";
+type Tab = "activity" | "agents" | "review" | "diff" | "checks" | "budget" | "decisions" | "artifacts";
 type FlowNodeData = {
   label: string;
   caption: string;
@@ -2245,6 +2246,7 @@ export function App({ onSignOut }: { onSignOut?: () => void } = {}) {
                     ["agents", `Agents ${activeRun.plan?.tasks.length || ""}`, Bot],
                     ["review", `${t("topology.tabs.review")} ${activeRun.findings.length || ""}`, ShieldCheck],
                     ["diff", "Diff", FileCode2],
+                    ["artifacts", t("artifacts.title"), Download],
                     ["checks", t("topology.tabs.checks"), ListChecks],
                     ["budget", t("topology.tabs.budget"), Braces],
                     ["decisions", t("topology.tabs.decisions"), Scale],
@@ -2257,6 +2259,7 @@ export function App({ onSignOut }: { onSignOut?: () => void } = {}) {
                   {tab === "agents" && <SubAgentsPanel run={activeRun} />}
                   {tab === "review" && <ReviewPanel findings={activeRun.findings} highlightKey={highlightFinding} />}
                   {tab === "diff" && <DiffPanel run={activeRun} artifacts={artifacts} mergeRequestConfigured={config?.mergeRequestConfigured} />}
+                  {tab === "artifacts" && <ArtifactsPanel key={activeRun.id} runId={activeRun.id} />}
                   {tab === "checks" && <ChecksPanel run={activeRun} />}
                   {tab === "budget" && <BudgetPanel run={activeRun} />}
                   {tab === "decisions" && <DecisionsPanel run={activeRun} config={config} />}

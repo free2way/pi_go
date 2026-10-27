@@ -1242,3 +1242,10 @@ button.agile-metrics-row:hover strong { color: #c3d274; }
 .backup-protected { display: flex; align-items: center; gap: 6px; color: var(--green, #73d6a2); font-size: 12px; }
 .backup-audit { padding-left: 20px; line-height: 1.8; font-size: 12px; overflow-wrap: anywhere; }
 @media (max-width: 700px) { .backups-page { padding: 16px; } .backup-entry { align-items: flex-start; flex-wrap: wrap; } }
+
+/* Diagnostic files use the existing detail panel and download controls. */
+.diagnostic-artifact-list { list-style: none; margin: 0; padding: 0; }
+.diagnostic-artifact-list li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 0; border-bottom: 1px solid #252a31; }
+.diagnostic-artifact-list li > div { min-width: 0; display: grid; gap: 5px; overflow-wrap: anywhere; }
+.diagnostic-artifact-list span, .diagnostic-artifact-list code { font-size: 10px; color: #8a919b; }
+.diagnostic-artifact-list button { flex-shrink: 0; }
