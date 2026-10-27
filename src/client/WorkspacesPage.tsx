@@ -13,7 +13,7 @@ import {
   UploadCloud,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { ConfigStatus, Run, ScmAuthMode, ScmProvider, Workspace, WorkspaceRemoteStatus, WorkspaceScmOverview } from "../shared/types";
 import { DEFAULT_LOCALE, intlLocale, t, type Locale } from "../shared/i18n";
 import { api } from "./api";
@@ -110,6 +110,19 @@ export function WorkspacesPage({ config, runs, onOpenCredentials, isAdmin }: {
   const [scmToken, setScmToken] = useState("");
   const [scmBusy, setScmBusy] = useState(false);
   const [scmError, setScmError] = useState("");
+  const [scmPushTarget, setScmPushTarget] = useState<Workspace>();
+  const scmPushDialog = useRef<HTMLDialogElement>(null);
+  const scmPushInFlight = useRef(false);
+
+  useEffect(() => {
+    const dialog = scmPushDialog.current;
+    if (!dialog) return;
+    if (scmPushTarget && isAdmin && scmPushTarget.id === scmWorkspaceId) {
+      if (!dialog.open) dialog.showModal();
+    } else if (dialog.open) {
+      dialog.close();
+    }
+  }, [scmPushTarget, isAdmin, scmWorkspaceId]);
 
   const load = useCallback(async () => {
     setLoadError("");
@@ -301,7 +314,9 @@ export function WorkspacesPage({ config, runs, onOpenCredentials, isAdmin }: {
   };
 
   const pushScm = async (workspace: Workspace) => {
-    if (!window.confirm(t("workspace.scmPushConfirm", { name: workspace.name }))) return;
+    if (scmPushInFlight.current || scmBusy || !isAdmin || scmWorkspaceId !== workspace.id || !canPushScm(workspace)) return;
+    scmPushInFlight.current = true;
+    setScmPushTarget(undefined);
     setScmBusy(true);
     setScmError("");
     try {
@@ -313,6 +328,7 @@ export function WorkspacesPage({ config, runs, onOpenCredentials, isAdmin }: {
     } catch (cause) {
       setScmError(t("workspace.scmFailed", { message: describeError(cause, locale) }));
     } finally {
+      scmPushInFlight.current = false;
       setScmBusy(false);
     }
   };
@@ -349,8 +365,27 @@ export function WorkspacesPage({ config, runs, onOpenCredentials, isAdmin }: {
     return /^https?:\/\//i.test(remote) && !scmOverview?.settings.tokenConfigured;
   };
 
+  const canPushScm = (workspace: Workspace) =>
+    !scmHttpsTokenRequired(workspace) && !!scmRemote && !["behind", "diverged", "no_remote"].includes(scmRemote.relation);
+
   return (
     <div className="workspaces-page">
+      <dialog
+        ref={scmPushDialog}
+        className="modal scm-push-dialog"
+        aria-labelledby="scm-push-title"
+        aria-describedby="scm-push-description"
+        onClose={() => setScmPushTarget(undefined)}
+      >
+        {scmPushTarget && <>
+          <h2 id="scm-push-title">{t("workspace.scmPushTitle")}</h2>
+          <p id="scm-push-description">{t("workspace.scmPushConfirm", { name: scmPushTarget.name })}</p>
+          <div className="modal-actions">
+            <button type="button" className="button secondary" autoFocus onClick={() => setScmPushTarget(undefined)}>{t("common.cancel")}</button>
+            <button type="button" className="button primary" disabled={scmBusy || !isAdmin || !canPushScm(scmPushTarget)} onClick={() => void pushScm(scmPushTarget)}>{t("workspace.scmPush")}</button>
+          </div>
+        </>}
+      </dialog>
       <section className="ws-heading">
         <div>
           <span className="eyebrow">SERVER WORKSPACES</span>
@@ -538,7 +573,7 @@ export function WorkspacesPage({ config, runs, onOpenCredentials, isAdmin }: {
                     <button type="button" disabled={scmBusy} onClick={() => void checkScm(workspace)}>{scmBusy ? <LoaderCircle className="spin" size={13} /> : <RotateCcw size={13} />}{t("workspace.scmCheck")}</button>
                     {remoteBrowseUrl && <a href={remoteBrowseUrl} target="_blank" rel="noreferrer"><ExternalLink size={13} />{t("workspace.scmOpen")}</a>}
                     {isAdmin && <button type="button" disabled={scmBusy} onClick={() => void saveScm(workspace)}><Check size={13} />{t("workspace.scmSave")}</button>}
-                    {isAdmin && <button type="button" className="primary" disabled={scmBusy || scmHttpsTokenRequired(workspace) || !scmRemote || scmRemote.relation === "behind" || scmRemote.relation === "diverged" || scmRemote.relation === "no_remote"} onClick={() => void pushScm(workspace)}><UploadCloud size={13} />{t("workspace.scmPush")}</button>}
+                    {isAdmin && <button type="button" className="primary" disabled={scmBusy || !canPushScm(workspace)} onClick={() => setScmPushTarget(workspace)}><UploadCloud size={13} />{t("workspace.scmPush")}</button>}
                     {isAdmin && scmOverview?.settings.updatedAt && <button type="button" className="danger" disabled={scmBusy} onClick={() => void deleteScm(workspace)}><Trash2 size={13} />{t("workspace.scmDelete")}</button>}
                   </div>
                   <div className="ws-scm-attempts">
