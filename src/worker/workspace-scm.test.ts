@@ -1,3 +1,7 @@
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { detectScmProvider, inspectWorkspaceRemote, pushWorkspaceBranch, redactRemoteUrl, scmAuthEnvironment, type ScmGitResult } from "./workspace-scm.js";
 
@@ -139,5 +143,40 @@ describe("workspace SCM", () => {
       expect(String(error)).not.toContain("sensitive diagnostic");
     }
     expect(f.pushed()).toBe(false);
+  });
+});
+
+
+describe("known SCM credential in exported source", () => {
+  it.each(["plain", "url", "json", "deleted-history", "filename"])("blocks the supplied opaque credential before push: %s", async (variant) => {
+    const cwd = mkdtempSync(join(tmpdir(), "pigo-known-export-"));
+    const run = (args: string[]) => execFileSync("git", ["-c", "core.hooksPath=/dev/null", ...args], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } });
+    try {
+      run(["init", "-b", "main"]);run(["config", "user.name", "Fixture"]);run(["config", "user.email", ["fixture", "example.invalid"].join("@")]);
+      run(["commit", "--allow-empty", "-m", "base"]);
+      const base = run(["rev-parse", "HEAD"]).trim();
+      run(["update-ref", "refs/pigo/remotes/origin/main", base]);
+      const token = "DUMMY_" + 'opaque/+" current-value';
+      const encoded = variant === "url" ? encodeURIComponent(token) : variant === "json" ? JSON.stringify(token).slice(1, -1) : token;
+      writeFileSync(join(cwd, variant === "filename" ? encodeURIComponent(token) + ".txt" : "source.txt"), variant === "filename" ? "ordinary source" : "ordinary opaque value " + encoded);
+      run(["add", "."]);run(["commit", "-m", "source"]);
+      if (variant === "deleted-history") { run(["rm", "source.txt"]);run(["commit", "-m", "delete source"]); }
+      let pushes = 0;
+      const git = async (args: string[]) => {
+        if (args[0] === "remote") return ok("https://repo.example.invalid/repository.git");
+        if (args[0] === "ls-remote") return ok(`${pushes ? run(["rev-parse", "HEAD"]).trim() : base} refs/heads/main`);
+        if (args[0] === "fetch") return ok();
+        if (args.includes("push")) { pushes++;run(["update-ref", "refs/pigo/remotes/origin/main", "HEAD"]);return ok(); }
+        try { return ok(run(args)); } catch { return { code: 1, stdout: "", stderr: "fixture read failed" }; }
+      };
+      try {
+        await pushWorkspaceBranch({ branch: "main", git, credential: { provider: "generic", authMode: "https_token", token } });
+        expect.fail("Known credential must not be pushed");
+      } catch (error) {
+        expect(error).toMatchObject({ code: "SCM_EXPORT_POLICY_BLOCKED" });
+        for (const value of [token, encodeURIComponent(token), JSON.stringify(token).slice(1, -1)]) expect(String(error)).not.toContain(value);
+      }
+      expect(pushes).toBe(0);
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
   });
 });

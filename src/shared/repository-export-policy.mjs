@@ -24,8 +24,18 @@ const rules = [
   ["secret", /(?:password|passwd|access[_-]?token|api[_-]?key|secret)["']?\s*[:=]\s*["'][A-Za-z0-9][A-Za-z0-9@._+:/!-]{7,}["']/iu],
 ];
 
-export function contentPolicy(text) {
+function credentialVariants(credentials) {
+  return [...new Set(credentials.filter((value) => typeof value === "string" && value.length > 0)
+    .flatMap((value) => [value, encodeURIComponent(value), JSON.stringify(value).slice(1, -1)]))];
+}
+
+export function contentPolicy(text, credentials = []) {
   const categories = rules.filter(([, pattern]) => pattern.test(text)).map(([category]) => category);
+  // Saved SCM credentials may be opaque values with no recognizable prefix or
+  // field name. Compare only explicit context, never return a matched value.
+  if (credentialVariants(credentials).some((variant) => text.includes(variant))) {
+    categories.push("secret");
+  }
   if (/(?:username|user[_-]?name|account[_-]?id|email)["']?\s*[:=]\s*["'][A-Za-z0-9][A-Za-z0-9@._+-]{2,}["']/iu.test(text)) categories.push("account_data");
   if (/(?:^|\n)\s*[A-Z0-9_]*(?:PASSWORD|PASSWD|TOKEN|API_KEY|SECRET)\s*[:=]\s*[A-Za-z0-9][A-Za-z0-9._+:/!-]{7,}/u.test(text)) categories.push("secret");
   return [...new Set(categories)];
@@ -42,7 +52,7 @@ const MAX_TOTAL_BYTES = 100 * 1024 * 1024;
  * new paths. Never return source text. Incomplete history, binary/unreadable
  * content and limits fail closed.
  */
-export async function inspectExportHistory({ git, head, base }) {
+export async function inspectExportHistory({ git, head, base, credentials = [] }) {
   if (!SHA.test(head) || (base && !SHA.test(base))) throw new ExportPolicyError("Invalid export revision");
   const checked = async (args) => {
     const result = await git(["--no-replace-objects", ...args]);
@@ -60,8 +70,12 @@ export async function inspectExportHistory({ git, head, base }) {
   const findings = new Map();
   const blobs = new Map();
   let bytes = 0;
+  const known = credentialVariants(credentials);
   const add = (category, name) => {
-    const path = name.replace(/[\u0000-\u001f\u007f]/gu, "?").slice(0, 180);
+    // Filenames are also diagnostics; remove full values before limiting text.
+    let safeName = name;
+    for (const value of known.toSorted((a, b) => b.length - a.length)) safeName = safeName.replaceAll(value, "[redacted]");
+    const path = safeName.replace(/[\u0000-\u001f\u007f]/gu, "?").slice(0, 180);
     findings.set(`${category}:${path}`, { category, path });
   };
   const treeEntry = async (commit, name) => {
@@ -104,6 +118,7 @@ export async function inspectExportHistory({ git, head, base }) {
     for (const name of [...new Set(changed.split("\0").filter(Boolean))]) {
       const current = await treeEntry(commit, name);
       if (!current) throw new ExportPolicyError("Incomplete export tree entry");
+      if (known.some((value) => name.includes(value))) add("secret", name);
       const category = pathPolicy(name);
       if (category) add(category, name);
       // Gitlinks and symlinks need explicit external review; never skip them silently.
@@ -124,7 +139,7 @@ export async function inspectExportHistory({ git, head, base }) {
         for (const line of parentValue.text.split(/\r?\n/u)) previousLines.add(line);
       }
       const introduced = value.text.split(/\r?\n/u).filter((line) => !previousLines.has(line)).join("\n");
-      for (const rule of contentPolicy(introduced)) add(rule, name);
+      for (const rule of contentPolicy(introduced, credentials)) add(rule, name);
     }
   }
   return [...findings.values()];

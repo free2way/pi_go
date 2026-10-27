@@ -27,9 +27,10 @@ export type WorkspacePushPolicyViolation = ExportFinding;
 export async function inspectWorkspacePushPolicy(input: {
   before: WorkspaceRemoteStatus;
   git: ScmGitExec;
+  credentials?: readonly string[];
 }): Promise<WorkspacePushPolicyViolation[]> {
   try {
-    return await inspectExportHistory({ git: input.git, head: input.before.localHead, base: input.before.remoteHead });
+    return await inspectExportHistory({ git: input.git, head: input.before.localHead, base: input.before.remoteHead, credentials: input.credentials });
   } catch {
     throw new WorkspaceScmError("SCM_EXPORT_POLICY_FAILED", "Unable to scan complete export history; push is blocked");
   }
@@ -183,7 +184,7 @@ export async function pushWorkspaceBranch(input: {
   if (before.relation === "synchronized") return { pushed: false, before, after: before };
   const rawRemote = (await input.git(["remote", "get-url", "origin"])).stdout.trim();
   requirePushAuthentication(rawRemote, input.credential);
-  const policyViolations = await inspectWorkspacePushPolicy({ before, git: input.git });
+  const policyViolations = await inspectWorkspacePushPolicy({ before, git: input.git, credentials: input.credential?.token ? [input.credential.token] : [] });
   if (policyViolations.length > 0) {
     const sample = policyViolations.slice(0, 10).map((item) => `${item.category}:${item.path}`).join(", ");
     const remainder = policyViolations.length > 10 ? ` (+${policyViolations.length - 10} more)` : "";
