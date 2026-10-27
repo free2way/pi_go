@@ -148,7 +148,7 @@ describe("workspace SCM", () => {
 
 
 describe("known SCM credential in exported source", () => {
-  it.each(["plain", "url", "json", "deleted-history", "filename"])("blocks the supplied opaque credential before push: %s", async (variant) => {
+  it.each(["plain", "url", "json", "deleted-history", "filename"].flatMap(variant => ["scm", "model"].map(source => ({ variant, source }))))("blocks the supplied opaque credential before push: $source $variant", async ({ variant, source }) => {
     const cwd = mkdtempSync(join(tmpdir(), "pigo-known-export-"));
     const run = (args: string[]) => execFileSync("git", ["-c", "core.hooksPath=/dev/null", ...args], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } });
     try {
@@ -170,7 +170,7 @@ describe("known SCM credential in exported source", () => {
         try { return ok(run(args)); } catch { return { code: 1, stdout: "", stderr: "fixture read failed" }; }
       };
       try {
-        await pushWorkspaceBranch({ branch: "main", git, credential: { provider: "generic", authMode: "https_token", token } });
+        await pushWorkspaceBranch({ branch: "main", git, credential: { provider: "generic", authMode: "https_token", token: source === "scm" ? token : "DUMMY_scm_auth" }, exportCredentials: source === "model" ? [token] : [] });
         expect.fail("Known credential must not be pushed");
       } catch (error) {
         expect(error).toMatchObject({ code: "SCM_EXPORT_POLICY_BLOCKED" });

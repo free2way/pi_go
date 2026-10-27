@@ -109,6 +109,7 @@ import { buildRequirementPrompt } from "./requirement-assistant.js";
 import { parsePiAssistantOutput, PI_ASSISTANT_PROMPT_VERSION } from "../shared/pi-assistant.js";
 import { buildPiAssistantPrompt, sanitizePiAssistantPayload } from "./pi-assistant.js";
 import { inspectWorkspaceRemote, pushWorkspaceBranch, WorkspaceScmError, type WorkspaceScmCredentialInput } from "./workspace-scm.js";
+import { parseExportCredentialContext } from "../shared/export-credential-context.js";
 
 const port = Number(process.env.PORT || 3200);
 const host = process.env.HOST || "localhost";
@@ -1006,12 +1007,13 @@ async function pushWorkspace(input: {
   relativePath: string;
   branch: string;
   credential?: WorkspaceScmCredentialInput;
+  exportCredentials?: readonly string[];
 }) {
   const target = await workspaceScmGit(input.relativePath);
   return serializeWorktreeMutation(async () => {
     const dirty = await git(target.directory, ["status", "--porcelain"]);
     if (dirty) throw new WorkspaceScmError("WORKSPACE_DIRTY", "Workspace has uncommitted changes; push is blocked");
-    return pushWorkspaceBranch({ branch: input.branch, credential: input.credential, git: target.exec });
+    return pushWorkspaceBranch({ branch: input.branch, credential: input.credential, exportCredentials: input.exportCredentials, git: target.exec });
   });
 }
 
@@ -2975,19 +2977,23 @@ const server = createServer(async (request, response) => {
         throw error;
       }
     }
-    if (request.method === "POST" && url.pathname === "/workspaces/push") {
-      const body = await readJson(request) as { relativePath?: unknown; branch?: unknown; credential?: WorkspaceScmCredentialInput };
+    if (request.method === "POST" && ["/workspaces/push", "/workspaces/push-guarded"].includes(url.pathname)) {
+      const body = await readJson(request) as { relativePath?: unknown; branch?: unknown; credential?: WorkspaceScmCredentialInput; exportCredentials?: unknown };
+      const exportCredentials = body.exportCredentials === undefined && url.pathname === "/workspaces/push"
+        ? [] : parseExportCredentialContext(body.exportCredentials);
+      if (!exportCredentials) return json(response, 400, { error: "Invalid export credential context", code: "SCM_EXPORT_POLICY_FAILED" });
       const relativePath = sanitizeRelativePath(String(body.relativePath ?? ""));
       if (!relativePath) return json(response, 422, { error: "Invalid workspace path", code: "WORKSPACE_INVALID" });
       try {
         return json(response, 200, await pushWorkspace({
           relativePath,
           branch: String(body.branch ?? ""),
+          exportCredentials,
           ...(body.credential ? { credential: body.credential } : {}),
         }));
       } catch (error) {
-        if (error instanceof WorkspaceScmError) return json(response, 409, { error: error.message, code: error.code });
-        throw error;
+        const credentials = [...exportCredentials, ...(body.credential?.token ? [body.credential.token] : [])];
+        return json(response, error instanceof WorkspaceScmError ? 409 : 500, { error: diagnosticMessage(error, credentials), code: error instanceof WorkspaceScmError ? error.code : "SCM_PUSH_FAILED" });
       }
     }
     if (request.method === "POST" && url.pathname === "/requirements/refine") {

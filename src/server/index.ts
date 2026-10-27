@@ -21,6 +21,7 @@ import { createInfrastructureAlertSweeper } from "./infrastructure-alerts.js";
 import { Authenticator, normalizePublicOrigin } from "./auth.js";
 import { ExpiringLruCache } from "./expiring-lru-cache.js";
 import { CredentialVault } from "./credential-vault.js";
+import { sourceExportCredentials } from "./source-export-credentials.js";
 import { normalizeReleaseCallbackOrigin, ReleaseSettingsStore, releaseSettingsStatus } from "./release-settings.js";
 import { releaseCallbackTokens, resolveReleaseRoute, type ReleaseEnvironment } from "./release-routing.js";
 import { ScmSettingsStore } from "./scm-settings.js";
@@ -234,6 +235,7 @@ const workspaces = new WorkspaceService(
   db,
   (pathName, init) => workerRequest(pathName, init, scmRequestTimeoutMs),
   scmSettings,
+  (actorId) => sourceExportCredentials(actorId, vault, (id) => identities.legacyOwnerFor(id)),
 );
 const agile = new AgileService(db);
 // Open registration means this cache can no longer be an unbounded process-wide
