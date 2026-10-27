@@ -126,6 +126,7 @@ export class WorkspaceService {
     private readonly db: Db,
     private readonly callWorker: WorkerCall,
     private readonly scmSettings?: ScmSettingsStore,
+    private readonly readExportCredentials: (actorId: string) => Promise<readonly string[]> = async () => [],
   ) {}
 
   async list(ownerKeys: string[]): Promise<Workspace[]> {
@@ -324,10 +325,18 @@ export class WorkspaceService {
     if (!branch) throw new WorkspaceError("SCM_BRANCH_MISSING", "Workspace default branch is not configured", 409);
     const credential = this.scmSettings?.get(id);
     const createdAt = new Date().toISOString();
+    let exportCredentials: readonly string[] = [];
     try {
-      const result = await this.callWorker<WorkspacePushResult>("/workspaces/push", {
+      try {
+        exportCredentials = await this.readExportCredentials(actorId);
+      } catch {
+        throw new WorkspaceError("SCM_EXPORT_POLICY_FAILED", "Source credential context unavailable; push is blocked", 503);
+      }
+      // A separate route fails closed against an older Worker; never fall back
+      // to a push endpoint that could silently ignore the credential context.
+      const result = await this.callWorker<WorkspacePushResult>("/workspaces/push-guarded", {
         method: "POST",
-        body: JSON.stringify({ relativePath: access.row.root_path, branch, ...(credential ? { credential } : {}) }),
+        body: JSON.stringify({ relativePath: access.row.root_path, branch, exportCredentials, ...(credential ? { credential } : {}) }),
       });
       await this.recordScmAttempt({
         id: newId("scm"), workspaceId: id, actorId, operation: "push",
@@ -338,7 +347,7 @@ export class WorkspaceService {
       });
       return result;
     } catch (error) {
-      const failure = workspaceWorkerFailure(error, "SCM_PUSH_FAILED", 503, credential?.token ? [credential.token] : []);
+      const failure = workspaceWorkerFailure(error, "SCM_PUSH_FAILED", 503, [...exportCredentials, ...(credential?.token ? [credential.token] : [])]);
       await this.recordScmAttempt({
         id: newId("scm"), workspaceId: id, actorId, operation: "push", status: "failed",
         localHead: access.row.git_head, remoteHead: null, detail: failure.message.slice(0, 800), createdAt,

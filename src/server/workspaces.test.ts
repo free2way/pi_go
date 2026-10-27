@@ -241,7 +241,7 @@ describe("workspace service", () => {
         provider: "github", remote: "https://github.com/org/repo.git", branch: "main",
         localHead: "abc", remoteHead: "def", relation: "ahead", ahead: 1, behind: 0, checkedAt: "now",
       };
-      if (pathName === "/workspaces/push") {
+      if (pathName === "/workspaces/push-guarded") {
         pushed = true;
         return {
           pushed: true,
@@ -274,7 +274,7 @@ describe("workspace service", () => {
       await settings.init();
       let received = "";
       const service = new WorkspaceService(db, (async (route: string, init?: RequestInit) => {
-        if (route === "/workspaces/verify") return verifyOk();
+        if (route === "/workspaces/verify") return verifyOk({ relativePath: "fixture" });
         received = JSON.parse(String(init?.body)).credential.token;
         throw Object.assign(new Error(`controlled SCM failure: Bearer ${marker} ${saved} ${encodeURIComponent(saved)}`), { code: "SCM_REMOTE_UNREACHABLE", status: 409 });
       }) as WorkerCall, settings);
@@ -304,7 +304,7 @@ describe("workspace service", () => {
     const db = await createTestDb();
     try {
       const service = new WorkspaceService(db, (async (route: string) => {
-        if (route === "/workspaces/verify") return verifyOk();
+        if (route === "/workspaces/verify") return verifyOk({ relativePath: "fixture" });
         throw raw;
       }) as WorkerCall);
       const workspace = await service.register("owner", "pi_go");
@@ -334,7 +334,7 @@ describe("workspace service", () => {
     vi.stubEnv("PI_DATA_FILE", privateFile);
     try {
       const service = new WorkspaceService(db, (async (route: string) => {
-        if (route === "/workspaces/verify") return verifyOk();
+        if (route === "/workspaces/verify") return verifyOk({ relativePath: "fixture" });
         throw new Error("controlled SCM failure");
       }) as WorkerCall);
       const workspace = await service.register("owner", "pi_go");
@@ -359,7 +359,7 @@ describe("workspace service", () => {
       const settings = new ScmSettingsStore(path.join(directory, "scm.json"), Buffer.alloc(32, 7).toString("base64"));
       await settings.init();
       const service = new WorkspaceService(db, (async (route: string) => {
-        if (route === "/workspaces/verify") return verifyOk();
+        if (route === "/workspaces/verify") return verifyOk({ relativePath: "fixture" });
         throw new Error("controlled SCM failure");
       }) as WorkerCall, settings);
       const workspace = await service.register("owner", "pi_go");
@@ -417,4 +417,48 @@ describe("workspace service", () => {
     expect(overview.attempts[0]?.detail).toContain("configured server timeout");
   });
 
+});
+
+
+describe("model credential source export context", () => {
+  async function fixture(read: (actor: string) => Promise<string[]>, legacyWorker = false) {
+    const db = await createTestDb();
+    const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
+    const worker = (async (route: string, init?: RequestInit) => {
+      if (route === "/workspaces/verify") return verifyOk({ relativePath: "fixture" });
+      calls.push({ path: route, body: JSON.parse(String(init?.body ?? "{}")) });
+      if (legacyWorker && route === "/workspaces/push-guarded") throw Object.assign(new Error("Unsupported route"), { status: 404 });
+      const remote = { provider: "generic", remote: "fixture", branch: "main", localHead: "a", remoteHead: "a", relation: "synchronized", ahead: 0, behind: 0, checkedAt: "now" };
+      return { pushed: false, before: remote, after: remote };
+    }) as WorkerCall;
+    const service = new WorkspaceService(db, worker, undefined, read);
+    const workspace = await service.register("owner", "fixture");
+    return { db, calls, service, workspace };
+  }
+  it("resolves only the acting user and uses a guarded Worker route", async () => {
+    const read = vi.fn(async () => ["DUMMY_model_context"]);
+    const f = await fixture(read);
+    await f.service.push(["owner"], f.workspace.id, "actor", { isAdmin: true });
+    expect(read).toHaveBeenCalledExactlyOnceWith("actor");
+    expect(f.calls).toEqual([{ path: "/workspaces/push-guarded", body: { relativePath: "fixture", branch: "main", exportCredentials: ["DUMMY_model_context"] } }]);
+  });
+  it("fails closed before Worker I/O if credential lookup fails", async () => {
+    const f = await fixture(async () => { throw new Error("DUMMY_private_lookup"); });
+    await expect(f.service.push(["owner"], f.workspace.id, "actor")).rejects.toMatchObject({ code: "SCM_EXPORT_POLICY_FAILED", status: 503 });
+    expect(f.calls).toHaveLength(0);
+    const rows = await f.db.query("SELECT detail FROM workspace_scm_sync_attempts WHERE workspace_id=$1", [f.workspace.id]);
+    expect(JSON.stringify(rows.rows)).not.toContain("DUMMY_private_lookup");
+  });
+  it("does not fall back to an unguarded push on an older Worker", async () => {
+    const f = await fixture(async () => [], true);
+    await expect(f.service.push(["owner"], f.workspace.id, "actor")).rejects.toMatchObject({ status: 404 });
+    expect(f.calls.map(c => c.path)).toEqual(["/workspaces/push-guarded"]);
+  });
+  it("checks workspace access before resolving model credentials", async () => {
+    const read = vi.fn(async () => ["DUMMY_private"]);
+    const f = await fixture(read);
+    await expect(f.service.push(["outsider"], f.workspace.id, "outsider")).rejects.toMatchObject({ code: "WORKSPACE_NOT_FOUND" });
+    expect(read).not.toHaveBeenCalled();
+    expect(f.calls).toHaveLength(0);
+  });
 });

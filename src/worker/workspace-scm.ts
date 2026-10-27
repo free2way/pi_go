@@ -174,6 +174,7 @@ export async function inspectWorkspaceRemote(input: {
 export async function pushWorkspaceBranch(input: {
   branch: string;
   credential?: WorkspaceScmCredentialInput;
+  exportCredentials?: readonly string[];
   git: ScmGitExec;
   now?: () => string;
 }): Promise<WorkspacePushResult> {
@@ -184,7 +185,7 @@ export async function pushWorkspaceBranch(input: {
   if (before.relation === "synchronized") return { pushed: false, before, after: before };
   const rawRemote = (await input.git(["remote", "get-url", "origin"])).stdout.trim();
   requirePushAuthentication(rawRemote, input.credential);
-  const policyViolations = await inspectWorkspacePushPolicy({ before, git: input.git, credentials: input.credential?.token ? [input.credential.token] : [] });
+  const policyViolations = await inspectWorkspacePushPolicy({ before, git: input.git, credentials: [...(input.exportCredentials ?? []), ...(input.credential?.token ? [input.credential.token] : [])] });
   if (policyViolations.length > 0) {
     const sample = policyViolations.slice(0, 10).map((item) => `${item.category}:${item.path}`).join(", ");
     const remainder = policyViolations.length > 10 ? ` (+${policyViolations.length - 10} more)` : "";
