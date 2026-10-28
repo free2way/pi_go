@@ -134,6 +134,7 @@ describe("prepareSandboxStateDirectory", () => {
       expect((await stat(path.join(state, "agent", "models.json"))).mode & 0o777).toBe(0o600);
       expect(JSON.parse(await readFile(path.join(state, "agent", "settings.json"), "utf8"))).toEqual({
         npmCommand: ["pnpm"],
+        retry: { enabled: false, provider: { maxRetries: 0 } },
       });
       expect((await stat(path.join(state, "agent", "settings.json"))).mode & 0o777).toBe(0o600);
       await rm(state, { recursive: true });
@@ -153,6 +154,7 @@ describe("prepareSandboxStateDirectory", () => {
       await prepareSandboxStateDirectory(state);
       expect(JSON.parse(await readFile(path.join(agent, "settings.json"), "utf8"))).toEqual({
         npmCommand: ["custom-pm"],
+        retry: { enabled: false, provider: { maxRetries: 0 } },
       });
     } finally {
       await rm(root, { recursive: true, force: true });

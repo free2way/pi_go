@@ -1,6 +1,7 @@
-import { mkdir, mkdtemp, open, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, rm } from "node:fs/promises";
 import path from "node:path";
 import type { ContainerCreateSpec } from "./docker-api.js";
+import { preparePiRetryPolicy, PiRetryPolicyError } from "./pi-retry-policy.js";
 
 export type SandboxNetwork = "none" | "bridge" | (string & {});
 
@@ -134,20 +135,10 @@ export function sandboxStateDirectory(worktree: string, override?: string): stri
  * the read-only host model file while the container is running.
  */
 export async function prepareSandboxStateDirectory(stateDirectory: string): Promise<void> {
+  await mkdir(stateDirectory, { recursive: true });
+  if ((await lstat(stateDirectory)).isSymbolicLink()) throw new PiRetryPolicyError();
   const agentDirectory = path.join(stateDirectory, "agent");
-  await mkdir(agentDirectory, { recursive: true });
-  // Pi's package manager supports pnpm natively. Seed only new per-run state so
-  // npm can stay absent from the final image without disabling allowlisted Pi
-  // extension/package installation. Never overwrite an operator-owned setting.
-  try {
-    await writeFile(
-      path.join(agentDirectory, "settings.json"),
-      `${JSON.stringify({ npmCommand: ["pnpm"] })}\n`,
-      { flag: "wx", mode: 0o600 },
-    );
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-  }
+  await preparePiRetryPolicy(agentDirectory);
   const mountpoint = await open(path.join(agentDirectory, "models.json"), "a", 0o600);
   await mountpoint.close();
 }
