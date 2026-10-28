@@ -18,6 +18,7 @@ import { AlertManager, createAlertSink } from "./alerts.js";
 import { syncStorageAlerts, type WorkspaceStorageStatus } from "./storage-alerts.js";
 import { readQueueObservation, syncQueueAlerts } from "./queue-alerts.js";
 import { createInfrastructureAlertSweeper } from "./infrastructure-alerts.js";
+import { registerOperationalMetrics } from "./operational-metrics.js";
 import { createProviderAlertSweeper, readProviderAlertObservation } from "./provider-alerts.js";
 import { Authenticator, normalizePublicOrigin } from "./auth.js";
 import { ExpiringLruCache } from "./expiring-lru-cache.js";
@@ -607,6 +608,8 @@ const runDirectoryCleaner: RunDirectoryCleaner = ({ runId, ownerId, dryRun }) =>
     method: "POST",
     body: JSON.stringify({ ownerId, dryRun }),
   });
+
+registerOperationalMetrics(app, { db, pool, version: webVersion, authorized: request => safeTokenMatch(request.headers.authorization) });
 
 app.addHook("onSend", async (request, reply, payload) => {
   reply.header("X-Content-Type-Options", "nosniff");

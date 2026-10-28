@@ -23,6 +23,31 @@ import {
 const token = "0123456789abcdef0123456789abcdef";
 const digest = `sha256:${"d".repeat(64)}`;
 
+test("metrics require bearer auth, expose bounded counts only, never mutate state or weaken deployment HMAC", async t => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "pigo-executor-metrics-"));
+  const { server, store } = await createExecutor({ config: { token, dataFile: path.join(directory, "state.json"), allowedEnvironments: new Set(["staging"]) } });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => { await new Promise(resolve => server.close(resolve)); await rm(directory, { recursive: true, force: true }); });
+  await store.mutate(state => {
+    for (const [i, status] of ["pending", "succeeded", "failed", "private-status-secret"].entries()) state.deliveries[`private-path-${i}`] = { status, callbackStatus: i ? "succeeded" : "failed", detail: token, repository: "/private/project", deliveryId: "private-id" };
+  });
+  const before = await readFile(store.file, "utf8"), url = `http://127.0.0.1:${server.address().port}`;
+  for (const headers of [{}, { authorization: "Bearer wrong" }]) assert.equal((await fetch(url + "/metrics", { headers })).status, 401);
+  const response = await fetch(url + "/metrics", { headers: { authorization: `Bearer ${token}` } });
+  assert.equal(response.status, 200); assert.match(response.headers.get("content-type"), /version=0.0.4/); assert.equal(response.headers.get("cache-control"), "no-store");
+  const text = await response.text();
+  assert.match(text, /pigo_executor_delivery_records\{service="pigo-release-executor",environment="staging",version="0.5.0",state="pending"\} 1\n/);
+  assert.match(text, /state="other"\} 1\n/); assert.doesNotMatch(text, /private-|private\/project|deliveryId/); assert.ok(!text.includes(token));
+  assert.equal((await fetch(url + "/hooks/pigo-release", { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: "{}" })).status, 401);
+  assert.equal(await readFile(store.file, "utf8"), before);
+  // Force a fresh exporter instance, so this checks failures rather than cache.
+  const fresh = await createExecutor({ config: { token, allowedEnvironments: new Set(["staging"]) }, store: { init: async () => {}, metricCounts: () => { throw new Error(token); } } });
+  await new Promise(resolve => fresh.server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise(resolve => fresh.server.close(resolve)));
+  const failure = await fetch(`http://127.0.0.1:${fresh.server.address().port}/metrics`, { headers: { authorization: `Bearer ${token}` } });
+  assert.equal(failure.status, 503); assert.deepEqual(await failure.json(), { error: "Metrics unavailable" });
+});
+
 test("webhook authentication requires both bearer token and raw-body HMAC", () => {
   const rawBody = Buffer.from('{"event":"run.release_requested"}');
   const signature = `sha256=${createHmac("sha256", token).update(rawBody).digest("hex")}`;
