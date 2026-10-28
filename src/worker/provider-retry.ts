@@ -1,4 +1,5 @@
 import { classifyProviderError, type ProviderErrorKind } from "./provider-errors.js";
+import { BudgetExceededError } from "./run-budget.js";
 
 export interface RetryPolicy {
   /** Maximum number of provider attempts (first try included). */
@@ -62,6 +63,9 @@ export async function withProviderRetry<T>(
     try {
       return await operation();
     } catch (error) {
+      // A tool continuation can exhaust the budget inside the Pi operation.
+      // This is a denied request, never a provider failure worth retrying.
+      if (error instanceof BudgetExceededError) throw error;
       lastError = error;
       const message = (error as Error)?.message ?? String(error);
       const kind = classifyProviderError(message);

@@ -77,4 +77,18 @@ describe("pi events", () => {
       totalTokens: 0,
     });
   });
+
+  it("keeps successful tool-turn usage when a denied continuation is aborted", () => {
+    const tracker = new UsageTracker();
+    tracker.track({ type: "message_end", message: { role: "assistant", stopReason: "toolUse", usage: { input: 10, output: 2, totalTokens: 12, cost: { total: 0.01 } } } });
+    tracker.track({ type: "message_end", message: { role: "assistant", stopReason: "aborted", usage: { input: 0, output: 0, totalTokens: 0 } } });
+    expect(tracker.reportedCalls).toBe(1); expect(tracker.totals.totalTokens).toBe(12);
+    expect(assistantErrorFromEvent({ type: "message_end", message: { role: "assistant", stopReason: "aborted", errorMessage: "Request aborted" } })).toContain("PI_ASSISTANT_ABORTED");
+  });
+  it("includes reported compaction usage without inventing usage for a failed compaction", () => {
+    const tracker = new UsageTracker();
+    tracker.track({ type: "compaction_end", result: { usage: { input: 20, output: 3, totalTokens: 23 } } });
+    tracker.track({ type: "compaction_end", aborted: true });
+    expect(tracker.reportedCalls).toBe(1); expect(tracker.totals.totalTokens).toBe(23);
+  });
 });

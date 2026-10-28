@@ -9,6 +9,7 @@ describe("provider error classification", () => {
     expect(classifyProviderError('Error: Unknown provider "openai-proxy". Use --list-models')).toBe("unsupported");
     expect(classifyProviderError("502 Bad Gateway")).toBe("provider");
     expect(classifyProviderError("something unusual happened")).toBe("unknown");
+    expect(classifyProviderError("PI_ASSISTANT_ABORTED: Request aborted")).toBe("protocol");
   });
 
   it("maps providers onto Pi key environment variables", () => {

@@ -70,7 +70,9 @@ export function assistantTextFromEvent(event: Record<string, unknown>): string |
 export function assistantErrorFromEvent(event: Record<string, unknown>): string | undefined {
   if (event.type !== "message_end") return undefined;
   const message = event.message as { role?: string; stopReason?: string; errorMessage?: string } | undefined;
-  if (message?.role !== "assistant" || message.stopReason !== "error") return undefined;
+  if (message?.role !== "assistant") return undefined;
+  if (message.stopReason === "aborted") return `PI_ASSISTANT_ABORTED: ${message.errorMessage || "Pi assistant request was cancelled"}`;
+  if (message.stopReason !== "error") return undefined;
   return message.errorMessage || "Pi assistant message ended with an error";
 }
 
@@ -87,6 +89,8 @@ export function toolNameFromEvent(event: Record<string, unknown>): string | unde
  */
 export class UsageTracker {
   readonly totals: UsageTotals = emptyUsage();
+  /** Responses with usable provider usage, separate from admitted requests. */
+  reportedCalls = 0;
   private pending?: PiUsage;
 
   track(event: Record<string, unknown>) {
@@ -95,11 +99,17 @@ export class UsageTracker {
       if (usage) this.pending = usage;
       return;
     }
+    if (event.type === "compaction_end") {
+      const result = event.result as { usage?: unknown } | undefined;
+      const usage = readUsage(result?.usage);
+      if (usage) { addUsage(this.totals, usage); this.reportedCalls += 1; }
+      return;
+    }
     if (event.type !== "message_end") return;
     const message = event.message as Record<string, unknown> | undefined;
     if (message?.role !== "assistant") return;
     const usage = readUsage(message.usage) ?? this.pending;
-    if (usage) addUsage(this.totals, usage);
+    if (usage) { addUsage(this.totals, usage); this.reportedCalls += 1; }
     this.pending = undefined;
   }
 }
