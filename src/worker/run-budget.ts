@@ -16,7 +16,9 @@ export interface RunBudgetContext {
    * AUD-10/NEW-08: atomically reserves one model-call slot before an attempt
    * starts, and throws once the hard model-call limit would be exceeded.
    */
-  reserve(role: RunRoleUsage["role"]): void;
+  reserve(role: RunRoleUsage["role"], uncommittedUsage?: UsageTotals): void;
+  /** Recheck time/token limits before consuming an already-reserved first slot. */
+  validateReserved(): void;
   /** Releases a reservation that never produced usage. */
   release(): void;
   /**
@@ -25,7 +27,7 @@ export interface RunBudgetContext {
    * unknown-usage flag so a retried failure is never free.
    */
   recordUnknown(): void;
-  record(role: RunRoleUsage["role"], input: { provider: string; model: string }, usage: UsageTotals): Promise<void>;
+  record(role: RunRoleUsage["role"], input: { provider: string; model: string }, usage: UsageTotals, accounting?: { calls: number; unknownCalls: number }): Promise<void>;
 }
 
 export class BudgetExceededError extends Error {
@@ -79,8 +81,18 @@ export function createRunBudget(options: CreateRunBudgetOptions): RunBudgetConte
   );
   const persist = (patch: Partial<Run>) => options.persist?.(patch);
   return {
-    reserve() {
-      const status = statusAt(currentUsage(), (run.modelCalls ?? 0) + pendingCalls);
+    validateReserved() {
+      if (pendingCalls < 1) throw new Error("Missing model reservation schema");
+      const status = statusAt(currentUsage(), (run.modelCalls ?? 0) + pendingCalls - 1);
+      if (status.state === "exhausted") throw new BudgetExceededError(status.reason ?? "运行预算已用尽");
+    },
+    reserve(_role, uncommittedUsage) {
+      const live = currentUsage();
+      const status = statusAt(uncommittedUsage ? addUsageTotals(live, {
+        inputTokens: uncommittedUsage.input, outputTokens: uncommittedUsage.output,
+        cacheReadTokens: uncommittedUsage.cacheRead, cacheWriteTokens: uncommittedUsage.cacheWrite,
+        totalTokens: uncommittedUsage.totalTokens, estimatedCost: uncommittedUsage.cost,
+      }) : live, (run.modelCalls ?? 0) + pendingCalls);
       if (status.state === "exhausted") throw new BudgetExceededError(status.reason ?? "运行预算已用尽");
       pendingCalls += 1;
     },
@@ -93,8 +105,11 @@ export function createRunBudget(options: CreateRunBudgetOptions): RunBudgetConte
       run.usageUnknownCalls = (run.usageUnknownCalls ?? 0) + 1;
       void Promise.resolve(persist({ modelCalls: run.modelCalls, usageUnknownCalls: run.usageUnknownCalls })).catch(() => undefined);
     },
-    async record(role, input, usageTotals) {
-      pendingCalls = Math.max(0, pendingCalls - 1);
+    async record(role, input, usageTotals, accounting = { calls: 1, unknownCalls: 0 }) {
+      const { calls, unknownCalls } = accounting;
+      if (!Number.isSafeInteger(calls) || calls < 1 || !Number.isSafeInteger(unknownCalls) || unknownCalls < 0 || unknownCalls > calls) throw new Error("Invalid model accounting schema");
+      pendingCalls = Math.max(0, pendingCalls - calls);
+      if (unknownCalls) run.usageUnknownCalls = (run.usageUnknownCalls ?? 0) + unknownCalls;
       const usage: RunUsage = {
         inputTokens: Math.round(usageTotals.input),
         outputTokens: Math.round(usageTotals.output),
@@ -103,7 +118,7 @@ export function createRunBudget(options: CreateRunBudgetOptions): RunBudgetConte
         totalTokens: Math.round(usageTotals.totalTokens),
         estimatedCost: usageTotals.cost,
       };
-      mergeRoleUsage(run, { role, provider: input.provider, model: input.model, usage });
+      mergeRoleUsage(run, { role, provider: input.provider, model: input.model, usage, calls });
       await persist({ usageRoles: run.usageRoles, modelCalls: run.modelCalls, usageUnknownCalls: run.usageUnknownCalls });
       // The caller folds this call's usage into the live tracker only after
       // `record` returns, so the pre-call snapshot would miss the crossing when a

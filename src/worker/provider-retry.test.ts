@@ -1,7 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 import { withProviderRetry } from "./provider-retry.js";
+import { BudgetExceededError } from "./run-budget.js";
 
 describe("withProviderRetry", () => {
+  it("never retries a budget refusal from inside an ongoing tool loop", async () => {
+    const operation = vi.fn(async () => { throw new BudgetExceededError("cap reached during Pi"); });
+    const failure = vi.fn();
+    await expect(withProviderRetry(operation, { onAttemptFailure: failure, policy: { attempts: 3, baseDelayMs: 1 } })).rejects.toBeInstanceOf(BudgetExceededError);
+    expect(operation).toHaveBeenCalledTimes(1); expect(failure).not.toHaveBeenCalled();
+  });
   it("retries transient rate limits with exponential backoff and then succeeds", async () => {
     const delays: number[] = [];
     let calls = 0;

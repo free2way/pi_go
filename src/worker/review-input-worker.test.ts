@@ -59,7 +59,13 @@ it.each(["diff-budget", "transport"])("actual Worker enforces %s before spending
     const marker = path.join(root, "pi-invoked");
     const verdict = JSON.stringify({ verdict: "approved", summary: "Synthetic protocol fixture", findings: [] });
     const event = JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: verdict }], stopReason: "stop" } });
-    await writeFile(path.join(bin, "pi"), `#!${process.execPath}\nrequire('node:fs').appendFileSync(${JSON.stringify(marker)}, 'x');console.log(${JSON.stringify(event)});\n`, { mode: 0o700 });
+    await writeFile(path.join(bin, "pi"), `#!${process.execPath}
+(async()=>{
+  const handlers={}, i=process.argv.indexOf('--extension');
+  if(i>=0){const module=await import(require('node:url').pathToFileURL(process.argv[i+1]).href);module.default({on:(name,handler)=>{handlers[name]=handler;}});await handlers.before_provider_request({}, {abort:()=>{throw Error('fixture refused');}});}
+  require('node:fs').appendFileSync(${JSON.stringify(marker)}, 'x');
+  const event=${event};handlers.message_end?.(event);console.log(JSON.stringify(event));
+})().catch(()=>process.exit(1));\n`, { mode: 0o700 });
     callback.listen(0, "127.0.0.1");
     await once(callback, "listening");
     const callbackAddress = callback.address();
@@ -129,7 +135,7 @@ it.each(["diff-budget", "transport"])("actual Worker enforces %s before spending
           expect(prepared?.event?.meta?.originalDiffBytes).toBeGreaterThan(160_000);
           expect(prepared?.event?.meta?.promptBytes).toBeLessThanOrEqual(120_000);
           expect(prepared?.event?.meta?.excludedFiles).toBeGreaterThan(0);
-          expect(rows.some((row) => row.event?.type === "review.approved" && row.patch?.state === "completed")).toBe(true);
+          expect(rows.some((row) => row.event?.type === "review.approved" && row.patch?.state === "completed"), JSON.stringify(rows.filter(x => x.event?.type.startsWith("provider.") || x.patch?.state === "needs_human").map(x => ({ type: x.event?.type, message: x.event?.message })))).toBe(true);
           expect(rows.find((row) => row.event?.type === "session.metrics")?.event?.meta?.modelCalls).toBe(1);
         } else {
           const blocked = rows.find((row) => row.event?.type === "pi.input_transport_blocked");

@@ -58,7 +58,13 @@ it("actual Worker redacts failed full-diff uploads without losing the durable pa
     const marker = path.join(root, "pi-invoked");
     const verdict = JSON.stringify({ verdict: "approved", summary: "Synthetic protocol fixture", findings: [] });
     const event = JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: verdict }], stopReason: "stop" } });
-    await writeFile(path.join(bin, "pi"), `#!${process.execPath}\nrequire('node:fs').appendFileSync(${JSON.stringify(marker)}, 'x');console.log(${JSON.stringify(event)});\n`, { mode: 0o700 });
+    await writeFile(path.join(bin, "pi"), `#!${process.execPath}
+(async()=>{
+  const handlers={}, i=process.argv.indexOf('--extension');
+  if(i>=0){const module=await import(require('node:url').pathToFileURL(process.argv[i+1]).href);module.default({on:(name,handler)=>{handlers[name]=handler;}});await handlers.before_provider_request({}, {abort:()=>{throw Error('fixture refused');}});}
+  require('node:fs').appendFileSync(${JSON.stringify(marker)}, 'x');
+  const event=${event};handlers.message_end?.(event);console.log(JSON.stringify(event));
+})().catch(()=>process.exit(1));\n`, { mode: 0o700 });
     callback.listen(0, "127.0.0.1");
     await once(callback, "listening");
     const callbackAddress = callback.address();
@@ -104,7 +110,7 @@ it("actual Worker redacts failed full-diff uploads without losing the durable pa
     await vi.waitFor(async () => {
       expect((await (await fetch(`${workerUrl}/health`)).json()).activeJobs, logs).toBe(0);
     }, { timeout: 20_000, interval: 50 });
-    expect(uploaded).toHaveLength(1);
+    expect(uploaded, JSON.stringify(updates.filter(x => x.event?.type.startsWith("provider.") || x.patch?.state === "needs_human").map(x => ({ type: x.event?.type, message: x.event?.message })))).toHaveLength(1);
     expect(Buffer.byteLength(uploaded[0].content)).toBeGreaterThan(3 * 1024 * 1024);
     const failures = updates.filter((update) => update.event?.type === "diff.upload_failed");
     expect(failures).toHaveLength(1);

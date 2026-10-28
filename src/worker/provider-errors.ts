@@ -11,6 +11,7 @@ export type ProviderErrorKind =
   | "unknown";
 
 const patterns: Array<[ProviderErrorKind, RegExp]> = [
+  ["protocol", /\bPI_ASSISTANT_ABORTED\b/],
   // AT-REL-007: persistence failures must be reported as storage problems, never
   // as a successful run.
   ["storage", /storage_unavailable|no space left on device|enospc|disk (space|full)|econnrefused|connection terminated|terminating connection|callback failed|数据库不可用|存储不可用/i],

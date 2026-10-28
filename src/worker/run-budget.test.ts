@@ -65,6 +65,19 @@ function harness(limits: BudgetLimits, seed: Seed = {}) {
 }
 
 describe("run budget 80% warning (COST-002/003)", () => {
+  it("settles known tool-turn usage and unknown attempts with all reserved calls", async () => {
+    const { run, budget } = harness({ ...tokensOnly(0), maxModelCalls: 3 });
+    budget.reserve("developer"); budget.reserve("developer");
+    await budget.record("developer", { provider: "fixture", model: "fixture" }, usageDelta(37), { calls: 2, unknownCalls: 1 });
+    expect(run.modelCalls).toBe(2); expect(run.usageUnknownCalls).toBe(1); expect(run.usageRoles?.[0].calls).toBe(2); expect(run.usageRoles?.[0].inputTokens).toBe(37);
+    expect(() => budget.reserve("reviewer")).not.toThrow();
+    expect(() => budget.reserve("reviewer")).toThrow(BudgetExceededError);
+  });
+  it("checks already-reported but uncommitted tool-turn tokens before granting continuation", () => {
+    const { budget } = harness(tokensOnly(100)); budget.reserve("developer");
+    expect(() => budget.reserve("developer", usageDelta(100))).toThrow(BudgetExceededError);
+    expect(() => budget.reserve("developer", usageDelta(99))).not.toThrow();
+  });
   it("warns once when a single call crosses 80% but stays under the cap", async () => {
     const { warnings, budget, call } = harness(tokensOnly(1000));
     await call(usageDelta(820));

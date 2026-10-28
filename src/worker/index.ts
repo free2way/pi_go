@@ -10,13 +10,14 @@ import { assignSubAgentCodenames } from "../shared/codenames.js";
 import { runChecks as runCheckSuite, throwIfCancelled, type CommandResult } from "./checks.js";
 import { CheckpointTracker, isCheckpointCurrent, memoryCheckpointClient, stages, type Checkpoint, type CheckpointClient, type StoredChecks, type StoredReview } from "./checkpoints.js";
 import { conflictFreeBatches, executionWaves, fallbackPlan, parseDevelopmentPlan } from "./orchestrator.js";
-import { UsageTracker, addUsage, assistantErrorFromEvent, assistantTextFromEvent, toRunUsage, toolNameFromEvent, type UsageTotals } from "./pi-events.js";
+import { UsageTracker, addUsage, assistantErrorFromEvent, assistantTextFromEvent, emptyUsage, toRunUsage, toolNameFromEvent, type UsageTotals } from "./pi-events.js";
 import { DockerApi } from "./docker-api.js";
 import { readBudgetLimits } from "./budget.js";
 import { BudgetExceededError, createRunBudget, type RunBudgetContext } from "./run-budget.js";
 import { runProviderOperation } from "./provider-attempts.js";
 import { scrubEnvironment } from "./pi-env.js";
 import { prepareProcessPiState } from "./pi-process-state.js";
+import { createPiAdmission, PiAdmissionProtocolError } from "./pi-admission.js";
 import { runHardenedGit } from "./git-hardening.js";
 import { apiKeyEnvName, classifyProviderError, providerErrorSummary } from "./provider-errors.js";
 import { sleep } from "./provider-retry.js";
@@ -34,6 +35,8 @@ import {
   resolveSandboxMode,
   SandboxContainerRegistry,
   SandboxUnavailableError,
+  prepareSandboxStateDirectory,
+  sandboxStateDirectory,
   withSandboxStateDirectory,
   SANDBOX_KILLED_EXIT_CODE,
   type SandboxMode,
@@ -1093,6 +1096,11 @@ async function runPi(input: {
   timeoutMs?: number;
   /** Empty string disables every Pi tool for pure structured generation. */
   tools?: string;
+  admission?: {
+    validateFirst: () => void;
+    reserveAdditional: (usage: UsageTotals) => void;
+    account: (entry: { calls: number; unknownCalls: number; usage: UsageTotals }) => void;
+  };
 }) {
   assertPiCliInput(input.prompt);
   const args = [
@@ -1148,6 +1156,19 @@ async function runPi(input: {
     });
   }
   const runTimeoutMs = input.timeoutMs ?? Number(process.env.PI_RUN_TIMEOUT_SECONDS || 1800) * 1000;
+  const stateDirectory = sandboxStateDirectory(input.cwd, input.statePath);
+  const admissionAbort = new AbortController();
+  if (input.admission) await prepareSandboxStateDirectory(stateDirectory);
+  const admission = input.admission ? await createPiAdmission({
+    stateDirectory,
+    validateFirst: input.admission.validateFirst,
+    reserveAdditional: input.admission.reserveAdditional,
+    onFault: () => admissionAbort.abort(),
+  }) : undefined;
+  const signal = admission ? AbortSignal.any([input.signal, admissionAbort.signal]) : input.signal;
+  const sandboxArgv = admission
+    ? ["node", path.join("/home/node/.pi", path.relative(stateDirectory, admission.runtime)), ...args]
+    : ["pi", ...args];
   const onStdoutLine = (line: string) => {
       const event = parsePiLine(line);
       if (!event) return;
@@ -1162,9 +1183,12 @@ async function runPi(input: {
         activityQueue = activityQueue.then(() => input.onActivity(`Pi 正在调用 ${toolName}`)).catch(() => undefined);
       }
   };
-  const result = sandboxMode === "container"
+  let result: CommandResult | undefined;
+  let executionError: unknown;
+  try {
+    result = sandboxMode === "container"
     ? await runInSandbox({
-        argv: ["pi", ...args],
+        argv: sandboxArgv,
         worktree: input.cwd,
         // GAP-03: the reviewer reads its own snapshot, which has no git metadata
         // to share, and the mount is read-only.
@@ -1173,20 +1197,28 @@ async function runPi(input: {
         env: sandboxEnvironment({ [input.apiKeyEnvironmentName]: input.apiKey, ...(input.readOnly ? { PIGO_SANDBOX_READONLY: "1" } : {}) }),
         network: agentNetwork,
         timeoutMs: runTimeoutMs,
-        signal: input.signal,
+        signal,
         onStdoutLine,
         label: "pi-agent",
         ...(mounts.length > 0 ? { pluginMounts: mounts } : {}),
         ...(input.statePath ? { statePath: input.statePath } : {}),
       })
-    : await command("pi", args, {
+    : await command(admission ? process.execPath : "pi", admission ? [admission.runtime, ...args] : args, {
         cwd: input.cwd,
         env: childEnvironment,
-        signal: input.signal,
+        signal,
         timeoutMs: runTimeoutMs,
         onStdoutLine,
       });
+  } catch (error) { executionError = error; }
+  const settled = await admission?.finish();
+  const deniedFirstRequest = settled?.admitted === 0 && settled.error instanceof BudgetExceededError;
+  const calls = deniedFirstRequest ? 0 : Math.max(1, settled?.admitted ?? tracker.reportedCalls);
+  input.admission?.account({ calls, unknownCalls: Math.max(0, calls - tracker.reportedCalls), usage: { ...tracker.totals } });
   await activityQueue;
+  if (settled?.error) throw settled.error;
+  if (executionError) throw executionError;
+  if (!result) throw new PiAdmissionProtocolError();
   // GAP-05: carry the captured output so a failed call's evidence is not lost.
   if (result.code !== 0) {
     throw new PiRunError(result.stderr.trim() || `Pi exited with ${result.code}`, {
@@ -1196,7 +1228,7 @@ async function runPi(input: {
     });
   }
   if (lastAssistantError) throw new Error(lastAssistantError);
-  return { text: finalText.trim(), usage: tracker.totals, plugins: { enabled: enabledLabels, denials } };
+  return { text: finalText.trim(), usage: tracker.totals, modelCalls: calls, plugins: { enabled: enabledLabels, denials } };
 }
 
 /** AUD-16: cap is high enough for realistic diffs; when it is hit the artifact
@@ -1262,7 +1294,7 @@ async function collectDiff(worktree: string, signal: AbortSignal, baseRef?: stri
  */
 async function runPiWithRetry(
   input: Parameters<typeof runPi>[0],
-  context: { runId: string; round: number; label: string; role: PiSessionRole; sessionKey?: string; retry?: boolean; budget?: RunBudgetContext; sessions?: SessionAccumulator },
+  context: { runId: string; round: number; label: string; role: PiSessionRole; sessionKey?: string; retry?: boolean; budget?: RunBudgetContext; sessions?: SessionAccumulator; usage?: UsageTotals },
 ) {
   // Local validation is outside retry/session/budget accounting.
   assertPiCliInput(input.prompt);
@@ -1279,13 +1311,37 @@ async function runPiWithRetry(
       const safeProviderMessage = (message: string) => redactWorkerDiagnostic(message, [input.apiKey]);
       // NEW-08/AUD-10: every provider attempt (including failed retries) is
       // reserved and accounted; the hard model-call limit stops the retry loop.
-      const outcome = await runProviderOperation(() => {
-        modelCalls += 1;
-        return runPi({ ...input, sessionId, role: context.role });
+      const outcome = await runProviderOperation(async () => {
+        let accounting = { calls: 1, unknownCalls: 1, usage: emptyUsage() };
+        let successful = false;
+        try {
+          const result = await runPi({ ...input, sessionId, role: context.role,
+            ...(budget ? { admission: {
+              validateFirst: () => budget.validateReserved(),
+              reserveAdditional: (usage: UsageTotals) => budget.reserve(context.role, usage),
+              account: (entry: typeof accounting) => { accounting = entry; },
+            } } : {}),
+          });
+          successful = true;
+          if (!budget) accounting.calls = result.modelCalls;
+          return result;
+        } finally {
+          modelCalls += accounting.calls;
+          try {
+            if (budget) {
+              if (accounting.calls > 0) await budget.record(context.role, input, accounting.usage, accounting);
+              else budget.release();
+            }
+          } finally {
+            // A later error must not discard earlier successful tool turns.
+            // Successful callers still add their final result exactly once.
+            if (!successful && context.usage) addUsage(context.usage, accounting.usage);
+          }
+        }
       }, {
         signal: input.signal,
         budget: budget
-          ? { reserve: () => budget.reserve(context.role), recordUnknown: () => budget.recordUnknown() }
+          ? { reserve: () => budget.reserve(context.role), recordUnknown: () => undefined }
           : undefined,
         shouldRetry: ({ elapsedMs }) => shouldRetryProviderAttempt({
           role: context.role,
@@ -1362,7 +1418,6 @@ async function runPiWithRetry(
   const result = call.result;
   // GAP-02: surface allowlist decisions as audit events (never silent).
   await reportPluginPolicy(context.runId, context.round, result.plugins.enabled, result.plugins.denials);
-  if (budget) await budget.record(context.role, input, result.usage);
   return result;
 }
 
@@ -1391,7 +1446,7 @@ async function planDevelopment(run: Run, worktree: string, credentials: JobInput
       apiKeyEnvironmentName: apiKeyEnvName(run.developer.provider),
       signal,
       onActivity: (message) => postUpdate(run.id, { event: { round: run.round, source: "developer", type: "planner.activity", message: `主 Agent：${message}` } }),
-    }, { runId: run.id, round: run.round, label: "主 Agent 规划", role: "planner", budget, sessions });
+    }, { runId: run.id, round: run.round, label: "主 Agent 规划", role: "planner", budget, sessions, usage });
     addUsage(usage, result.usage);
     return parseDevelopmentPlan(redactJobSecrets(result.text, credentials), maxSubagents);
   } catch (error) {
@@ -1438,7 +1493,7 @@ async function runDeveloperAgent(input: {
       },
     }),
     ...(input.statePath ? { statePath: input.statePath } : {}),
-  }, { runId: input.run.id, round: input.run.round, label: input.activityPrefix ?? "开发 Agent", role: input.role ?? "developer", sessionKey: input.sessionSuffix, budget: input.budget, sessions: input.sessions });
+  }, { runId: input.run.id, round: input.run.round, label: input.activityPrefix ?? "开发 Agent", role: input.role ?? "developer", sessionKey: input.sessionSuffix, budget: input.budget, sessions: input.sessions, usage: input.usage });
   addUsage(input.usage, result.usage);
   await chat(input.run, "developer", "developer", "orchestrator", "response", redactJobSecrets(result.text, input.credentials), input.signal, extra);
   return result.text;
@@ -1955,7 +2010,7 @@ async function performReview(input: {
       apiKeyEnvironmentName: apiKeyEnvName(input.run.reviewer.provider),
       signal: input.signal,
       onActivity: (message) => postUpdate(input.run.id, { event: { round: input.round, source: "reviewer", type: "agent.activity", message } }),
-    }, { runId: input.run.id, round: input.round, label: "审核 Agent", role: "reviewer", budget: input.budget, sessions: input.sessions });
+    }, { runId: input.run.id, round: input.round, label: "审核 Agent", role: "reviewer", budget: input.budget, sessions: input.sessions, usage: input.usage });
   } catch (providerError) {
     if (providerError instanceof BudgetExceededError || providerError instanceof PiInputTransportError) throw providerError;
     const reason = diagnosticMessage(providerError, Object.values(input.credentials), 500);
@@ -1997,7 +2052,7 @@ async function performReview(input: {
         apiKeyEnvironmentName: apiKeyEnvName(input.run.reviewer.provider),
         signal: input.signal,
         onActivity: (message) => postUpdate(input.run.id, { event: { round: input.round, source: "reviewer", type: "agent.activity", message } }),
-      }, { runId: input.run.id, round: input.round, label: "审核 Agent（协议重试）", role: "reviewer", retry: true, budget: input.budget, sessions: input.sessions });
+      }, { runId: input.run.id, round: input.round, label: "审核 Agent（协议重试）", role: "reviewer", retry: true, budget: input.budget, sessions: input.sessions, usage: input.usage });
     } catch (providerError) {
       if (providerError instanceof BudgetExceededError || providerError instanceof PiInputTransportError) throw providerError;
       const providerReason = diagnosticMessage(providerError, Object.values(input.credentials), 500);
