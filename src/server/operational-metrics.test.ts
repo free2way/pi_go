@@ -2,7 +2,7 @@ import Fastify from "fastify";
 import { afterEach, expect, it, vi } from "vitest";
 import type { Db } from "./db.js";
 import { parseOperationalRows, registerOperationalMetrics } from "./operational-metrics.js";
-import { ApiMetrics, operationalLabels } from "../shared/operational-metrics.js";
+import { ApiMetrics, metricsAuthorized, operationalLabels } from "../shared/operational-metrics.js";
 
 const rows = () => [...["calls", "tokens", "estimated_cost_usd", "unknown_calls", "failures"].map(bucket => ({ family: "usage", bucket, value: bucket === "tokens" ? "42" : "0" })), { family: "queue", bucket: "oldest_wait_seconds", value: "0.5" }];
 const apps: ReturnType<typeof Fastify>[] = [];
@@ -19,6 +19,13 @@ function fixture(observe: () => Promise<{ rows: Record<string, unknown>[] }>) {
   return { app, query, statements };
 }
 const scrape = (app: ReturnType<typeof Fastify>) => app.inject({ url: "/api/internal/metrics", headers: { authorization: "Bearer fixture" } });
+
+it("only accepts distinct, explicitly configured read-only credentials", () => {
+  const read = "read-only-fixture".repeat(3), privileged = "privileged-fixture".repeat(3);
+  expect(metricsAuthorized(`Bearer ${read}`, read, privileged)).toBe(true);
+  for (const header of [undefined, read, `Bearer ${privileged}`, "Bearer wrong"]) expect(metricsAuthorized(header, read, privileged)).toBe(false);
+  for (const configured of ["", "short", privileged]) expect(metricsAuthorized(`Bearer ${configured}`, configured, privileged)).toBe(false);
+});
 
 it("denies ordinary sessions and missing/wrong service credentials before touching the database", async () => {
   const { app, query } = fixture(async () => ({ rows: rows() }));

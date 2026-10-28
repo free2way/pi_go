@@ -623,6 +623,7 @@ export function loadConfig(environment = process.env) {
   };
   return {
     token,
+    metricsToken: environment.PIGO_EXECUTOR_METRICS_TOKEN?.trim() || "",
     host: environment.HOST || "127.0.0.1",
     port,
     workspaceRoot,
@@ -706,9 +707,9 @@ export async function createExecutor(options = {}) {
         return json(reply, 200, { status: "ok", service: SERVICE, version: VERSION, ...store.summary() });
       }
       if (request.method === "GET" && request.url === "/metrics") {
-        // Scrapes are read-only and use bearer auth. Deployments still require
-        // both bearer and the raw-body HMAC on their existing route.
-        if (!config.token || !safeEqual(String(request.headers.authorization ?? ""), `Bearer ${config.token}`)) return json(reply, 401, { error: "Unauthorized" });
+        // Dedicated read-only credentials cannot also be deployment credentials.
+        if (!config.metricsToken || config.metricsToken.length < 32 || config.metricsToken === config.token || config.metricsToken === config.releaseGatewayToken
+          || !safeEqual(String(request.headers.authorization ?? ""), `Bearer ${config.metricsToken}`)) return json(reply, 401, { error: "Unauthorized" });
         try {
           if (!metricsCache || Date.now() - metricsCache.at >= 15_000) metricsCache = { at: Date.now(), counts: store.metricCounts() };
         } catch { return json(reply, 503, { error: "Metrics unavailable" }); }

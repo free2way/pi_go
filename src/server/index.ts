@@ -19,6 +19,7 @@ import { syncStorageAlerts, type WorkspaceStorageStatus } from "./storage-alerts
 import { readQueueObservation, syncQueueAlerts } from "./queue-alerts.js";
 import { createInfrastructureAlertSweeper } from "./infrastructure-alerts.js";
 import { registerOperationalMetrics } from "./operational-metrics.js";
+import { metricsAuthorized } from "../shared/operational-metrics.js";
 import { createProviderAlertSweeper, readProviderAlertObservation } from "./provider-alerts.js";
 import { Authenticator, normalizePublicOrigin } from "./auth.js";
 import { ExpiringLruCache } from "./expiring-lru-cache.js";
@@ -609,7 +610,8 @@ const runDirectoryCleaner: RunDirectoryCleaner = ({ runId, ownerId, dryRun }) =>
     body: JSON.stringify({ ownerId, dryRun }),
   });
 
-registerOperationalMetrics(app, { db, pool, version: webVersion, authorized: request => safeTokenMatch(request.headers.authorization) });
+registerOperationalMetrics(app, { db, pool, version: webVersion,
+  authorized: request => metricsAuthorized(request.headers.authorization, process.env.PI_METRICS_TOKEN?.trim() || "", internalToken) });
 
 app.addHook("onSend", async (request, reply, payload) => {
   reply.header("X-Content-Type-Options", "nosniff");

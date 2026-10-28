@@ -1,8 +1,16 @@
 import { diagnosticSecrets, redactDiagnosticText } from "./diagnostics.js";
+import { timingSafeEqual } from "node:crypto";
 
 export const METRICS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8";
 export type MetricLabels = { service: string; environment: string; version: string };
 export type MetricSample = { value: number; labels?: Record<string, string> };
+
+/** A scraper must not receive a credential that can submit jobs or deployments. */
+export function metricsAuthorized(authorization: string | undefined, readToken: string, privilegedToken: string): boolean {
+  if (readToken.length < 32 || readToken === privilegedToken || !authorization?.startsWith("Bearer ")) return false;
+  const actual = Buffer.from(authorization.slice(7)), expected = Buffer.from(readToken);
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
 
 /** Only operator labels and fixed enums; never accept request or model labels. */
 export function operationalLabels(service: "pigo-web" | "pigo-worker", version: string, env = process.env): MetricLabels {

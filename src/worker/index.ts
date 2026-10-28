@@ -6,7 +6,7 @@ import path from "node:path";
 import readline from "node:readline";
 import type { ChatChannel, ChatParticipant, ChatRole, DevelopmentPlan, Finding, ProjectInfo, Run, RunEvent, RunRoleUsage, RunState, SubAgentTask, WorkspaceVerifyResult } from "../shared/types.js";
 import { clipChatContent } from "../shared/chat.js";
-import { gauge, METRICS_CONTENT_TYPE, operationalLabels, processMetrics } from "../shared/operational-metrics.js";
+import { gauge, METRICS_CONTENT_TYPE, metricsAuthorized, operationalLabels, processMetrics } from "../shared/operational-metrics.js";
 import { assignSubAgentCodenames } from "../shared/codenames.js";
 import { runChecks as runCheckSuite, throwIfCancelled, type CommandResult } from "./checks.js";
 import { CheckpointTracker, isCheckpointCurrent, memoryCheckpointClient, stages, type Checkpoint, type CheckpointClient, type StoredChecks, type StoredReview } from "./checkpoints.js";
@@ -3014,14 +3014,15 @@ const server = createServer(async (request, response) => {
       return json(response, 200, { status: "ok", service: "pigo-worker", version: version || null, activeJobs: active.size, storage: storage.state });
     }
     if (request.method === "GET" && url.pathname === "/health/storage") return json(response, 200, await storageStatus());
-    if (!authorized(request)) return json(response, 401, { error: "Unauthorized" });
     if (request.method === "GET" && url.pathname === "/metrics") {
+      if (!metricsAuthorized(request.headers.authorization, process.env.PI_METRICS_TOKEN?.trim() || "", internalToken)) return json(response, 401, { error: "Unauthorized" });
       const labels = operationalLabels("pigo-worker", process.env.PI_WORKER_VERSION?.trim() || "unknown");
       response.writeHead(200, { "Content-Type": METRICS_CONTENT_TYPE, "Cache-Control": "no-store" });
       return response.end(processMetrics(labels)
         + gauge("pigo_worker_active_jobs", "Currently admitted Worker jobs.", labels, [{ value: active.size }])
         + gauge("pigo_worker_capacity", "Configured maximum concurrent jobs.", labels, [{ value: maxActiveJobs }]));
     }
+    if (!authorized(request)) return json(response, 401, { error: "Unauthorized" });
     if (request.method === "GET" && (url.pathname === "/projects" || url.pathname === "/workspaces")) return json(response, 200, await listProjects());
     if (request.method === "POST" && url.pathname === "/workspaces/verify") {
       const body = await readJson(request) as { relativePath?: unknown };
