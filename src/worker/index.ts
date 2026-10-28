@@ -16,6 +16,7 @@ import { readBudgetLimits } from "./budget.js";
 import { BudgetExceededError, createRunBudget, type RunBudgetContext } from "./run-budget.js";
 import { runProviderOperation } from "./provider-attempts.js";
 import { scrubEnvironment } from "./pi-env.js";
+import { prepareProcessPiState } from "./pi-process-state.js";
 import { runHardenedGit } from "./git-hardening.js";
 import { apiKeyEnvName, classifyProviderError, providerErrorSummary } from "./provider-errors.js";
 import { sleep } from "./provider-retry.js";
@@ -1135,6 +1136,17 @@ async function runPi(input: {
   // the worker's own tokens and the other role's key are stripped.
   const childEnvironment = scrubEnvironment(process.env, [input.apiKeyEnvironmentName]);
   childEnvironment[input.apiKeyEnvironmentName] = input.apiKey;
+  if (sandboxMode !== "container") {
+    // Never write retry overrides, sessions or auth into the operator's home.
+    childEnvironment.PI_CODING_AGENT_DIR = await prepareProcessPiState({
+      worktree: input.cwd,
+      statePath: input.statePath,
+      provider: input.provider,
+      apiKeyEnvironmentName: input.apiKeyEnvironmentName,
+      modelsFile: process.env.PI_SANDBOX_MODELS_FILE
+        || (process.env.PI_CODING_AGENT_DIR ? path.join(process.env.PI_CODING_AGENT_DIR, "models.json") : "/app/pi-models.json"),
+    });
+  }
   const runTimeoutMs = input.timeoutMs ?? Number(process.env.PI_RUN_TIMEOUT_SECONDS || 1800) * 1000;
   const onStdoutLine = (line: string) => {
       const event = parsePiLine(line);
