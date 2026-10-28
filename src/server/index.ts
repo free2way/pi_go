@@ -18,6 +18,7 @@ import { AlertManager, createAlertSink } from "./alerts.js";
 import { syncStorageAlerts, type WorkspaceStorageStatus } from "./storage-alerts.js";
 import { readQueueObservation, syncQueueAlerts } from "./queue-alerts.js";
 import { createInfrastructureAlertSweeper } from "./infrastructure-alerts.js";
+import { createProviderAlertSweeper, readProviderAlertObservation } from "./provider-alerts.js";
 import { Authenticator, normalizePublicOrigin } from "./auth.js";
 import { ExpiringLruCache } from "./expiring-lru-cache.js";
 import { CredentialVault } from "./credential-vault.js";
@@ -4075,8 +4076,14 @@ const infrastructureAlerts = createInfrastructureAlertSweeper({
   storage: () => workerRequest("/health/storage", undefined, 2_500),
 });
 infrastructureAlerts.start();
+const providerAlerts = createProviderAlertSweeper({
+  alerts,
+  read: () => readProviderAlertObservation(db, modelCatalog.map((model) => model.provider)),
+  warn: () => app.log.warn("provider alert observation failed"),
+});
+providerAlerts.start();
 for (const signal of ["SIGTERM", "SIGINT"] as const) {
-  process.once(signal, () => infrastructureAlerts.stop());
+  process.once(signal, () => { infrastructureAlerts.stop(); providerAlerts.stop(); });
 }
 
 // docs/26 §16.1 / AT-JEV L2 gate: the decision-plane metrics sweep. It runs in

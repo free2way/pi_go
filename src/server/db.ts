@@ -579,6 +579,12 @@ export const databaseMigrations: Migration[] = [
       CREATE INDEX idx_workspace_scm_attempts_workspace ON workspace_scm_sync_attempts(workspace_id, created_at);
     `,
   },
+  {
+    id: 17,
+    name: "provider-alert-outcome-observation",
+    sql: `CREATE INDEX idx_run_events_provider_alert ON run_events((meta_json::jsonb ->> 'provider'), at DESC, run_id DESC, seq DESC)
+      WHERE source = 'system' AND type IN ('provider.attempt_failed', 'session.metrics');`,
+  },
 ];
 
 export async function runMigrations(db: Db) {
