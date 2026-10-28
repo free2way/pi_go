@@ -91,4 +91,11 @@ describe("pi events", () => {
     tracker.track({ type: "compaction_end", aborted: true });
     expect(tracker.reportedCalls).toBe(1); expect(tracker.totals.totalTokens).toBe(23);
   });
+  it("retains partial streaming usage while keeping the failed request unknown", () => {
+    const tracker = new UsageTracker();
+    tracker.track({ type: "message_end", message: { role: "assistant", stopReason: "toolUse", usage: { input: 10, output: 2, totalTokens: 12 } } });
+    tracker.track({ type: "message_update", usage: { input: 20, output: 1, totalTokens: 21, cost: { total: 0.01 } } });
+    tracker.track({ type: "message_end", message: { role: "assistant", stopReason: "error", usage: { input: 0, output: 0, totalTokens: 0 } } });
+    expect(tracker.totals.totalTokens).toBe(33); expect(tracker.totals.cost).toBe(0.01); expect(tracker.reportedCalls).toBe(1);
+  });
 });

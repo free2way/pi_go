@@ -102,14 +102,22 @@ export class UsageTracker {
     if (event.type === "compaction_end") {
       const result = event.result as { usage?: unknown } | undefined;
       const usage = readUsage(result?.usage);
-      if (usage) { addUsage(this.totals, usage); this.reportedCalls += 1; }
+      if (usage) {
+        addUsage(this.totals, usage);
+        if (!event.aborted && !event.errorMessage) this.reportedCalls += 1;
+      }
       return;
     }
     if (event.type !== "message_end") return;
     const message = event.message as Record<string, unknown> | undefined;
     if (message?.role !== "assistant") return;
     const usage = readUsage(message.usage) ?? this.pending;
-    if (usage) { addUsage(this.totals, usage); this.reportedCalls += 1; }
+    if (usage) {
+      addUsage(this.totals, usage);
+      // An error can retain the last cumulative snapshot without a completed
+      // invoice. Keep that lower bound and still mark the admitted call unknown.
+      if (message.stopReason !== "error" && message.stopReason !== "aborted") this.reportedCalls += 1;
+    }
     this.pending = undefined;
   }
 }
