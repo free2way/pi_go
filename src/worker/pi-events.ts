@@ -68,7 +68,7 @@ export function assistantTextFromEvent(event: Record<string, unknown>): string |
  * `auto_retry_*` events) before surfacing the error here.
  */
 export function assistantErrorFromEvent(event: Record<string, unknown>): string | undefined {
-  if (event.type !== "message_end") return undefined;
+  if (event.type !== "message_end" && event.type !== "pigo_compaction_request_end") return undefined;
   const message = event.message as { role?: string; stopReason?: string; errorMessage?: string } | undefined;
   if (message?.role !== "assistant") return undefined;
   if (message.stopReason === "aborted") return `PI_ASSISTANT_ABORTED: ${message.errorMessage || "Pi assistant request was cancelled"}`;
@@ -92,14 +92,32 @@ export class UsageTracker {
   /** Responses with usable provider usage, separate from admitted requests. */
   reportedCalls = 0;
   private pending?: PiUsage;
+  private managedCompaction = false;
 
   track(event: Record<string, unknown>) {
+    if (event.type === "pigo_compaction_start") {
+      this.managedCompaction = true;
+      return;
+    }
+    if (event.type === "pigo_compaction_request_end") {
+      const message = event.message as Record<string, unknown> | undefined;
+      if (message?.role !== "assistant") return;
+      const usage = readUsage(message.usage);
+      if (usage) {
+        addUsage(this.totals, usage);
+        if (message.stopReason !== "error" && message.stopReason !== "aborted") this.reportedCalls += 1;
+      }
+      return;
+    }
     if (event.type === "message_update") {
       const usage = readUsage(event.usage);
       if (usage) this.pending = usage;
       return;
     }
     if (event.type === "compaction_end") {
+      // Managed summaries are reported per actual request, including failed
+      // compactions. The native event aggregates them and must not bill twice.
+      if (this.managedCompaction) { this.managedCompaction = false; return; }
       const result = event.result as { usage?: unknown } | undefined;
       const usage = readUsage(result?.usage);
       if (usage) {

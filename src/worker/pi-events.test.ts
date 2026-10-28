@@ -91,6 +91,25 @@ describe("pi events", () => {
     tracker.track({ type: "compaction_end", aborted: true });
     expect(tracker.reportedCalls).toBe(1); expect(tracker.totals.totalTokens).toBe(23);
   });
+  it("counts each managed summary once and ignores the native aggregate", () => {
+    const tracker = new UsageTracker();
+    tracker.track({ type: "pigo_compaction_start" });
+    for (const tokens of [12, 25]) tracker.track({ type: "pigo_compaction_request_end", message: { role: "assistant", stopReason: "stop", usage: { input: tokens - 2, output: 2, totalTokens: tokens } } });
+    tracker.track({ type: "compaction_end", result: { usage: { input: 33, output: 4, totalTokens: 37 } } });
+    tracker.track({ type: "message_end", message: { role: "assistant", stopReason: "stop", usage: { input: 8, output: 2, totalTokens: 10 } } });
+    expect(tracker.reportedCalls).toBe(3); expect(tracker.totals.totalTokens).toBe(47);
+  });
+  it("retains per-request compaction usage when a later summary fails or is denied", () => {
+    const tracker = new UsageTracker();
+    tracker.track({ type: "pigo_compaction_start" });
+    tracker.track({ type: "pigo_compaction_request_end", message: { role: "assistant", stopReason: "stop", usage: { input: 10, output: 2, totalTokens: 12 } } });
+    const failure = { type: "pigo_compaction_request_end", message: { role: "assistant", stopReason: "error", errorMessage: "503 fixture", usage: { input: 20, output: 1, totalTokens: 21 } } };
+    tracker.track(failure);
+    tracker.track({ type: "compaction_end", errorMessage: "503 fixture" });
+    expect(tracker.reportedCalls).toBe(1); expect(tracker.totals.totalTokens).toBe(33);
+    expect(assistantErrorFromEvent(failure)).toBe("503 fixture");
+    expect(assistantTextFromEvent({ ...failure, message: { ...failure.message, content: [{ type: "text", text: "Private summary" }] } })).toBeUndefined();
+  });
   it("retains partial streaming usage while keeping the failed request unknown", () => {
     const tracker = new UsageTracker();
     tracker.track({ type: "message_end", message: { role: "assistant", stopReason: "toolUse", usage: { input: 10, output: 2, totalTokens: 12 } } });
