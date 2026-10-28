@@ -1173,9 +1173,15 @@ async function runPi(input: {
       const event = parsePiLine(line);
       if (!event) return;
       tracker.track(event);
-      if (event.type === "message_end") {
+      if (event.type === "message_end" || event.type === "pigo_compaction_request_end") {
         const message = event.message as { role?: string } | undefined;
-        if (message?.role === "assistant") lastAssistantError = assistantErrorFromEvent(event);
+        if (message?.role === "assistant") {
+          const error = assistantErrorFromEvent(event);
+          // Summary success cannot clear a primary response's error. Only a
+          // completed primary response can replace that result; summary errors
+          // must still fail the invocation when Pi terminates with exit zero.
+          if (event.type === "message_end" || error) lastAssistantError = error;
+        }
       }
       finalText = assistantTextFromEvent(event) || finalText;
       const toolName = toolNameFromEvent(event);
