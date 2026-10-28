@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -18,12 +18,19 @@ afterEach(async () => {
 async function fixture(reserveAdditional: (usage: UsageTotals) => void = vi.fn()) {
   const stateDirectory = await mkdtemp(path.join(tmpdir(), "pigo-admission-")); roots.push(stateDirectory);
   const onFault = vi.fn(); const manager = await createPiAdmission({ stateDirectory, reserveAdditional, onFault }); managers.push(manager);
-  await writeFile(path.join(manager.directory, "ready.json"), '{"protocol":1}');
+  await publish(manager, "ready.json", { protocol: 1 });
   return { manager, onFault, reserveAdditional, stateDirectory };
 }
+async function publish(m: Awaited<ReturnType<typeof createPiAdmission>>, name: string, value: unknown) {
+  // Match the real extension's atomic publish; direct truncation can expose an
+  // empty valid-message fixture to the strict reader on a busy CI runner.
+  const file = path.join(m.directory, name), temporary = `${file}.tmp`;
+  await writeFile(temporary, JSON.stringify(value));
+  await rename(temporary, file);
+}
 async function request(m: Awaited<ReturnType<typeof createPiAdmission>>, sequence: number) {
-  await writeFile(path.join(m.directory, "request.json"), JSON.stringify({ protocol: 1, sequence, usage: emptyUsage() }));
-  return vi.waitFor(async () => JSON.parse(await readFile(path.join(m.directory, `reply-${sequence}.json`), "utf8")), { timeout: 1000, interval: 10 });
+  await publish(m, "request.json", { protocol: 1, sequence, usage: emptyUsage() });
+  return vi.waitFor(async () => JSON.parse(await readFile(path.join(m.directory, `reply-${sequence}.json`), "utf8")), { timeout: 5000, interval: 10 });
 }
 describe("Worker-owned Pi request admission", () => {
   it("uses the prepaid first call, reserves every next call once, and rejects a repeated denial", async () => {
@@ -36,7 +43,7 @@ describe("Worker-owned Pi request admission", () => {
   });
   it("does not reserve a duplicate request twice", async () => {
     const f = await fixture(); await request(f.manager, 1); await request(f.manager, 2);
-    await writeFile(path.join(f.manager.directory, "request.json"), JSON.stringify({ protocol: 1, sequence: 2, usage: emptyUsage() }));
+    await publish(f.manager, "request.json", { protocol: 1, sequence: 2, usage: emptyUsage() });
     await new Promise(resolve => setTimeout(resolve, 25));
     expect(f.reserveAdditional).toHaveBeenCalledTimes(1); expect(f.manager.admitted).toBe(2);
   });
