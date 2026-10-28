@@ -2,7 +2,7 @@
 export const PI_ADMISSION_RUNTIME = String.raw`
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 const file = fileURLToPath(import.meta.url);
 const directory = path.dirname(file);
@@ -17,14 +17,15 @@ export default function registerAdmission(pi) {
   try {
     const totals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0 };
     let sequence = 0;
-    pi.on("message_end", (event) => {
-      if (event.message?.role !== "assistant") return;
-      const raw = event.message.usage;
+    function recordUsage(raw) {
       if (!raw) return;
       for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"]) totals[key] += amount(raw[key]);
       totals.cost += amount(raw.cost?.total);
+    }
+    pi.on("message_end", (event) => {
+      if (event.message?.role === "assistant") recordUsage(event.message.usage);
     });
-    pi.on("before_provider_request", async (_event, context) => {
+    async function admit(context) {
       const current = ++sequence;
       try {
         write("request.json", { protocol, sequence: current, usage: totals });
@@ -45,6 +46,48 @@ export default function registerAdmission(pi) {
         // explicitly before returning control to its provider transport.
         context.abort();
         throw new Error("PI_ADMISSION_SCHEMA_DENIED");
+      }
+    }
+    pi.on("before_provider_request", (_event, context) => admit(context));
+    pi.on("session_before_compact", async (event, context) => {
+      let providerFailed = false;
+      try {
+        // Use the pinned Pi SDK's own compactor, but wrap each summary request.
+        // The ordinary before_provider_request hook does not cover compaction.
+        let cursor = path.dirname(fs.realpathSync(process.argv[1])), sdk;
+        for (let depth = 0; depth < 5; depth++, cursor = path.dirname(cursor)) {
+          try {
+            const metadata = JSON.parse(fs.readFileSync(path.join(cursor, "package.json"), "utf8"));
+            if (metadata.name === "@earendil-works/pi-coding-agent") {
+              sdk = await import(pathToFileURL(path.join(cursor, "dist/index.js")).href);
+              break;
+            }
+          } catch { /* Try the next package ancestor; never use a remote import. */ }
+        }
+        if (typeof sdk?.compact !== "function" || !context.model) throw new Error("unsupported");
+        // Pi redirects extension console output; write only this private JSON
+        // protocol to the CLI's actual event fd, without summary text or keys.
+        const emit = value => fs.writeSync(1, JSON.stringify(value) + "\n");
+        emit({ type: "pigo_compaction_start" });
+        const stream = async (model, messages, options) => {
+          await admit(context);
+          const response = await context.modelRegistry.streamSimple(model, messages, { ...options, maxRetries: 0 }).result();
+          recordUsage(response.usage);
+          providerFailed ||= response.stopReason === "error" || response.stopReason === "aborted";
+          emit({ type: "pigo_compaction_request_end", message: { role: "assistant", usage: response.usage, stopReason: response.stopReason, errorMessage: response.errorMessage } });
+          return { result: async () => response };
+        };
+        const compaction = await sdk.compact(event.preparation, context.model, undefined, undefined,
+          event.customInstructions, event.signal, context.thinkingLevel, stream, undefined,
+          { enabled: false, provider: { maxRetries: 0 } });
+        return { compaction };
+      } catch {
+        // Pi swallows extension exceptions and otherwise runs its unguarded
+        // default compactor. Terminate instead. A provider message above lets
+        // the Worker classify/retry that failure using its single retry layer.
+        if (providerFailed) process.exit(0);
+        fs.writeSync(2, "PI_COMPACTION_SCHEMA_FAILED\n");
+        process.exit(78);
       }
     });
     write("ready.json", { protocol });

@@ -10,6 +10,7 @@ describe("provider error classification", () => {
     expect(classifyProviderError("502 Bad Gateway")).toBe("provider");
     expect(classifyProviderError("something unusual happened")).toBe("unknown");
     expect(classifyProviderError("PI_ASSISTANT_ABORTED: Request aborted")).toBe("protocol");
+    expect(classifyProviderError("PI_COMPACTION_SCHEMA_FAILED")).toBe("protocol");
   });
 
   it("maps providers onto Pi key environment variables", () => {

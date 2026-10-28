@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { createPiAdmission, PiAdmissionProtocolError } from "./pi-admission.js";
-import { emptyUsage, type UsageTotals } from "./pi-events.js";
+import { emptyUsage, UsageTracker, type UsageTotals } from "./pi-events.js";
 import { BudgetExceededError, createRunBudget } from "./run-budget.js";
 import { baseDemoRun } from "../server/demo-runner.js";
 
@@ -33,6 +33,38 @@ async function request(m: Awaited<ReturnType<typeof createPiAdmission>>, sequenc
   return vi.waitFor(async () => JSON.parse(await readFile(path.join(m.directory, `reply-${sequence}.json`), "utf8")), { timeout: 5000, interval: 10 });
 }
 describe("Worker-owned Pi request admission", () => {
+  it.each(["allowed", "call-cap", "token-cap", "provider-error", "missing-sdk"])("managed compaction respects %s with the actual Worker handshake", async mode => {
+    const dir = await mkdtemp(path.join(tmpdir(), "pigo-compaction-")); roots.push(dir);
+    const reserved: UsageTotals[] = [];
+    const m = await createPiAdmission({ stateDirectory: dir, reserveAdditional: usage => {
+      reserved.push({ ...usage });
+      if (mode === "call-cap" || (mode === "token-cap" && usage.totalTokens >= 12)) throw new BudgetExceededError("fixture cap");
+    }, onFault: vi.fn() }); managers.push(m);
+    const sdk = path.join(dir, "sdk"), cli = path.join(sdk, "dist/bundle/cli.js"), marker = path.join(dir, "requests");
+    await mkdir(path.dirname(cli), { recursive: true });
+    await writeFile(cli, "// fixture CLI entry\n");
+    await writeFile(path.join(sdk, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", type: "module" }));
+    if (mode !== "missing-sdk") await writeFile(path.join(sdk, "dist/index.js"), `export async function compact(_p,model,_key,_headers,_instructions,_signal,_thinking,stream){for(let i=0;i<2;i++){const response=await(await stream(model,{},{})).result();if(response.stopReason==='error')throw Error('summary failed');}return{summary:'fixture',usage:{input:20,output:4,totalTokens:24}};}`);
+    const script = `import fs from'node:fs';process.argv[1]=${JSON.stringify(cli)};const {default:register}=await import(${JSON.stringify(pathToFileURL(m.runtime).href)});const h={};register({on:(n,f)=>{h[n]=f;}});const ctx={model:{provider:'fixture',id:'fixture'},abort:()=>{},modelRegistry:{streamSimple:(_m,_c,options)=>{if(options.maxRetries!==0)throw Error('internal retry enabled');fs.appendFileSync(${JSON.stringify(marker)},'x');return{result:async()=>({role:'assistant',usage:{input:10,output:2,totalTokens:12},stopReason:${JSON.stringify(mode === "provider-error" ? "error" : "stop")},errorMessage:'503 fixture'})};}}};const result=await h.session_before_compact({preparation:{},signal:new AbortController().signal},ctx);console.log(JSON.stringify({type:'compaction_end',result:result.compaction}));await h.before_provider_request({},ctx);`;
+    const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+      const child = spawn(process.execPath, ["--input-type=module", "-e", script], { stdio: ["ignore", "pipe", "pipe"] }); let stdout = "", stderr = "";
+      child.stdout.on("data", b => { stdout += String(b); }); child.stderr.on("data", b => { stderr += String(b); }); child.once("error", reject); child.once("close", code => resolve({ code, stdout, stderr }));
+    });
+    const tracker = new UsageTracker();
+    for (const line of result.stdout.trim().split("\n").filter(Boolean)) tracker.track(JSON.parse(line));
+    const requests = (await readFile(marker, "utf8").catch(() => "")).length;
+    if (mode === "allowed") {
+      expect(result.code).toBe(0); expect(requests).toBe(2); expect(m.admitted).toBe(3);
+      expect(reserved.map(u => u.totalTokens)).toEqual([12, 24]); expect(tracker.totals.totalTokens).toBe(24); expect(tracker.reportedCalls).toBe(2);
+    } else if (mode === "missing-sdk") {
+      expect(result.code).toBe(78); expect(requests).toBe(0); expect(m.admitted).toBe(0); expect(result.stderr).toContain("PI_COMPACTION_SCHEMA_FAILED");
+    } else {
+      expect(requests).toBe(1); expect(m.admitted).toBe(1); expect(tracker.totals.totalTokens).toBe(12);
+      expect(tracker.reportedCalls).toBe(mode === "provider-error" ? 0 : 1);
+      if (mode === "provider-error") expect(result.code).toBe(0);
+      else { expect(result.code).toBe(78); expect(m.error).toBeInstanceOf(BudgetExceededError); }
+    }
+  });
   it("uses the prepaid first call, reserves every next call once, and rejects a repeated denial", async () => {
     const exhausted = new BudgetExceededError("model cap reached"); let n = 0;
     const f = await fixture(vi.fn(() => { if (++n === 2) throw exhausted; }));
