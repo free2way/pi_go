@@ -1,9 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { diagnosticSecrets, redactDiagnosticText, redactDiagnosticValue } from "./diagnostics.js";
+import { diagnosticSecrets, redactDiagnosticText, redactDiagnosticValue, redactKnownSecretText } from "./diagnostics.js";
 
 const fake = (label: string) => ["DUMMY", label].join("_");
 
 describe("service diagnostics", () => {
+  it("redacts known reply echoes without applying field patterns or breaking JSON", () => {
+    const key = fake('quoted/+"'), forms = [key, encodeURIComponent(key), JSON.stringify(key).slice(1, -1)];
+    for (const form of forms) {
+      const input = JSON.stringify({ summary: form, tokenCount: 7, source: "export const value = 2;" });
+      const output = redactKnownSecretText(input, [key]);
+      expect(JSON.parse(output)).toEqual({ summary: "[redacted]", tokenCount: 7, source: "export const value = 2;" });
+      for (const variant of forms) expect(output).not.toContain(variant);
+    }
+  });
   it("collects only service-secret environment values, including opaque webhook URLs", () => {
     const values = diagnosticSecrets({ PI_INTERNAL_TOKEN: fake("internal"), PGPASSWORD: fake("database"), PI_ALERT_WEBHOOK: "https://alerts.example.invalid/opaque", LANG: "en_US", NODE_ENV: "test", EMPTY_KEY: "" });
     expect(values).toEqual(["DUMMY_internal", "DUMMY_database", "https://alerts.example.invalid/opaque"]);
