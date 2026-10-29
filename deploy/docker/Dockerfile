@@ -1,4 +1,4 @@
-FROM node:22.23.3-alpine3.24
+FROM node:22.23.4-alpine3.24
 
 ARG PI_VERSION=1.3.0
 ARG PNPM_VERSION=12.15.0

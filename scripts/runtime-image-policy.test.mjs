@@ -9,9 +9,9 @@ test("published runtime stages use the fixed Alpine base and refresh installed p
   const web = read("deploy/docker/Dockerfile.web");
   const executor = read("deploy/executor/Dockerfile");
 
-  assert.match(runtime, /^FROM node:22\.23\.3-alpine3\.24$/mu);
-  assert.match(web, /^FROM node:22\.23\.3-alpine3\.24 AS runtime$/mu);
-  assert.match(executor, /^FROM node:22\.23\.3-alpine3\.24$/mu);
+  assert.match(runtime, /^FROM node:22\.23\.4-alpine3\.24$/mu);
+  assert.match(web, /^FROM node:22\.23\.4-alpine3\.24 AS runtime$/mu);
+  assert.match(executor, /^FROM node:22\.23\.4-alpine3\.24$/mu);
   for (const dockerfile of [runtime, web, executor]) {
     assert.match(dockerfile, /apk upgrade --no-cache/u);
     assert.doesNotMatch(dockerfile, /bookworm/u);
