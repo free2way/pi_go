@@ -110,6 +110,7 @@ services:
       # Same value in demo-web and demo-worker; doctor asserts parity without
       # printing the token.
       PI_INTERNAL_TOKEN: ${PI_INTERNAL_TOKEN:?Set PI_INTERNAL_TOKEN in deploy/docker/demo.env}
+      PI_METRICS_TOKEN: ${PI_METRICS_TOKEN:-}
       PI_DEMO_MODE: "true"
       PI_REAL_RUNS_ENABLED: "true"
       PI_WEB_VERSION: ${PIGO_DEMO_VERSION:?Set PIGO_DEMO_VERSION in deploy/docker/demo.env}
@@ -290,6 +291,8 @@ services:
       # pi-agent-network cannot round-robin callbacks into production web).
       PI_WEB_CALLBACK_URL: http://demo-web:3100
       PI_INTERNAL_TOKEN: ${PI_INTERNAL_TOKEN:?Set PI_INTERNAL_TOKEN in deploy/docker/demo.env}
+      PI_METRICS_TOKEN: ${PI_METRICS_TOKEN:-}
+      PI_DEPLOYMENT_ENVIRONMENT: ${PI_DEPLOYMENT_ENVIRONMENT:-staging}
       PI_WORKER_VERSION: ${PIGO_DEMO_VERSION:?Set PIGO_DEMO_VERSION in deploy/docker/demo.env}
       PI_WORKER_ID: ${PIGO_DEMO_WORKER_ID:-pigo-demo-worker}
       PI_DEVELOPER_PROVIDER: ${PI_DEVELOPER_PROVIDER:-deepseek}

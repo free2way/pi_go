@@ -97,6 +97,7 @@ services:
       PI_REAL_RUNS_ENABLED: ${PI_REAL_RUNS_ENABLED:-false}
       PI_WORKER_URL: http://worker:3200
       PI_INTERNAL_TOKEN: ${PI_INTERNAL_TOKEN:-}
+      PI_METRICS_TOKEN: ${PI_METRICS_TOKEN:-}
       # AUD-08 (v0.22): explicit model allowlist. Empty string = the builtin
       # catalog merged with the role defaults; a JSON array is strict/verbatim.
       PI_MODEL_CATALOG_JSON: ${PI_MODEL_CATALOG_JSON:-}
@@ -284,6 +285,8 @@ services:
       PI_WORKSPACE_ROOT: /workspace
       PI_WEB_CALLBACK_URL: http://web:3100
       PI_INTERNAL_TOKEN: ${PI_INTERNAL_TOKEN:-}
+      PI_METRICS_TOKEN: ${PI_METRICS_TOKEN:-}
+      PI_DEPLOYMENT_ENVIRONMENT: ${PI_DEPLOYMENT_ENVIRONMENT:-production}
       PI_MAX_REVIEW_ROUNDS: ${PI_MAX_REVIEW_ROUNDS:-3}
       PI_MAX_SUBAGENTS: ${PI_MAX_SUBAGENTS:-3}
       PI_MAX_ACTIVE_JOBS: ${PI_MAX_ACTIVE_JOBS:-1}

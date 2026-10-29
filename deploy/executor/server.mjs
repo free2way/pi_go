@@ -299,6 +299,16 @@ export class JsonStateStore {
     };
   }
 
+  metricCounts() {
+    const states = ["pending", "succeeded", "failed", "other"];
+    const counts = { delivery: Object.fromEntries(states.map(s => [s, 0])), callback: Object.fromEntries(states.map(s => [s, 0])) };
+    for (const item of Object.values(this.value.deliveries)) {
+      counts.delivery[states.includes(item.status) ? item.status : "other"]++;
+      counts.callback[states.includes(item.callbackStatus) ? item.callbackStatus : "other"]++;
+    }
+    return counts;
+  }
+
   async persist() {
     const temporary = `${this.file}.${process.pid}.tmp`;
     await writeFile(temporary, `${JSON.stringify(this.value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
@@ -613,6 +623,7 @@ export function loadConfig(environment = process.env) {
   };
   return {
     token,
+    metricsToken: environment.PIGO_EXECUTOR_METRICS_TOKEN?.trim() || "",
     host: environment.HOST || "127.0.0.1",
     port,
     workspaceRoot,
@@ -640,6 +651,7 @@ export async function createExecutor(options = {}) {
   const store = options.store ?? new JsonStateStore(config.dataFile);
   await store.init();
   let jobs = Promise.resolve();
+  let metricsCache;
 
   async function processDelivery(payload, key) {
     let outcome;
@@ -693,6 +705,26 @@ export async function createExecutor(options = {}) {
     try {
       if (request.method === "GET" && request.url === "/healthz") {
         return json(reply, 200, { status: "ok", service: SERVICE, version: VERSION, ...store.summary() });
+      }
+      if (request.method === "GET" && request.url === "/metrics") {
+        // Dedicated read-only credentials cannot also be deployment credentials.
+        if (!config.metricsToken || config.metricsToken.length < 32 || config.metricsToken === config.token || config.metricsToken === config.releaseGatewayToken
+          || !safeEqual(String(request.headers.authorization ?? ""), `Bearer ${config.metricsToken}`)) return json(reply, 401, { error: "Unauthorized" });
+        try {
+          if (!metricsCache || Date.now() - metricsCache.at >= 15_000) metricsCache = { at: Date.now(), counts: store.metricCounts() };
+        } catch { return json(reply, 503, { error: "Metrics unavailable" }); }
+        const only = allowedEnvironments.size === 1 ? [...allowedEnvironments][0] : "unknown";
+        const environment = ["staging", "production"].includes(only) ? only : "unknown";
+        const labels = `service="${SERVICE}",environment="${environment}",version="${VERSION}"`;
+        let output = "";
+        for (const [kind, counts] of Object.entries(metricsCache.counts)) {
+          const name = `pigo_executor_${kind}_records`;
+          output += `# HELP ${name} Retained ${kind} records; counts may decrease after retention.\n# TYPE ${name} gauge\n`;
+          for (const [state, value] of Object.entries(counts)) output += `${name}{${labels},state="${state}"} ${value}\n`;
+        }
+        output += `# HELP pigo_executor_observation_age_seconds Age of cached executor counts.\n# TYPE pigo_executor_observation_age_seconds gauge\npigo_executor_observation_age_seconds{${labels}} ${(Date.now() - metricsCache.at) / 1000}\n`;
+        reply.writeHead(200, { "Content-Type": "text/plain; version=0.0.4; charset=utf-8", "Cache-Control": "no-store" });
+        return reply.end(output);
       }
       if (request.method !== "POST" || request.url !== "/hooks/pigo-release") return json(reply, 404, { error: "Not found" });
       if (!String(request.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {

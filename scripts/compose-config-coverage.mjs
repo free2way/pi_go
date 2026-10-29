@@ -30,6 +30,7 @@ import path from "node:path";
  */
 export const CRITICAL_ENV = {
   web: [
+    "PI_METRICS_TOKEN",
     // Clerk email registration/authentication (secret remains env-only)
     "CLERK_PUBLISHABLE_KEY",
     "CLERK_SECRET_KEY",
@@ -106,6 +107,8 @@ export const CRITICAL_ENV = {
     "TYPESAFE_API_KEY",
   ],
   worker: [
+    "PI_METRICS_TOKEN",
+    "PI_DEPLOYMENT_ENVIRONMENT",
     // plugins (GAP-02)
     "PI_PLUGIN_ALLOWLIST",
     "PI_PLUGIN_REQUESTS",
