@@ -1,0 +1,48 @@
+Host backup retention
+=====================
+
+backup.sh creates a private backup directory and never runs automatic retention.
+PI_BACKUP_KEEP_DAYS no longer authorizes cleanup. Existing host cron jobs must be
+reviewed separately; publishing this source does not update deployed host scripts.
+
+Prerequisites: Linux, Bash, Python 3, Docker access for backup/restore, an owned
+backup root (mode 700), timestamp directories YYYYMMDDTHHMMSSZ (700), and regular
+single-link files owned by the operator (600). Python retention itself requires
+no Docker access. Symlinks, unexpected backup files, damaged manifests/checksums,
+unsafe permissions, future backups and changed plans fail closed.
+
+The fixed UTC policy selects the newest backup in each of the last 7 calendar
+days, the current and previous 3 ISO weeks, and the current and previous 2 months.
+The newest backup is always protected. Empty historical buckets are not invented;
+multiple backups in one bucket do not all receive protection.
+
+1. Run backup.sh against the intended backup root.
+2. Run restore-verify.sh with the newest backup directory. It creates a NEW owned
+   scratch database, compares recorded table counts/run digest, verifies vault
+   ciphertext integrity, drops only its own scratch database and writes a private
+   restore-verification.json. Any failure prevents a new success receipt.
+   This is not full application recovery, vault decryption or off-host recovery.
+3. Review the plan (no changes by default):
+     python3 backup-retention.py /path/to/owned-backups
+   The newest backup needs a matching restore receipt no older than 7 UTC days.
+4. Only after reviewing keep/move, explicitly apply that exact plan:
+     python3 backup-retention.py /path/to/owned-backups --apply \
+       --expect-plan-sha256 <planSha256>
+   A changed snapshot or UTC policy date requires a fresh plan. Concurrent apply
+   operations use an exclusive lock. No automatic cron integration is installed.
+5. Moved backups remain under .quarantine/retention_<id>/ with a private journal.
+   To undo, first review the restoration plan:
+     python3 backup-retention.py /path/to/owned-backups --restore retention_<id>
+   Then apply its planSha256 using --apply --expect-plan-sha256 <restore-plan-hash>.
+   Conflicting destinations or changed quarantined bytes are never overwritten.
+   An interrupted operation can be inspected and restored with the same ID; the
+   actual quarantined directories are checked against the original snapshot.
+
+Quarantine is reversible and DOES NOT free disk space. This tool has no permanent
+payload deletion operation. Monitor capacity and review any later purge procedure
+separately. It cannot prove backup recoverability for every historical snapshot.
+Receipts/journals are local procedural evidence, not cryptographic attestations;
+the host owner and anyone able to edit private backups remain trusted operators.
+Do not edit backup payloads or run another retention tool concurrently. An apply
+error may leave a partial quarantine; inspect the printed/recorded transaction ID
+under .quarantine and use the restore plan rather than retrying a stale plan hash.
