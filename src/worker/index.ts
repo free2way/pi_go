@@ -57,7 +57,7 @@ import { runGuardedMerge, type GuardedMergeResult, type MergeGuardGitExec } from
 import { WorkspaceLockManager, workspaceKeyFor } from "./workspace-lock.js";
 import { PiRunError, failureOutputForEvent } from "./agent-failure.js";
 import { redactWorkerDiagnostic, workerDiagnosticMessage } from "./diagnostic-redaction.js";
-import { redactKnownSecretText } from "../shared/diagnostics.js";
+import { diagnosticSecrets, redactKnownSecretText } from "../shared/diagnostics.js";
 import { createQueueWake } from "./queue-wake.js";
 import { migrateLegacySubAgentState, subAgentStateDirectory } from "./subagent-state.js";
 import { captureFailedSubAgentWorktree } from "./subagent-artifacts.js";
@@ -647,7 +647,12 @@ async function loadTracker(runId: string, credentials: JobInput["credentials"]) 
 }
 
 function redactJobSecrets(message: string, credentials: JobInput["credentials"]) {
-  return redactKnownSecretText(message, [credentials.developer, credentials.reviewer]);
+  // Structured replies must remain valid JSON. Replace only known values;
+  // generic diagnostic field patterns would rewrite model protocol fields.
+  return redactKnownSecretText(message, [
+    credentials.developer, credentials.reviewer,
+    ...diagnosticSecrets(process.env), callbackBase, workspaceRoot,
+  ]);
 }
 
 function json(response: ServerResponse, statusCode: number, body: unknown) {
