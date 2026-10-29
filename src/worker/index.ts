@@ -57,6 +57,7 @@ import { runGuardedMerge, type GuardedMergeResult, type MergeGuardGitExec } from
 import { WorkspaceLockManager, workspaceKeyFor } from "./workspace-lock.js";
 import { PiRunError, failureOutputForEvent } from "./agent-failure.js";
 import { redactWorkerDiagnostic, workerDiagnosticMessage } from "./diagnostic-redaction.js";
+import { redactKnownSecretText } from "../shared/diagnostics.js";
 import { migrateLegacySubAgentState, subAgentStateDirectory } from "./subagent-state.js";
 import { captureFailedSubAgentWorktree } from "./subagent-artifacts.js";
 import { planRecovery, recoveryResumePhase, recoveryUpdateState } from "./run-recovery.js";
@@ -644,10 +645,7 @@ async function loadTracker(runId: string, credentials: JobInput["credentials"]) 
 }
 
 function redactJobSecrets(message: string, credentials: JobInput["credentials"]) {
-  return [credentials.developer, credentials.reviewer].reduce(
-    (safe, secret) => secret ? safe.replaceAll(secret, "[redacted]") : safe,
-    message,
-  );
+  return redactKnownSecretText(message, [credentials.developer, credentials.reviewer]);
 }
 
 function json(response: ServerResponse, statusCode: number, body: unknown) {
@@ -1086,6 +1084,8 @@ async function runPi(input: {
   /** Explicit state location for nested sub-agent worktrees. */
   statePath?: string;
   apiKey: string;
+  /** Worker-only redaction context; never forwarded to Pi or its environment. */
+  diagnosticCredentials?: readonly string[];
   apiKeyEnvironmentName: string;
   signal: AbortSignal;
   onActivity: (message: string) => Promise<void>;
@@ -1187,7 +1187,8 @@ async function runPi(input: {
       finalText = assistantTextFromEvent(event) || finalText;
       const toolName = toolNameFromEvent(event);
       if (toolName) {
-        activityQueue = activityQueue.then(() => input.onActivity(`Pi 正在调用 ${toolName}`)).catch(() => undefined);
+        const activity = diagnosticMessage(`Pi 正在调用 ${toolName}`, [input.apiKey, ...(input.diagnosticCredentials ?? [])]);
+        activityQueue = activityQueue.then(() => input.onActivity(activity)).catch(() => undefined);
       }
   };
   let result: CommandResult | undefined;
@@ -1312,10 +1313,10 @@ async function runPiWithRetry(
   const call = await cliSessionManager.execute({
     plan,
     signal: input.signal,
-    onActivity: input.onActivity,
+    onActivity: message => input.onActivity(diagnosticMessage(message, [input.apiKey, ...(input.diagnosticCredentials ?? [])])),
     invoke: async (sessionId) => {
       let modelCalls = 0;
-      const safeProviderMessage = (message: string) => redactWorkerDiagnostic(message, [input.apiKey]);
+      const safeProviderMessage = (message: string) => redactWorkerDiagnostic(message, [input.apiKey, ...(input.diagnosticCredentials ?? [])]);
       // NEW-08/AUD-10: every provider attempt (including failed retries) is
       // reserved and accounted; the hard model-call limit stops the retry loop.
       const outcome = await runProviderOperation(async () => {
@@ -1450,6 +1451,7 @@ async function planDevelopment(run: Run, worktree: string, credentials: JobInput
       // COST-006: planning is a sizing decision, so it runs with low reasoning.
       thinking: process.env.PI_PLANNER_THINKING === "high" || process.env.PI_PLANNER_THINKING === "medium" ? process.env.PI_PLANNER_THINKING : "low",
       apiKey: credentials.developer,
+      diagnosticCredentials: Object.values(credentials),
       apiKeyEnvironmentName: apiKeyEnvName(run.developer.provider),
       signal,
       onActivity: (message) => postUpdate(run.id, { event: { round: run.round, source: "developer", type: "planner.activity", message: `主 Agent：${message}` } }),
@@ -1489,6 +1491,7 @@ async function runDeveloperAgent(input: {
     model: input.run.developer.model,
     prompt: input.prompt,
     apiKey: input.credentials.developer,
+    diagnosticCredentials: Object.values(input.credentials),
     apiKeyEnvironmentName: apiKeyEnvName(input.run.developer.provider),
     signal: input.signal,
     onActivity: (message) => postUpdate(input.run.id, {
@@ -2014,6 +2017,7 @@ async function performReview(input: {
       readOnly: true,
       thinking: reviewerThinking,
       apiKey: input.credentials.reviewer,
+      diagnosticCredentials: Object.values(input.credentials),
       apiKeyEnvironmentName: apiKeyEnvName(input.run.reviewer.provider),
       signal: input.signal,
       onActivity: (message) => postUpdate(input.run.id, { event: { round: input.round, source: "reviewer", type: "agent.activity", message } }),
@@ -2056,6 +2060,7 @@ async function performReview(input: {
         readOnly: true,
         thinking: "low",
         apiKey: input.credentials.reviewer,
+        diagnosticCredentials: Object.values(input.credentials),
         apiKeyEnvironmentName: apiKeyEnvName(input.run.reviewer.provider),
         signal: input.signal,
         onActivity: (message) => postUpdate(input.run.id, { event: { round: input.round, source: "reviewer", type: "agent.activity", message } }),

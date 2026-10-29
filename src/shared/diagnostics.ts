@@ -1,11 +1,19 @@
-/** Plain-text diagnostics only; never rewrite executable source or model JSON. */
-export function redactDiagnosticText(text: string, secrets: readonly string[] = []): string {
-  const values = [...new Set(secrets.filter(Boolean).flatMap((secret) => [
-    secret, encodeURIComponent(secret), JSON.stringify(secret).slice(1, -1),
-  ]))].sort((a, b) => b.length - a.length);
+/** Literal known values and URI/JSON forms, including their JSON string envelope.
+ * No field-pattern rewriting: structured model replies must remain valid JSON.
+ */
+export function redactKnownSecretText(text: string, secrets: readonly string[] = []): string {
+  const values = [...new Set(secrets.filter(Boolean).flatMap(secret =>
+    [secret, encodeURIComponent(secret), JSON.stringify(secret).slice(1, -1)]
+      .flatMap(form => [form, JSON.stringify(form).slice(1, -1)]),
+  ))].sort((a, b) => b.length - a.length);
   let safe = text;
   for (const value of values) safe = safe.replaceAll(value, "[redacted]");
-  return safe
+  return safe;
+}
+
+/** Plain-text diagnostics only; never rewrite executable source or model JSON. */
+export function redactDiagnosticText(text: string, secrets: readonly string[] = []): string {
+  return redactKnownSecretText(text, secrets)
     .replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s/<>"']*@[^\s<>"']+/gi, "[redacted-url]")
     .replace(/\b(Bearer|Basic)\s+[^\s,"'<>[\]}]+/gi, "$1 [redacted]")
     .replace(/([?&](?:access_token|api_key|token|password|secret|signature)=)[^&#\s"'<>]+/gi, "$1[redacted]")
