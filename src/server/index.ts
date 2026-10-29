@@ -8,6 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { internalUpdateRejection, releasesStoryBlocks, storyBlockReleaseNote } from "../shared/run-state.js";
+import { notifyQueuedJob } from "./job-notification.js";
 import { buildStoryRunInput, STORY_STATUS_LABELS, type RunBudget, type StoryDetail } from "../shared/agile.js";
 import { resolveRequestLocale, type Locale } from "../shared/i18n.js";
 import type { ConfigStatus, CurrentUser, ModelCatalogResponse, ReviewScope, Run, RunEvent, RunReleaseRecord, RunRollbackRecord, Workspace } from "../shared/types.js";
@@ -3605,7 +3606,7 @@ async function jobCredentialsFor(run: Run): Promise<{ developer: string; reviewe
   return undefined;
 }
 
-/** Creates a durable job row and pushes it to the worker; the row survives a restart. */
+/** Persist first; a notification makes the Worker drain durable jobs in order. */
 async function dispatchJob(
   run: Run,
   checks: string[],
@@ -3616,11 +3617,20 @@ async function dispatchJob(
   const jobId = newId("job");
   const kind = "run";
   await jobQueue.createJob({ id: jobId, runId: run.id, kind, payload: { ...payload, checks } });
-  await jobQueue.reserveJob(jobId);
+  await store.appendEvent({
+    runId: run.id, round: run.round, source: "system", type: "run.queued",
+    message: "任务已进入持久队列，等待 Worker 按顺序领取", at: new Date().toISOString(),
+  });
   try {
-    await workerRequest("/jobs", {
-      method: "POST",
-      body: JSON.stringify({ run, checks, credentials, jobId, ...payload }),
+    await notifyQueuedJob({
+      wake: () => workerRequest("/jobs/wake", { method: "POST", body: "{}" }),
+      legacyPush: async () => {
+        await jobQueue!.reserveJob(jobId);
+        return workerRequest("/jobs", {
+          method: "POST",
+          body: JSON.stringify({ run, checks, credentials, jobId, ...payload }),
+        });
+      },
     });
     return { jobId, accepted: true as const };
   } catch (error) {
