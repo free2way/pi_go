@@ -7,6 +7,7 @@
 #
 # Usage (on the deployment host):  bash restore-verify.sh [backup-dir]
 set -euo pipefail
+umask 077
 
 PROJECT_DIR="${PI_PIGO_DIR:-/app/pi-agent}"
 PG_CONTAINER="${PI_PG_CONTAINER:-pi-agent-postgres-1}"
@@ -40,16 +41,24 @@ echo "== verifying restore of $TARGET =="
 
 # Validate backup integrity before any database operation. Use argv, never
 # interpolate filesystem paths into Python source (paths may contain quotes).
-EXPECTED="$(python3 - "$TARGET" <<'PY'
-import hashlib, json, pathlib, re, sys
+VERIFIED_INPUT="$(python3 - "$TARGET" <<'PY'
+import hashlib, json, pathlib, re, sys, os, stat
 root = pathlib.Path(sys.argv[1])
 def digest(file):
     value = hashlib.sha256()
-    with file.open('rb') as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b''):
-            value.update(block)
+    fd = os.open(file, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError('not regular')
+        with os.fdopen(fd, 'rb', closefd=False) as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b''):
+                value.update(block)
+    finally:
+        os.close(fd)
     return value.hexdigest()
 try:
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError('unsafe directory')
     manifest = json.loads((root / 'manifest.json').read_text())
     database = manifest['database']
     required = {'users', 'identities', 'workspaces', 'runs', 'events', 'agents',
@@ -72,12 +81,56 @@ try:
         raise ValueError('credential backup missing or hash differs')
     elif not isinstance(json.loads(vault.read_text()), dict):
         raise ValueError('credential backup is invalid')
-    print(json.dumps(database, sort_keys=True))
+    names = ['database.dump', 'manifest.json', 'credentials.vault.json', 'compose.yaml',
+             'env.backup', 'web.env.sanitized', 'worker.env.sanitized']
+    files = {name: digest(root / name) for name in names if (root / name).exists() or (root / name).is_symlink()}
+    print(json.dumps({'database': database, 'files': files}, sort_keys=True))
 except Exception:
     print('RESTORE REFUSED: backup manifest or file integrity is invalid', file=sys.stderr)
     sys.exit(1)
 PY
 )"
+EXPECTED="$(python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["database"], sort_keys=True))' <<< "$VERIFIED_INPUT")"
+
+# A receipt is written only after data validation AND successful scratch cleanup.
+# Bind the exact pre-restore bytes so later retention cannot trust a stale drill.
+record_verification() {
+  python3 - "$TARGET" "$VERIFIED_INPUT" <<'PY'
+import datetime, hashlib, json, os, pathlib, stat, sys, tempfile
+root = pathlib.Path(sys.argv[1]); verified = json.loads(sys.argv[2]); temporary = None
+def digest(file):
+    fd = os.open(file, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode): raise ValueError('not regular')
+        h = hashlib.sha256()
+        with os.fdopen(fd, 'rb', closefd=False) as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b''): h.update(block)
+        return h.hexdigest()
+    finally: os.close(fd)
+try:
+    if root.is_symlink(): raise ValueError('unsafe directory')
+    if any(digest(root / name) != expected for name, expected in verified['files'].items()):
+        raise ValueError('backup changed')
+    destination = root / 'restore-verification.json'
+    if destination.is_symlink() or (destination.exists() and not destination.is_file()):
+        raise ValueError('unsafe receipt')
+    fd, temporary = tempfile.mkstemp(prefix='.restore-proof-', dir=root)
+    with os.fdopen(fd, 'w') as stream:
+        json.dump({'schemaVersion': 1, 'result': 'verified', 'scope': 'database-stats-and-vault-integrity',
+                   'verifiedAt': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                   'files': verified['files']}, stream, sort_keys=True)
+        stream.write('\n'); stream.flush(); os.fsync(stream.fileno())
+    os.replace(temporary, destination); temporary = None
+    directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try: os.fsync(directory_fd)
+    finally: os.close(directory_fd)
+except Exception:
+    print('RESTORE RECEIPT REFUSED: backup bytes changed or receipt could not be saved', file=sys.stderr)
+    sys.exit(1)
+finally:
+    if temporary is not None: os.unlink(temporary)
+PY
+}
 
 created=0
 cleanup() {
@@ -90,7 +143,11 @@ cleanup() {
       echo "scratch cleanup failed: $SCRATCH_DB retained for operator inspection" >&2
       result=1
     elif [ "$result" -eq 0 ]; then
-      echo "RESTORE VERIFIED OK (owned scratch database dropped)"
+      if record_verification; then
+        echo "RESTORE VERIFIED OK (owned scratch database dropped; verification receipt saved)"
+      else
+        result=1
+      fi
     fi
   fi
   exit "$result"

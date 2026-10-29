@@ -11,7 +11,6 @@ PG_CONTAINER="${PI_PG_CONTAINER:-pi-agent-postgres-1}"
 WEB_CONTAINER="${PI_WEB_CONTAINER:-pi-agent-web-1}"
 PG_USER="${PI_PG_USER:-pigo}"
 PG_DB="${PI_PG_DB:-pigo}"
-KEEP_DAYS="${PI_BACKUP_KEEP_DAYS:-14}"
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 TARGET="$BACKUP_ROOT/$TS"
@@ -88,7 +87,6 @@ cat "$TARGET/manifest.json"
 chmod 600 "$TARGET"/* 2>/dev/null || true
 echo "backup complete: $TARGET"
 
-# ---------------------------------------------------------------- retention
-if [ -d "$BACKUP_ROOT" ]; then
-  find "$BACKUP_ROOT" -maxdepth 1 -mindepth 1 -type d -mtime "+$KEEP_DAYS" -print -exec rm -rf {} + 2>/dev/null || true
-fi
+# Retention is a separate, explicit operation after scratch restore verification.
+# Never recursively remove directories merely because their mtime is old.
+echo "retention not applied: use backup-retention.py to review a verified plan"

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync, statSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -39,6 +39,7 @@ if (sql.startsWith('select json_build_object')) {
   const counts = JSON.parse(process.env.RESTORE_TEST_COUNTS);
   if (mode === 'mismatch') counts.jobs += 1;
   process.stdout.write(JSON.stringify(counts));
+  if (mode === 'changed-input') fs.appendFileSync(process.env.RESTORE_TEST_BACKUP + '/database.dump', 'changed-during-restore');
 }
 if (sql.startsWith('DROP DATABASE') && mode === 'cleanup-error') process.exit(6);
 `, { mode: 0o755 });
@@ -46,7 +47,7 @@ if (sql.startsWith('DROP DATABASE') && mode === 'cleanup-error') process.exit(6)
     const result = spawnSync("bash", [script, backup], { encoding: "utf8", env: {
       ...process.env, PATH: `${bin}:${process.env.PATH}`, PI_RESTORE_DB: "pigo_restore_verify_test",
       PI_PG_DB: "pigo", PI_PG_USER: "pigo", RESTORE_TEST_LOG: log,
-      RESTORE_TEST_COUNTS: JSON.stringify(counts), ...extra,
+      RESTORE_TEST_COUNTS: JSON.stringify(counts), RESTORE_TEST_BACKUP: backup, ...extra,
     } });
     const calls = readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
     return { ...result, calls, output: result.stdout + result.stderr };
@@ -55,7 +56,7 @@ if (sql.startsWith('DROP DATABASE') && mode === 'cleanup-error') process.exit(6)
 }
 
 test("restore succeeds only in its newly created scratch database, including quoted backup paths", (t) => {
-  const { run } = fixture(t);
+  const { run, backup } = fixture(t);
   const result = run();
   assert.equal(result.status, 0, result.output);
   assert.match(result.output, /RESTORE VERIFIED OK/);
@@ -63,6 +64,10 @@ test("restore succeeds only in its newly created scratch database, including quo
   assert.equal(result.calls.at(-1).at(-1), 'DROP DATABASE "pigo_restore_verify_test"');
   assert.ok(result.calls.filter((args) => args.includes("psql")).every((args) => args.includes("ON_ERROR_STOP=1") && args.includes("-X")));
   assert.ok(result.calls.every((args) => !/WITH \(FORCE\)|DROP DATABASE IF EXISTS/.test(args.at(-1))));
+  const receipt = JSON.parse(readFileSync(join(backup, "restore-verification.json")));
+  assert.equal(receipt.result, "verified");
+  assert.equal(receipt.files["database.dump"], hash(readFileSync(join(backup, "database.dump"))));
+  assert.equal(statSync(join(backup, "restore-verification.json")).mode & 0o777, 0o600);
 });
 
 for (const name of ["pigo", "postgres", "template1", "pigo_restore_verify;DROP DATABASE pigo", "pigo_restore_verify_" + "x".repeat(64)]) {
@@ -91,18 +96,22 @@ test("existing scratch is never dropped, reused or force-disconnected", (t) => {
 
 for (const [mode, code] of [["restore-error", 4], ["query-error", 5], ["mismatch", 1]]) {
   test(`${mode} fails and cleans only the database created by this invocation`, (t) => {
-    const result = fixture(t).run({ RESTORE_TEST_MODE: mode });
+    const { backup, run } = fixture(t);
+    const result = run({ RESTORE_TEST_MODE: mode });
     assert.equal(result.status, code, result.output);
     assert.equal(result.calls.at(-1).at(-1), 'DROP DATABASE "pigo_restore_verify_test"');
     assert.doesNotMatch(result.output, /RESTORE VERIFIED OK/);
+    assert.equal(existsSync(join(backup, "restore-verification.json")), false);
   });
 }
 
 test("cleanup failure must not report a successful drill", (t) => {
-  const result = fixture(t).run({ RESTORE_TEST_MODE: "cleanup-error" });
+  const { backup, run } = fixture(t);
+  const result = run({ RESTORE_TEST_MODE: "cleanup-error" });
   assert.equal(result.status, 1);
   assert.match(result.output, /retained for operator inspection/);
   assert.doesNotMatch(result.output, /RESTORE VERIFIED OK/);
+  assert.equal(existsSync(join(backup, "restore-verification.json")), false);
 });
 
 test("tampered dump is rejected before creating any database", (t) => {
@@ -138,6 +147,29 @@ test("incomplete database evidence is rejected before Docker", (t) => {
   const { manifest, saveManifest, run } = fixture(t);
   manifest.database = { runs: 1 };
   saveManifest();
+  const result = run();
+  assert.equal(result.status, 1);
+  assert.equal(result.calls.length, 0);
+});
+
+test("input changed during restore cannot replace an earlier verification receipt", t => {
+  const { backup, run } = fixture(t);
+  const receipt = join(backup, "restore-verification.json");
+  writeFileSync(receipt, "previous-proof");
+  const result = run({ RESTORE_TEST_MODE: "changed-input" });
+  assert.equal(result.status, 1, result.output);
+  assert.match(result.output, /RESTORE RECEIPT REFUSED/);
+  assert.doesNotMatch(result.output, /RESTORE VERIFIED OK/);
+  assert.equal(readFileSync(receipt, "utf8"), "previous-proof");
+  assert.match(result.calls.at(-1).at(-1), /^DROP DATABASE/);
+});
+
+test("symlinked dump is refused before creating a scratch database", t => {
+  const { backup, run } = fixture(t);
+  const dump = readFileSync(join(backup, "database.dump"));
+  writeFileSync(join(backup, "external"), dump);
+  rmSync(join(backup, "database.dump"));
+  symlinkSync(join(backup, "external"), join(backup, "database.dump"));
   const result = run();
   assert.equal(result.status, 1);
   assert.equal(result.calls.length, 0);
