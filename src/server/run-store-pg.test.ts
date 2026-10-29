@@ -3,6 +3,8 @@ import type { Run, RunEvent } from "../shared/types.js";
 import { baseRealRun } from "./real-run.js";
 import { PostgresRunStore } from "./run-store-pg.js";
 import { createTestDb } from "./test-db.js";
+import { artifactDiagnosticDownloadSafe } from "./artifact-api.js";
+import { createHash } from "node:crypto";
 
 function makeRun(overrides: Partial<Run> = {}): Run {
   const run = baseRealRun({
@@ -330,6 +332,31 @@ describe("PostgresRunStore", () => {
     const row = (await db.query("SELECT content, base_sha FROM run_artifacts WHERE run_id = $1 AND artifact_id = 'diff'", [run.id])).rows[0];
     expect(String(row.content)).toBe(full);
     expect(String(row.base_sha)).toBe("abc123");
+  });
+
+  it("retains diagnostic provenance across store restarts and clears it on an untrusted overwrite", async () => {
+    const db = await createTestDb();
+    const store = new PostgresRunStore(db);
+    await store.init();
+    const run = makeRun();
+    await store.createRun(run, event(run.id, "run.created"));
+    await store.saveArtifact({ runId: run.id, artifactId: "trace", kind: "trace", content: "safe", diagnosticPolicyVersion: 1 });
+    const restarted = new PostgresRunStore(db);
+    await restarted.init();
+    expect(await restarted.getArtifact(run.id, "trace")).toMatchObject({ content: "safe", diagnosticPolicyVersion: 1 });
+    // A rolling-deploy writer from the prior schema updates content/hash but
+    // does not know either provenance column. The stale stamp must not authorize it.
+    const opaque = "unknown retired opaque value";
+    await db.query("UPDATE run_artifacts SET content=$1, bytes=$2, sha256=$3 WHERE run_id=$4 AND artifact_id='trace'", [opaque, Buffer.byteLength(opaque), createHash("sha256").update(opaque).digest("hex"), run.id]);
+    const stale = await restarted.getArtifact(run.id, "trace");
+    expect(stale?.diagnosticPolicySha256).not.toBe(stale?.sha256);
+    expect(await artifactDiagnosticDownloadSafe({ ...stale!, content: stale!.content! }, run, {}, async () => [])).toBe(false);
+    await restarted.saveArtifact({ runId: run.id, artifactId: "trace", kind: "trace", content: "untrusted" });
+    expect(await store.getArtifact(run.id, "trace")).toMatchObject({ content: "untrusted", diagnosticPolicyVersion: null, diagnosticPolicySha256: null });
+    await db.query("INSERT INTO run_artifacts(run_id,artifact_id,kind,bytes,created_at,content) VALUES($1,$2,$3,$4,$5,$6)", [run.id, "historical", "trace", 6, run.createdAt, "opaque"]);
+    expect(await restarted.getArtifact(run.id, "historical")).toMatchObject({ content: "opaque", diagnosticPolicyVersion: null });
+    // The provenance is private storage state, not a caller-editable list field.
+    expect((await store.listArtifacts(run.id)).every((artifact) => !("diagnosticPolicyVersion" in artifact))).toBe(true);
   });
 
   it("stores check exit codes for check records (GAP-04)", async () => {

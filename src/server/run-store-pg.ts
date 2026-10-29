@@ -517,11 +517,16 @@ export class PostgresRunStore implements RunStoreLike {
   /** Reads artifact metadata + content from PostgreSQL so the download is authoritative. */
   async getArtifact(runId: string, artifactId: string): Promise<ArtifactContent | undefined> {
     const row = (await this.db.query(
-      "SELECT run_id, artifact_id, kind, bytes, sha256, base_sha, created_at, content FROM run_artifacts WHERE run_id = $1 AND artifact_id = $2",
+      "SELECT run_id, artifact_id, kind, bytes, sha256, base_sha, created_at, content, diagnostic_policy_version, diagnostic_policy_sha256 FROM run_artifacts WHERE run_id = $1 AND artifact_id = $2",
       [runId, artifactId],
     )).rows[0];
     if (!row) return undefined;
-    return { ...this.mapArtifact(row), content: row.content === null || row.content === undefined ? null : String(row.content) };
+    return {
+      ...this.mapArtifact(row),
+      content: row.content === null || row.content === undefined ? null : String(row.content),
+      diagnosticPolicyVersion: row.diagnostic_policy_version == null ? null : Number(row.diagnostic_policy_version),
+      diagnosticPolicySha256: row.diagnostic_policy_sha256 == null ? null : String(row.diagnostic_policy_sha256),
+    };
   }
 
   /**
@@ -534,11 +539,11 @@ export class PostgresRunStore implements RunStoreLike {
     const bytes = Buffer.byteLength(input.content, "utf8");
     const hash = sha256(input.content);
     await this.db.query(
-      `INSERT INTO run_artifacts (run_id, artifact_id, kind, bytes, sha256, base_sha, created_at, content)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      `INSERT INTO run_artifacts (run_id, artifact_id, kind, bytes, sha256, base_sha, created_at, content, diagnostic_policy_version, diagnostic_policy_sha256)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        ON CONFLICT (run_id, artifact_id) DO UPDATE SET
-         kind = $3, bytes = $4, sha256 = $5, base_sha = $6, created_at = $7, content = $8`,
-      [input.runId, input.artifactId, input.kind, bytes, hash, input.baseSha ?? null, createdAt, input.content],
+         kind = $3, bytes = $4, sha256 = $5, base_sha = $6, created_at = $7, content = $8, diagnostic_policy_version = $9, diagnostic_policy_sha256 = $10`,
+      [input.runId, input.artifactId, input.kind, bytes, hash, input.baseSha ?? null, createdAt, input.content, input.diagnosticPolicyVersion ?? null, input.diagnosticPolicyVersion == null ? null : hash],
     );
     return {
       runId: input.runId,

@@ -40,7 +40,7 @@ import { createProviderProbe, providerProbeDisabled } from "./provider-probe.js"
 import { verifyPendingCredentials } from "./credential-verification.js";
 import { RateLimiter } from "./rate-limit.js";
 import { PostgresRunStore } from "./run-store-pg.js";
-import { artifactDiagnosticCredentials, redactArtifactDiagnostic, saveInternalRunArtifact } from "./artifact-api.js";
+import { artifactDiagnosticCredentials, artifactDiagnosticDownloadSafe, saveInternalRunArtifact } from "./artifact-api.js";
 import { type ApprovePlan, approveEventMeta, planApprove } from "./approve.js";
 import { conflictReplyFor, isStorageFailure, requestErrorReply } from "./request-errors.js";
 import { diagnosticSecrets, redactDiagnosticText } from "../shared/diagnostics.js";
@@ -2214,7 +2214,7 @@ app.get<{ Params: { id: string; artifactId: string } }>("/api/runs/:id/artifacts
   const kind = artifact?.kind ?? "patch";
   // Do not silently alter a historical body or advertise its old SHA for new
   // bytes. Require regeneration instead; the stored record is left untouched.
-  if (kind !== "patch" && redactArtifactDiagnostic(kind, content, run.worktree, process.env, await readArtifactCredentials(run)) !== content) {
+  if (!await artifactDiagnosticDownloadSafe({ kind, content, diagnosticPolicyVersion: artifact?.diagnosticPolicyVersion, diagnosticPolicySha256: artifact?.diagnosticPolicySha256 }, run, process.env, readArtifactCredentials)) {
     return reply.code(409).send({ error: "Diagnostic artifact requires secure regeneration", code: "ARTIFACT_DIAGNOSTICS_UNSAFE" });
   }
   const contentType = kind === "patch" ? "text/x-patch; charset=utf-8" : "application/octet-stream";
