@@ -25,6 +25,9 @@ export type ArtifactRecord = RunArtifact;
 
 export interface ArtifactContent extends ArtifactRecord {
   content: string | null;
+  /** Server-side sanitizer provenance; absent on historical/untrusted writes. */
+  diagnosticPolicyVersion?: number | null;
+  diagnosticPolicySha256?: string | null;
 }
 
 export interface SaveArtifactInput {
@@ -34,6 +37,7 @@ export interface SaveArtifactInput {
   content: string;
   baseSha?: string | null;
   createdAt?: string;
+  diagnosticPolicyVersion?: number | null;
 }
 
 /**
@@ -215,6 +219,8 @@ export class RunStore implements RunStoreLike {
       baseSha: input.baseSha ?? null,
       createdAt: input.createdAt ?? new Date().toISOString(),
       content: input.content,
+      diagnosticPolicyVersion: input.diagnosticPolicyVersion ?? null,
+      diagnosticPolicySha256: input.diagnosticPolicyVersion == null ? null : artifactSha(input.content),
     };
     this.artifacts.set(`${input.runId}|${input.artifactId}`, record);
     return record;

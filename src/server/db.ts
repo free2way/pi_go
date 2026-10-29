@@ -585,6 +585,13 @@ export const databaseMigrations: Migration[] = [
     sql: `CREATE INDEX idx_run_events_provider_alert ON run_events((meta_json::jsonb ->> 'provider'), at DESC, run_id DESC, seq DESC)
       WHERE source = 'system' AND type IN ('provider.attempt_failed', 'session.metrics');`,
   },
+  {
+    id: 18,
+    name: "artifact-diagnostic-provenance",
+    // Do not backfill trust onto bodies written before the sanitizer boundary.
+    sql: `ALTER TABLE run_artifacts ADD COLUMN diagnostic_policy_version INTEGER;
+      ALTER TABLE run_artifacts ADD COLUMN diagnostic_policy_sha256 TEXT;`,
+  },
 ];
 
 export async function runMigrations(db: Db) {

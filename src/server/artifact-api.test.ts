@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { artifactDiagnosticCredentials, redactArtifactDiagnostic, saveInternalRunArtifact } from "./artifact-api.js";
+import { ARTIFACT_DIAGNOSTIC_POLICY_VERSION, artifactDiagnosticCredentials, artifactDiagnosticDownloadSafe, redactArtifactDiagnostic, saveInternalRunArtifact } from "./artifact-api.js";
 import { createHash } from "node:crypto";
 import { baseDemoRun } from "./demo-runner.js";
 import { RunStore } from "./store.js";
@@ -21,6 +21,79 @@ async function testStore() {
 
 afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
+});
+
+describe("diagnostic artifact download provenance", () => {
+  it.each(["plain", "url", "json"])("refuses an opaque historical %s secret even after its key is rotated away", async (format) => {
+    const { store, run } = await testStore();
+    const old = ["DUMMY", 'retired/+" value'].join("_");
+    const value = format === "url" ? encodeURIComponent(old) : format === "json" ? JSON.stringify(old).slice(1, -1) : old;
+    const content = "historical opaque " + value;
+    await store.saveArtifact({ runId: run.id, artifactId: "legacy", kind: "trace", content });
+    // A current-key-only scan cannot detect this retired arbitrary value.
+    expect(redactArtifactDiagnostic("trace", content, undefined, {}, ["DUMMY_replacement"])).toBe(content);
+    const read = vi.fn(async () => ["DUMMY_replacement"]);
+    const stored = await store.getArtifact(run.id, "legacy");
+    expect(await artifactDiagnosticDownloadSafe({ ...stored!, content }, run, {}, read)).toBe(false);
+    expect(read).not.toHaveBeenCalled();
+    expect((await store.getArtifact(run.id, "legacy"))?.content).toBe(content);
+  });
+
+  it.each([undefined, null, 0, -1, 2])("does not trust missing or unsupported policy version %s", async (version) => {
+    const { run } = await testStore();
+    expect(await artifactDiagnosticDownloadSafe({ kind: "trace", content: "normal text", diagnosticPolicyVersion: version }, run, {}, async () => [])).toBe(false);
+  });
+
+  it.each(["trace", "log", "text", "future-kind"])("keeps sanitized %s bytes downloadable across rotation", async (kind) => {
+    const { store, run } = await testStore();
+    const value = "DUMMY_old_opaque";
+    await saveInternalRunArtifact(store, { runId: run.id, artifactId: "current", kind, content: "diagnostic " + value }, {}, async () => [value]);
+    const stored = await store.getArtifact(run.id, "current");
+    expect(stored?.diagnosticPolicyVersion).toBe(ARTIFACT_DIAGNOSTIC_POLICY_VERSION);
+    expect(stored?.content).toBe("diagnostic [redacted]");
+    expect(await artifactDiagnosticDownloadSafe({ ...stored!, content: stored!.content! }, run, {}, async () => ["DUMMY_new_opaque"])).toBe(true);
+  });
+
+  it("rechecks current credentials and propagates a failed context lookup for marked output", async () => {
+    const { run } = await testStore();
+    const content = "ordinary DUMMY_newly_configured";
+    const artifact = { kind: "trace", content, diagnosticPolicyVersion: ARTIFACT_DIAGNOSTIC_POLICY_VERSION, diagnosticPolicySha256: createHash("sha256").update(content).digest("hex") };
+    expect(await artifactDiagnosticDownloadSafe(artifact, run, {}, async () => ["DUMMY_newly_configured"])).toBe(false);
+    await expect(artifactDiagnosticDownloadSafe(artifact, run, {}, async () => { throw new Error("lookup failed"); })).rejects.toThrow("lookup failed");
+  });
+
+  it("rejects a changed body under a stale marker left by an older writer", async () => {
+    const { store, run } = await testStore();
+    await saveInternalRunArtifact(store, { runId: run.id, artifactId: "trace", kind: "trace", content: "ordinary" }, {}, async () => []);
+    const original = await store.getArtifact(run.id, "trace");
+    const read = vi.fn(async () => []);
+    expect(await artifactDiagnosticDownloadSafe({ ...original!, content: "unknown retired opaque value" }, run, {}, read)).toBe(false);
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it("does not mark output trusted without the run credential resolver", async () => {
+    const { store, run } = await testStore();
+    await saveInternalRunArtifact(store, { runId: run.id, artifactId: "incomplete", kind: "trace", content: "ordinary" }, {});
+    expect((await store.getArtifact(run.id, "incomplete"))?.diagnosticPolicyVersion).toBeNull();
+  });
+
+  it("ignores an upload caller's attempted provenance and clears trust on a direct overwrite", async () => {
+    const { store, run } = await testStore();
+    const input = { runId: run.id, artifactId: "trace", kind: "trace", content: "ordinary", diagnosticPolicyVersion: 999 };
+    await saveInternalRunArtifact(store, input, {}, async () => []);
+    expect((await store.getArtifact(run.id, "trace"))?.diagnosticPolicyVersion).toBe(ARTIFACT_DIAGNOSTIC_POLICY_VERSION);
+    await store.saveArtifact({ runId: run.id, artifactId: "trace", kind: "trace", content: "untrusted replacement" });
+    expect((await store.getArtifact(run.id, "trace"))?.diagnosticPolicyVersion).toBeNull();
+  });
+
+  it("preserves source patch export without requiring diagnostic provenance or credentials", async () => {
+    const { run } = await testStore();
+    const content = "--- a/file\n+++ b/file\n+Bearer DUMMY_source\n";
+    const read = vi.fn(async () => { throw new Error("unavailable"); });
+    expect(await artifactDiagnosticDownloadSafe({ kind: "patch", content }, run, {}, read)).toBe(true);
+    expect(read).not.toHaveBeenCalled();
+    expect(content).toContain("Bearer DUMMY_source");
+  });
 });
 
 describe("saveInternalRunArtifact (NEW-07)", () => {
