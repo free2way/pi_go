@@ -58,6 +58,7 @@ import { WorkspaceLockManager, workspaceKeyFor } from "./workspace-lock.js";
 import { PiRunError, failureOutputForEvent } from "./agent-failure.js";
 import { redactWorkerDiagnostic, workerDiagnosticMessage } from "./diagnostic-redaction.js";
 import { redactKnownSecretText } from "../shared/diagnostics.js";
+import { createQueueWake } from "./queue-wake.js";
 import { migrateLegacySubAgentState, subAgentStateDirectory } from "./subagent-state.js";
 import { captureFailedSubAgentWorktree } from "./subagent-artifacts.js";
 import { planRecovery, recoveryResumePhase, recoveryUpdateState } from "./run-recovery.js";
@@ -603,6 +604,7 @@ async function dispatchJob(input: JobInput, controller: AbortController) {
     clearInterval(touch);
     await result.handle.release().catch(() => undefined);
     void drainDeferredJobs();
+    pendingJobWake.wake();
   }
   return true;
 }
@@ -2868,7 +2870,7 @@ async function reclaimPendingJobs() {
   }
   let started = 0;
   for (const job of jobs) {
-    if (active.size >= maxActiveJobs) break;
+    if (shuttingDown || active.size >= maxActiveJobs) break;
     if (active.has(job.run.id)) continue;
     if (!job.credentials?.developer || !job.credentials?.reviewer) {
       console.warn(`[jobs] skipping ${job.jobId}: credentials unavailable`);
@@ -2892,9 +2894,13 @@ async function reclaimPendingJobs() {
       console.error(`[jobs] reclaimed job ${job.jobId} failed to start: ${diagnosticMessage(error, Object.values(job.credentials))}`);
     });
   }
-  if (started > 0) console.warn(`[jobs] reclaimed ${started} unfinished job(s) after restart`);
+  if (started > 0) console.warn(`[jobs] admitted ${started} durable queue job(s)`);
   return started;
 }
+
+const pendingJobWake = createQueueWake(reclaimPendingJobs, (error) => {
+  console.warn(`[jobs] queue notification failed: ${diagnosticMessage(error)}`);
+});
 
 /**
  * A1: regenerates a run's full patch from its run directory, using the same
@@ -3221,6 +3227,12 @@ const server = createServer(async (request, response) => {
         activePiAssistants -= 1;
       }
     }
+    if (request.method === "POST" && url.pathname === "/jobs/wake") {
+      if (shuttingDown) return json(response, 503, { error: "Worker is stopping", code: "WORKER_SHUTTING_DOWN" });
+      if ((await storageStatus()).state === "critical") return json(response, 507, { error: "Disk space critically low; refusing new jobs" });
+      pendingJobWake.wake();
+      return json(response, 202, { accepted: true, queued: true });
+    }
     if (request.method === "POST" && url.pathname === "/jobs") {
       // P1: a shutting-down worker stops claiming new jobs so it can reclaim its
       // sandbox containers without racing a new run.
@@ -3338,6 +3350,7 @@ if (sandboxMode === "unavailable") {
 const shutdown = createShutdownHandler({
   stopClaiming: () => {
     shuttingDown = true;
+    pendingJobWake.stop();
     server.close();
   },
   stopSandboxes: () => sandboxContainers.stopAll(),
@@ -3354,9 +3367,9 @@ for (const signal of ["SIGTERM", "SIGINT"] as const) {
 
 server.listen(port, host, () => {
   process.stdout.write(`pigo-worker listening on http://${host}:${port}\n`);
-  void reclaimPendingJobs();
+  pendingJobWake.wake();
   const timer = setInterval(() => {
-    void reclaimPendingJobs();
+    pendingJobWake.wake();
     // A deferred job whose holder went stale (crash) has no release event.
     void drainDeferredJobs();
     // AT-JEV-056: hourly (self-throttled) decision-audit retention sweep. A
