@@ -23,6 +23,35 @@ import {
 const token = "0123456789abcdef0123456789abcdef";
 const digest = `sha256:${"d".repeat(64)}`;
 
+test("executor deployment diagnostics are redacted before persistence and callbacks", async t => {
+  const secret = 'DUMMY_executor_opaque?=%@-' + 'x'.repeat(40);
+  const directory = await mkdtemp(path.join(os.tmpdir(), "pigo-executor-diagnostic-")), callbacks = [];
+  const config = { token: secret, workspaceRoot: directory, appPath: ".", dataFile: path.join(directory, "state.json"), callbackPublicOrigin: "https://callback.invalid", allowedEnvironments: new Set(["staging"]), fetchImpl: async (_url, options) => { callbacks.push({ authorization: options.headers.Authorization, body: JSON.parse(options.body) }); return new Response("{}", { status: 200 }); } };
+  const { server, store } = await createExecutor({ config });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => { await new Promise(resolve => server.close(resolve)); await rm(directory, { recursive: true, force: true }); });
+  const payload = { event: "run.release_requested", environment: "staging", deliveryId: "diagnostic:run:staging", attempt: 1, callbackUrl: "https://callback.invalid/api/internal/runs/fixture/release-result", repository: "missing-" + secret, commit: "a".repeat(40) }, raw = JSON.stringify(payload);
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/hooks/pigo-release`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${secret}`, "x-pigo-delivery-id": payload.deliveryId, "x-pigo-signature": `sha256=${createHmac("sha256", secret).update(raw).digest("hex")}` }, body: raw });
+  assert.equal(response.status, 202);
+  for (let i = 0; i < 100 && store.getDelivery(payload.deliveryId + ":1")?.callbackStatus !== "succeeded"; i++) await new Promise(resolve => setTimeout(resolve, 10));
+  const delivery = store.getDelivery(payload.deliveryId + ":1"), final = callbacks.find(x => x.body.status === "failed");
+  assert.equal(delivery.status, "failed"); assert.equal(delivery.callbackStatus, "succeeded"); assert.ok(final);
+  assert.match(delivery.detail, /ENOENT/); assert.match(final.body.detail, /ENOENT/);
+  assert.ok(!delivery.detail.includes(secret) && !delivery.detail.includes(directory));
+  assert.ok(!(await readFile(store.file, "utf8")).includes(secret));
+  assert.equal(final.body.deliveryId, payload.deliveryId); assert.equal(final.body.attempt, 1);
+  assert.ok(callbacks.every(x => x.authorization === `Bearer ${secret}` && !x.body.detail.includes(secret) && !x.body.detail.includes(directory)));
+});
+
+test("callback diagnostics redact whole plain URI and JSON values before truncation and preserve metadata", async () => {
+  const secret = 'DUMMY_callback_opaque?=%@quoted"-' + 'x'.repeat(60), commit = 'a'.repeat(40);
+  for (const form of [secret, encodeURIComponent(secret), JSON.stringify(secret).slice(1, -1)]) {
+    let captured;
+    await postCallback({ token: secret, callbackPublicOrigin: "https://callback.invalid", fetchImpl: async (_url, options) => { captured = JSON.parse(options.body); assert.equal(options.headers.Authorization, `Bearer ${secret}`); return new Response("{}", { status: 200 }); } }, { deliveryId: "diagnostic:1", attempt: 1, callbackUrl: "https://callback.invalid/api/internal/runs/fixture/release-result" }, { status: "failed", detail: "failure " + "z".repeat(450) + form + " post", commit, imageDigest: digest });
+    assert.match(captured.detail, /\[redacted\]/); assert.ok(captured.detail.length <= 500); assert.ok(!captured.detail.includes(form)); assert.equal(captured.commit, commit); assert.equal(captured.imageDigest, digest);
+  }
+});
+
 test("metrics require bearer auth, expose bounded counts only, never mutate state or weaken deployment HMAC", async t => {
   const metricsToken = createHmac("sha256", token).update("read-only-metrics-fixture").digest("hex");
   const directory = await mkdtemp(path.join(os.tmpdir(), "pigo-executor-metrics-"));
