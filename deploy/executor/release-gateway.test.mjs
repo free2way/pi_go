@@ -13,8 +13,10 @@ import {
   ensureTargetNetwork,
   isRootlessDockerSecurityOptions,
   loadReleaseGatewayConfig,
+  managedReleaseContainerName,
   validateManagedReleaseContainer,
   validateReleaseRequest,
+  verifyStagingPromotion,
 } from "./release-gateway.mjs";
 
 const token = "0123456789abcdef0123456789abcdef";
@@ -53,6 +55,61 @@ test("release gateway configuration fails closed", () => {
   assert.throws(() => loadReleaseGatewayConfig({ ...valid, PIGO_RELEASE_REQUIRE_ROOTLESS: "true" }), /literal 0 or 1/);
   assert.equal(loadReleaseGatewayConfig({ ...valid, PIGO_RELEASE_REQUIRE_ROOTLESS: "1" }).requireRootless, true);
   assert.equal(loadReleaseGatewayConfig({ ...valid, PIGO_RELEASE_REQUIRE_ROOTLESS: "0" }).requireRootless, false);
+});
+
+test("release instance defaults preserve existing target names and distinct instances cannot collide", () => {
+  const base = { PIGO_RELEASE_GATEWAY_TOKEN: token };
+  assert.equal(managedReleaseContainerName(loadReleaseGatewayConfig(base), "staging"), "pigo-release-order-status-staging");
+  assert.equal(managedReleaseContainerName({}, "production"), "pigo-release-order-status-production");
+  const one = loadReleaseGatewayConfig({ ...base, PIGO_RELEASE_INSTANCE: "team-one" });
+  const two = loadReleaseGatewayConfig({ ...base, PIGO_RELEASE_INSTANCE: "team-two" });
+  assert.equal(managedReleaseContainerName(one, "staging"), "pigo-release-team-one-staging");
+  assert.notEqual(managedReleaseContainerName(one, "staging"), managedReleaseContainerName(two, "staging"));
+  assert.notEqual(managedReleaseContainerName(one, "staging"), managedReleaseContainerName(one, "production"));
+  assert.throws(() => managedReleaseContainerName(one, "other"), /invalid release environment/);
+});
+
+test("release instance rejects path, CLI, Unicode and excessive names before Docker access", () => {
+  for (const name of ["../other", "with space", "--privileged", "UPPER", "a/b", "a_b", "a.", "tail-", "a\nb", "应用", "a".repeat(25)]) {
+    assert.throws(() => loadReleaseGatewayConfig({ PIGO_RELEASE_GATEWAY_TOKEN: token, PIGO_RELEASE_INSTANCE: name }), /PIGO_RELEASE_INSTANCE/);
+    assert.throws(() => managedReleaseContainerName({ instanceName: name }, "staging"), /PIGO_RELEASE_INSTANCE/);
+  }
+  const name = managedReleaseContainerName({ instanceName: "a".repeat(24) }, "production");
+  assert.ok((name + "-previous").length <= 63);
+});
+
+test("requests cannot override an operator's release instance", () => {
+  const request = { event: "deploy", environment: "staging", repository: "/workspace/project-a", commit: "a".repeat(40) };
+  for (const field of ["instanceName", "instance", "containerName", "PIGO_RELEASE_INSTANCE"]) {
+    assert.throws(() => validateReleaseRequest({ ...request, [field]: "other" }), /not allowed/);
+  }
+});
+
+test("promotion looks only for the same instance's staging target and refuses a missing or foreign one", async () => {
+  const config = loadReleaseGatewayConfig({ PIGO_RELEASE_GATEWAY_TOKEN: token, PIGO_RELEASE_INSTANCE: "team-one" });
+  const payload = { event: "deploy", environment: "production", commit: "a".repeat(40), expectedImageDigest: digest };
+  const calls = [];
+  await assert.rejects(() => verifyStagingPromotion(config, payload, async (_command, args) => {
+    calls.push(args);
+    return { stdout: "", stderr: "" };
+  }), /same gateway-managed image/);
+  assert.deepEqual(calls, [["container", "ls", "--all", "--filter", "name=^/pigo-release-team-one-staging$", "--format", "{{.Names}}"]]);
+  await assert.rejects(() => verifyStagingPromotion(config, payload, async () => ({ stdout: "pigo-release-team-two-staging", stderr: "" })), /ambiguous managed container/);
+});
+
+test("deployment inspects only its own current and previous targets before rejecting unmanaged state", async () => {
+  const config = loadReleaseGatewayConfig({ PIGO_RELEASE_GATEWAY_TOKEN: token, PIGO_RELEASE_INSTANCE: "team-one" });
+  const calls = [];
+  const runCommand = async (_command, args) => {
+    calls.push(args);
+    if (args[0] === "network" && args[1] === "ls") return { stdout: config.targetNetwork, stderr: "" };
+    if (args[0] === "network") return { stdout: JSON.stringify([{ Name: config.targetNetwork, Driver: "bridge", Internal: false, Attachable: false, Ingress: false, Labels: { "pigo.release.gateway": "1" }, Options: { "com.docker.network.bridge.host_binding_ipv4": "127.0.0.1" } }]), stderr: "" };
+    if (args[1] === "ls") return { stdout: "pigo-release-team-one-staging-previous", stderr: "" };
+    return { stdout: JSON.stringify([{ Name: "/pigo-release-team-two-staging-previous" }]), stderr: "" };
+  };
+  await assert.rejects(() => deployManagedContainer(config, { environment: "staging", commit: "a".repeat(40) }, { image: "local/fixture:test", imageDigest: digest }, { runCommand }), /unmanaged backup container/);
+  assert.equal(calls.some(args => ["stop", "rm", "rename", "create", "start"].includes(args[1])), false);
+  assert.ok(calls.some(args => args.includes("name=^/pigo-release-team-one-staging-previous$")));
 });
 
 test("release gateway verifies a required rootless execution daemon before listening", async () => {
@@ -204,10 +261,11 @@ test("managed release policy rejects host takeover primitives", () => {
   }
 });
 
-test("failed smoke restores the previous managed container", async () => {
+async function verifySmokeRollback(instanceName) {
   const commit = "a".repeat(40);
   const previousCommit = "b".repeat(40);
   const config = {
+    instanceName,
     imageRepository: "local/app",
     targetNetwork: "pigo-release-targets",
     stagingPort: 18080,
@@ -246,7 +304,7 @@ test("failed smoke restores the previous managed container", async () => {
     },
     Mounts: [],
   });
-  const name = "pigo-release-order-status-staging";
+  const name = instanceName ? "pigo-release-team-one-staging" : "pigo-release-order-status-staging";
   const backup = `${name}-previous`;
   let active = container(name, `local/app:${previousCommit}`, previousCommit);
   let saved;
@@ -302,7 +360,11 @@ test("failed smoke restores the previous managed container", async () => {
   assert.equal(calls.some((args) => args[1] === "rename" && args[2] === name && args[3] === backup), true);
   assert.equal(calls.some((args) => args[1] === "rename" && args[2] === backup && args[3] === name), true);
   assert.equal(calls.some((args) => args[1] === "rm" && args.at(-1) === name), true);
-});
+}
+
+for (const instanceName of [undefined, "team-one"]) {
+  test(`failed smoke restores only the ${instanceName ?? "default"} instance previous container`, () => verifySmokeRollback(instanceName));
+}
 
 test("release gateway HTTP surface exposes no generic Docker route", async () => {
   let executions = 0;
@@ -342,6 +404,7 @@ test("compose keeps Docker socket only on the internal release gateway", async (
   assert.match(executor, /release-control/);
   assert.match(gateway, /\$\{PIGO_RELEASE_DOCKER_SOCKET:-\/var\/run\/docker\.sock\}:\/var\/run\/docker\.sock/);
   assert.match(gateway, /PIGO_RELEASE_REQUIRE_ROOTLESS: \$\{PIGO_RELEASE_REQUIRE_ROOTLESS:-1\}/);
+  assert.match(gateway, /PIGO_RELEASE_INSTANCE: \$\{PIGO_RELEASE_INSTANCE:-order-status\}/u);
   assert.match(gateway, /release-control/);
   assert.doesNotMatch(gateway, /^\s+- release-targets$/mu);
   assert.doesNotMatch(gateway, /ports:/);
@@ -355,6 +418,7 @@ test("staging compose uses an isolated release gateway with the same workspace",
   const gateway = compose.slice(gatewayStart, compose.indexOf("\nvolumes:"));
 
   assert.notEqual(gatewayStart, -1);
+  assert.match(gateway, /PIGO_RELEASE_INSTANCE: \$\{PIGO_RELEASE_INSTANCE:-order-status\}/u);
   assert.match(executor, /depends_on:\s+release-gateway:\s+condition: service_healthy/u);
   assert.match(executor, /PIGO_RELEASE_GATEWAY_URL: http:\/\/pigo-release-gateway-staging:3310/u);
   assert.match(gateway, /container_name: pigo-release-gateway-staging/u);
