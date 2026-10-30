@@ -1030,7 +1030,7 @@ export class AgileService {
       if (!Number.isFinite(age) || age < input.timeoutMs) continue;
       const result = await this.settleReleaseDeployResult({
         releaseId: row.id,
-        actorId: "system",
+        actorId: "system:release-callback-timeout",
         now,
         action: "release.deploy_failed",
         deploy: {
