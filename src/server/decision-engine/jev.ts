@@ -14,6 +14,7 @@
  */
 
 import { checkPayloadLimits, questionSchemaHash, redactText, truncateChars } from "./redaction.js";
+import { serverDiagnosticMessage } from "../server-diagnostics.js";
 import { mapProviderResponse } from "./response-schema.js";
 import type { DecisionEngine, DecisionEngineConfig, DecisionEvaluation, DecisionQuestion, DecisionRequest, DecisionStatus, FallbackReason } from "./types.js";
 import type { EngineDeps } from "./disabled.js";
@@ -350,9 +351,10 @@ function failureEvaluation(input: FailureEvaluationInput): DecisionEvaluation {
  * diagnostic: HTTP-level field NAMES plus validation locations/messages only.
  * FastAPI's `HTTPValidationError.detail[]` carries `loc`/`msg`/`type`, but some
  * errors also echo the offending `input` — those keys are never read here, so
- * no `state`, question or credential content can reach the log.
+ * no `input`/`ctx` object is exported. Every selected string, including field
+ * names and validation locations, still needs the current secret context.
  */
-async function describeProviderError(response: Response): Promise<string> {
+async function describeProviderError(response: Response, credentials: readonly string[]): Promise<string> {
   const text = await response.text();
   let parsed: unknown;
   try {
@@ -364,16 +366,19 @@ async function describeProviderError(response: Response): Promise<string> {
     parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : undefined;
   if (!record) return `bodyKind=${typeof parsed} len=${text.length}`;
   const parts: string[] = [];
-  // Provider-authored strings are free text: a validation error may echo request
-  // content. Run them through the same redactor used for outbound state so no
-  // secret/PII can reach the log even with the diagnostic enabled.
-  const safe = (value: unknown, maxChars: number) => truncateChars(redactText(String(value ?? "")), maxChars);
+  // The resolved key may come from a user's vault rather than the environment.
+  // Redact complete known values before either PII rules or display limits can
+  // split them. Keep outbound model payload redaction and authentication intact.
+  const safe = (value: unknown, maxChars: number) => truncateChars(redactText(serverDiagnosticMessage(value, {
+    credentials,
+    limit: Number.MAX_SAFE_INTEGER,
+  })), maxChars);
   const detail = record.detail;
   if (Array.isArray(detail)) {
     for (const item of detail.slice(0, 8)) {
       const entry = item && typeof item === "object" ? (item as Record<string, unknown>) : undefined;
       if (!entry) continue;
-      const loc = Array.isArray(entry.loc) ? entry.loc.map((value) => String(value)).join(".") : "-";
+      const loc = Array.isArray(entry.loc) ? safe(entry.loc.map((value) => String(value)).join("."), 120) : "-";
       parts.push(`loc=${loc} msg=${safe(entry.msg, 120)} type=${safe(entry.type, 40)}`);
     }
   } else if (typeof detail === "string") {
@@ -383,7 +388,8 @@ async function describeProviderError(response: Response): Promise<string> {
     const value = record[key];
     if (typeof value === "string") parts.push(`${key}=${safe(value, 160)}`);
   }
-  return `keys=[${Object.keys(record).join(",")}] ${parts.join(" | ")}`;
+  const keys = Object.keys(record).slice(0, 16).map((key) => safe(key, 40));
+  return truncateChars(`keys=[${keys.join(",")}] ${parts.join(" | ")}`, 2_000);
 }
 
 /**
@@ -514,8 +520,9 @@ export function createJevEngine(config: DecisionEngineConfig, deps: JevDeps = {}
             // Temporary, env-gated (`PI_JEV_DIAG=1`) diagnostic: a live 422 is
             // otherwise indistinguishable by field. `describeProviderError` logs
             // only validation locations/messages and top-level field names — it
-            // never logs `input`/`ctx`/`state`/the payload or anything key-derived.
-            const described = await describeProviderError(response).catch(() => "body-unreadable");
+            // never logs `input`/`ctx`/`state` or the payload. Provider-authored
+            // strings are projected with this call's resolved key and base URL.
+            const described = await describeProviderError(response, [apiKey, config.baseUrl]).catch(() => "body-unreadable");
             console.warn(`[jev-diag] HTTP ${status} ${described}`);
           }
           if (status === 401 || status === 403) {
