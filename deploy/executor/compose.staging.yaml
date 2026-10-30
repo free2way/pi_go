@@ -72,6 +72,7 @@ services:
       PIGO_EXECUTOR_TARGET_NETWORK: ${PIGO_EXECUTOR_TARGET_NETWORK:-pigo-release-targets}
       PIGO_EXECUTOR_STAGING_PORT: ${PIGO_EXECUTOR_STAGING_PORT:-18080}
       PIGO_RELEASE_REQUIRE_ROOTLESS: ${PIGO_RELEASE_REQUIRE_ROOTLESS:-1}
+      PIGO_RELEASE_INSTANCE: ${PIGO_RELEASE_INSTANCE:-order-status}
     volumes:
       - ${PIGO_HOST_WORKSPACE_ROOT:?Set the exact host workspace root}:/workspace:ro
       - ${PIGO_RELEASE_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock

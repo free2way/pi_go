@@ -34,6 +34,20 @@ function strictFlag(value, name) {
   throw new Error(`${name} must be the literal 0 or 1`);
 }
 
+function releaseInstance(value) {
+  const name = String(value ?? "").trim() || "order-status";
+  if (!/^[a-z0-9](?:[a-z0-9-]{0,22}[a-z0-9])?$/u.test(name)) {
+    throw new Error("PIGO_RELEASE_INSTANCE must be 1-24 lowercase letters, digits or internal hyphens");
+  }
+  return name;
+}
+
+/** Operator configuration only: callers cannot choose another instance's targets. */
+export function managedReleaseContainerName(config, environment) {
+  if (environment !== "staging" && environment !== "production") throw new Error("invalid release environment");
+  return `pigo-release-${releaseInstance(config.instanceName)}-${environment}`;
+}
+
 function safeEqual(left, right) {
   const a = createHash("sha256").update(String(left)).digest();
   const b = createHash("sha256").update(String(right)).digest();
@@ -117,6 +131,7 @@ export function loadReleaseGatewayConfig(environment = process.env) {
   const productionPort = number("PIGO_EXECUTOR_PRODUCTION_PORT", 18081);
   return {
     token: secret(environment.PIGO_RELEASE_GATEWAY_TOKEN, "PIGO_RELEASE_GATEWAY_TOKEN"),
+    instanceName: releaseInstance(environment.PIGO_RELEASE_INSTANCE),
     host: environment.HOST || "0.0.0.0",
     port,
     workspaceRoot: path.resolve(workspaceRoot),
@@ -300,7 +315,7 @@ for (const [input, expected] of cases) {
 `;
 
 export async function deployManagedContainer(config, payload, artifact, runtime) {
-  const name = `pigo-release-order-status-${payload.environment}`;
+  const name = managedReleaseContainerName(config, payload.environment);
   const backup = `${name}-previous`;
   const hostPort = payload.environment === "staging" ? config.stagingPort : config.productionPort;
   const policy = {
@@ -361,9 +376,9 @@ export async function deployManagedContainer(config, payload, artifact, runtime)
   }
 }
 
-async function verifyStagingPromotion(config, payload, runCommand) {
+export async function verifyStagingPromotion(config, payload, runCommand) {
   if (payload.event !== "deploy" || payload.environment !== "production") return;
-  const name = "pigo-release-order-status-staging";
+  const name = managedReleaseContainerName(config, "staging");
   const staging = await findContainer(config, "staging", name, runCommand);
   const policy = {
     name,
