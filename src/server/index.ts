@@ -84,6 +84,7 @@ import { planRemoteSyncGate, type RemoteCommitEvidence } from "./scm-release-gat
 import type { RequirementRefinement } from "../shared/requirement-assistant.js";
 import type { PiAssistantAnswer } from "../shared/pi-assistant.js";
 import { serverDiagnosticMessage, serverLoggerOptions } from "./server-diagnostics.js";
+import { readReleaseTimeoutObservation, syncReleaseTimeoutAlerts } from "./release-timeout-alerts.js";
 
 const app = Fastify({
   logger: serverLoggerOptions(),
@@ -3683,12 +3684,13 @@ async function expireStaleReleaseDeploys() {
     const expired = await agile.expireStaleReleaseDeploys({ timeoutMs: RELEASE_DEPLOY_STALE_MS });
     if (expired.length > 0) {
       app.log.warn({ expired }, "release deploy callback timed out; attempt marked failed and retryable");
-      alerts.raise({
-        key: "release_deploy_timeout",
-        severity: "warning",
-        message: "发布部署回调超时，已标记失败并可重试",
-        details: { count: expired.length, releases: expired.slice(0, 10) },
-      });
+    }
+    try {
+      syncReleaseTimeoutAlerts(alerts, await readReleaseTimeoutObservation(db));
+    } catch (error) {
+      // A failed aggregate read cannot erase the positive expiry evidence.
+      if (expired.length > 0) syncReleaseTimeoutAlerts(alerts, { outstanding: expired.length });
+      throw error;
     }
   } catch (error) {
     app.log.error({ error: serverDiagnosticMessage(error) }, "stale release deploy expiry failed");
