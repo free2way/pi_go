@@ -22,6 +22,25 @@ import {
 const token = "0123456789abcdef0123456789abcdef";
 const digest = `sha256:${"d".repeat(64)}`;
 
+test("gateway diagnostics redact secrets and private paths before HTTP and logging", async t => {
+  const key = 'DUMMY_gateway_opaque?=%@quoted"-' + 'x'.repeat(40);
+  const logs = [], original = console.error;
+  console.error = line => logs.push(line);
+  t.after(() => { console.error = original; });
+  const server = createReleaseGateway({ token: key, workspaceRoot: "/workspace" }, async () => {
+    throw new Error('failure ' + 'a'.repeat(450) + key + ' ' + encodeURIComponent(key) + ' ' + JSON.stringify(key).slice(1, -1) + ' ' + ['https://', 'operator', ':', 'synthetic-pass', '@', 'registry.invalid/repo'].join('') + ' /workspace/private-project/Dockerfile');
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/v1/deploy`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` }, body: JSON.stringify({ event: "deploy", environment: "staging", repository: "/workspace/project", commit: "a".repeat(40) }) });
+  const body = await response.json();
+  assert.equal(response.status, 400); assert.ok(body.error.length <= 500); assert.match(body.error, /\[redacted\]/); assert.ok(logs.length > 0);
+  for (const value of [body.error, ...logs.map(line => JSON.parse(line).message)]) {
+    for (const marker of [key, encodeURIComponent(key), JSON.stringify(key).slice(1, -1), "synthetic-pass", "/workspace/"]) assert.ok(!value.includes(marker));
+    assert.match(value, /failure/);
+  }
+});
+
 test("release gateway authenticates with an independent bearer secret", () => {
   assert.equal(authorizeReleaseGateway({ authorization: `Bearer ${token}` }, token), true);
   assert.equal(authorizeReleaseGateway({ authorization: "Bearer wrong" }, token), false);

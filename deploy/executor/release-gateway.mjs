@@ -6,6 +6,8 @@ import { pathToFileURL } from "node:url";
 import {
   command,
   executorEnvironment,
+  logExecutorDiagnostic,
+  redactExecutorDiagnostic,
   resolveApplicationTarget,
 } from "./server.mjs";
 
@@ -430,14 +432,14 @@ export function createReleaseGateway(config, execute = executeRelease) {
       let decoded;
       try { decoded = JSON.parse(raw.toString("utf8")); } catch { return json(reply, 400, { error: "Invalid JSON" }); }
       let payload;
-      try { payload = validateReleaseRequest(decoded); } catch (error) { return json(reply, 400, { error: error.message }); }
+      try { payload = validateReleaseRequest(decoded); } catch (error) { return json(reply, 400, { error: redactExecutorDiagnostic(config, error) }); }
       const operation = queue.then(() => execute(config, payload));
       queue = operation.catch(() => undefined);
       return json(reply, 200, await operation);
     } catch (error) {
       const status = Number.isInteger(error?.statusCode) ? error.statusCode : 400;
-      console.error(JSON.stringify({ level: "error", event: "release_gateway.failed", message: error.message }));
-      return json(reply, status, { error: status >= 500 ? "Release gateway failed" : String(error.message).slice(0, 500) });
+      logExecutorDiagnostic(config, "error", "release_gateway.failed", { message: error });
+      return json(reply, status, { error: status >= 500 ? "Release gateway failed" : redactExecutorDiagnostic(config, error) });
     }
   });
 }
@@ -458,4 +460,4 @@ async function main() {
 }
 
 const invoked = process.argv[1] ? pathToFileURL(process.argv[1]).href : "";
-if (import.meta.url === invoked) main().catch((error) => { console.error(error.message); process.exit(1); });
+if (import.meta.url === invoked) main().catch((error) => { logExecutorDiagnostic({}, "error", "release_gateway.start_failed", { message: error }); process.exit(1); });

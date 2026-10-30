@@ -11,6 +11,36 @@ const BODY_LIMIT = 128 * 1024;
 const LOG_LIMIT = 64 * 1024;
 const COMMAND_TIMEOUT_MS = 15 * 60_000;
 
+/** Display diagnostics only; never use this to rewrite commands or identities. */
+export function redactExecutorDiagnostic(config, value, limit = 500) {
+  const secrets = [config.token, config.releaseGatewayToken, config.metricsToken,
+    config.callbackPublicOrigin, config.callbackInternalOrigin, config.releaseGatewayUrl,
+    ...Object.entries(process.env).filter(([name, text]) => text && /(?:_TOKEN|_SECRET|_PASSWORD|_KEY|_CREDENTIALS?|_WEBHOOK)$/iu.test(name)).map(([, text]) => text),
+  ].filter(text => typeof text === "string" && text.length > 0);
+  const forms = [...new Set(secrets.flatMap(text => [text, encodeURIComponent(text), JSON.stringify(text).slice(1, -1)]
+    .flatMap(form => [form, JSON.stringify(form).slice(1, -1)])))].sort((a, b) => b.length - a.length);
+  let text = value instanceof Error ? value.message : typeof value === "string" ? value : "operation failed";
+  for (const form of forms) text = text.replaceAll(form, "[redacted]");
+  text = text
+    .replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s/<>"']*@[^\s<>"']+/giu, "[redacted-url]")
+    .replace(/\b(Bearer|Basic)\s+[^\s,"'<>[\]}]+/giu, "$1 [redacted]")
+    .replace(/([?&](?:access_token|api_key|token|password|secret|signature)=)[^&#\s"'<>]+/giu, "$1[redacted]")
+    .replace(/\b([\w-]*(?:api[_-]?key|token|password|passwd|secret|credential)[\w-]*["']?\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}\][]+)/giu, "$1[redacted]")
+    .replace(/\/(?:workspace|app|data|tmp|home|srv|run|var|private|Users|Volumes)(?=\/|$)(?:\/[^\s"'<>`]*)?/gu, "[internal-path]");
+  // Also cover custom operator roots not included in the common path prefixes.
+  for (const location of [config.workspaceRoot, config.dataFile]) {
+    if (typeof location === "string" && location.length > 1) text = text.replaceAll(location, "[internal-path]");
+  }
+  return text.slice(0, limit);
+}
+
+export function logExecutorDiagnostic(config, level, event, fields) {
+  const safe = Object.fromEntries(Object.entries(fields).map(([key, value]) => [key,
+    typeof value === "string" || value instanceof Error ? redactExecutorDiagnostic(config, value, 2_000) : value,
+  ]));
+  console[level](JSON.stringify({ level, event, ...safe }));
+}
+
 function safeEqual(left, right) {
   const a = Buffer.from(left);
   const b = Buffer.from(right);
@@ -364,7 +394,7 @@ async function releaseGatewayRequest(config, body) {
   const raw = await response.text();
   let decoded;
   try { decoded = raw ? JSON.parse(raw) : {}; } catch { throw new Error("release gateway returned invalid JSON"); }
-  if (!response.ok) throw new Error(`release gateway rejected deployment: ${String(decoded.error || `HTTP ${response.status}`).slice(0, 300)}`);
+  if (!response.ok) throw new Error(`release gateway rejected deployment: ${redactExecutorDiagnostic(config, String(decoded.error || `HTTP ${response.status}`), 300)}`);
   if (!decoded || typeof decoded !== "object" || !/^sha256:[a-f0-9]{64}$/.test(decoded.imageDigest ?? "")) {
     throw new Error("release gateway returned incomplete deployment evidence");
   }
@@ -511,7 +541,7 @@ export async function postCallback(config, payload, outcome) {
     deliveryId: payload.deliveryId,
     attempt: payload.attempt,
     status: outcome.status,
-    detail: outcome.detail.slice(0, 500),
+    detail: redactExecutorDiagnostic(config, outcome.detail),
     ...(outcome.deploymentId ? { deploymentId: outcome.deploymentId } : {}),
     ...(outcome.url ? { url: outcome.url } : {}),
     ...(outcome.commit ? { commit: outcome.commit } : {}),
@@ -558,7 +588,7 @@ export async function postProgress(config, payload, stage, detail) {
       attempt: payload.attempt,
       status: "progress",
       stage,
-      detail: detail.slice(0, 500),
+      detail: redactExecutorDiagnostic(config, detail),
     }),
     signal: AbortSignal.timeout(5_000),
   });
@@ -659,7 +689,7 @@ export async function createExecutor(options = {}) {
       try {
         await postProgress(config, payload, stage, detail);
       } catch (error) {
-        console.warn(JSON.stringify({ level: "warn", event: "progress.callback_failed", deliveryId: payload.deliveryId, attempt: payload.attempt, stage, message: error.message }));
+        logExecutorDiagnostic(config, "warn", "progress.callback_failed", { deliveryId: payload.deliveryId, attempt: payload.attempt, stage, message: error.message });
       }
     };
     try {
@@ -670,8 +700,9 @@ export async function createExecutor(options = {}) {
           : await runReleaseRegistration(config, store, payload);
       outcome = { status: "succeeded", ...result };
     } catch (error) {
-      outcome = { status: "failed", detail: (error instanceof Error ? error.message : "deployment failed").slice(0, 500) };
+      outcome = { status: "failed", detail: redactExecutorDiagnostic(config, error instanceof Error ? error : "deployment failed") };
     }
+    outcome = { ...outcome, detail: redactExecutorDiagnostic(config, outcome.detail) };
     await store.mutate((state) => {
       state.deliveries[key] = { ...state.deliveries[key], ...outcome, finishedAt: new Date().toISOString() };
       if (outcome.status === "succeeded" && (payload.event === "run.release_requested" || payload.event === "run.rollback_requested")) state.latestByEnvironment[payload.environment] = key;
@@ -680,7 +711,7 @@ export async function createExecutor(options = {}) {
       await postCallback(config, payload, outcome);
       await store.mutate((state) => { state.deliveries[key].callbackStatus = "succeeded"; });
     } catch (error) {
-      console.error(JSON.stringify({ level: "error", event: "callback.failed", deliveryId: payload.deliveryId, attempt: payload.attempt, message: error.message }));
+      logExecutorDiagnostic(config, "error", "callback.failed", { deliveryId: payload.deliveryId, attempt: payload.attempt, message: error.message });
       await store.mutate((state) => { state.deliveries[key].callbackStatus = "failed"; });
     }
   }
@@ -690,14 +721,14 @@ export async function createExecutor(options = {}) {
       await postCallback(config, payload, outcome);
       await store.mutate((state) => { state.deliveries[key].callbackStatus = "succeeded"; });
     } catch (error) {
-      console.error(JSON.stringify({ level: "error", event: "callback.retry_failed", deliveryId: payload.deliveryId, attempt: payload.attempt, message: error.message }));
+      logExecutorDiagnostic(config, "error", "callback.retry_failed", { deliveryId: payload.deliveryId, attempt: payload.attempt, message: error.message });
       await store.mutate((state) => { state.deliveries[key].callbackStatus = "failed"; });
     }
   }
 
   for (const recovered of store.takeRecoveredCallbacks?.() ?? []) {
     jobs = jobs.then(() => retryCallback(recovered.payload, recovered.key, recovered.outcome)).catch((error) => {
-      console.error(JSON.stringify({ level: "error", event: "recovery.callback_unhandled", deliveryId: recovered.payload.deliveryId, message: error.message }));
+      logExecutorDiagnostic(config, "error", "recovery.callback_unhandled", { deliveryId: recovered.payload.deliveryId, message: error.message });
     });
   }
 
@@ -752,14 +783,12 @@ export async function createExecutor(options = {}) {
         }
         callbackTarget(payload.callbackUrl, config.callbackPublicOrigin, config.callbackInternalOrigin);
       } catch (error) {
-        console.warn(JSON.stringify({
-          level: "warn",
-          event: "request.rejected",
+        logExecutorDiagnostic(config, "warn", "request.rejected", {
           status: 400,
           deliveryId: deliveryId.slice(0, 200),
-          reason: (error instanceof Error ? error.message : "invalid request").slice(0, 500),
-        }));
-        return json(reply, 400, { error: error.message });
+          reason: redactExecutorDiagnostic(config, error instanceof Error ? error : "invalid request"),
+        });
+        return json(reply, 400, { error: redactExecutorDiagnostic(config, error) });
       }
       const key = deliveryKey(payload);
       const fingerprint = bodyFingerprint(rawBody);
@@ -784,14 +813,14 @@ export async function createExecutor(options = {}) {
           callbackStatus: "pending",
           startedAt: new Date().toISOString(),
           ...(payload.commit ? { commit: payload.commit } : {}),
-          ...(payload.reason ? { reason: payload.reason } : {}),
+          ...(payload.reason ? { reason: redactExecutorDiagnostic(config, payload.reason) } : {}),
         };
         return { kind: "claimed" };
       });
       if (claim.kind === "conflict") return json(reply, 409, { error: "delivery id and attempt were reused with a different payload" });
       if (claim.kind === "retry-callback") {
         jobs = jobs.then(() => retryCallback(payload, key, claim.existing)).catch((error) => {
-          console.error(JSON.stringify({ level: "error", event: "callback.retry_unhandled", deliveryId, message: error.message }));
+          logExecutorDiagnostic(config, "error", "callback.retry_unhandled", { deliveryId, message: error.message });
         });
         return json(reply, 202, { accepted: true, duplicate: true, callbackRetry: true, status: claim.existing.status, deliveryId, attempt: payload.attempt });
       }
@@ -800,13 +829,13 @@ export async function createExecutor(options = {}) {
         return json(reply, status, { accepted: status === 202, duplicate: true, status: claim.existing.status, deliveryId, attempt: payload.attempt });
       }
       jobs = jobs.then(() => processDelivery(payload, key)).catch((error) => {
-        console.error(JSON.stringify({ level: "error", event: "job.unhandled", deliveryId, message: error.message }));
+        logExecutorDiagnostic(config, "error", "job.unhandled", { deliveryId, message: error.message });
       });
       return json(reply, 202, { accepted: true, deliveryId, attempt: payload.attempt });
     } catch (error) {
       const status = Number.isInteger(error.status) ? error.status : 500;
-      console.error(JSON.stringify({ level: "error", event: "request.failed", status, message: error.message }));
-      return json(reply, status, { error: status === 500 ? "Internal server error" : error.message });
+      logExecutorDiagnostic(config, "error", "request.failed", { status, message: error.message });
+      return json(reply, status, { error: status === 500 ? "Internal server error" : redactExecutorDiagnostic(config, error) });
     }
   });
   return { server, config, store };
@@ -821,6 +850,6 @@ async function main() {
 
 const invoked = process.argv[1] ? pathToFileURL(process.argv[1]).href : "";
 if (import.meta.url === invoked) main().catch((error) => {
-  console.error(error);
+  logExecutorDiagnostic({}, "error", "executor.start_failed", { message: error });
   process.exit(1);
 });
