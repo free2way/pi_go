@@ -11,7 +11,8 @@ const ok = (stdout = ""): ScmGitResult => ({ code: 0, stdout, stderr: "" });
 const LOCAL = "a".repeat(40), REMOTE = "b".repeat(40);
 const credential = { provider: "github" as const, authMode: "https_token" as const, token: "test-token" };
 
-function fixture(options: { behind?: boolean; forbidden?: boolean; remoteMissing?: boolean } = {}) {
+function fixture(options: { behind?: boolean; forbidden?: boolean; forbiddenPath?: string; remoteMissing?: boolean } = {}) {
+  const forbiddenPath = options.forbiddenPath ?? (options.forbidden ? "docs/development.md" : undefined);
   let pushed = false;
   const calls: string[][] = [];
   const git = async (args: string[]) => {
@@ -27,8 +28,8 @@ function fixture(options: { behind?: boolean; forbidden?: boolean; remoteMissing
       if (scan) return ok(command[1] === "--count" ? "1\n" : LOCAL + "\n");
       return ok(pushed ? "0 0\n" : options.behind ? "1 2\n" : "1 0\n");
     }
-    if (command[0] === "diff-tree") return ok(options.forbidden ? "docs/development.md\0" : "");
-    if (command[0] === "ls-tree") return ok(options.forbidden && command[3] === LOCAL ? "100644 blob e69de29bb2d1d6434b8b29ae775ad8c2e48c5391 0\tdocs/development.md\0" : "");
+    if (command[0] === "diff-tree") return ok(forbiddenPath ? `${forbiddenPath}\0` : "");
+    if (command[0] === "ls-tree") return ok(forbiddenPath && command[3] === LOCAL ? `100644 blob e69de29bb2d1d6434b8b29ae775ad8c2e48c5391 0\t${forbiddenPath}\0` : "");
     if (command[0] === "cat-file") return ok("");
     if (command.includes("push")) { pushed = true; return ok(); }
     throw new Error("Unexpected git command");
@@ -117,6 +118,13 @@ describe("workspace SCM", () => {
     const { git, pushed } = fixture({ forbidden: true });
     await expect(pushWorkspaceBranch({ branch: "main", git, credential })).rejects.toMatchObject({ code: "SCM_EXPORT_POLICY_BLOCKED" });
     expect(pushed()).toBe(false);
+  });
+
+  it.each(["backup.sql", "database.dump", "deploy.log", "backups/archive.txt", "test-results/output.json", ".codex-artifacts/output.txt"])("refuses artifact history %s before invoking push", async (forbiddenPath) => {
+    const { git, pushed, calls } = fixture({ forbiddenPath });
+    await expect(pushWorkspaceBranch({ branch: "main", git, credential })).rejects.toMatchObject({ code: "SCM_EXPORT_POLICY_BLOCKED" });
+    expect(pushed()).toBe(false);
+    expect(calls.some(args => args.includes("push"))).toBe(false);
   });
 
   it("pushes only the scanned SHA and disables implicit tag pushes", async () => {
