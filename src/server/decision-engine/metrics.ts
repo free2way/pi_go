@@ -124,7 +124,7 @@ function positiveNumber(env: NodeJS.ProcessEnv, name: string, fallback: number):
 /** A strictly positive integer, else the documented default. */
 function positiveInt(env: NodeJS.ProcessEnv, name: string, fallback: number, max = Number.MAX_SAFE_INTEGER): number {
   const value = positiveNumber(env, name, fallback);
-  return Math.min(Math.floor(value), max);
+  return Number.isInteger(value) ? Math.min(value, max) : fallback;
 }
 
 /** A probability in [0, 1]; anything else (including >1 / negative) is the default. */

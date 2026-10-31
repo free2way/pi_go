@@ -218,6 +218,58 @@ describe("computeDecisionMetrics", () => {
 });
 
 describe("resolveDecisionMetricsConfig", () => {
+  it.each(["0.5", "1e-9", "1.5", "0", "-1", "NaN", "Infinity", "not-a-number"])("rejects invalid positive-integer configuration %s", (value) => {
+    const config = resolveDecisionMetricsConfig({
+      PI_DECISION_METRICS_WINDOW_HOURS: value,
+      PI_DECISION_METRICS_INTERVAL_SECONDS: value,
+      PI_DECISION_ALERT_MIN_SAMPLES: value,
+    });
+    expect(config.windowHours).toBe(24);
+    expect(config.intervalSeconds).toBe(300);
+    expect(config.thresholds.minSamples).toBe(20);
+  });
+
+  it.each([1, 2, 60])("preserves valid integer configuration %s", (value) => {
+    const config = resolveDecisionMetricsConfig({
+      PI_DECISION_METRICS_WINDOW_HOURS: String(value),
+      PI_DECISION_METRICS_INTERVAL_SECONDS: String(value),
+      PI_DECISION_ALERT_MIN_SAMPLES: String(value),
+    });
+    expect(config.windowHours).toBe(value);
+    expect(config.intervalSeconds).toBe(value);
+    expect(config.thresholds.minSamples).toBe(value);
+  });
+
+  it("retains upper bounds for large positive integers", () => {
+    const config = resolveDecisionMetricsConfig({
+      PI_DECISION_METRICS_WINDOW_HOURS: "1e20",
+      PI_DECISION_METRICS_INTERVAL_SECONDS: "1e20",
+      PI_DECISION_ALERT_MIN_SAMPLES: "1e20",
+    });
+    expect(config.windowHours).toBe(720);
+    expect(config.intervalSeconds).toBe(86400);
+    expect(config.thresholds.minSamples).toBe(Number.MAX_SAFE_INTEGER);
+  });
+
+  it("schedules the default interval and query window after fractional input", async () => {
+    const setInterval = vi.fn(() => 1);
+    const clearInterval = vi.fn();
+    const listRecent = vi.fn(async () => []);
+    const sweeper = createDecisionMetricsSweeper({
+      env: { PI_DECISION_METRICS_INTERVAL_SECONDS: "0.5", PI_DECISION_METRICS_WINDOW_HOURS: "0.5" },
+      enabled: () => true, listRecent, circuits: () => [], raise: vi.fn(), clear: vi.fn(),
+      now: () => new Date("2026-10-31T12:00:00.000Z"),
+      timers: { setInterval, clearInterval },
+    });
+    sweeper.start();
+    try {
+      expect(setInterval).toHaveBeenCalledWith(expect.any(Function), 300000);
+      await sweeper.sweep();
+      expect(listRecent).toHaveBeenCalledWith({ sinceIso: "2026-10-30T12:00:00.000Z", limit: DECISION_METRICS_MAX_ROWS + 1 });
+    } finally { sweeper.stop(); }
+    expect(clearInterval).toHaveBeenCalledWith(1);
+  });
+
   it("uses the documented defaults when the env is absent/blank", () => {
     const config = resolveDecisionMetricsConfig({});
     expect(config.windowHours).toBe(DECISION_METRICS_DEFAULTS.windowHours);
