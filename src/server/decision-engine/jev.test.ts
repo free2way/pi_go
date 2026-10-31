@@ -282,6 +282,83 @@ describe("jev engine — retry table", () => {
     }
   });
 
+  it.each(["plain", "uri", "json"])("redacts the resolved credential in every provider diagnostic position (%s)", async (form) => {
+    const key = 'DUMMY_jev+/"lowentropy';
+    const echoed = form === "uri" ? encodeURIComponent(key) : form === "json" ? JSON.stringify(key).slice(1, -1) : key;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.stubEnv("PI_JEV_DIAG", "1");
+    try {
+      const body = {
+        [echoed]: "ignored",
+        detail: [{ loc: ["body", "state", echoed], msg: `Rejected ${echoed}`, type: `category ${echoed}`, input: "IGNORED_INPUT" }],
+        error: `Rejected ${echoed}`,
+        message: `Rejected ${echoed}`,
+        error_type: `category ${echoed}`,
+      };
+      const fetchImpl = vi.fn(async (_url: unknown, init: RequestInit | undefined) => {
+        expect(init?.headers).toMatchObject({ Authorization: `Bearer ${key}` });
+        return json(body, 422);
+      });
+      const result = await createJevEngine(config(), { fetchImpl: fetchImpl as typeof fetch, resolveApiKey: () => key }).evaluate(request());
+      expect(result.fallbackReason).toBe("contract_invalid");
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      const logged = warn.mock.calls.flat().join(" ");
+      expect(logged).toContain("HTTP 422");
+      expect(logged).toContain("loc=body.state.[redacted]");
+      expect(logged).not.toContain(key);
+      expect(logged).not.toContain(echoed);
+      expect(logged).not.toContain("IGNORED_INPUT");
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("redacts a complete resolved credential before diagnostic display limits", async () => {
+    const key = `DUMMY_${"x".repeat(300)}+/"suffix`;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.stubEnv("PI_JEV_DIAG", "1");
+    try {
+      const result = await createJevEngine(config(), {
+        resolveApiKey: () => key,
+        fetchImpl: (async () => json({ message: `Rejected ${key}` }, 422)) as typeof fetch,
+      }).evaluate(request());
+      expect(result.fallbackReason).toBe("contract_invalid");
+      const logged = warn.mock.calls.flat().join(" ");
+      expect(logged).toContain("message=Rejected [redacted]");
+      expect(logged).not.toContain(`DUMMY_${"x".repeat(30)}`);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("redacts configured secrets and private paths in diagnostic field names and locations", async () => {
+    const platformMarker = 'DUMMY_platform+/"opaque';
+    const privatePath = "/fixture/private/jev-config.json";
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.stubEnv("PI_JEV_DIAG", "1");
+    vi.stubEnv("PI_INTERNAL_TOKEN", platformMarker);
+    vi.stubEnv("PI_DATA_FILE", privatePath);
+    try {
+      const body = { [privatePath]: "ignored", detail: [{ loc: ["body", platformMarker], msg: privatePath, type: "value_error" }] };
+      await createJevEngine(config(), { fetchImpl: (async () => json(body, 422)) as typeof fetch }).evaluate(request());
+      const logged = warn.mock.calls.flat().join(" ");
+      expect(logged).toContain("[redacted]");
+      expect(logged).not.toContain(platformMarker);
+      expect(logged).not.toContain(privatePath);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("bounds provider-controlled diagnostic field names and locations", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.stubEnv("PI_JEV_DIAG", "1");
+    try {
+      const body = {
+        ...Object.fromEntries(Array.from({ length: 256 }, (_, i) => [`field_${i}_${"x".repeat(300)}`, "ignored"])),
+        detail: Array.from({ length: 32 }, () => ({ loc: Array(1000).fill("location"), msg: "m".repeat(400), type: "t".repeat(400) })),
+      };
+      const result = await createJevEngine(config(), { fetchImpl: (async () => json(body, 422)) as typeof fetch }).evaluate(request());
+      expect(result.fallbackReason).toBe("contract_invalid");
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls.flat().join(" ").length).toBeLessThanOrEqual(2100);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
   it("does not retry an other 4xx", async () => {
     const fetchImpl = vi.fn(async () => json({ error: "bad request" }, 400));
     const engine = createJevEngine(config(), { fetchImpl: fetchImpl as unknown as typeof fetch });
