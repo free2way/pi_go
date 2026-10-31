@@ -12,6 +12,13 @@ export function pathPolicy(name) {
   if (/(^|\/)(\.env(?!\.example$)|id_rsa|id_dsa|id_ecdsa|id_ed25519|credentials|secrets?)(\.|\/|$)/u.test(value)
     || /\.(pem|key|p12|pfx|jks|keystore)$/u.test(value)) return "credential_file";
   if (/(^|\/)(accounts?|users?|credentials).*(export|backup|dump|\.csv|\.sql)/u.test(value)) return "account_export";
+  if (/(^|\/)(backups?|dumps?)(\/|$)/u.test(value)
+    || /\.(?:dump|bak|backup)(?:\.(?:gz|bz2|xz|zip))?$/u.test(value)
+    || /\.sql\.(?:gz|bz2|xz)$/u.test(value)
+    || /(?:^|[/._-])(?:backup|dump)s?(?:[._-]|$)/u.test(value.split("/").at(-1))
+      && /\.(?:sql|json|csv|tar|tgz|gz|zip)$/u.test(value)) return "backup_artifact";
+  if (/(^|\/)logs?(\/|$)/u.test(value) || /\.log(?:\.\d+)?(?:\.gz)?$/u.test(value)) return "deployment_log";
+  if (/(^|\/)(\.codex-artifacts|test-results|playwright-report|blob-report|\.playwright|dist|coverage|node_modules)(\/|$)/u.test(value)) return "runtime_artifact";
   return undefined;
 }
 

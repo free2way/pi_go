@@ -1,9 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { inspectExportHistory, pathPolicy } from "../src/shared/repository-export-policy.mjs";
 
 import { formatFinding, isScannablePath, scanRepository, scanText } from "./repository-policy-scan.mjs";
 
@@ -65,4 +67,48 @@ test("repository scan ignores unchanged baseline lines but rejects newly introdu
   assert.deepEqual(scanRepository(r.cwd).findings, []);
   writeFileSync(join(r.cwd, "config.txt"), `${["legacy", "example.invalid"].join("@")}\nsafe=2\nACCESS_TOKEN=${"a".repeat(30)}\n`);
   assert.deepEqual(scanRepository(r.cwd).findings, [{ path: "config.txt", line: 3, rule: "secret" }]);
+});
+
+const artifactCases = [
+  ["backup.sql", "backup_artifact"],
+  ["database.dump", "backup_artifact"],
+  ["snapshot.bak", "backup_artifact"],
+  ["db-backup.sql.gz", "backup_artifact"],
+  ["backups/archive.txt", "backup_artifact"],
+  ["deploy.log", "deployment_log"],
+  ["logs/output.txt", "deployment_log"],
+  ["test-results/output.json", "runtime_artifact"],
+  [".codex-artifacts/output.txt", "runtime_artifact"],
+  ["playwright-report/index.html", "runtime_artifact"],
+  ["dist/server/index.js", "runtime_artifact"],
+  ["coverage/output.json", "runtime_artifact"],
+];
+
+for (const [file, category] of artifactCases) {
+  test(`history and actual CI command reject ${file} even after deletion`, async (t) => {
+    const r = repository(t);
+    writeFileSync(join(r.cwd, "baseline.txt"), "DUMMY baseline\n");
+    r.run(["add", "."]); r.run(["commit", "-m", "baseline"]);
+    const base = r.run(["rev-parse", "HEAD"]).trim();
+    mkdirSync(dirname(join(r.cwd, file)), { recursive: true });
+    writeFileSync(join(r.cwd, file), "DUMMY synthetic payload\n");
+    r.run(["add", "--", file]); r.run(["commit", "-m", "fixture"]);
+    r.run(["rm", "--", file]); r.run(["commit", "-m", "remove fixture"]);
+    const head = r.run(["rev-parse", "HEAD"]).trim();
+    const findings = await inspectExportHistory({ head, base, git: async (args) => ({ code: 0, stdout: r.run(args), stderr: "" }) });
+    assert.deepEqual(findings, [{ category, path: file }]);
+    const script = fileURLToPath(new URL("./repository-policy-scan.mjs", import.meta.url));
+    let rejected;
+    try { execFileSync(process.execPath, [script], { cwd: r.cwd, env: { ...process.env, PIGO_EXPORT_BASE: base }, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }); }
+    catch (error) { rejected = error; }
+    assert.equal(rejected?.status, 1);
+    assert.match(rejected.stderr, new RegExp(category));
+    assert.doesNotMatch(rejected.stderr, /synthetic payload/);
+  });
+}
+
+test("artifact rules preserve SQL migrations and ordinary source files", () => {
+  for (const file of ["db/migrations/001.sql", "src/domain.sql", "src/backup.ts", "src/logger.ts", "src/artifact.ts", "scripts/backup-retention.mjs", "src/server/admin-backups.test.ts"]) {
+    assert.equal(pathPolicy(file), undefined, file);
+  }
 });
