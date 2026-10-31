@@ -9,10 +9,58 @@ import {
   DECISION_METRICS_MAX_ROWS,
   nearestRankPercentile,
   resolveDecisionMetricsConfig,
+  readDecisionMetrics,
   type DecisionAlertThresholds,
   type DecisionMetricRow,
 } from "./metrics.js";
 import type { Alert } from "../alerts.js";
+
+describe("decision metrics failure diagnostics", () => {
+  const forms = [
+    { name: "plain", encode: (value: string) => value },
+    { name: "URI", encode: encodeURIComponent },
+    { name: "JSON", encode: (value: string) => JSON.stringify(value).slice(1, -1) },
+  ];
+  it.each(forms)("redacts complete configured values before the sweep warning limit ($name)", async ({ encode }) => {
+    const marker = `DUMMY_metric+/"${"x".repeat(300)}END`;
+    const error = new Error(encode(marker));
+    const warn = vi.fn();
+    const raise = vi.fn();
+    const clear = vi.fn();
+    const sweeper = createDecisionMetricsSweeper({
+      env: { TYPESAFE_API_KEY: marker }, enabled: () => true,
+      listRecent: async () => { throw error; }, circuits: () => [], warn, raise, clear,
+    });
+    expect(await sweeper.sweep()).toBeUndefined();
+    expect(warn).toHaveBeenCalledWith("decision metrics sweep failed; alerts unchanged", { error: "[redacted]" });
+    expect(raise).not.toHaveBeenCalled();
+    expect(clear).not.toHaveBeenCalled();
+    expect(error.message).toBe(encode(marker));
+  });
+  it.each(forms)("redacts complete configured values before the read warning limit ($name)", async ({ encode }) => {
+    const marker = `DUMMY_metric+/"${"x".repeat(300)}END`;
+    const error = new Error(encode(marker));
+    const warn = vi.fn();
+    const result = await readDecisionMetrics({
+      enabled: true, windowHours: 24, environment: { TYPESAFE_API_KEY: marker },
+      listRecent: async () => { throw error; }, circuits: () => [], warn,
+    });
+    expect(result.available).toBe(false);
+    expect(warn).toHaveBeenCalledWith("decision metrics read failed; serving an empty aggregate", { error: "[redacted]" });
+    expect(error.message).toBe(encode(marker));
+  });
+  it("redacts a long configured private path before either warning limit", async () => {
+    const privatePath = `/fixture/private/${"segment/".repeat(40)}proof.json`;
+    const message = `query failed for ${privatePath}`;
+    const environment = { PI_DATA_FILE: privatePath };
+    const read = async () => { throw new Error(message); };
+    const warn = vi.fn();
+    await createDecisionMetricsSweeper({ env: environment, enabled: () => true, listRecent: read, circuits: () => [], warn, raise: vi.fn(), clear: vi.fn() }).sweep();
+    await readDecisionMetrics({ enabled: true, windowHours: 24, environment, listRecent: read, circuits: () => [], warn });
+    expect(warn).toHaveBeenCalledTimes(2);
+    for (const [, details] of warn.mock.calls) expect(details).toEqual({ error: "query failed for [redacted]" });
+  });
+});
 
 /**
  * docs/26 §16.1 · decision-plane monitoring. Pure: no database, no clock, no

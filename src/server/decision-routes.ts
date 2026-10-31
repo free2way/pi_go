@@ -1150,6 +1150,7 @@ export function registerDecisionRoutes(app: FastifyInstance, deps: DecisionRoute
       const degraded = await readDecisionMetrics({
         enabled: false,
         windowHours: config.windowHours,
+        environment: deps.env,
         listRecent: async () => [],
         circuits,
         ...(deps.now ? { now: deps.now } : {}),
@@ -1168,6 +1169,7 @@ export function registerDecisionRoutes(app: FastifyInstance, deps: DecisionRoute
     const read = await readDecisionMetrics({
       enabled,
       windowHours: config.windowHours,
+      environment: deps.env,
       listRecent,
       circuits,
       ...(deps.now ? { now: deps.now } : {}),

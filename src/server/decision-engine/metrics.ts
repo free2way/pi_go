@@ -30,7 +30,7 @@ import type {
   DecisionMetricsWindow,
 } from "../../shared/decision-metrics.js";
 import { DECISION_METRIC_STATUSES } from "../../shared/decision-metrics.js";
-import { truncateChars } from "./redaction.js";
+import { serverDiagnosticMessage } from "../server-diagnostics.js";
 
 /** The row projection the metrics need; a full audit record is assignable to it. */
 export interface DecisionMetricRow {
@@ -421,7 +421,7 @@ export function createDecisionMetricsSweeper(deps: DecisionMetricsSweeperDeps): 
       rows = await deps.listRecent({ sinceIso, limit: DECISION_METRICS_MAX_ROWS + 1 });
     } catch (error) {
       deps.warn?.("decision metrics sweep failed; alerts unchanged", {
-        error: truncateChars((error as Error)?.message ?? String(error), 200),
+        error: serverDiagnosticMessage(error, { environment: deps.env, limit: 200 }),
       });
       return undefined;
     }
@@ -472,6 +472,8 @@ export function createDecisionMetricsSweeper(deps: DecisionMetricsSweeperDeps): 
 export async function readDecisionMetrics(input: {
   enabled: boolean;
   windowHours: number;
+  /** Same configuration context as the route; redact before display limits. */
+  environment?: NodeJS.ProcessEnv;
   listRecent: (query: { sinceIso: string; limit: number }) => Promise<readonly DecisionMetricRow[]>;
   circuits: () => readonly DecisionMetricCircuit[];
   now?: () => Date;
@@ -504,7 +506,7 @@ export async function readDecisionMetrics(input: {
     };
   } catch (error) {
     input.warn?.("decision metrics read failed; serving an empty aggregate", {
-      error: truncateChars((error as Error)?.message ?? String(error), 200),
+      error: serverDiagnosticMessage(error, { environment: input.environment, limit: 200 }),
     });
     return { available: false, metrics: emptyDecisionMetrics(circuits), window, computedAt: at.toISOString(), enabled: true };
   }
