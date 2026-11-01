@@ -3,6 +3,7 @@ import type { Run, RunEvent } from "../shared/types.js";
 import { findingFingerprint } from "../shared/finding-fingerprint.js";
 import type { Db } from "./db.js";
 import { mergeHumanNotes } from "./run-notes.js";
+import { serverDiagnosticMessage } from "./server-diagnostics.js";
 import type {
   AppendEventOptions,
   ArtifactContent,
@@ -329,7 +330,7 @@ export class PostgresRunStore implements RunStoreLike {
           try {
             listener(record);
           } catch (error) {
-            console.error("[store] event listener failed", error);
+            console.error("[store] event listener failed", serverDiagnosticMessage(error));
           }
         }
       }
@@ -443,7 +444,7 @@ export class PostgresRunStore implements RunStoreLike {
       try {
         listener(record);
       } catch (error) {
-        console.error("[store] event listener failed", error);
+        console.error("[store] event listener failed", serverDiagnosticMessage(error));
       }
     }
     return record;

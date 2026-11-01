@@ -3,6 +3,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Run, RunArtifact, RunEvent } from "../shared/types.js";
 import { mergeHumanNotes } from "./run-notes.js";
+import { serverDiagnosticMessage } from "./server-diagnostics.js";
 
 interface DatabaseShape {
   runs: Run[];
@@ -247,7 +248,7 @@ export class RunStore implements RunStoreLike {
   private persist() {
     const attempt = this.writeQueue
       .catch((error) => {
-        console.error("[store] previous persist failed; continuing with the next write", error);
+        console.error("[store] previous persist failed; continuing with the next write", serverDiagnosticMessage(error, { credentials: [this.filePath] }));
       })
       .then(async () => {
         const temporary = `${this.filePath}.tmp`;

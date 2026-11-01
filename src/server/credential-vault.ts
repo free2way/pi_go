@@ -1,6 +1,7 @@
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { serverDiagnosticMessage } from "./server-diagnostics.js";
 import type {
   CredentialStatus,
   CredentialVerificationState,
@@ -333,7 +334,7 @@ export class CredentialVault {
   private persist() {
     const attempt = this.writeQueue
       .catch((error) => {
-        console.error("[vault] previous persist failed; continuing with the next write", error);
+        console.error("[vault] previous persist failed; continuing with the next write", serverDiagnosticMessage(error, { credentials: [this.filePath] }));
       })
       .then(async () => {
         const temporary = `${this.filePath}.tmp`;
