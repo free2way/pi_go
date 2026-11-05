@@ -25,6 +25,7 @@
  */
 
 import { decisionAuditRetentionEnabled } from "../shared/decision-retention.js";
+import { workerDiagnosticMessage } from "./diagnostic-redaction.js";
 
 /** Internal web route that performs one sweep (see `decision-routes.ts`). */
 export const DECISION_AUDIT_RETENTION_PATH = "/decisions/audit/retention";
@@ -45,11 +46,6 @@ export interface AuditRetentionTriggerOptions {
   intervalMs?: number;
   /** Warning sink; defaults to `console.warn`. */
   warn?: (message: string) => void;
-}
-
-function safeErrorText(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error ?? "");
-  return message.slice(0, 300);
 }
 
 /**
@@ -80,7 +76,12 @@ export function createAuditRetentionTrigger(options: AuditRetentionTriggerOption
       );
       return true;
     } catch (error) {
-      warn(`[decisions] audit retention sweep trigger failed: ${safeErrorText(error)}`);
+      warn(`[decisions] audit retention sweep trigger failed: ${workerDiagnosticMessage(error, {
+        environment: env,
+        credentials: [env.PI_WEB_CALLBACK_URL ?? ""],
+        privatePaths: [env.PI_WORKSPACE_ROOT ?? ""],
+        limit: 300,
+      })}`);
       return false;
     }
   };

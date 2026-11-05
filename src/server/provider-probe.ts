@@ -16,6 +16,7 @@
  */
 
 import type { ProviderModelCapability } from "../shared/types.js";
+import { serverDiagnosticMessage } from "./server-diagnostics.js";
 
 /** @deprecated kept as an alias for older call sites; use ProviderModelCapability. */
 export type ModelCapabilityOverride = ProviderModelCapability;
@@ -207,9 +208,10 @@ export function createProviderProbe(options: ProviderProbeOptions = {}): Provide
               ? `array(${body.length})`
               : typeof body;
         const firstItem = Array.isArray(body?.data) && body.data[0] ? Object.keys(objectOrUndefined(body.data[0]) ?? {}).join("|") : "-";
-        console.warn(
+        console.warn(serverDiagnosticMessage(
           `[probe-diag] provider=${provider} http=${response.status} topLevel=[${shape}] parsed=${rawList.length} firstItemKeys=[${firstItem}]`,
-        );
+          { environment: env, credentials: [apiKey, base] },
+        ));
       }
       // `/v1/models` items are provider-specific: OpenAI-style lists carry `id`,
       // TypeSafe System One carries `name` (verified against the live
@@ -223,7 +225,11 @@ export function createProviderProbe(options: ProviderProbeOptions = {}): Provide
       const capabilities = extractCapabilities(rawList);
       return capabilities ? { ok: true, models, capabilities } : { ok: true, models };
     } catch (error) {
-      return { ok: false, code: "PROBE_UNREACHABLE", message: `provider 探测失败：${(error as Error).message}` };
+      return {
+        ok: false,
+        code: "PROBE_UNREACHABLE",
+        message: `provider 探测失败：${serverDiagnosticMessage(error, { environment: env, credentials: [apiKey, base] })}`,
+      };
     }
   };
 }

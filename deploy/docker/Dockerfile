@@ -4,6 +4,7 @@ ARG PI_VERSION=1.3.0
 ARG PNPM_VERSION=12.15.0
 ARG UNDICI_VERSION=8.12.2
 ARG CURL_VERSION=8.23.0-r0
+ARG EXPAT_VERSION=2.10.0-r0
 
 # Pi pins an affected HTTP client. Replace the actual package code, not its
 # version metadata; keep Pi's CLI/protocol version stable until upstream fixes it.
@@ -14,6 +15,7 @@ RUN apk upgrade --no-cache \
         "curl@curlfix=${CURL_VERSION}" \
         git \
         "libcurl@curlfix=${CURL_VERSION}" \
+        "libexpat=${EXPAT_VERSION}" \
         openssh-client \
         ripgrep \
     && npm install -g --ignore-scripts \
