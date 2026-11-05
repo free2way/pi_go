@@ -34,7 +34,7 @@ import {
   type DecisionAuditRetentionPolicy,
 } from "../../shared/decision-retention.js";
 import type { DecisionAuditPruneResult, DecisionAuditPruneStore } from "./audit-store.js";
-import { truncateChars } from "./redaction.js";
+import { serverDiagnosticMessage } from "../server-diagnostics.js";
 
 /**
  * Minimum spacing between sweeps. Deliberately shorter than the worker's hourly
@@ -84,11 +84,6 @@ function defaultWarn(message: string, details: Record<string, unknown>): void {
   console.warn(`${message} ${JSON.stringify(details)}`);
 }
 
-function errorText(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error ?? "");
-  return truncateChars(message, 300);
-}
-
 /**
  * Builds the sweep function. It resolves `undefined` when nothing was done
  * (retention disabled, or the throttle window has not elapsed) or when the
@@ -132,7 +127,7 @@ export function createDecisionAuditRetentionSweeper(
         retentionDays: policy.retentionDays,
         maxRows: policy.maxRows,
         cutoff,
-        error: errorText(error),
+        error: serverDiagnosticMessage(error, { environment: options.env ?? process.env, limit: 300 }),
       });
       return undefined;
     }

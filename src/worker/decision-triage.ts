@@ -21,6 +21,8 @@
  *     and cost under its own `role: "decision"` accounting (docs/26 §13).
  */
 
+import { workerDiagnosticMessage } from "./diagnostic-redaction.js";
+
 /** Internal gateway path for one review-triage evaluation. */
 export const REVIEW_TRIAGE_DECISION_PATH = "/decisions/evaluate";
 export const REVIEW_TRIAGE_KIND = "review_triage";
@@ -62,13 +64,9 @@ export interface ReviewTriageTriggerOptions {
   enabled: boolean;
   /** Transport, normally the worker's `internalRequest` (same auth as checkpoints/jobs). */
   send: ReviewTriageSend;
+  env?: NodeJS.ProcessEnv;
   /** Warning sink for a failed trigger; defaults to `console.warn`. */
   warn?: (message: string) => void;
-}
-
-function safeErrorText(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error ?? "");
-  return message.slice(0, 300);
 }
 
 /**
@@ -76,6 +74,7 @@ function safeErrorText(error: unknown): string {
  * failure is logged and dropped, never rethrown.
  */
 export function createReviewTriageTrigger(options: ReviewTriageTriggerOptions): (runId: string) => Promise<void> {
+  const env = options.env ?? process.env;
   const warn = options.warn ?? ((message: string) => console.warn(message));
   return async function triggerReviewTriage(runId: string): Promise<void> {
     if (!options.enabled) return;
@@ -88,7 +87,12 @@ export function createReviewTriageTrigger(options: ReviewTriageTriggerOptions): 
     } catch (error) {
       // docs/26 §15.1: the decision plane is an enhancement, never a dependency.
       // The message is bounded and contains ids/status only — never a credential.
-      warn(`[decision] review triage evaluate failed for ${runId}: ${safeErrorText(error)}`);
+      warn(`[decision] review triage evaluate failed for ${runId}: ${workerDiagnosticMessage(error, {
+        environment: env,
+        credentials: [env.PI_WEB_CALLBACK_URL ?? ""],
+        privatePaths: [env.PI_WORKSPACE_ROOT ?? ""],
+        limit: 300,
+      })}`);
     }
   };
 }
