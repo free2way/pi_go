@@ -54,7 +54,7 @@ jobs:
       - name: Scan candidate runtime for high and critical vulnerabilities
         id: validate_scan_runtime
         continue-on-error: true
-        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         with:
           image: local/pi-coding-agent:1.0.0
           fail-build: true
@@ -66,7 +66,7 @@ jobs:
       - name: Scan candidate web for high and critical vulnerabilities
         id: validate_scan_web
         continue-on-error: true
-        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         with:
           image: local/pigo-web:ci
           fail-build: true
@@ -78,7 +78,7 @@ jobs:
       - name: Scan candidate worker for high and critical vulnerabilities
         id: validate_scan_worker
         continue-on-error: true
-        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         with:
           image: local/pigo-worker:ci
           fail-build: true
@@ -90,7 +90,7 @@ jobs:
       - name: Scan candidate sandbox for high and critical vulnerabilities
         id: validate_scan_sandbox
         continue-on-error: true
-        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         with:
           image: local/pigo-sandbox:ci
           fail-build: true
@@ -102,7 +102,7 @@ jobs:
       - name: Scan candidate executor for high and critical vulnerabilities
         id: validate_scan_executor
         continue-on-error: true
-        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         with:
           image: local/pigo-executor:ci
           fail-build: true
@@ -270,7 +270,7 @@ jobs:
       - name: Scan runtime for high and critical vulnerabilities
         id: scan_runtime
         continue-on-error: true
-        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         with:
           sbom: supply-chain/sbom/runtime.spdx.json
           fail-build: true
@@ -282,7 +282,7 @@ jobs:
       - name: Scan web for high and critical vulnerabilities
         id: scan_web
         continue-on-error: true
-        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         with:
           sbom: supply-chain/sbom/web.spdx.json
           fail-build: true
@@ -294,7 +294,7 @@ jobs:
       - name: Scan worker for high and critical vulnerabilities
         id: scan_worker
         continue-on-error: true
-        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         with:
           sbom: supply-chain/sbom/worker.spdx.json
           fail-build: true
@@ -306,7 +306,7 @@ jobs:
       - name: Scan sandbox for high and critical vulnerabilities
         id: scan_sandbox
         continue-on-error: true
-        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         with:
           sbom: supply-chain/sbom/sandbox.spdx.json
           fail-build: true
@@ -318,7 +318,7 @@ jobs:
       - name: Scan executor for high and critical vulnerabilities
         id: scan_executor
         continue-on-error: true
-        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         with:
           sbom: supply-chain/sbom/executor.spdx.json
           fail-build: true
