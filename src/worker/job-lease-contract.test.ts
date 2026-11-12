@@ -23,7 +23,7 @@ describe("worker durable lease contract", () => {
     const body = source.slice(source.indexOf("async function runPi("), source.indexOf("function emptyPlan"));
     expect(body).toContain("apiKeyEnvNames(input.provider)");
     expect(body).toContain("scrubEnvironment(process.env, credentialEnvironmentNames)");
-    expect(body).toContain("for (const name of credentialEnvironmentNames) childEnvironment[name] = input.apiKey");
+    expect(body).toContain("roleCredentialVariables(input.provider, input.apiKey)");
   });
 
   it("classifies queueable Worker refusals by code, never by message text", async () => {

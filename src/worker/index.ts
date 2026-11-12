@@ -16,7 +16,7 @@ import { DockerApi } from "./docker-api.js";
 import { readBudgetLimits } from "./budget.js";
 import { BudgetExceededError, createRunBudget, type RunBudgetContext } from "./run-budget.js";
 import { runProviderOperation } from "./provider-attempts.js";
-import { scrubEnvironment } from "./pi-env.js";
+import { roleCredentialVariables, scrubEnvironment } from "./pi-env.js";
 import { prepareProcessPiState } from "./pi-process-state.js";
 import { createPiAdmission, PiAdmissionProtocolError } from "./pi-admission.js";
 import { runHardenedGit } from "./git-hardening.js";
@@ -1188,8 +1188,8 @@ async function runPi(input: {
   // SEC-003/010: only the current role's credential reaches the agent process;
   // the worker's own tokens and the other role's key are stripped.
   const credentialEnvironmentNames = apiKeyEnvNames(input.provider);
-  const childEnvironment = scrubEnvironment(process.env, credentialEnvironmentNames);
-  for (const name of credentialEnvironmentNames) childEnvironment[name] = input.apiKey;
+  const roleEnvironment = roleCredentialVariables(input.provider, input.apiKey);
+  const childEnvironment = { ...scrubEnvironment(process.env, credentialEnvironmentNames), ...roleEnvironment };
   if (sandboxMode !== "container") {
     // Never write retry overrides, sessions or auth into the operator's home.
     childEnvironment.PI_CODING_AGENT_DIR = await prepareProcessPiState({
@@ -1248,7 +1248,7 @@ async function runPi(input: {
         repository: input.readOnly ? undefined : await repositoryForWorktree(input.cwd),
         readOnly: input.readOnly,
         env: sandboxEnvironment({
-          ...Object.fromEntries(credentialEnvironmentNames.map((name) => [name, input.apiKey])),
+          ...roleEnvironment,
           ...(input.readOnly ? { PIGO_SANDBOX_READONLY: "1" } : {}),
         }),
         network: agentNetwork,
