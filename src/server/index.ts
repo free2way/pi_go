@@ -40,6 +40,7 @@ import { createProviderProbe, providerProbeDisabled } from "./provider-probe.js"
 import { verifyPendingCredentials } from "./credential-verification.js";
 import { RateLimiter } from "./rate-limit.js";
 import { PostgresRunStore, type JobRecord } from "./run-store-pg.js";
+import { workerRefusalDisposition } from "./worker-refusal.js";
 import { artifactDiagnosticCredentials, artifactDiagnosticDownloadSafe, saveInternalRunArtifact } from "./artifact-api.js";
 import { type ApprovePlan, approveEventMeta, planApprove } from "./approve.js";
 import { conflictReplyFor, isStorageFailure, requestErrorReply } from "./request-errors.js";
@@ -3639,7 +3640,7 @@ async function dispatchJob(
     return { jobId, accepted: true as const };
   } catch (error) {
     const code = (error as { code?: unknown }).code;
-    if (code === "WORKER_CAPACITY" || code === "STORAGE_UNKNOWN" || code === "WORKER_SHUTTING_DOWN") {
+    if (workerRefusalDisposition(error) === "queue") {
       // REL-002 / AUD-05: stay queued instead of failing the run, and release the
       // reservation right away so the job can be claimed as soon as a slot frees.
       await jobQueue.releaseReservation(jobId, "web-dispatch", String(code));

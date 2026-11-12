@@ -29,9 +29,7 @@ describe("worker durable lease contract", () => {
   it("classifies queueable Worker refusals by code, never by message text", async () => {
     const source = await readFile(new URL("../server/index.ts", import.meta.url), "utf8");
     const body = source.slice(source.indexOf("async function dispatchJob(\n  run:"), source.indexOf("/** Re-queues jobs whose worker"));
-    expect(body).toContain('code === "WORKER_CAPACITY"');
-    expect(body).toContain('code === "STORAGE_UNKNOWN"');
-    expect(body).toContain('code === "WORKER_SHUTTING_DOWN"');
+    expect(body).toContain("workerRefusalDisposition(error)");
     expect(body).not.toMatch(/capacity\/i\.test/);
     expect(body).toContain("finishJobAsSystem");
   });
