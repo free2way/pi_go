@@ -48,6 +48,16 @@ describe("workspace disk alert reconciliation", () => {
     expect(alerts.activeKeys).toEqual(["disk_critical"]);
   });
 
+  it("raises an explicit fail-closed alert when disk inspection is unknown", () => {
+    const sink = vi.fn();
+    const alerts = new AlertManager(sink, 60_000);
+    syncStorageAlerts(alerts, { state: "unknown", freeBytes: -1, totalBytes: -1, freePercent: -1 });
+    expect(alerts.activeKeys).toEqual(["disk_unknown"]);
+    expect(sink).toHaveBeenCalledWith(expect.objectContaining({ key: "disk_unknown", severity: "critical" }));
+    syncStorageAlerts(alerts, observation("ok"));
+    expect(alerts.activeKeys).toEqual([]);
+  });
+
   it.each([
     { state: "ok" as const, freeBytes: -1, totalBytes: -1, freePercent: -1 },
     { ...observation("ok"), freeBytes: Number.NaN },

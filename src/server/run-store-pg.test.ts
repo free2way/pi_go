@@ -156,8 +156,61 @@ describe("PostgresRunStore", () => {
     expect((await store.getJob("job_1"))?.state).toBe("queued");
 
     await store.claimJob("job_1", "worker-b");
-    await store.finishJob("job_1", "done");
+    await store.finishJob("job_1", "worker-b", "done");
     expect((await store.listPendingJobs({ staleAfterMs: 60_000 })).length).toBe(0);
+  });
+
+  it("enforces exclusive durable job leases (AT-NX-Q01-Q05)", async () => {
+    const db = await createTestDb();
+    const store = new PostgresRunStore(db);
+    await store.init();
+    const run = makeRun();
+    await store.createRun(run, event(run.id, "run.created"));
+    await store.createJob({ id: "job_lease", runId: run.id, kind: "run", payload: {} });
+
+    await store.reserveJob("job_lease");
+    const first = await store.claimJob("job_lease", "worker-a", 60_000);
+    expect(first).toMatchObject({ workerId: "worker-a", state: "claimed", attempts: 1 });
+    const startedAt = first?.startedAt;
+
+    expect((await store.claimJob("job_lease", "worker-a", 60_000))?.attempts).toBe(1);
+    expect(await store.claimJob("job_lease", "worker-b", 60_000)).toBeUndefined();
+    expect(await store.heartbeatJob("job_lease", "worker-b")).toBe(false);
+    expect(await store.finishJob("job_lease", "worker-b", "done")).toEqual({ ok: false, idempotent: false });
+    expect(await store.releaseReservation("job_lease", "worker-b", "not owner")).toBe(false);
+
+    await db.query("UPDATE jobs SET heartbeat_at = $1 WHERE id = 'job_lease'", [new Date(Date.now() - 600_000).toISOString()]);
+    const takeover = await store.claimJob("job_lease", "worker-b", 60_000);
+    expect(takeover).toMatchObject({ workerId: "worker-b", state: "claimed", attempts: 2, startedAt });
+
+    // A lease obtained on the final permitted attempt must still admit the
+    // owning Worker through its idempotent pre-execution claim.
+    await db.query("UPDATE jobs SET attempts = 5 WHERE id = 'job_lease'");
+    expect((await store.claimJob("job_lease", "worker-b", 60_000))?.attempts).toBe(5);
+
+    expect(await store.finishJob("job_lease", "worker-a", "done")).toEqual({ ok: false, idempotent: false });
+    expect(await store.finishJob("job_lease", "worker-b", "done")).toEqual({ ok: true, idempotent: false });
+    expect(await store.finishJob("job_lease", "worker-b", "done")).toEqual({ ok: true, idempotent: true });
+  });
+
+  it("rejects a run delivery from a worker that lost its lease (AT-NX-Q09)", async () => {
+    const db = await createTestDb();
+    const store = new PostgresRunStore(db);
+    await store.init();
+    const run = makeRun();
+    await store.createRun(run, event(run.id, "run.created"));
+    await store.createJob({ id: "job_callback", runId: run.id, kind: "run", payload: {} });
+    await store.claimJob("job_callback", "worker-b");
+
+    await expect(store.applyDelivery({
+      runId: run.id,
+      deliveryId: "job_callback:stale",
+      lease: { jobId: "job_callback", workerId: "worker-a" },
+      patch: { summary: "must not apply" },
+      event: { runId: run.id, round: 1, source: "system", type: "run.stale", message: "stale", at: new Date().toISOString() },
+    })).rejects.toMatchObject({ code: "JOB_LEASE_LOST" });
+    expect(store.getRun(run.id)?.summary).not.toBe("must not apply");
+    expect((await store.getEvents(run.id)).some((item) => item.type === "run.stale")).toBe(false);
   });
 
   it("imports a legacy runs.json exactly once", async () => {

@@ -592,6 +592,12 @@ export const databaseMigrations: Migration[] = [
     sql: `ALTER TABLE run_artifacts ADD COLUMN diagnostic_policy_version INTEGER;
       ALTER TABLE run_artifacts ADD COLUMN diagnostic_policy_sha256 TEXT;`,
   },
+  {
+    id: 19,
+    name: "job-lease-claimable-index",
+    sql: `CREATE INDEX jobs_claimable_idx ON jobs (state, heartbeat_at, updated_at)
+      WHERE state IN ('queued', 'claimed');`,
+  },
 ];
 
 export async function runMigrations(db: Db) {

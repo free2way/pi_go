@@ -86,7 +86,7 @@ export interface SystemStatusInput {
   };
   infrastructure: {
     database: { status: "ok" | "unavailable"; error?: string };
-    worker: { status: "ok" | "unreachable" | "unknown"; activeJobs?: number; storage?: "ok" | "low" | "critical" };
+    worker: { status: "ok" | "unreachable" | "unknown"; activeJobs?: number; storage?: "ok" | "low" | "critical" | "unknown" };
   };
   /** `null` when the queue could not be queried (non-PostgreSQL store / SQL error). */
   jobStates: StateCountRow[] | null;

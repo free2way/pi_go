@@ -67,7 +67,7 @@ export interface SystemStatusResponse {
   versions: { web: string | null; worker: string | null };
   infrastructure: {
     database: { status: SystemSectionStatus; error?: string };
-    worker: { status: "ok" | "unreachable" | "unknown"; activeJobs?: number; storage?: "ok" | "low" | "critical" };
+    worker: { status: "ok" | "unreachable" | "unknown"; activeJobs?: number; storage?: "ok" | "low" | "critical" | "unknown" };
   };
   queue: {
     status: SystemSectionStatus;

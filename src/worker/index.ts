@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { mkdir, readFile, readdir, realpath, rm, stat, statfs } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
 import type { ChatChannel, ChatParticipant, ChatRole, DevelopmentPlan, Finding, ProjectInfo, Run, RunEvent, RunRoleUsage, RunState, SubAgentTask, WorkspaceVerifyResult } from "../shared/types.js";
@@ -20,7 +20,9 @@ import { scrubEnvironment } from "./pi-env.js";
 import { prepareProcessPiState } from "./pi-process-state.js";
 import { createPiAdmission, PiAdmissionProtocolError } from "./pi-admission.js";
 import { runHardenedGit } from "./git-hardening.js";
-import { apiKeyEnvName, classifyProviderError, providerErrorSummary } from "./provider-errors.js";
+import { apiKeyEnvName, apiKeyEnvNames, classifyProviderError, providerErrorSummary } from "./provider-errors.js";
+import { readStorageStatus, type StorageStatus } from "./storage-status.js";
+import { createJobHeartbeat } from "./job-heartbeat.js";
 import { sleep } from "./provider-retry.js";
 import { parseReview, type ReviewResult } from "./review-protocol.js";
 import { convergenceGuardEnabled, convergenceStop, reviewStallRounds } from "./review-convergence.js";
@@ -171,30 +173,17 @@ const reviewStallRoundsThreshold = reviewStallRounds();
 const reviewerThinking = parseThinkingLevel(process.env.PI_REVIEWER_THINKING, defaultReviewerThinking);
 const reviewerRetryMaxElapsed = reviewerRetryMaxElapsedMs();
 
-export type StorageStatus = {
-  state: "ok" | "low" | "critical";
-  freeBytes: number;
-  totalBytes: number;
-  freePercent: number;
-  path: string;
-};
-
 /**
  * AT-REL-010: reports workspace disk headroom so new work stops before the
  * source repositories or their worktrees are damaged by a full disk.
  */
 async function storageStatus(): Promise<StorageStatus> {
-  try {
-    const stats = await statfs(workspaceRoot);
-    const freeBytes = Number(stats.bavail) * Number(stats.bsize);
-    const totalBytes = Number(stats.blocks) * Number(stats.bsize);
-    const freeMb = freeBytes / 1024 / 1024;
-    const state = freeMb <= criticalFreeDiskMb ? "critical" : freeMb <= minFreeDiskMb ? "low" : "ok";
-    return { state, freeBytes, totalBytes, freePercent: totalBytes ? Number(((freeBytes / totalBytes) * 100).toFixed(2)) : 0, path: workspaceRoot };
-  } catch (error) {
-    console.warn(`[storage] statfs failed: ${diagnosticMessage(error)}`);
-    return { state: "ok", freeBytes: -1, totalBytes: -1, freePercent: -1, path: workspaceRoot };
-  }
+  return readStorageStatus({
+    path: workspaceRoot,
+    minFreeMb: minFreeDiskMb,
+    criticalFreeMb: criticalFreeDiskMb,
+    onError: (error) => console.warn(`[storage] statfs failed: ${diagnosticMessage(error)}`),
+  });
 }
 let worktreeMutationQueue: Promise<void> = Promise.resolve();
 
@@ -472,7 +461,12 @@ async function internalRequest(pathName: string, init?: RequestInit, timeoutMs =
     signal: AbortSignal.timeout(timeoutMs),
   });
   const body = await response.json().catch(() => ({})) as Record<string, unknown>;
-  if (!response.ok) throw new Error(String(body.error || `Internal request failed: ${response.status}`));
+  if (!response.ok) {
+    const failure = new Error(String(body.error || `Internal request failed: ${response.status}`)) as Error & { status?: number; code?: string };
+    failure.status = response.status;
+    failure.code = typeof body.code === "string" ? body.code : undefined;
+    throw failure;
+  }
   return body;
 }
 
@@ -490,7 +484,8 @@ const jobApi = {
   claim: (jobId: string) => internalRequest(`/jobs/${encodeURIComponent(jobId)}/claim`, { method: "POST", body: JSON.stringify({ workerId }) }),
   heartbeat: (jobId: string) => internalRequest(`/jobs/${encodeURIComponent(jobId)}/heartbeat`, { method: "POST", body: JSON.stringify({ workerId }) }),
   finish: (jobId: string, state: string, error?: string) => internalRequest(`/jobs/${encodeURIComponent(jobId)}/finish`, { method: "POST", body: JSON.stringify({ workerId, state, error }) }),
-  pending: async () => (await internalRequest(`/jobs/pending?workerId=${encodeURIComponent(workerId)}`)).jobs as PendingJob[],
+  release: (jobId: string, reason: string) => internalRequest(`/jobs/${encodeURIComponent(jobId)}/release`, { method: "POST", body: JSON.stringify({ workerId, reason }) }),
+  lease: async (capacity: number) => (await internalRequest("/jobs/lease", { method: "POST", body: JSON.stringify({ workerId, capacity }) })).jobs as PendingJob[],
 };
 
 /**
@@ -536,15 +531,25 @@ type PendingJob = {
   retryReview?: boolean;
 };
 
-/** Keeps a claimed job's heartbeat fresh so only a truly dead worker is reclaimed. */
-function startJobHeartbeat(jobId: string | undefined, credentials: JobInput["credentials"]) {
-  if (!jobId) return () => undefined;
-  void jobApi.claim(jobId).catch((error) => console.warn(`[jobs] claim failed: ${diagnosticMessage(error, Object.values(credentials))}`));
-  const timer = setInterval(() => {
-    void jobApi.heartbeat(jobId).catch((error) => console.warn(`[jobs] heartbeat failed: ${diagnosticMessage(error, Object.values(credentials))}`));
-  }, 20_000);
-  timer.unref?.();
-  return () => clearInterval(timer);
+const jobHeartbeatMs = 20_000;
+const jobStaleMs = Math.max(jobHeartbeatMs * 2, Number(process.env.PI_JOB_STALE_SECONDS || 120) * 1_000);
+const activeJobLeases = new Map<string, string>();
+
+/** Keeps a claimed job fresh and aborts before an uncertain lease can expire. */
+function startJobHeartbeat(jobId: string | undefined, credentials: JobInput["credentials"], controller: AbortController) {
+  if (!jobId) return { stop: () => undefined, leaseLost: () => false };
+  return createJobHeartbeat({
+    intervalMs: jobHeartbeatMs,
+    staleMs: jobStaleMs,
+    heartbeat: () => jobApi.heartbeat(jobId),
+    onLeaseLost: (error) => {
+      console.warn(`[jobs] lease lost for ${jobId}: ${diagnosticMessage(error, Object.values(credentials))}`);
+      controller.abort();
+    },
+    onWarning: (error, failures, limit) => {
+      console.warn(`[jobs] heartbeat failed (${failures}/${limit}): ${diagnosticMessage(error, Object.values(credentials))}`);
+    },
+  });
 }
 
 /** How often a lock holder proves it is still alive. */
@@ -560,8 +565,33 @@ const deferredJobs = new Map<string, { input: JobInput; reason: string }>();
 let drainingDeferred = false;
 
 async function dispatchJob(input: JobInput, controller: AbortController) {
+  if (input.jobId) {
+    try {
+      await jobApi.claim(input.jobId);
+      activeJobLeases.set(input.run.id, input.jobId);
+    } catch (error) {
+      if ((error as { code?: unknown }).code === "JOB_LEASE_LOST" || (error as { status?: unknown }).status === 409) {
+        active.delete(input.run.id);
+        deferredJobs.delete(input.run.id);
+        input.credentials.developer = "";
+        input.credentials.reviewer = "";
+        console.warn(`[jobs] refusing ${input.run.id}: durable lease is held by another worker`);
+        return false;
+      }
+      throw error;
+    }
+  }
   const key = workspaceKeyFor(input.run);
-  const result = await workspaceLocks.acquire(key, input.run.id);
+  let result;
+  try {
+    result = await workspaceLocks.acquire(key, input.run.id);
+  } catch (error) {
+    if (input.jobId) {
+      await jobApi.release(input.jobId, "Workspace lock acquisition failed").catch(() => undefined);
+      activeJobLeases.delete(input.run.id);
+    }
+    throw error;
+  }
   if (!result.acquired) {
     // Do not run, do not finish the job: leave it for the drain loop / durable
     // requeue. `active` is cleared so capacity accounting stays honest.
@@ -580,6 +610,10 @@ async function dispatchJob(input: JobInput, controller: AbortController) {
         meta: { workspace: key, holderRunId: holder?.runId, holderWorkerId: holder?.workerId, staleSeconds: Math.round(workspaceLockStaleMs / 1000) },
       },
     }).catch((error) => console.warn(`[jobs] could not record workspace.locked for ${input.run.id}: ${diagnosticMessage(error, Object.values(input.credentials))}`));
+    if (input.jobId) {
+      await jobApi.release(input.jobId, reason).catch((error) => console.warn(`[jobs] could not release deferred lease: ${diagnosticMessage(error, Object.values(input.credentials))}`));
+      activeJobLeases.delete(input.run.id);
+    }
     console.warn(`[jobs] deferring ${input.run.id}: ${diagnosticMessage(reason, Object.values(input.credentials))}`);
     return false;
   }
@@ -603,6 +637,7 @@ async function dispatchJob(input: JobInput, controller: AbortController) {
   } finally {
     clearInterval(touch);
     await result.handle.release().catch(() => undefined);
+    activeJobLeases.delete(input.run.id);
     void drainDeferredJobs();
     pendingJobWake.wake();
   }
@@ -737,9 +772,11 @@ async function postUpdate(runId: string, input: {
   // AUD-15: every internal update carries a delivery key so a retried or
   // duplicated call is applied at most once (patch and event atomically).
   const deliveryId = `${runId}:${Date.now().toString(36)}:${randomBytes(6).toString("hex")}`;
-  const payload: { patch?: object; event?: object; deliveryId: string } = {
+  const jobId = activeJobLeases.get(runId);
+  const payload: { patch?: object; event?: object; deliveryId: string; jobId?: string; workerId?: string } = {
     ...input,
     deliveryId,
+    ...(jobId ? { jobId, workerId } : {}),
     ...(input.event ? { event: { ...input.event } } : {}),
   };
   // NEW-07: an oversized diff is uploaded as a real server artifact first; the
@@ -1150,8 +1187,9 @@ async function runPi(input: {
   let activityQueue = Promise.resolve();
   // SEC-003/010: only the current role's credential reaches the agent process;
   // the worker's own tokens and the other role's key are stripped.
-  const childEnvironment = scrubEnvironment(process.env, [input.apiKeyEnvironmentName]);
-  childEnvironment[input.apiKeyEnvironmentName] = input.apiKey;
+  const credentialEnvironmentNames = apiKeyEnvNames(input.provider);
+  const childEnvironment = scrubEnvironment(process.env, credentialEnvironmentNames);
+  for (const name of credentialEnvironmentNames) childEnvironment[name] = input.apiKey;
   if (sandboxMode !== "container") {
     // Never write retry overrides, sessions or auth into the operator's home.
     childEnvironment.PI_CODING_AGENT_DIR = await prepareProcessPiState({
@@ -1209,7 +1247,10 @@ async function runPi(input: {
         // to share, and the mount is read-only.
         repository: input.readOnly ? undefined : await repositoryForWorktree(input.cwd),
         readOnly: input.readOnly,
-        env: sandboxEnvironment({ [input.apiKeyEnvironmentName]: input.apiKey, ...(input.readOnly ? { PIGO_SANDBOX_READONLY: "1" } : {}) }),
+        env: sandboxEnvironment({
+          ...Object.fromEntries(credentialEnvironmentNames.map((name) => [name, input.apiKey])),
+          ...(input.readOnly ? { PIGO_SANDBOX_READONLY: "1" } : {}),
+        }),
         network: agentNetwork,
         timeoutMs: runTimeoutMs,
         signal,
@@ -2272,7 +2313,7 @@ async function executeJob(input: JobInput, controller: AbortController) {
   // A re-claimed job (worker restart) resumes against the checkpoints already
   // recorded for this run: reuse the worktree and skip finished stages (REL-002/003).
   const recovering = Boolean(!input.resume && !input.retryReview && (input.recovery || tracker.size > 0));
-  const stopHeartbeat = startJobHeartbeat(input.jobId, input.credentials);
+  const heartbeat = startJobHeartbeat(input.jobId, input.credentials, controller);
   let outcomeState: "done" | "failed" | "cancelled" = "done";
   let terminalRecorded = true;
   // AUD-10: one Run level deadline covers model calls, checks and container work.
@@ -2729,6 +2770,12 @@ async function executeJob(input: JobInput, controller: AbortController) {
     await update(run, "needs_human", "system", "run.needs_human", maxRounds.message, { findings, usage: toRunUsage(usage), usageRoles: run.usageRoles, modelCalls: run.modelCalls, durationMs: Date.now() - started }, { meta: maxRounds.meta });
   } catch (error) {
     const locale = runLocale(run);
+    if (heartbeat.leaseLost()) {
+      outcomeState = "cancelled";
+      terminalRecorded = false;
+      console.warn(`[jobs] ${input.jobId ?? run.id} stopped after losing its durable lease; terminal callback suppressed`);
+      return;
+    }
     if (deadlineExceeded) {
       terminalRecorded = false;
       const deadline = guardText(deadlineExceededText(runLimits.maxDurationSeconds), locale);
@@ -2845,10 +2892,10 @@ async function executeJob(input: JobInput, controller: AbortController) {
     }
   } finally {
     deadline.cancel();
-    stopHeartbeat();
-    if (input.jobId && terminalRecorded) {
+    heartbeat.stop();
+    if (input.jobId && terminalRecorded && !heartbeat.leaseLost()) {
       await jobApi.finish(input.jobId, outcomeState).catch((error) => console.warn(`[jobs] finish failed: ${diagnosticMessage(error, Object.values(input.credentials))}`));
-    } else if (input.jobId) {
+    } else if (input.jobId && !heartbeat.leaseLost()) {
       console.warn(`[jobs] keeping ${input.jobId} claimed so it can be retried after the store recovers`);
     }
     input.credentials.developer = "";
@@ -2862,13 +2909,14 @@ async function reclaimPendingJobs() {
   // P1: a shutting-down worker never claims new work.
   if (shuttingDown) return 0;
   if (active.size >= maxActiveJobs) return 0;
-  if ((await storageStatus()).state === "critical") {
-    console.warn("[jobs] disk space critically low; skipping reclaim until cleaned up");
+  const storage = await storageStatus();
+  if (storage.state === "critical" || storage.state === "unknown") {
+    console.warn(`[jobs] storage ${storage.state}; skipping reclaim until inspection succeeds`);
     return 0;
   }
   let jobs: PendingJob[] = [];
   try {
-    jobs = await jobApi.pending();
+    jobs = await jobApi.lease(maxActiveJobs - active.size);
   } catch (error) {
     console.warn(`[jobs] reclaim failed: ${diagnosticMessage(error)}`);
     return 0;
@@ -3234,7 +3282,9 @@ const server = createServer(async (request, response) => {
     }
     if (request.method === "POST" && url.pathname === "/jobs/wake") {
       if (shuttingDown) return json(response, 503, { error: "Worker is stopping", code: "WORKER_SHUTTING_DOWN" });
-      if ((await storageStatus()).state === "critical") return json(response, 507, { error: "Disk space critically low; refusing new jobs" });
+      const storage = await storageStatus();
+      if (storage.state === "unknown") return json(response, 503, { error: "Workspace storage status is unknown", code: "STORAGE_UNKNOWN" });
+      if (storage.state === "critical") return json(response, 507, { error: "Disk space critically low; refusing new jobs", code: "STORAGE_CRITICAL" });
       pendingJobWake.wake();
       return json(response, 202, { accepted: true, queued: true });
     }
@@ -3246,10 +3296,13 @@ const server = createServer(async (request, response) => {
       if (!body.run?.id || body.run.mode !== "real" || !Array.isArray(body.checks) || !body.credentials?.developer || !body.credentials?.reviewer) return json(response, 400, { error: "Invalid job" });
       // Dispatch is at-least-once: a run already executing locally is not an error.
       if (active.has(body.run.id)) return json(response, 202, { accepted: true, runId: body.run.id, note: "already running" });
-      if (active.size >= maxActiveJobs) return json(response, 429, { error: "Worker capacity reached; retry after an active job finishes" });
+      if (active.size >= maxActiveJobs) return json(response, 429, { error: "Worker capacity reached; retry after an active job finishes", code: "WORKER_CAPACITY" });
       const storage = await storageStatus();
+      if (storage.state === "unknown") {
+        return json(response, 503, { error: "Workspace storage status is unknown; refusing new jobs", code: "STORAGE_UNKNOWN" });
+      }
       if (storage.state === "critical") {
-        return json(response, 507, { error: `Disk space critically low (${Math.round(storage.freeBytes / 1024 / 1024)} MB free); refusing new jobs` });
+        return json(response, 507, { error: `Disk space critically low (${Math.round(storage.freeBytes / 1024 / 1024)} MB free); refusing new jobs`, code: "STORAGE_CRITICAL" });
       }
       const controller = new AbortController();
       active.set(body.run.id, controller);

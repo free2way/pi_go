@@ -27,4 +27,7 @@ export const workerOnlySecrets = [
   "PIGO_POSTGRES_PASSWORD",
   "DEEPSEEK_API_KEY",
   "OPENAI_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "GEMINI_API_KEY",
+  "GOOGLE_API_KEY",
 ] as const;

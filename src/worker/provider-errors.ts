@@ -64,8 +64,14 @@ export function apiKeyEnvName(provider: string): string {
   if (normalized.startsWith("openai")) return "OPENAI_API_KEY";
   if (normalized.startsWith("deepseek")) return "DEEPSEEK_API_KEY";
   if (normalized.startsWith("anthropic") || normalized.includes("claude")) return "ANTHROPIC_API_KEY";
-  if (normalized.startsWith("google") || normalized.includes("gemini")) return "GOOGLE_API_KEY";
+  if (normalized.startsWith("google") || normalized.includes("gemini")) return "GEMINI_API_KEY";
   return `${provider.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_API_KEY`;
+}
+
+/** Transitional aliases for providers whose older Pi catalog used Google's name. */
+export function apiKeyEnvNames(provider: string): string[] {
+  const primary = apiKeyEnvName(provider);
+  return primary === "GEMINI_API_KEY" ? [primary, "GOOGLE_API_KEY"] : [primary];
 }
 
 /** Short, UI-friendly rendering used in run summaries: `kind｜hint`. */
