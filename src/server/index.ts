@@ -91,6 +91,7 @@ import { registerInternalReleaseRoutes } from "./routes/internal/releases.js";
 import { registerInternalRunRoutes } from "./routes/internal/runs.js";
 import { runStateSchema } from "./routes/internal/run-schemas.js";
 import { registerAccountAdminRoutes } from "./routes/account-admin.js";
+import { registerCredentialRoutes } from "./routes/model-key-routes.js";
 
 const app = Fastify({
   logger: serverLoggerOptions(),
@@ -287,14 +288,6 @@ const requirementRefineSchema = z.object({
     model: z.string().trim().min(1).max(120),
   }).strict().optional(),
 }).strict();
-
-const credentialSchema = z.object({
-  provider: z.string().trim().min(1).max(80).optional(),
-  apiKey: z.string().trim().min(12).max(512).optional(),
-  developerApiKey: z.string().trim().min(12).max(512).optional(),
-  reviewerApiKey: z.string().trim().min(12).max(512).optional(),
-}).refine((value) => (value.provider && value.apiKey) || value.developerApiKey || value.reviewerApiKey, "At least one credential is required")
-  .refine((value) => !value.provider || Boolean(value.apiKey), "apiKey is required when provider is set");
 
 const piAssistantAskSchema = z.object({
   message: z.string().trim().min(1).max(2_000),
@@ -725,57 +718,15 @@ registerAccountAdminRoutes(app, {
   credentialWrites,
 });
 
-app.get("/api/credentials/status", async (request) => vault.status(vaultKeyFor(request)));
-
-app.put("/api/credentials", async (request, reply) => {
-  const user = auth.user(request);
-  const credentialLimit = credentialWrites.check(user.id);
-  if (!credentialLimit.allowed) return tooManyRequests(reply, credentialLimit.retryAfterMs);
-  const parsed = credentialSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid credential request" });
-  const userId = vaultKeyFor(request);
-  const writes: Array<{ provider: string; apiKey: string }> = [];
-  if (parsed.data.provider && parsed.data.apiKey) {
-    writes.push({ provider: parsed.data.provider, apiKey: parsed.data.apiKey });
-  } else {
-    // Legacy role-based payloads map onto the configured role providers.
-    if (parsed.data.developerApiKey) writes.push({ provider: modelDefaults.developer.provider, apiKey: parsed.data.developerApiKey });
-    if (parsed.data.reviewerApiKey) writes.push({ provider: modelDefaults.reviewer.provider, apiKey: parsed.data.reviewerApiKey });
-  }
-  let status = vault.status(userId);
-  for (const write of writes) {
-    status = await vault.set(userId, write);
-    // AUD-08 / AT-MODEL-004: verify the key against the provider before it can be
-    // considered available. `PI_MODEL_PROBE_MODE=off` is the explicit opt-out for
-    // providers without a reachable /models endpoint: it records an operator
-    // assertion, never a fake verification.
-    if (providerProbeDisabled()) {
-      status = await vault.markOperatorAsserted(userId, write.provider);
-      continue;
-    }
-    const probe = await providerProbe(write).catch(() => undefined);
-    if (probe?.ok) {
-      status = await vault.markVerified(userId, write.provider, probe.models, probe.capabilities ?? null);
-    } else {
-      status = await vault.markUnverified(userId, write.provider);
-    }
-  }
-  // AT-JEV-092: a revoked/replaced TypeSafe key must be recoverable by the
-  // operator action our alert asks for. The decision plane's breaker is keyed by
-  // `baseUrl|model|hasApiKey` (never the key itself), so a new credential alone
-  // could NOT clear an auth-latched breaker — it stayed open until a process
-  // restart. Storing a credential is exactly when a fresh attempt is legitimate,
-  // and resetting carries no key material.
-  if (writes.length > 0) resetDecisionCircuitBreakers();
-  return status;
-});
-
-app.delete<{ Querystring: { provider?: string } }>("/api/credentials", async (request, reply) => {
-  const user = auth.user(request);
-  const credentialLimit = credentialWrites.check(user.id);
-  if (!credentialLimit.allowed) return tooManyRequests(reply, credentialLimit.retryAfterMs);
-  await vault.delete(vaultKeyFor(request), request.query?.provider || undefined);
-  return reply.code(204).send();
+registerCredentialRoutes(app, {
+  currentUser: (request) => auth.user(request),
+  vaultKeyFor,
+  vault,
+  credentialWrites,
+  modelDefaults,
+  providerProbe,
+  providerProbeDisabled,
+  resetDecisionCircuitBreakers,
 });
 
 app.get("/api/models", async (request): Promise<ModelCatalogResponse> => {
