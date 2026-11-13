@@ -12,7 +12,7 @@ import { notifyQueuedJob } from "./job-notification.js";
 import { buildStoryRunInput, STORY_STATUS_LABELS, type RunBudget, type StoryDetail } from "../shared/agile.js";
 import { resolveRequestLocale, type Locale } from "../shared/i18n.js";
 import type { ConfigStatus, CurrentUser, ModelCatalogResponse, ReviewScope, Run, RunEvent, RunReleaseRecord, RunRollbackRecord, Workspace } from "../shared/types.js";
-import { AccountError, AccountService, accountAdminGate } from "./accounts.js";
+import { AccountService } from "./accounts.js";
 import { BackupManager, dumpBackup } from "./backups.js";
 import { registerBackupRoutes } from "./backup-routes.js";
 import { AlertManager, createAlertSink } from "./alerts.js";
@@ -90,6 +90,7 @@ import { registerInternalJobRoutes } from "./routes/internal/jobs.js";
 import { registerInternalReleaseRoutes } from "./routes/internal/releases.js";
 import { registerInternalRunRoutes } from "./routes/internal/runs.js";
 import { runStateSchema } from "./routes/internal/run-schemas.js";
+import { registerAccountAdminRoutes } from "./routes/account-admin.js";
 
 const app = Fastify({
   logger: serverLoggerOptions(),
@@ -664,36 +665,6 @@ app.get("/api/auth/config", async () => auth.publicConfig());
 // Guardrails (no self role change, never lose the last active admin) live in
 // `accounts.ts` and are unit-tested; every change appends a `user_audit` row.
 // ---------------------------------------------------------------------------
-const accountService = new AccountService(db);
-const accountPatchSchema = z.object({
-  role: z.enum(["admin", "user"]).optional(),
-  status: z.enum(["active", "disabled"]).optional(),
-}).strict().refine((value) => value.role !== undefined || value.status !== undefined, { message: "至少需要提供 role 或 status" });
-const accountGrantSchema = z.object({
-  workspaceId: z.string().trim().min(1).max(120),
-  permission: z.enum(["read", "write"]),
-}).strict();
-const secureUrlSchema = z.string().trim().url().max(2_048).refine((value) => {
-  const url = new URL(value);
-  return url.protocol === "https:" && !url.username && !url.password;
-}, "必须是未包含用户名或密码的 HTTPS URL");
-const releaseSettingsSchema = z.object({
-  webhookUrl: secureUrlSchema,
-  webhookToken: z.string().trim().min(12).max(1_024).optional(),
-  publicOrigin: secureUrlSchema,
-}).strict();
-
-/** Returns the calling admin, or sends 403 and returns undefined. */
-async function requireAccountAdmin(request: FastifyRequest, reply: FastifyReply) {
-  const user = auth.user(request);
-  const gate = accountAdminGate(await identities.isAdmin(user.id));
-  if (!gate.allowed) {
-    reply.code(gate.status).send({ error: gate.message, code: gate.code });
-    return undefined;
-  }
-  return user;
-}
-
 const backups = new BackupManager({
   root: path.join(path.dirname(dataFile), "backups"),
   dump: (destination) => dumpBackup(process.env.PI_DATABASE_URL || "", destination),
@@ -745,89 +716,13 @@ function releaseSettingsProjection() {
   };
 }
 
-app.get("/api/admin/release-settings", async (request, reply) => {
-  if (!(await requireAccountAdmin(request, reply))) return reply;
-  return releaseSettingsProjection();
-});
-
-app.put("/api/admin/release-settings", async (request, reply) => {
-  const actor = await requireAccountAdmin(request, reply);
-  if (!actor) return reply;
-  const limit = credentialWrites.check(`release-settings:${actor.id}`);
-  if (!limit.allowed) return tooManyRequests(reply, limit.retryAfterMs);
-  const parsed = releaseSettingsSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
-  if (!parsed.data.webhookToken && !releaseSettings.get()?.webhookToken) {
-    return reply.code(400).send({ error: "首次配置必须填写 Webhook Token", code: "RELEASE_TOKEN_REQUIRED" });
-  }
-  await releaseSettings.set(parsed.data);
-  return releaseSettingsProjection();
-});
-
-app.delete("/api/admin/release-settings", async (request, reply) => {
-  const actor = await requireAccountAdmin(request, reply);
-  if (!actor) return reply;
-  const limit = credentialWrites.check(`release-settings:${actor.id}`);
-  if (!limit.allowed) return tooManyRequests(reply, limit.retryAfterMs);
-  await releaseSettings.delete();
-  return releaseSettingsProjection();
-});
-
-function accountErrorReply(reply: FastifyReply, error: unknown) {
-  if (error instanceof AccountError) return reply.code(error.status).send({ error: error.message, code: error.code });
-  throw error;
-}
-
-app.get("/api/accounts", async (request, reply) => {
-  if (!(await requireAccountAdmin(request, reply))) return reply;
-  return { accounts: await accountService.list() };
-});
-
-// Registered before `/api/accounts/:id` so the static segment wins the match.
-app.get("/api/accounts/workspaces", async (request, reply) => {
-  if (!(await requireAccountAdmin(request, reply))) return reply;
-  return { workspaces: await accountService.listWorkspaces() };
-});
-
-app.get<{ Params: { id: string } }>("/api/accounts/:id", async (request, reply) => {
-  if (!(await requireAccountAdmin(request, reply))) return reply;
-  const account = await accountService.get(request.params.id);
-  if (!account) return reply.code(404).send({ error: "账户不存在", code: "ACCOUNT_NOT_FOUND" });
-  return account;
-});
-
-app.patch<{ Params: { id: string } }>("/api/accounts/:id", async (request, reply) => {
-  const actor = await requireAccountAdmin(request, reply);
-  if (!actor) return reply;
-  const parsed = accountPatchSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
-  try {
-    return await accountService.update(request.params.id, parsed.data, actor.id);
-  } catch (error) {
-    return accountErrorReply(reply, error);
-  }
-});
-
-app.post<{ Params: { id: string } }>("/api/accounts/:id/grants", async (request, reply) => {
-  const actor = await requireAccountAdmin(request, reply);
-  if (!actor) return reply;
-  const parsed = accountGrantSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
-  try {
-    return await accountService.setGrant(request.params.id, parsed.data, actor.id);
-  } catch (error) {
-    return accountErrorReply(reply, error);
-  }
-});
-
-app.delete<{ Params: { id: string; workspaceId: string } }>("/api/accounts/:id/grants/:workspaceId", async (request, reply) => {
-  const actor = await requireAccountAdmin(request, reply);
-  if (!actor) return reply;
-  try {
-    return await accountService.removeGrant(request.params.id, request.params.workspaceId);
-  } catch (error) {
-    return accountErrorReply(reply, error);
-  }
+registerAccountAdminRoutes(app, {
+  currentUser: (request) => auth.user(request),
+  isAdmin: (userId) => identities.isAdmin(userId),
+  accounts: new AccountService(db),
+  releaseSettings,
+  releaseSettingsProjection,
+  credentialWrites,
 });
 
 app.get("/api/credentials/status", async (request) => vault.status(vaultKeyFor(request)));
