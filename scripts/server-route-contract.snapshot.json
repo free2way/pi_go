@@ -1,0 +1,665 @@
+{
+  "schemaVersion": 1,
+  "routes": [
+    {
+      "method": "DELETE",
+      "url": "/api/accounts/:id/grants/:workspaceId",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "DELETE",
+      "url": "/api/admin/release-settings",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "DELETE",
+      "url": "/api/agile/projects/:id",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "DELETE",
+      "url": "/api/credentials",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "DELETE",
+      "url": "/api/releases/:id",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "DELETE",
+      "url": "/api/runs/:id",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "DELETE",
+      "url": "/api/sprints/:id",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "DELETE",
+      "url": "/api/stories/:id",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "DELETE",
+      "url": "/api/templates/:id",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "DELETE",
+      "url": "/api/workspaces/:id",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "DELETE",
+      "url": "/api/workspaces/:id/scm",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/accounts",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/accounts/:id",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/accounts/workspaces",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/admin/backups",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/admin/release-settings",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/agile/metrics",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/agile/projects",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/agile/projects/:id",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/agile/releases/:id/retrospective",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/agile/releases/:id/summary",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/auth/config",
+      "bodyLimit": null,
+      "auth": "public"
+    },
+    {
+      "method": "GET",
+      "url": "/api/config/status",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/credentials/status",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/deployments",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/health",
+      "bodyLimit": null,
+      "auth": "public"
+    },
+    {
+      "method": "GET",
+      "url": "/api/health/detail",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/internal/jobs/pending",
+      "bodyLimit": null,
+      "auth": "internal"
+    },
+    {
+      "method": "GET",
+      "url": "/api/internal/metrics",
+      "bodyLimit": null,
+      "auth": "metrics-or-internal"
+    },
+    {
+      "method": "GET",
+      "url": "/api/internal/runs/:id/checkpoints",
+      "bodyLimit": null,
+      "auth": "internal"
+    },
+    {
+      "method": "GET",
+      "url": "/api/me",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/models",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/projects",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/releases",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/runs",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/runs/:id",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/runs/:id/artifacts",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/runs/:id/artifacts/:artifactId/download",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/runs/:id/decision-brief",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/runs/:id/events",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/runs/:id/patch",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/runs/:id/rounds",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/runs/:id/stream",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/runs/:runId/decisions",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/sprints",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/stories",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/stories/:id",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/system/status",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/templates",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/workspaces",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/workspaces/:id",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "/api/workspaces/:id/scm",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "DECISION_METRICS_PATH",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "GET",
+      "url": "PROVIDER_CREDITS_PATH",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "PATCH",
+      "url": "/api/accounts/:id",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "PATCH",
+      "url": "/api/agile/projects/:id",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "PATCH",
+      "url": "/api/releases/:id",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "PATCH",
+      "url": "/api/sprints/:id",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "PATCH",
+      "url": "/api/stories/:id",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "PATCH",
+      "url": "/api/workspaces/:id",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/accounts/:id/grants",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/admin/backups",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/agile/projects",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/agile/releases/:id/publish",
+      "bodyLimit": "1024 * 1024",
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/assistant/ask",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/internal/agile/releases/:id/release-result",
+      "bodyLimit": null,
+      "auth": "release-callback"
+    },
+    {
+      "method": "POST",
+      "url": "/api/internal/jobs/:id/claim",
+      "bodyLimit": null,
+      "auth": "internal"
+    },
+    {
+      "method": "POST",
+      "url": "/api/internal/jobs/:id/finish",
+      "bodyLimit": null,
+      "auth": "internal"
+    },
+    {
+      "method": "POST",
+      "url": "/api/internal/jobs/:id/heartbeat",
+      "bodyLimit": null,
+      "auth": "internal"
+    },
+    {
+      "method": "POST",
+      "url": "/api/internal/jobs/:id/release",
+      "bodyLimit": null,
+      "auth": "internal"
+    },
+    {
+      "method": "POST",
+      "url": "/api/internal/jobs/lease",
+      "bodyLimit": null,
+      "auth": "internal"
+    },
+    {
+      "method": "POST",
+      "url": "/api/internal/runs/:id/artifacts",
+      "bodyLimit": "8 * 1024 * 1024",
+      "auth": "internal"
+    },
+    {
+      "method": "POST",
+      "url": "/api/internal/runs/:id/checkpoints",
+      "bodyLimit": null,
+      "auth": "internal"
+    },
+    {
+      "method": "POST",
+      "url": "/api/internal/runs/:id/release-result",
+      "bodyLimit": null,
+      "auth": "release-callback"
+    },
+    {
+      "method": "POST",
+      "url": "/api/internal/runs/:id/rollback-result",
+      "bodyLimit": null,
+      "auth": "release-callback"
+    },
+    {
+      "method": "POST",
+      "url": "/api/internal/runs/:id/update",
+      "bodyLimit": "4 * 1024 * 1024",
+      "auth": "internal"
+    },
+    {
+      "method": "POST",
+      "url": "/api/releases",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/requirements/refine",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/runs",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/runs/:id/approve",
+      "bodyLimit": "1024 * 1024",
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/runs/:id/cancel",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/runs/:id/merge-request",
+      "bodyLimit": "1024 * 1024",
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/runs/:id/merge",
+      "bodyLimit": "1024 * 1024",
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/runs/:id/publish",
+      "bodyLimit": "1024 * 1024",
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/runs/:id/reject",
+      "bodyLimit": "1024 * 1024",
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/runs/:id/reopen",
+      "bodyLimit": "1024 * 1024",
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/runs/:id/resume",
+      "bodyLimit": "1024 * 1024",
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/runs/:id/retry-review",
+      "bodyLimit": "1024 * 1024",
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/runs/:id/rollback",
+      "bodyLimit": "1024 * 1024",
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/runs/batch",
+      "bodyLimit": "1024 * 1024",
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/runs/cleanup",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/sprints",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/stories",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/stories/:id/block",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/stories/:id/reopen",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/stories/:id/runs",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/stories/:id/unblock",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/templates",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/workspaces/:id/refresh",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/workspaces/:id/scm/check",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/workspaces/:id/scm/push",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/workspaces/clone",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/workspaces/create",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "/api/workspaces/register",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "POST",
+      "url": "DECISION_AUDIT_RETENTION_PATH",
+      "bodyLimit": null,
+      "auth": "internal"
+    },
+    {
+      "method": "POST",
+      "url": "DECISION_EVALUATE_PATH",
+      "bodyLimit": null,
+      "auth": "internal"
+    },
+    {
+      "method": "PUT",
+      "url": "/api/admin/release-settings",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "PUT",
+      "url": "/api/credentials",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "PUT",
+      "url": "/api/workspaces/:id/scm",
+      "bodyLimit": null,
+      "auth": "session"
+    },
+    {
+      "method": "PUT",
+      "url": "PROVIDER_CREDITS_PATH",
+      "bodyLimit": null,
+      "auth": "session"
+    }
+  ]
+}
