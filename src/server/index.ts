@@ -1,13 +1,13 @@
 import fastifyStatic from "@fastify/static";
 import { clerkPlugin } from "@clerk/fastify";
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import { internalUpdateRejection, releasesStoryBlocks, storyBlockReleaseNote } from "../shared/run-state.js";
+import { releasesStoryBlocks, storyBlockReleaseNote } from "../shared/run-state.js";
 import { notifyQueuedJob } from "./job-notification.js";
 import { buildStoryRunInput, STORY_STATUS_LABELS, type RunBudget, type StoryDetail } from "../shared/agile.js";
 import { resolveRequestLocale, type Locale } from "../shared/i18n.js";
@@ -39,13 +39,12 @@ import { baseRealRun } from "./real-run.js";
 import { createProviderProbe, providerProbeDisabled } from "./provider-probe.js";
 import { verifyPendingCredentials } from "./credential-verification.js";
 import { RateLimiter } from "./rate-limit.js";
-import { PostgresRunStore, type JobRecord } from "./run-store-pg.js";
+import { PostgresRunStore } from "./run-store-pg.js";
 import { workerRefusalDisposition } from "./worker-refusal.js";
-import { artifactDiagnosticCredentials, artifactDiagnosticDownloadSafe, saveInternalRunArtifact } from "./artifact-api.js";
+import { artifactDiagnosticCredentials, artifactDiagnosticDownloadSafe } from "./artifact-api.js";
 import { type ApprovePlan, approveEventMeta, planApprove } from "./approve.js";
 import { conflictReplyFor, isStorageFailure, requestErrorReply } from "./request-errors.js";
 import { diagnosticSecrets, redactDiagnosticText } from "../shared/diagnostics.js";
-import { releaseDiagnosticDetailSchema } from "./release-diagnostics.js";
 import { appendHumanNote } from "./run-notes.js";
 import { resumeDeadlinePatch } from "./run-deadline-base.js";
 import { parseRunSearch, searchRuns } from "./run-search.js";
@@ -57,7 +56,7 @@ import { createDecisionEngine, loadDecisionEngineConfig } from "./decision-engin
 import { resetDecisionCircuitBreakers, decisionCircuitSnapshot } from "./decision-engine/jev.js";
 import { createDecisionMetricsSweeper } from "./decision-engine/metrics.js";
 import { buildReviewTriageBatches } from "./decision-engine/review-triage.js";
-import { decisionEngineStatus, registerDecisionRoutes, type DecisionEngineStatus } from "./decision-routes.js";
+import { decisionEngineStatus, registerDecisionReadRoutes, registerInternalDecisionRoutes, type DecisionEngineStatus, type DecisionServices } from "./decision-routes.js";
 import { registerProviderCreditsRoutes } from "./provider-credits-routes.js";
 import { readModelPriceTable, readProviderCreditBook, writeProviderCreditBook } from "./provider-cost-config.js";
 import { buildAcceptanceSnapshot } from "./acceptance.js";
@@ -75,7 +74,7 @@ import { AgileError, AgileService } from "./agile.js";
 import { readAgileMetrics, readReleaseRetrospective, readReleaseSummary } from "./agile-metrics.js";
 import { projectCreateSchema, projectPatchSchema, releaseCreateSchema, releasePatchSchema, releasePublishSchema, sprintCreateSchema, sprintPatchSchema, storyBlockSchema, storyCreateSchema, storyPatchSchema, storySubmitSchema, templateCreateSchema } from "./agile-schemas.js";
 import { executeRelease } from "./release-execution.js";
-import { isReleasePublishTerminal, planReleaseDeployCallback, planReleasePublish, planReleasePublishGate, RELEASE_DEPLOY_STALE_MS, RELEASE_PUBLISH_POLICY } from "./release-publish.js";
+import { isReleasePublishTerminal, planReleasePublish, planReleasePublishGate, RELEASE_DEPLOY_STALE_MS, RELEASE_PUBLISH_POLICY } from "./release-publish.js";
 import { runReleaseDeploy } from "./release-deploy.js";
 import compress from "@fastify/compress";
 import { cacheControlFor, isBuildAssetRequest } from "./static-cache.js";
@@ -86,6 +85,11 @@ import type { RequirementRefinement } from "../shared/requirement-assistant.js";
 import type { PiAssistantAnswer } from "../shared/pi-assistant.js";
 import { serverDiagnosticMessage, serverLoggerOptions } from "./server-diagnostics.js";
 import { readReleaseTimeoutObservation, syncReleaseTimeoutAlerts } from "./release-timeout-alerts.js";
+import { registerInternalAuthorization, safeSecretMatch } from "./routes/internal/auth.js";
+import { registerInternalJobRoutes } from "./routes/internal/jobs.js";
+import { registerInternalReleaseRoutes } from "./routes/internal/releases.js";
+import { registerInternalRunRoutes } from "./routes/internal/runs.js";
+import { runStateSchema } from "./routes/internal/run-schemas.js";
 
 const app = Fastify({
   logger: serverLoggerOptions(),
@@ -291,7 +295,6 @@ const credentialSchema = z.object({
 }).refine((value) => (value.provider && value.apiKey) || value.developerApiKey || value.reviewerApiKey, "At least one credential is required")
   .refine((value) => !value.provider || Boolean(value.apiKey), "apiKey is required when provider is set");
 
-const runStateSchema = z.enum(["queued", "preparing", "developing", "checking", "reviewing", "completed", "needs_human", "failed", "cancelled"]);
 const piAssistantAskSchema = z.object({
   message: z.string().trim().min(1).max(2_000),
   context: z.object({
@@ -332,144 +335,6 @@ const piAssistantAskSchema = z.object({
     model: z.string().trim().min(1).max(120),
   }).strict().optional(),
 }).strict();
-const checkpointSchema = z.object({
-  stageKey: z.string().trim().min(1).max(120),
-  status: z.enum(["running", "completed", "failed"]),
-  payload: z.unknown().optional(),
-  idempotencyKey: z.string().trim().min(1).max(200).optional(),
-});
-const findingSchema = z.object({
-  id: z.string().min(1).max(120),
-  severity: z.enum(["critical", "high", "medium", "low"]),
-  file: z.string().max(400).nullable(),
-  line: z.number().int().min(0).nullable(),
-  title: z.string().min(1).max(300),
-  evidence: z.string().max(8_000),
-  requiredChange: z.string().max(8_000),
-  resolved: z.boolean(),
-  // Stable content identity (`<normalized file>|<normalized title>`); see
-  // src/shared/finding-fingerprint.ts. Longer than the legacy hash, hence 800.
-  fingerprint: z.string().max(800).optional(),
-  firstSeenRound: z.number().int().min(1).max(99).optional(),
-  lastSeenRound: z.number().int().min(1).max(99).optional(),
-  observations: z.number().int().min(0).max(10_000).optional(),
-  consecutiveRounds: z.number().int().min(0).max(10_000).optional(),
-});
-const checkResultSchema = z.object({
-  id: z.string().min(1).max(80),
-  name: z.string().min(1).max(160),
-  command: z.string().min(1).max(1_000),
-  status: z.enum(["pending", "running", "passed", "failed"]),
-  durationMs: z.number().min(0).optional(),
-  exitCode: z.number().int().min(-1_000).max(1_000).optional(),
-  output: z.string().max(64_000).optional(),
-});
-const subAgentTaskSchema = z.object({
-  id: z.string().min(1).max(64),
-  title: z.string().min(1).max(200),
-  description: z.string().max(8_000),
-  files: z.array(z.string().max(400)).max(40),
-  dependsOn: z.array(z.string().max(64)).max(20),
-  status: z.enum(["planned", "running", "completed", "merged", "failed"]),
-  branch: z.string().max(300).optional(),
-  // Item-3: stable sub-agent codename (additive; title remains authoritative).
-  name: z.string().min(1).max(60).optional(),
-  summary: z.string().max(4_000).optional(),
-  durationMs: z.number().min(0).optional(),
-});
-const developmentPlanSchema = z.object({
-  complexity: z.enum(["small", "medium", "large"]),
-  rationale: z.string().max(4_000),
-  strategy: z.enum(["single", "parallel"]),
-  tasks: z.array(subAgentTaskSchema).max(8),
-});
-const runRoleUsageSchema = z.object({
-  role: z.string().min(1).max(40),
-  provider: z.string().min(1).max(80),
-  model: z.string().min(1).max(120),
-  inputTokens: z.number().min(0),
-  outputTokens: z.number().min(0),
-  cacheReadTokens: z.number().min(0).optional(),
-  cacheWriteTokens: z.number().min(0).optional(),
-  estimatedCost: z.number().min(0),
-  calls: z.number().int().min(0),
-  // AT-JEV-062: calls with no price table (decision plane) are counted here, so
-  // a reader can render "unknown" instead of $0.000. Additive/optional.
-  unpricedCalls: z.number().int().min(0).max(10_000).optional(),
-});
-const runUsageSchema = z.object({
-  inputTokens: z.number().min(0),
-  outputTokens: z.number().min(0),
-  estimatedCost: z.number().min(0),
-  cacheReadTokens: z.number().min(0).optional(),
-  cacheWriteTokens: z.number().min(0).optional(),
-  totalTokens: z.number().min(0).optional(),
-});
-const runSessionSummarySchema = z.object({
-  sessionId: z.string().min(1).max(300),
-  role: z.string().min(1).max(40),
-  rounds: z.array(z.number().int().min(1).max(99)).max(99),
-  calls: z.number().int().min(0),
-  resumed: z.boolean(),
-  durationMs: z.number().min(0),
-  inputTokens: z.number().min(0),
-  outputTokens: z.number().min(0),
-  cacheReadTokens: z.number().min(0),
-  cacheWriteTokens: z.number().min(0),
-  modelCalls: z.number().int().min(0),
-  firstAt: z.string().max(80),
-  lastAt: z.string().max(80),
-});
-const runPatchSchema = z.object({
-  state: runStateSchema,
-  round: z.number().int().min(1).max(99),
-  summary: z.string().max(8_000),
-  // AUD-16: the worker reports the full run diff (bounded at 3.4M chars); the
-  // JSON body limit is 4 MiB, so the schema must allow the same magnitude.
-  diff: z.string().max(3_500_000),
-  findings: z.array(findingSchema).max(100),
-  checks: z.array(checkResultSchema).max(16),
-  plan: developmentPlanSchema,
-  usage: runUsageSchema,
-  usageRoles: z.array(runRoleUsageSchema).max(20),
-  // Sprint 2: additive per-session reuse/latency summary.
-  sessions: z.array(runSessionSummarySchema).max(40),
-  modelCalls: z.number().int().min(0).max(10_000),
-  usageUnknownCalls: z.number().int().min(0).max(10_000),
-  checkSnapshot: z.string().max(80),
-  reviewSnapshot: z.string().max(80),
-  checkPassed: z.boolean(),
-  baseSha: z.string().max(80),
-  durationMs: z.number().min(0).max(86_400_000),
-  worktree: z.string().max(600),
-}).partial().strict();
-const internalEventSchema = z.object({
-  round: z.number().int().min(1).max(99),
-  source: z.enum(["system", "developer", "checks", "reviewer"]),
-  type: z.string().min(1).max(120),
-  message: z.string().min(1).max(8_000),
-  meta: z.record(z.string(), z.unknown()).optional(),
-});
-const internalUpdateSchema = z.object({
-  patch: runPatchSchema.optional(),
-  event: internalEventSchema.optional(),
-  /** Optional at-least-once delivery key so a retried callback is not double counted (AT-REL-004). */
-  deliveryId: z.string().min(1).max(160).optional(),
-  /** Lease identity; optional only for one rolling-upgrade compatibility window. */
-  jobId: z.string().min(1).max(160).optional(),
-  workerId: z.string().min(1).max(120).optional(),
-}).strict();
-// NEW-07: the worker uploads a full diff body through this route when the inline
-// callback cannot carry it. The route raises the body limit for itself only.
-const internalArtifactSchema = z.object({
-  artifactId: z.string().min(1).max(160),
-  kind: z.string().min(1).max(40).default("patch"),
-  content: z.string().min(1).max(9_000_000),
-  baseSha: z.string().max(80).optional(),
-  ownerId: z.string().max(120).optional(),
-}).strict();
-const INTERNAL_ARTIFACT_BODY_LIMIT = 8 * 1024 * 1024;
-
 // SEC-008 / AT-SEC-005: per-user write limits for credential and run mutations.
 const credentialWrites = new RateLimiter(10);
 const runCreations = new RateLimiter(Number(process.env.PI_RUN_CREATE_PER_MINUTE || 20));
@@ -577,13 +442,6 @@ function tooManyRequests(reply: FastifyReply, retryAfterMs: number) {
   return reply.code(429).send({ error: "请求过于频繁，请稍后再试", code: "RATE_LIMITED" });
 }
 
-function safeSecretMatch(value: string | undefined, secret: string) {
-  if (!value || !secret) return false;
-  const actual = Buffer.from(value.replace(/^Bearer\s+/i, ""));
-  const expected = Buffer.from(secret);
-  return actual.length === expected.length && timingSafeEqual(actual, expected);
-}
-
 function safeTokenMatch(value: string | undefined) {
   return safeSecretMatch(value, internalToken);
 }
@@ -616,8 +474,13 @@ const runDirectoryCleaner: RunDirectoryCleaner = ({ runId, ownerId, dryRun }) =>
     body: JSON.stringify({ ownerId, dryRun }),
   });
 
-registerOperationalMetrics(app, { db, pool, version: webVersion,
-  authorized: request => metricsAuthorized(request.headers.authorization, process.env.PI_METRICS_TOKEN?.trim() || "", internalToken) });
+registerOperationalMetrics(app, { db, pool, version: webVersion });
+const activeReleaseTokens = () => releaseCallbackTokens(releaseSettings.get(), process.env);
+registerInternalAuthorization(app, {
+  worker: safeTokenMatch,
+  release: (authorization) => activeReleaseTokens().some((token) => safeSecretMatch(authorization, token)) || safeTokenMatch(authorization),
+  metrics: (authorization) => metricsAuthorized(authorization, process.env.PI_METRICS_TOKEN?.trim() || "", internalToken),
+});
 
 app.addHook("onSend", async (request, reply, payload) => {
   reply.header("X-Content-Type-Options", "nosniff");
@@ -854,11 +717,6 @@ function effectiveReleaseConfig(environment: ReleaseEnvironment) {
     source: route.source,
     environmentSpecific: route.environmentSpecific,
   };
-}
-
-function releaseCallbackAuthorized(authorization: string | undefined) {
-  return releaseCallbackTokens(releaseSettings.get(), process.env)
-    .some((token) => safeSecretMatch(authorization, token)) || safeTokenMatch(authorization);
 }
 
 function releaseSettingsProjection() {
@@ -1987,84 +1845,6 @@ app.post<{ Params: { id: string } }>("/api/agile/releases/:id/publish", { bodyLi
 });
 
 /**
- * Internal final-status callback for asynchronous (HTTP 202) release deploys,
- * mirroring `POST /api/internal/runs/:id/release-result`. Authenticated with the
- * deploy webhook token (or the internal token).
- *
- * The callback is matched against the **exact current attempt** (delivery id +
- * attempt + a still-`pending` record). Retries reuse the delivery id, so a late
- * callback for a previous attempt is rejected with `RELEASE_ATTEMPT_STALE` and an
- * audit row, and can never overwrite the newer attempt; a duplicate callback for
- * the current attempt stays idempotent (`{ ok: true }`, no write).
- */
-app.post<{ Params: { id: string } }>("/api/internal/agile/releases/:id/release-result", async (request, reply) => {
-  const authorized = releaseCallbackAuthorized(request.headers.authorization);
-  if (!authorized) return reply.code(401).send({ error: "Unauthorized" });
-  const parsed = releaseDeployResultSchema.safeParse(request.body ?? {});
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid release result", details: parsed.error.issues });
-  const actorId = `deploy-system:${parsed.data.deliveryId}`;
-  try {
-    const release = await agile.getRelease([], request.params.id, true);
-    const current = release.deploy ?? null;
-    const plan = planReleaseDeployCallback({
-      current,
-      deliveryId: parsed.data.deliveryId,
-      attempt: parsed.data.attempt,
-      status: parsed.data.status,
-      detail: parsed.data.detail,
-      deploymentId: parsed.data.deploymentId,
-      url: parsed.data.url,
-      ...(parsed.data.status === "succeeded"
-        ? {
-            commit: parsed.data.commit,
-            image: parsed.data.image,
-            imageDigest: parsed.data.imageDigest,
-            reviewedCommits: parsed.data.reviewedCommits,
-          }
-        : {}),
-      now: new Date().toISOString(),
-    });
-    if (plan.kind === "reject") {
-      // A stale/unsolicited callback is audited but changes no state.
-      if (plan.audit && current) {
-        await agile.recordReleaseDeployRejection({ releaseId: release.id, actorId, detail: plan.message, deploy: current });
-      }
-      return reply.code(plan.status).send({
-        error: plan.message,
-        code: plan.code,
-        ...(plan.attempt === undefined ? {} : { attempt: plan.attempt }),
-      });
-    }
-    if (plan.kind === "duplicate") return { ok: true, release };
-    const settled = await agile.settleReleaseDeployResult({
-      releaseId: release.id,
-      action: plan.action,
-      actorId,
-      deploy: plan.deploy,
-    });
-    if (!settled.applied) {
-      // A concurrent writer won the race. A stale attempt is rejected + audited;
-      // a same-verdict winner is an idempotent duplicate. The stored record is
-      // authoritative either way — it is never overwritten.
-      const stored = settled.release.deploy ?? null;
-      if (settled.rejected === "stale_attempt") {
-        await agile.recordReleaseDeployRejection({ releaseId: release.id, actorId, detail: "部署回调因 attempt 已过期而被拒绝", deploy: stored ?? plan.deploy });
-        return reply.code(409).send({
-          error: "Release callback attempt is stale",
-          code: "RELEASE_ATTEMPT_STALE",
-          ...(stored?.attempt === undefined ? {} : { attempt: stored.attempt }),
-        });
-      }
-      if (stored && stored.status === plan.deploy.status) return { ok: true, release: settled.release };
-      return reply.code(409).send({ error: `Release deploy is already ${stored?.status ?? "unknown"}`, code: "RELEASE_ALREADY_FINAL" });
-    }
-    return { ok: true, release: settled.release };
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-/**
  * Sprint 4 core: release summary + retrospective export. Both are read-only,
  * owner-scoped projections of the release's stories and their linked runs. An
  * unknown/foreign release answers a 404 (`RELEASE_NOT_FOUND`) exactly like the
@@ -2667,7 +2447,6 @@ async function acceptanceSnapshotFor(run: Run, input: {
 }
 
 const completedMergeSchema = z.object({ confirm: z.literal(true), note: z.string().trim().max(2_000).optional() });
-const releaseDetailSchema = releaseDiagnosticDetailSchema(() => releaseCallbackTokens(releaseSettings.get(), process.env));
 const releaseSchema = z.object({
   environment: z.enum(["staging", "production"]),
   confirm: z.literal(true),
@@ -2678,86 +2457,6 @@ const rollbackSchema = z.object({
   reason: z.string().trim().min(3).max(2_000),
   retry: z.boolean().optional(),
 }).strict();
-const releaseResultSchema = z.discriminatedUnion("status", [
-  z.object({
-    deliveryId: z.string().trim().min(8).max(120),
-    attempt: z.number().int().min(1).optional(),
-    status: z.literal("progress"),
-    stage: z.enum(["validating", "deploying", "networking", "smoke", "verifying"]),
-    detail: releaseDetailSchema,
-  }).strict(),
-  z.object({
-    deliveryId: z.string().trim().min(8).max(120),
-    attempt: z.number().int().min(1).optional(),
-    status: z.literal("succeeded"),
-    detail: releaseDetailSchema,
-    deploymentId: z.string().trim().max(200).optional(),
-    url: z.string().url().max(1_000).optional(),
-    commit: z.string().regex(/^[0-9a-f]{40}$/),
-    image: z.string().trim().min(1).max(500),
-    imageDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
-  }).strict(),
-  z.object({
-    deliveryId: z.string().trim().min(8).max(120),
-    attempt: z.number().int().min(1).optional(),
-    status: z.literal("failed"),
-    detail: releaseDetailSchema,
-    deploymentId: z.string().trim().max(200).optional(),
-    url: z.string().url().max(1_000).optional(),
-  }).strict(),
-]);
-const rollbackResultSchema = z.discriminatedUnion("status", [
-  z.object({
-    deliveryId: z.string().trim().min(8).max(120),
-    attempt: z.number().int().min(1),
-    status: z.literal("progress"),
-    stage: z.enum(["validating", "deploying", "networking", "smoke", "verifying"]),
-    detail: releaseDetailSchema,
-  }).strict(),
-  z.object({
-    deliveryId: z.string().trim().min(8).max(120),
-    attempt: z.number().int().min(1),
-    status: z.literal("succeeded"),
-    detail: releaseDetailSchema,
-    deploymentId: z.string().trim().max(200).optional(),
-    url: z.string().url().max(1_000).optional(),
-    commit: z.string().regex(/^[0-9a-f]{40}$/),
-    image: z.string().trim().min(1).max(500),
-    imageDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
-    rolledBackFromCommit: z.string().regex(/^[0-9a-f]{40}$/).optional(),
-    rolledBackFromDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/).optional(),
-  }).strict(),
-  z.object({
-    deliveryId: z.string().trim().min(8).max(120),
-    attempt: z.number().int().min(1),
-    status: z.literal("failed"),
-    detail: releaseDetailSchema,
-  }).strict(),
-]);
-/** Final-status callback for an asynchronous agile release deploy. */
-const releaseDeployResultSchema = z.discriminatedUnion("status", [
-  z.object({
-    deliveryId: z.string().trim().min(8).max(120),
-    attempt: z.number().int().min(1).optional(),
-    status: z.literal("succeeded"),
-    detail: releaseDetailSchema,
-    deploymentId: z.string().trim().max(200).optional(),
-    url: z.string().url().max(1_000).optional(),
-    commit: z.string().regex(/^[0-9a-f]{40}$/),
-    image: z.string().trim().min(1).max(500),
-    imageDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
-    reviewedCommits: z.array(z.string().regex(/^[0-9a-f]{40}$/)).min(1).max(200),
-  }).strict(),
-  z.object({
-    deliveryId: z.string().trim().min(8).max(120),
-    attempt: z.number().int().min(1).optional(),
-    status: z.literal("failed"),
-    detail: releaseDetailSchema,
-    deploymentId: z.string().trim().max(200).optional(),
-    url: z.string().url().max(1_000).optional(),
-  }).strict(),
-]);
-
 async function mergeCompletedRun(request: FastifyRequest, run: Run, userId: string, note?: string) {
   const now = new Date().toISOString();
   const acceptance = await acceptanceSnapshotFor(run, {
@@ -3150,169 +2849,6 @@ app.post<{ Params: { id: string } }>("/api/runs/:id/rollback", { bodyLimit: 1024
     meta: { ...rollback },
   }, { deliveryId: `rollback-result:${rollback.deliveryId}:${rollback.attempt}` }).catch(() => undefined);
   return finalized.run;
-});
-
-/** Authenticated progress/final callback for production rollback attempts. */
-app.post<{ Params: { id: string } }>("/api/internal/runs/:id/rollback-result", async (request, reply) => {
-  const authorized = releaseCallbackAuthorized(request.headers.authorization);
-  if (!authorized) return reply.code(401).send({ error: "Unauthorized" });
-  const parsed = rollbackResultSchema.safeParse(request.body ?? {});
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid rollback result", details: parsed.error.issues });
-  const run = store.getRun(request.params.id);
-  if (!run) return reply.code(404).send({ error: "Run not found" });
-  const current = run.rollback;
-  if (!current || current.deliveryId !== parsed.data.deliveryId) {
-    return reply.code(409).send({ error: "Rollback delivery id does not match", code: "ROLLBACK_DELIVERY_MISMATCH" });
-  }
-  if (current.attempt !== parsed.data.attempt) {
-    return reply.code(409).send({ error: "Rollback callback attempt is stale", code: "ROLLBACK_ATTEMPT_STALE", attempt: current.attempt });
-  }
-  if (parsed.data.status === "progress") {
-    if (current.status !== "triggered" && current.status !== "publishing") {
-      return reply.code(409).send({ error: `Rollback is already ${current.status}`, code: "ROLLBACK_ALREADY_FINAL" });
-    }
-    await store.appendEvent({
-      runId: run.id,
-      round: run.round,
-      source: "system",
-      type: "run.rollback_progress",
-      message: parsed.data.detail ?? parsed.data.stage,
-      at: new Date().toISOString(),
-      meta: { deliveryId: current.deliveryId, attempt: current.attempt, stage: parsed.data.stage },
-    }, { deliveryId: `rollback-progress:${current.deliveryId}:${current.attempt}:${parsed.data.stage}` });
-    return { ok: true, rollback: current, progress: parsed.data.stage };
-  }
-  if (current.status === parsed.data.status) return { ok: true, rollback: current };
-  if (current.status !== "triggered" && current.status !== "publishing") {
-    return reply.code(409).send({ error: `Rollback is already ${current.status}`, code: "ROLLBACK_ALREADY_FINAL" });
-  }
-  if (parsed.data.status === "succeeded"
-    && (parsed.data.commit !== current.commit || parsed.data.imageDigest !== current.imageDigest)) {
-    return reply.code(409).send({ error: "Rollback result does not match the immutable target", code: "ROLLBACK_DIGEST_MISMATCH" });
-  }
-  const rollback: RunRollbackRecord = {
-    ...current,
-    status: parsed.data.status,
-    finishedAt: new Date().toISOString(),
-    detail: parsed.data.detail,
-    ...(parsed.data.status === "succeeded" ? {
-      deploymentId: parsed.data.deploymentId,
-      url: parsed.data.url,
-      image: parsed.data.image,
-      imageDigest: parsed.data.imageDigest,
-      rolledBackFromCommit: parsed.data.rolledBackFromCommit,
-      rolledBackFromDigest: parsed.data.rolledBackFromDigest,
-    } : {}),
-  };
-  const result = await store.updateRunGuarded(run.id, (latest) => latest.rollback?.deliveryId === current.deliveryId
-    && latest.rollback.attempt === current.attempt
-    && (latest.rollback.status === "triggered" || latest.rollback.status === "publishing")
-    ? { allow: true as const }
-    : { allow: false as const, code: "ROLLBACK_STATE_CHANGED", message: "回滚状态已变化" }, { rollback });
-  if (!result.ok) return reply.code(409).send({ error: result.message, code: result.code });
-  await store.appendEvent({
-    runId: run.id,
-    round: run.round,
-    source: "system",
-    type: rollback.status === "succeeded" ? "run.rollback_succeeded" : "run.rollback_failed",
-    message: rollback.status === "succeeded" ? "production 回滚完成" : `回滚失败：${rollback.detail ?? "未知原因"}`,
-    at: rollback.finishedAt!,
-    meta: { ...rollback },
-  }, { deliveryId: `rollback-callback:${rollback.deliveryId}:${rollback.attempt}` });
-  return { ok: true, rollback };
-});
-
-/** Authenticated final-status callback for asynchronous (HTTP 202) publishers. */
-app.post<{ Params: { id: string } }>("/api/internal/runs/:id/release-result", async (request, reply) => {
-  const authorized = releaseCallbackAuthorized(request.headers.authorization);
-  if (!authorized) return reply.code(401).send({ error: "Unauthorized" });
-  const parsed = releaseResultSchema.safeParse(request.body ?? {});
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid release result", details: parsed.error.issues });
-  const run = store.getRun(request.params.id);
-  if (!run) return reply.code(404).send({ error: "Run not found" });
-  const current = run.release;
-  if (!current || current.deliveryId !== parsed.data.deliveryId) {
-    return reply.code(409).send({ error: "Release delivery id does not match", code: "RELEASE_DELIVERY_MISMATCH" });
-  }
-  if ((parsed.data.attempt !== undefined && parsed.data.attempt !== current.attempt)
-    || (parsed.data.attempt === undefined && current.attempt > 1)) {
-    return reply.code(409).send({ error: "Release callback attempt is stale", code: "RELEASE_ATTEMPT_STALE", attempt: current.attempt });
-  }
-  if (parsed.data.status === "succeeded" && parsed.data.commit !== current.commit) {
-    return reply.code(409).send({ error: "Release callback commit does not match the requested commit", code: "RELEASE_COMMIT_MISMATCH" });
-  }
-  if (parsed.data.status === "succeeded" && current.environment === "production"
-    && (!current.expectedImageDigest || parsed.data.imageDigest !== current.expectedImageDigest)) {
-    return reply.code(409).send({ error: "Production image digest does not match the staged digest", code: "RELEASE_DIGEST_MISMATCH" });
-  }
-  if (parsed.data.status === "progress") {
-    if (current.status !== "triggered" && current.status !== "publishing") {
-      return reply.code(409).send({ error: `Release is already ${current.status}`, code: "RELEASE_ALREADY_FINAL" });
-    }
-    const progressMessages: Record<typeof parsed.data.stage, string> = {
-      validating: "正在校验工作区与审核提交",
-      deploying: "正在执行受控部署脚本",
-      networking: "正在准备隔离的冒烟检查网络",
-      smoke: "正在执行健康检查与业务冒烟测试",
-      verifying: "正在校验不可变镜像摘要",
-    };
-    await store.appendEvent({
-      runId: run.id,
-      round: run.round,
-      source: "system",
-      type: "run.release_progress",
-      message: progressMessages[parsed.data.stage],
-      at: new Date().toISOString(),
-      meta: {
-        deliveryId: current.deliveryId,
-        attempt: current.attempt,
-        stage: parsed.data.stage,
-        ...(parsed.data.detail ? { detail: parsed.data.detail } : {}),
-      },
-    }, { deliveryId: `release-progress:${current.deliveryId}:${current.attempt}:${parsed.data.stage}` });
-    return { ok: true, release: current, progress: parsed.data.stage };
-  }
-  if (current.status === parsed.data.status) {
-    await store.appendEvent({
-      runId: run.id,
-      round: run.round,
-      source: "system",
-      type: current.status === "succeeded" ? "run.release_succeeded" : "run.release_failed",
-      message: current.status === "succeeded" ? `代码已发布到 ${current.environment}` : `发布失败：${current.detail ?? "未知原因"}`,
-      at: current.finishedAt ?? new Date().toISOString(),
-      meta: { ...current },
-    }, { deliveryId: `release-callback:${current.deliveryId}` });
-    return { ok: true, release: current };
-  }
-  if (current.status !== "triggered" && current.status !== "publishing") {
-    return reply.code(409).send({ error: `Release is already ${current.status}`, code: "RELEASE_ALREADY_FINAL" });
-  }
-  const release: RunReleaseRecord = {
-    ...current,
-    status: parsed.data.status,
-    finishedAt: new Date().toISOString(),
-    detail: parsed.data.detail,
-    ...(parsed.data.deploymentId ? { deploymentId: parsed.data.deploymentId } : {}),
-    ...(parsed.data.url ? { url: parsed.data.url } : {}),
-    ...(parsed.data.status === "succeeded"
-      ? { image: parsed.data.image, imageDigest: parsed.data.imageDigest }
-      : {}),
-  };
-  const result = await store.updateRunGuarded(run.id, (latest) => latest.release?.deliveryId === current.deliveryId
-    && (latest.release.status === "triggered" || latest.release.status === "publishing")
-    ? { allow: true as const }
-    : { allow: false as const, code: "RELEASE_STATE_CHANGED", message: "发布状态已变化" }, { release });
-  if (!result.ok) return reply.code(409).send({ error: result.message, code: result.code });
-  await store.appendEvent({
-    runId: run.id,
-    round: run.round,
-    source: "system",
-    type: release.status === "succeeded" ? "run.release_succeeded" : "run.release_failed",
-    message: release.status === "succeeded" ? `代码已发布到 ${release.environment}` : `发布失败：${release.detail ?? "未知原因"}`,
-    at: release.finishedAt!,
-    meta: { ...release },
-  }, { deliveryId: `release-callback:${release.deliveryId}` });
-  return { ok: true, release };
 });
 
 app.post<{ Params: { id: string } }>("/api/runs/:id/reject", { bodyLimit: 1024 * 1024 }, async (request, reply) => {
@@ -3812,234 +3348,17 @@ app.addHook("preHandler", async (request) => {
   await store.hydrate(id).catch(() => undefined);
 });
 
-app.post<{ Params: { id: string } }>("/api/internal/runs/:id/update", { bodyLimit: 4 * 1024 * 1024 }, async (request, reply) => {
-  if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
-  const parsed = internalUpdateSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid internal update", details: parsed.error.issues });
-  const run = store.getRun(request.params.id);
-  if (!run) return reply.code(404).send({ error: "Run not found" });
-  // Chat/状态抑制：终态运行（例如用户刚取消）不再接受任何 worker 内部更新，
-  // 否则迟到的 chat.message 会追加在 run.cancelled 之后并覆盖终态。
-  const rejection = internalUpdateRejection(run);
-  if (rejection) return reply.code(409).send({ error: rejection });
-  const { patch, event, deliveryId, jobId, workerId } = parsed.data;
-  if ((jobId && !workerId) || (!jobId && workerId) || ((jobId || workerId) && !deliveryId)) {
-    return reply.code(400).send({ error: "jobId, workerId and deliveryId must be supplied together" });
-  }
-  try {
-    if (deliveryId && jobQueue) {
-      // AUD-15: patch + event + delivery record commit in one transaction, so a
-      // duplicated internal call can neither double count nor rewind state.
-      const result = await jobQueue.applyDelivery({
-        runId: run.id,
-        deliveryId,
-        patch: patch as Partial<Run> | undefined,
-        event: event ? { ...event, runId: run.id, at: new Date().toISOString() } : undefined,
-        ...(jobId && workerId ? { lease: { jobId, workerId } } : {}),
-      });
-      // AUD-16: the terminal callback carries the run diff; persist it in full.
-      if (result.applied) await persistTerminalDiffArtifact(store.getRun(run.id));
-      if (result.applied) await reconcileStoryForRun(run.id);
-      return { ok: true, applied: result.applied, seq: result.seq };
-    }
-    if (patch) await store.updateRun(run.id, patch as Partial<Run>);
-    if (event) await store.appendEvent({ ...event, runId: run.id, at: new Date().toISOString() });
-    if (patch) await persistTerminalDiffArtifact(store.getRun(run.id));
-    if (patch) await reconcileStoryForRun(run.id);
-    return { ok: true, applied: true };
-  } catch (error) {
-    if ((error as { code?: unknown }).code === "JOB_LEASE_LOST") {
-      return reply.code(409).send({ error: "Job lease lost", code: "JOB_LEASE_LOST" });
-    }
-    const conflict = conflictReplyFor(error);
-    if (conflict) {
-      if (conflict.code === "INVALID_STATE_TRANSITION") {
-        await store.appendEvent({
-          runId: run.id,
-          round: run.round,
-          source: "system",
-          type: "run.transition_rejected",
-          message: `拒绝非法状态转移：${conflict.message}`,
-          at: new Date().toISOString(),
-        }).catch(() => undefined);
-      }
-      return reply.code(conflict.status).send({ error: conflict.message, code: conflict.code });
-    }
-    throw error;
-  }
-});
-
-// NEW-07 / AUD-16: internal artifact upload. The worker persists a full diff here
-// (beyond the 3 MiB inline callback budget) and references the returned artifact
-// id/hash/bytes in the callback, so the browser download is the complete body.
-app.post<{ Params: { id: string } }>("/api/internal/runs/:id/artifacts", { bodyLimit: INTERNAL_ARTIFACT_BODY_LIMIT }, async (request, reply) => {
-  if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
-  const parsed = internalArtifactSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid artifact upload", details: parsed.error.issues });
-  const result = await saveInternalRunArtifact(store, { runId: request.params.id, ...parsed.data }, process.env, readArtifactCredentials);
-  if (!result.ok) return reply.code(result.status).send({ error: result.error });
-  return { ok: true, artifact: result.artifact };
-});
-
-// ------------------------------------------- internal job + checkpoint API (REL-002/003)
-
-async function workerPayloadsForJobs(
-  entries: Array<{ job: JobRecord; wasStarted: boolean }>,
-  workerId: string,
-  mutate: boolean,
-) {
-  const payloads: Array<Record<string, unknown>> = [];
-  for (const entry of entries) {
-    const { job } = entry;
-    // Multi-process safety: a run written by another web instance (rolling
-    // deploy, ops tooling) is hydrated here before the job payload is built, so
-    // the worker never receives a job it cannot resolve.
-    const run = store instanceof PostgresRunStore
-      ? await store.hydrate(job.runId)
-      : store.getRun(job.runId);
-    if (!run) {
-      if (mutate) {
-        const ageMs = Date.now() - Date.parse(job.createdAt);
-        if (ageMs > 15 * 60_000) await jobQueue!.finishJobAsSystem(job.id, "failed", "Run missing");
-        else await jobQueue!.releaseReservation(job.id, workerId, "Run missing (等待运行记录可见)");
-      }
-      continue;
-    }
-    if (["completed", "failed", "cancelled", "needs_human"].includes(run.state)) {
-      if (mutate) await jobQueue!.finishJobAsSystem(job.id, "done", `Run already ${run.state}`);
-      continue;
-    }
-    const credentials = await jobCredentialsFor(run);
-    if (!credentials) {
-      if (mutate) {
-        await jobQueue!.finishJobAsSystem(job.id, "failed", "Credentials unavailable for the pinned providers");
-        await store.updateRun(run.id, { state: "needs_human", summary: "恢复执行失败：该任务所用模型的 provider 凭据不可用，请在「模型与凭据」页检查" }).catch(() => undefined);
-        await store.appendEvent({
-          runId: run.id,
-          round: run.round,
-          source: "system",
-          type: "run.recovery_blocked",
-          message: "Worker 重启后无法恢复：缺少该任务 provider 的凭据（任务未丢失，可在配置凭据后重新恢复）",
-          at: new Date().toISOString(),
-        }).catch(() => undefined);
-      }
-      continue;
-    }
-    const payload = (job.payload ?? {}) as Record<string, unknown>;
-    // AUD-05: the durable job payload decides what the worker executes: a job
-    // that never started must create the run directory, only a started one is a
-    // recovery; human resume/retry intent survives a queue wait or a crash.
-    payloads.push({
-      jobId: job.id,
-      kind: job.kind,
-      run,
-      checks: Array.isArray(payload.checks) ? payload.checks : [],
-      credentials,
-      wasStarted: entry.wasStarted,
-      ...(payload.resume ? { resume: payload.resume } : {}),
-      ...(payload.retryReview ? { retryReview: true } : {}),
-    });
-  }
-  return payloads;
-}
-
-app.get<{ Querystring: { workerId?: string } }>("/api/internal/jobs/pending", async (request, reply) => {
-  if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
-  if (!jobQueue) return reply.code(503).send({ error: "Job queue unavailable" });
-  reply.header("Deprecation", "true");
-  // Old workers ignore a failed asynchronous claim. Returning candidate rows
-  // here would therefore preserve the duplicate-execution race during a rolling
-  // upgrade. Keep the endpoint read-only and empty for one compatibility window;
-  // new workers use the atomic POST /jobs/lease endpoint.
-  return { jobs: [] };
-});
-
-app.post("/api/internal/jobs/lease", async (request, reply) => {
-  if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
-  if (!jobQueue) return reply.code(503).send({ error: "Job queue unavailable" });
-  const parsed = z.object({
-    workerId: z.string().trim().min(1).max(120),
-    capacity: z.number().int().min(1).max(4),
-  }).strict().safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid lease request", details: parsed.error.issues });
-  const leased = await jobQueue.leaseJobs({ ...parsed.data, staleAfterMs: JOB_STALE_MS });
-  return { jobs: await workerPayloadsForJobs(leased, parsed.data.workerId, true) };
-});
-
-app.post<{ Params: { id: string } }>("/api/internal/jobs/:id/claim", async (request, reply) => {
-  if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
-  if (!jobQueue) return reply.code(503).send({ error: "Job queue unavailable" });
-  const workerId = String((request.body as { workerId?: unknown })?.workerId ?? "unknown").slice(0, 120);
-  const job = await jobQueue.claimJob(request.params.id, workerId, JOB_STALE_MS);
-  if (!job) return reply.code(409).send({ error: "Job lease lost", code: "JOB_LEASE_LOST" });
-  return { ok: true, job };
-});
-
-app.post<{ Params: { id: string } }>("/api/internal/jobs/:id/heartbeat", async (request, reply) => {
-  if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
-  if (!jobQueue) return reply.code(503).send({ error: "Job queue unavailable" });
-  const workerId = String((request.body as { workerId?: unknown })?.workerId ?? "unknown").slice(0, 120);
-  if (!await jobQueue.heartbeatJob(request.params.id, workerId)) {
-    return reply.code(409).send({ error: "Job lease lost", code: "JOB_LEASE_LOST" });
-  }
-  return { ok: true };
-});
-
-app.post<{ Params: { id: string } }>("/api/internal/jobs/:id/release", async (request, reply) => {
-  if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
-  if (!jobQueue) return reply.code(503).send({ error: "Job queue unavailable" });
-  const body = (request.body ?? {}) as { workerId?: unknown; reason?: unknown };
-  const workerId = String(body.workerId ?? "unknown").slice(0, 120);
-  const released = await jobQueue.releaseReservation(request.params.id, workerId, String(body.reason ?? "Worker deferred job").slice(0, 500));
-  if (!released) return reply.code(409).send({ error: "Job lease lost", code: "JOB_LEASE_LOST" });
-  return { ok: true };
-});
-
-app.post<{ Params: { id: string } }>("/api/internal/jobs/:id/finish", async (request, reply) => {
-  if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
-  if (!jobQueue) return reply.code(503).send({ error: "Job queue unavailable" });
-  const body = (request.body ?? {}) as { workerId?: unknown; state?: unknown; error?: unknown };
-  const workerId = String(body.workerId ?? "unknown").slice(0, 120);
-  const state = body.state === "failed" || body.state === "cancelled" ? body.state : "done";
-  const result = await jobQueue.finishJob(request.params.id, workerId, state, body.error === undefined ? undefined : String(body.error).slice(0, 500));
-  if (!result.ok) return reply.code(409).send({ error: "Job lease lost", code: "JOB_LEASE_LOST" });
-  return { ok: true, idempotent: result.idempotent };
-});
-
-app.get<{ Params: { id: string } }>("/api/internal/runs/:id/checkpoints", async (request, reply) => {
-  if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
-  if (!jobQueue) return reply.code(503).send({ error: "Checkpoints unavailable" });
-  const run = store.getRun(request.params.id);
-  if (!run) return reply.code(404).send({ error: "Run not found" });
-  return { checkpoints: await jobQueue.listCheckpoints(run.id) };
-});
-
-app.post<{ Params: { id: string } }>("/api/internal/runs/:id/checkpoints", async (request, reply) => {
-  if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
-  if (!jobQueue) return reply.code(503).send({ error: "Checkpoints unavailable" });
-  const parsed = checkpointSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid checkpoint", details: parsed.error.issues });
-  const run = store.getRun(request.params.id);
-  if (!run) return reply.code(404).send({ error: "Run not found" });
-  await jobQueue.saveCheckpoint({
-    runId: run.id,
-    stageKey: parsed.data.stageKey,
-    status: parsed.data.status,
-    payload: parsed.data.payload,
-    idempotencyKey: parsed.data.idempotencyKey ?? `${run.id}:${parsed.data.stageKey}`,
-  });
-  return { ok: true };
-});
+registerInternalRunRoutes(app, { store, jobQueue, persistTerminalDiffArtifact, reconcileStoryForRun, readArtifactCredentials });
+registerInternalJobRoutes(app, { store, jobQueue, staleAfterMs: JOB_STALE_MS, jobCredentialsFor });
+registerInternalReleaseRoutes(app, { agile, store, releaseTokens: activeReleaseTokens, agileErrorReply });
 
 /**
  * docs/26 §8: the decision plane's internal evaluate API and the owner-scoped,
  * read-only audit query API. The evaluate route is authenticated with the SAME
- * internal worker token as the other `/api/internal/*` routes (`safeTokenMatch`,
- * and the preHandler deliberately skips session auth under `/api/internal/`),
- * so a browser session can never trigger an outbound provider call.
+ * worker token as the other worker endpoints through the internal preHandler.
  */
 const decisionAudit = new DecisionAuditStore(db);
-registerDecisionRoutes(app, {
+const decisionServices: DecisionServices = {
   store,
   audit: decisionAudit,
   env: process.env,
@@ -4049,7 +3368,6 @@ registerDecisionRoutes(app, {
   loadConfig: (env) => loadDecisionEngineConfig(env, { allowMissingApiKey: true }),
   createEngine: createDecisionEngine,
   buildBatches: buildReviewTriageBatches,
-  internalAuthorized: (request) => safeTokenMatch(request.headers.authorization),
   ownerKeysFor,
   readVaultKey,
   // docs/26 §16.1: the metrics route is a normal session route (owner-agnostic
@@ -4066,7 +3384,9 @@ registerDecisionRoutes(app, {
   // raises one deduplicated warning through the existing AlertManager (structured
   // log + optional PI_ALERT_WEBHOOK). Details carry ids and version strings only.
   raiseAlert: (alert) => alerts.raise(alert),
-});
+};
+registerInternalDecisionRoutes(app, decisionServices);
+registerDecisionReadRoutes(app, decisionServices);
 
 /**
  * AT-JEV-062：provider 额度是**人工录入**的（账户余额查不到），已花费由决策审计的

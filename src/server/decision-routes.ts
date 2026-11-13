@@ -87,7 +87,7 @@ export type CreateDecisionEngine = (
  */
 export const DECISION_KEY_PROVIDERS = ["typesafe", "jev"] as const;
 
-export interface DecisionRouteDeps {
+export interface DecisionServices {
   store: DecisionRunStore;
   audit: DecisionAuditStoreLike;
   env: NodeJS.ProcessEnv;
@@ -99,13 +99,6 @@ export interface DecisionRouteDeps {
    * deliberately over-limit batch) without a provider or a network.
    */
   buildBatches: BuildDecisionBatches;
-  /**
-   * Internal-token guard. The route is registered by `index.ts` with
-   * `(request) => safeTokenMatch(request.headers.authorization)`, exactly like
-   * the other `/api/internal/*` routes — a browser session (cookie/JWT) never
-   * satisfies it.
-   */
-  internalAuthorized: (request: FastifyRequest) => boolean;
   /** Same owner scoping as every other run route (`ownerKeysFor` in index.ts). */
   ownerKeysFor: (request: FastifyRequest) => string | string[];
   /**
@@ -415,7 +408,7 @@ export interface ResolvedDecisionKey {
  */
 export async function resolveDecisionApiKey(
   userId: string,
-  deps: Pick<DecisionRouteDeps, "env" | "readVaultKey">,
+  deps: Pick<DecisionServices, "env" | "readVaultKey">,
 ): Promise<ResolvedDecisionKey> {
   for (const provider of DECISION_KEY_PROVIDERS) {
     const key = await deps.readVaultKey?.(userId, provider);
@@ -531,7 +524,7 @@ export function buildAuditRecord(input: {
 async function appendDecisionEvents(
   record: DecisionEvaluationRecord,
   run: Run,
-  deps: DecisionRouteDeps,
+  deps: DecisionServices,
   batch: { index: number; count: number },
 ) {
   const batchMeta = { batchIndex: batch.index + 1, batchCount: batch.count };
@@ -597,7 +590,7 @@ async function appendDecisionEvents(
  */
 async function raiseModelDriftIfNeeded(
   record: DecisionEvaluationRecord,
-  deps: DecisionRouteDeps,
+  deps: DecisionServices,
   at: string,
 ): Promise<void> {
   const resolvedModel = record.resolvedModel?.trim();
@@ -650,7 +643,7 @@ async function raiseModelDriftIfNeeded(
  */
 function raiseAuthenticationFailureIfNeeded(
   record: DecisionEvaluationRecord,
-  deps: DecisionRouteDeps,
+  deps: DecisionServices,
   at: string,
 ): void {
   if (record.status !== "fallback" && record.status !== "rejected") return;
@@ -735,10 +728,10 @@ export function decisionMaxConcurrent(env: NodeJS.ProcessEnv): number {
  * first line.
  */
 const ADMISSION_WARN_INTERVAL_MS = 60_000;
-const admissionWarnState = new WeakMap<DecisionRouteDeps, { lastWarnAt: number }>();
+const admissionWarnState = new WeakMap<DecisionServices, { lastWarnAt: number }>();
 
 /** Emits at most one warn per window, carrying the live admission counters. */
-function warnAdmissionRejected(deps: DecisionRouteDeps, admission: AdmissionController, nowMs: number): void {
+function warnAdmissionRejected(deps: DecisionServices, admission: AdmissionController, nowMs: number): void {
   let state = admissionWarnState.get(deps);
   if (!state) {
     state = { lastWarnAt: 0 };
@@ -771,7 +764,7 @@ function warnAdmissionRejected(deps: DecisionRouteDeps, admission: AdmissionCont
  */
 export async function evaluateDecisionForRun(
   input: { runId: string; kind: DecisionKind },
-  deps: DecisionRouteDeps,
+  deps: DecisionServices,
 ): Promise<DecisionEvaluateOutcome> {
   const now = (deps.now ?? (() => new Date()))().toISOString();
   const run = deps.store.getRun(input.runId);
@@ -892,7 +885,7 @@ export async function evaluateDecisionForRun(
  */
 async function evaluateAdmittedBatches(
   input: { runId: string; kind: DecisionKind },
-  deps: DecisionRouteDeps,
+  deps: DecisionServices,
   run: Run,
   config: DecisionEngineConfig,
   resolveApiKey: (() => string | undefined) | undefined,
@@ -1058,8 +1051,22 @@ function asPruneStore(audit: DecisionAuditStoreLike): DecisionAuditPruneStore | 
   return typeof candidate.pruneOlderThan === "function" ? (candidate as DecisionAuditPruneStore) : undefined;
 }
 
-/** Registers both decision-plane routes on the app. */
+export interface DecisionRouteDeps extends DecisionServices {
+  internalAuthorized: (request: FastifyRequest) => boolean;
+}
+
+/** Registers the decision-plane routes with an injected worker guard. */
 export function registerDecisionRoutes(app: FastifyInstance, deps: DecisionRouteDeps) {
+  app.register(async (internal) => {
+    internal.addHook("preHandler", async (request, reply) => {
+      if (!deps.internalAuthorized(request)) return reply.code(401).send({ error: "Unauthorized" });
+    });
+    registerInternalDecisionRoutes(internal, deps);
+  });
+  registerDecisionReadRoutes(app, deps);
+}
+
+export function registerInternalDecisionRoutes(app: FastifyInstance, deps: DecisionServices) {
   /**
    * AT-JEV-072: the evaluate route always runs behind an admission controller.
    * The cap comes from `PI_DECISION_MAX_CONCURRENT` (default 4); the warn sink is
@@ -1067,14 +1074,13 @@ export function registerDecisionRoutes(app: FastifyInstance, deps: DecisionRoute
    * (one controller per app), and so the WeakMap-keyed warning throttle sees a
    * stable deps identity.
    */
-  const evaluateDeps: DecisionRouteDeps = {
+  const evaluateDeps: DecisionServices = {
     ...deps,
     admission: deps.admission ?? createAdmissionController({ maxConcurrent: decisionMaxConcurrent(deps.env) }),
     warn: deps.warn ?? ((message, details) => app.log.warn(details, message)),
   };
 
   app.post(DECISION_EVALUATE_PATH, async (request, reply) => {
-    if (!deps.internalAuthorized(request)) return reply.code(401).send({ error: "Unauthorized" });
     const parsed = decisionEvaluateSchema.safeParse(request.body ?? {});
     if (!parsed.success) {
       return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
@@ -1103,7 +1109,6 @@ export function registerDecisionRoutes(app: FastifyInstance, deps: DecisionRoute
       })
     : undefined;
   app.post(DECISION_AUDIT_RETENTION_PATH, async (request, reply) => {
-    if (!deps.internalAuthorized(request)) return reply.code(401).send({ error: "Unauthorized" });
     if (!sweepAuditRetention) {
       // Only a store without the retention seam (an old/injected fake) lands
       // here; the production store implements it.
@@ -1112,7 +1117,9 @@ export function registerDecisionRoutes(app: FastifyInstance, deps: DecisionRoute
     const sweep = await sweepAuditRetention();
     return { ok: true, skipped: sweep === undefined, sweep: sweep ?? null };
   });
+}
 
+export function registerDecisionReadRoutes(app: FastifyInstance, deps: DecisionServices) {
   app.get<{ Params: { runId: string }; Querystring: { limit?: string } }>(
     "/api/runs/:runId/decisions",
     async (request, reply) => {
