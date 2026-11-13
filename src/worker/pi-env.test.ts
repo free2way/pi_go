@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { scrubEnvironment, workerOnlySecrets } from "./pi-env.js";
+import { roleCredentialVariables, scrubEnvironment, workerOnlySecrets } from "./pi-env.js";
 
 describe("scrubEnvironment", () => {
   it("keeps the current role's credential and drops every other secret (AT-SEC-008)", () => {
@@ -36,5 +36,24 @@ describe("scrubEnvironment", () => {
     expect(sanitized.SOMEPROVIDER_API_KEY).toBeUndefined();
     expect(sanitized.MY_CREDENTIAL).toBeUndefined();
     expect(sanitized.PI_ALERT_WEBHOOK).toBe("https://hooks.example");
+  });
+
+  it("injects Gemini's current and transitional aliases with only the active role key", () => {
+    const current = roleCredentialVariables("google", "x");
+    const inherited = Object.fromEntries([
+      ["PATH", "/usr/bin"],
+      ["OPENAI_API_KEY", "y"],
+      ["DEEPSEEK_API_KEY", "y"],
+      ["GEMINI_API_KEY", "z"],
+      ["GOOGLE_API_KEY", "z"],
+    ]);
+    const sanitized = {
+      ...scrubEnvironment(inherited, Object.keys(current)),
+      ...current,
+    };
+    expect(sanitized.GEMINI_API_KEY).toBe("x");
+    expect(sanitized.GOOGLE_API_KEY).toBe("x");
+    expect(sanitized.OPENAI_API_KEY).toBeUndefined();
+    expect(sanitized.DEEPSEEK_API_KEY).toBeUndefined();
   });
 });

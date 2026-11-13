@@ -1,3 +1,5 @@
+import { apiKeyEnvNames } from "./provider-errors.js";
+
 /**
  * SEC-003 / SEC-010: agent processes and check commands must never inherit the
  * worker's own secrets (internal callback token, vault secret, database
@@ -19,6 +21,11 @@ export function scrubEnvironment(env: NodeJS.ProcessEnv, keep: string[] = []): N
   return sanitized;
 }
 
+/** Only the active role's Pi-compatible provider aliases receive its key. */
+export function roleCredentialVariables(provider: string, apiKey: string): Record<string, string> {
+  return Object.fromEntries(apiKeyEnvNames(provider).map((name) => [name, apiKey]));
+}
+
 /** Names that must never be visible to an agent or a check command. */
 export const workerOnlySecrets = [
   "PI_INTERNAL_TOKEN",
@@ -27,4 +34,7 @@ export const workerOnlySecrets = [
   "PIGO_POSTGRES_PASSWORD",
   "DEEPSEEK_API_KEY",
   "OPENAI_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "GEMINI_API_KEY",
+  "GOOGLE_API_KEY",
 ] as const;

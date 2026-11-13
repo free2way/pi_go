@@ -67,6 +67,7 @@ export function storageLabel(storage: SystemStatusResponse["infrastructure"]["wo
   if (storage === "ok") return t(locale, "system.storage.ok");
   if (storage === "low") return t(locale, "system.storage.low");
   if (storage === "critical") return t(locale, "system.storage.critical");
+  if (storage === "unknown") return t(locale, "system.storage.unknown");
   return t(locale, "system.unknown");
 }
 

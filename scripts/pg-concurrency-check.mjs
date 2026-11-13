@@ -216,6 +216,31 @@ try {
   const initial = await readRow();
   assert("setup: temp run created in reviewing", initial?.state === "reviewing", `state=${initial?.state}`);
 
+  // ------------------------- AT-NX-Q06: atomic lease sets never overlap
+  let leaseRoundsPassed = 0;
+  for (let round = 0; round < 20; round += 1) {
+    const ids = Array.from({ length: 50 }, (_, index) => `job_pgcheck_${round}_${index}_${randomBytes(3).toString("hex")}`);
+    for (const id of ids) await storeA.createJob({ id, runId, kind: "run", payload: { round } });
+    const leased = [];
+    await Promise.all(Array.from({ length: 8 }, async (_, workerIndex) => {
+      while (true) {
+        const batch = await storeA.leaseJobs({
+          workerId: `worker-${round}-${workerIndex}`,
+          capacity: 1 + ((round + workerIndex) % 4),
+          staleAfterMs: 60_000,
+        });
+        if (batch.length === 0) break;
+        leased.push(...batch.map((entry) => entry.job.id));
+      }
+    }));
+    const attempts = await pool.query("SELECT id, attempts FROM jobs WHERE run_id = $1", [runId]);
+    const unique = new Set(leased);
+    if (leased.length === 50 && unique.size === 50 && attempts.rows.length === 50
+      && attempts.rows.every((row) => Number(row.attempts) === 1)) leaseRoundsPassed += 1;
+    await pool.query("DELETE FROM jobs WHERE run_id = $1", [runId]);
+  }
+  assert("20 rounds of 8-client leasing return every job exactly once", leaseRoundsPassed === 20, `rounds=${leaseRoundsPassed}/20`);
+
   // ------------------------------------------- 1. instance A cancels the run
   await storeA.updateRun(runId, { state: "cancelled" });
   const afterA = await readRow();

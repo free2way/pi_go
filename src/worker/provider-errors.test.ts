@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { apiKeyEnvName, classifyProviderError, providerErrorSummary } from "./provider-errors.js";
+import { apiKeyEnvName, apiKeyEnvNames, classifyProviderError, providerErrorSummary } from "./provider-errors.js";
 
 describe("provider error classification", () => {
   it("classifies credential, rate limit, timeout, unsupported and provider failures", () => {
@@ -17,6 +17,10 @@ describe("provider error classification", () => {
     expect(apiKeyEnvName("deepseek")).toBe("DEEPSEEK_API_KEY");
     expect(apiKeyEnvName("openai-proxy")).toBe("OPENAI_API_KEY");
     expect(apiKeyEnvName("anthropic")).toBe("ANTHROPIC_API_KEY");
+    expect(apiKeyEnvName("google")).toBe("GEMINI_API_KEY");
+    expect(apiKeyEnvName("gemini-2.5-pro")).toBe("GEMINI_API_KEY");
+    expect(apiKeyEnvNames("google")).toEqual(["GEMINI_API_KEY", "GOOGLE_API_KEY"]);
+    expect(apiKeyEnvNames("deepseek")).toEqual(["DEEPSEEK_API_KEY"]);
     expect(apiKeyEnvName("acme-models")).toBe("ACME_MODELS_API_KEY");
   });
 

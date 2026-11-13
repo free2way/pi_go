@@ -68,6 +68,14 @@ export class RunConflictError extends Error {
   }
 }
 
+export class JobLeaseLostError extends Error {
+  readonly code = "JOB_LEASE_LOST";
+  constructor(readonly jobId: string) {
+    super(`Job lease lost: ${jobId}`);
+    this.name = "JobLeaseLostError";
+  }
+}
+
 /** Creates the delivery table used to make internal updates idempotent. */
 export async function recordDelivery(db: Db, runId: string, deliveryId: string, seq?: number) {
   await db.query(
@@ -268,6 +276,7 @@ export class PostgresRunStore implements RunStoreLike {
     deliveryId: string;
     patch?: Partial<Run>;
     event?: Omit<RunEvent, "seq">;
+    lease?: { jobId: string; workerId: string };
   }) {
     const seen = (await this.db.query(
       "SELECT seq FROM run_deliveries WHERE run_id = $1 AND delivery_id = $2",
@@ -278,6 +287,18 @@ export class PostgresRunStore implements RunStoreLike {
     }
 
     const result = await this.db.withTransaction(async (tx) => {
+      if (input.lease) {
+        const lease = (await tx.query(
+          "SELECT run_id, worker_id, state FROM jobs WHERE id = $1 FOR SHARE",
+          [input.lease.jobId],
+        )).rows[0];
+        if (!lease
+          || String(lease.run_id) !== input.runId
+          || String(lease.worker_id) !== input.lease.workerId
+          || String(lease.state) !== "claimed") {
+          throw new JobLeaseLostError(input.lease.jobId);
+        }
+      }
       const inserted = (await tx.query(
         "INSERT INTO run_deliveries (run_id, delivery_id, applied_at) VALUES ($1, $2, $3) ON CONFLICT (run_id, delivery_id) DO NOTHING RETURNING delivery_id",
         [input.runId, input.deliveryId, new Date().toISOString()],
@@ -650,21 +671,32 @@ export class PostgresRunStore implements RunStoreLike {
   }
 
   /** AUD-05: releases a reservation so a queued job can be claimed again immediately. */
-  async releaseReservation(id: string, reason?: string) {
-    const now = new Date().toISOString();
-    await this.db.query(
-      "UPDATE jobs SET state = 'queued', worker_id = NULL, claimed_at = NULL, heartbeat_at = NULL, last_error = COALESCE($2, last_error), updated_at = $3 WHERE id = $1 AND state IN ('queued','claimed')",
-      [id, reason ?? null, now],
-    );
-  }
-
-  async claimJob(id: string, workerId: string) {
+  async releaseReservation(id: string, workerId: string, reason?: string) {
     const now = new Date().toISOString();
     const result = await this.db.query(
+      `UPDATE jobs SET state = 'queued', worker_id = NULL, claimed_at = NULL, heartbeat_at = NULL,
+         last_error = COALESCE($3, last_error), updated_at = $4
+       WHERE id = $1 AND state = 'claimed' AND worker_id = $2 RETURNING id`,
+      [id, workerId, reason ?? null, now],
+    );
+    return result.rows.length > 0;
+  }
+
+  async claimJob(id: string, workerId: string, staleAfterMs = 120_000) {
+    const now = new Date().toISOString();
+    const staleCutoff = new Date(Date.now() - staleAfterMs).toISOString();
+    const result = await this.db.query(
       `UPDATE jobs SET state = 'claimed', worker_id = $2, claimed_at = $3, heartbeat_at = $3, started_at = COALESCE(started_at, $3),
-         attempts = attempts + 1, updated_at = $3
-       WHERE id = $1 AND state IN ('queued', 'claimed') RETURNING id`,
-      [id, workerId, now],
+         attempts = attempts + CASE WHEN worker_id = $2 THEN 0 ELSE 1 END, updated_at = $3
+       WHERE id = $1 AND (
+         (state = 'claimed' AND worker_id = $2)
+         OR (attempts < 5 AND (
+           state = 'queued'
+           OR (state = 'claimed' AND worker_id = 'web-dispatch')
+           OR (state = 'claimed' AND (heartbeat_at IS NULL OR heartbeat_at < $4))
+         ))
+       ) RETURNING id`,
+      [id, workerId, now, staleCutoff],
     );
     if (result.rows.length === 0) return undefined;
     return this.getJob(id);
@@ -672,12 +704,62 @@ export class PostgresRunStore implements RunStoreLike {
 
   async heartbeatJob(id: string, workerId: string) {
     const now = new Date().toISOString();
-    await this.db.query("UPDATE jobs SET heartbeat_at = $3, updated_at = $3 WHERE id = $1 AND worker_id = $2", [id, workerId, now]);
+    const result = await this.db.query(
+      "UPDATE jobs SET heartbeat_at = $3, updated_at = $3 WHERE id = $1 AND worker_id = $2 AND state = 'claimed' RETURNING id",
+      [id, workerId, now],
+    );
+    return result.rows.length > 0;
   }
 
-  async finishJob(id: string, state: Exclude<JobState, "queued" | "claimed">, lastError?: string) {
+  async finishJob(id: string, workerId: string, state: Exclude<JobState, "queued" | "claimed">, lastError?: string) {
     const now = new Date().toISOString();
-    await this.db.query("UPDATE jobs SET state = $2, last_error = $3, updated_at = $4 WHERE id = $1", [id, state, lastError ?? null, now]);
+    const result = await this.db.query(
+      `UPDATE jobs SET state = $3, last_error = $4, updated_at = $5
+       WHERE id = $1 AND worker_id = $2 AND state = 'claimed' RETURNING id`,
+      [id, workerId, state, lastError ?? null, now],
+    );
+    if (result.rows.length > 0) return { ok: true, idempotent: false };
+    const current = await this.getJob(id);
+    if (current?.workerId === workerId && current.state === state) return { ok: true, idempotent: true };
+    return { ok: false, idempotent: false };
+  }
+
+  /** Web-only terminal path for missing/terminal runs or unavailable credentials. */
+  async finishJobAsSystem(id: string, state: Exclude<JobState, "queued" | "claimed">, reason?: string) {
+    const now = new Date().toISOString();
+    const result = await this.db.query(
+      `UPDATE jobs SET state = $2, last_error = $3, updated_at = $4
+       WHERE id = $1 AND state IN ('queued', 'claimed') RETURNING id`,
+      [id, state, reason ?? null, now],
+    );
+    return result.rows.length > 0;
+  }
+
+  /** Atomically leases the oldest claimable jobs to one worker. */
+  async leaseJobs(input: { workerId: string; capacity: number; staleAfterMs: number }) {
+    const now = new Date().toISOString();
+    const staleCutoff = new Date(Date.now() - input.staleAfterMs).toISOString();
+    const capacity = Math.min(4, Math.max(1, Math.trunc(input.capacity)));
+    const result = await this.db.query(
+      `WITH picked AS (
+         SELECT id, started_at AS prev_started_at FROM jobs
+          WHERE attempts < 5 AND (
+            state = 'queued'
+            OR (state = 'claimed' AND (heartbeat_at IS NULL OR heartbeat_at < $1))
+          )
+          ORDER BY updated_at ASC
+          FOR UPDATE SKIP LOCKED
+          LIMIT $2
+       )
+       UPDATE jobs j SET state = 'claimed', worker_id = $3, claimed_at = $4, heartbeat_at = $4,
+         attempts = j.attempts + 1, updated_at = $4
+       FROM picked WHERE j.id = picked.id
+       RETURNING j.id, j.run_id, j.kind, j.state, j.payload_json, j.worker_id, j.claimed_at,
+         j.heartbeat_at, j.started_at, j.attempts, j.last_error, j.created_at, j.updated_at,
+         picked.prev_started_at`,
+      [staleCutoff, capacity, input.workerId, now],
+    );
+    return result.rows.map((row) => ({ job: this.mapJob(row), wasStarted: row.prev_started_at !== null }));
   }
 
   /**

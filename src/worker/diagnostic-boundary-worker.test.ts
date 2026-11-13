@@ -35,10 +35,15 @@ it.each(["snapshot", "control", "terminal", "http"])("actual Worker protects %s 
         return;
       }
       updates.push(body);
-    } else if (mode === "control" && /\/checkpoints$|\/claim$|\/finish$|\/jobs\/pending\?/.test(route)) {
-      hits.push(route.includes("pending?") ? "pending" : route.split("/").pop()!);
-      response.writeHead(503).end(JSON.stringify({ error: route.includes("pending?") ? reason : `${reason} ${developer} ${reviewer}` }));
-      return;
+    } else if (mode === "control" && /\/checkpoints$|\/claim$|\/finish$|\/jobs\/lease$/.test(route)) {
+      const label = route.endsWith("/lease") ? "lease" : route.split("/").pop()!;
+      hits.push(label);
+      // One direct push proves claim is fail-closed; the other proceeds far
+      // enough to exercise checkpoint and finish diagnostics independently.
+      if (label !== "claim" || route.includes("job_boundary_zh")) {
+        response.writeHead(503).end(JSON.stringify({ error: label === "lease" ? reason : `${reason} ${developer} ${reviewer}` }));
+        return;
+      }
     } else if (route.endsWith("/finish")) hits.push("finish");
     response.end(JSON.stringify({ checkpoints: [], jobs: [] }));
   });
@@ -147,9 +152,9 @@ const r=cp.spawnSync(${JSON.stringify(realGit)},a,{stdio:'inherit'});process.exi
       expect(failures.every((u) => u.event?.message.includes("ENOSPC"))).toBe(true);
       expect(updates.some((u) => ["review.approved", "session.metrics"].includes(u.event?.type ?? ""))).toBe(false);
     } else if (mode === "control") {
-      for (const label of ["pending", "claim", "checkpoints", "finish"]) expect(hits).toContain(label);
-      for (const label of ["reclaim failed", "claim failed", "checkpoints", "finish failed"]) expect(logs).toContain(label);
-      expect(updates.filter((u) => u.event?.type === "pi.input_transport_blocked")).toHaveLength(2);
+      for (const label of ["lease", "claim", "checkpoints", "finish"]) expect(hits).toContain(label);
+      for (const label of ["reclaim failed", "failed to start", "checkpoints", "finish failed"]) expect(logs).toContain(label);
+      expect(updates.filter((u) => u.event?.type === "pi.input_transport_blocked")).toHaveLength(1);
     } else if (mode === "terminal") {
       expect(hits.filter((h) => h === "terminal")).toHaveLength(4);
       expect(hits).not.toContain("finish");

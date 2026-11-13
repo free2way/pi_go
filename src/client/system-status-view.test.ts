@@ -54,6 +54,7 @@ describe("system-status-view: labels and rows", () => {
     expect(storageLabel("ok")).toBe("充足");
     expect(storageLabel("low")).toBe("偏低");
     expect(storageLabel("critical")).toBe("严重不足");
+    expect(storageLabel("unknown")).toBe("磁盘状态未知");
     expect(storageLabel(undefined)).toBe(SYSTEM_UNKNOWN);
   });
 
@@ -61,6 +62,7 @@ describe("system-status-view: labels and rows", () => {
     expect(databaseLabel({ status: "ok" }, "en")).toBe("Healthy");
     expect(workerLabel({ status: "unreachable" }, "en")).toBe("Unreachable");
     expect(storageLabel("critical", "en")).toBe("Critically low");
+    expect(storageLabel("unknown", "en")).toBe("Storage status unknown");
     expect(formatAge(90_000, "en")).toBe("1 min");
     expect(formatVersion("  ", "en")).toBe("Unknown");
     expect(failureCategoryLabel("storage", "en")).toBe("Storage error");

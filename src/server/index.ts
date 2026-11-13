@@ -39,7 +39,8 @@ import { baseRealRun } from "./real-run.js";
 import { createProviderProbe, providerProbeDisabled } from "./provider-probe.js";
 import { verifyPendingCredentials } from "./credential-verification.js";
 import { RateLimiter } from "./rate-limit.js";
-import { PostgresRunStore } from "./run-store-pg.js";
+import { PostgresRunStore, type JobRecord } from "./run-store-pg.js";
+import { workerRefusalDisposition } from "./worker-refusal.js";
 import { artifactDiagnosticCredentials, artifactDiagnosticDownloadSafe, saveInternalRunArtifact } from "./artifact-api.js";
 import { type ApprovePlan, approveEventMeta, planApprove } from "./approve.js";
 import { conflictReplyFor, isStorageFailure, requestErrorReply } from "./request-errors.js";
@@ -454,6 +455,9 @@ const internalUpdateSchema = z.object({
   event: internalEventSchema.optional(),
   /** Optional at-least-once delivery key so a retried callback is not double counted (AT-REL-004). */
   deliveryId: z.string().min(1).max(160).optional(),
+  /** Lease identity; optional only for one rolling-upgrade compatibility window. */
+  jobId: z.string().min(1).max(160).optional(),
+  workerId: z.string().min(1).max(120).optional(),
 }).strict();
 // NEW-07: the worker uploads a full diff body through this route when the inline
 // callback cannot carry it. The route raises the body limit for itself only.
@@ -1225,7 +1229,7 @@ app.get("/api/system/status", async (request) => {
     app.log.warn({ error: serverDiagnosticMessage(error, { limit: 200 }) }, "system status database ping failed");
   }
 
-  const storage = workerHealth?.storage === "ok" || workerHealth?.storage === "low" || workerHealth?.storage === "critical"
+  const storage = workerHealth?.storage === "ok" || workerHealth?.storage === "low" || workerHealth?.storage === "critical" || workerHealth?.storage === "unknown"
     ? workerHealth.storage
     : undefined;
   const infrastructure: SystemStatusInput["infrastructure"] = {
@@ -3635,11 +3639,11 @@ async function dispatchJob(
     });
     return { jobId, accepted: true as const };
   } catch (error) {
-    const message = (error as Error).message;
-    if (/capacity/i.test(message)) {
+    const code = (error as { code?: unknown }).code;
+    if (workerRefusalDisposition(error) === "queue") {
       // REL-002 / AUD-05: stay queued instead of failing the run, and release the
       // reservation right away so the job can be claimed as soon as a slot frees.
-      await jobQueue.releaseReservation(jobId, "worker capacity reached");
+      await jobQueue.releaseReservation(jobId, "web-dispatch", String(code));
       await store.appendEvent({
         runId: run.id,
         round: run.round,
@@ -3650,7 +3654,7 @@ async function dispatchJob(
       });
       return { jobId, accepted: false as const };
     }
-    await jobQueue.finishJob(jobId, "failed", serverDiagnosticMessage(error, { credentials: Object.values(credentials), limit: 500 }));
+    await jobQueue.finishJobAsSystem(jobId, "failed", serverDiagnosticMessage(error, { credentials: Object.values(credentials), limit: 500 }));
     throw error;
   }
 }
@@ -3818,7 +3822,10 @@ app.post<{ Params: { id: string } }>("/api/internal/runs/:id/update", { bodyLimi
   // 否则迟到的 chat.message 会追加在 run.cancelled 之后并覆盖终态。
   const rejection = internalUpdateRejection(run);
   if (rejection) return reply.code(409).send({ error: rejection });
-  const { patch, event, deliveryId } = parsed.data;
+  const { patch, event, deliveryId, jobId, workerId } = parsed.data;
+  if ((jobId && !workerId) || (!jobId && workerId) || ((jobId || workerId) && !deliveryId)) {
+    return reply.code(400).send({ error: "jobId, workerId and deliveryId must be supplied together" });
+  }
   try {
     if (deliveryId && jobQueue) {
       // AUD-15: patch + event + delivery record commit in one transaction, so a
@@ -3828,6 +3835,7 @@ app.post<{ Params: { id: string } }>("/api/internal/runs/:id/update", { bodyLimi
         deliveryId,
         patch: patch as Partial<Run> | undefined,
         event: event ? { ...event, runId: run.id, at: new Date().toISOString() } : undefined,
+        ...(jobId && workerId ? { lease: { jobId, workerId } } : {}),
       });
       // AUD-16: the terminal callback carries the run diff; persist it in full.
       if (result.applied) await persistTerminalDiffArtifact(store.getRun(run.id));
@@ -3840,6 +3848,9 @@ app.post<{ Params: { id: string } }>("/api/internal/runs/:id/update", { bodyLimi
     if (patch) await reconcileStoryForRun(run.id);
     return { ok: true, applied: true };
   } catch (error) {
+    if ((error as { code?: unknown }).code === "JOB_LEASE_LOST") {
+      return reply.code(409).send({ error: "Job lease lost", code: "JOB_LEASE_LOST" });
+    }
     const conflict = conflictReplyFor(error);
     if (conflict) {
       if (conflict.code === "INVALID_STATE_TRANSITION") {
@@ -3872,42 +3883,46 @@ app.post<{ Params: { id: string } }>("/api/internal/runs/:id/artifacts", { bodyL
 
 // ------------------------------------------- internal job + checkpoint API (REL-002/003)
 
-app.get<{ Querystring: { workerId?: string } }>("/api/internal/jobs/pending", async (request, reply) => {
-  if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
-  if (!jobQueue) return reply.code(503).send({ error: "Job queue unavailable" });
-  await requeueStaleJobs();
-  const jobs = await jobQueue.listPendingJobs({ staleAfterMs: JOB_STALE_MS });
+async function workerPayloadsForJobs(
+  entries: Array<{ job: JobRecord; wasStarted: boolean }>,
+  workerId: string,
+  mutate: boolean,
+) {
   const payloads: Array<Record<string, unknown>> = [];
-  for (const job of jobs) {
+  for (const entry of entries) {
+    const { job } = entry;
     // Multi-process safety: a run written by another web instance (rolling
     // deploy, ops tooling) is hydrated here before the job payload is built, so
     // the worker never receives a job it cannot resolve.
-    let run = store.getRun(job.runId);
-    if (!run && store instanceof PostgresRunStore) run = await store.hydrate(job.runId);
+    const run = store instanceof PostgresRunStore
+      ? await store.hydrate(job.runId)
+      : store.getRun(job.runId);
     if (!run) {
-      // Transient visibility gap: keep the job claimable and record the reason
-      // instead of failing it (a failure would strand the run in `queued`).
-      const ageMs = Date.now() - Date.parse(String((job as { createdAt?: string }).createdAt ?? new Date().toISOString()));
-      if (ageMs > 15 * 60_000) await jobQueue.finishJob(job.id, "failed", "Run missing");
-      else await jobQueue.deferJob(job.id, "Run missing (等待运行记录可见)");
+      if (mutate) {
+        const ageMs = Date.now() - Date.parse(job.createdAt);
+        if (ageMs > 15 * 60_000) await jobQueue!.finishJobAsSystem(job.id, "failed", "Run missing");
+        else await jobQueue!.releaseReservation(job.id, workerId, "Run missing (等待运行记录可见)");
+      }
       continue;
     }
     if (["completed", "failed", "cancelled", "needs_human"].includes(run.state)) {
-      await jobQueue.finishJob(job.id, "done");
+      if (mutate) await jobQueue!.finishJobAsSystem(job.id, "done", `Run already ${run.state}`);
       continue;
     }
     const credentials = await jobCredentialsFor(run);
     if (!credentials) {
-      await jobQueue.finishJob(job.id, "failed", "Credentials unavailable for the pinned providers");
-      await store.updateRun(run.id, { state: "needs_human", summary: "恢复执行失败：该任务所用模型的 provider 凭据不可用，请在「模型与凭据」页检查" }).catch(() => undefined);
-      await store.appendEvent({
-        runId: run.id,
-        round: run.round,
-        source: "system",
-        type: "run.recovery_blocked",
-        message: "Worker 重启后无法恢复：缺少该任务 provider 的凭据（任务未丢失，可在配置凭据后重新恢复）",
-        at: new Date().toISOString(),
-      }).catch(() => undefined);
+      if (mutate) {
+        await jobQueue!.finishJobAsSystem(job.id, "failed", "Credentials unavailable for the pinned providers");
+        await store.updateRun(run.id, { state: "needs_human", summary: "恢复执行失败：该任务所用模型的 provider 凭据不可用，请在「模型与凭据」页检查" }).catch(() => undefined);
+        await store.appendEvent({
+          runId: run.id,
+          round: run.round,
+          source: "system",
+          type: "run.recovery_blocked",
+          message: "Worker 重启后无法恢复：缺少该任务 provider 的凭据（任务未丢失，可在配置凭据后重新恢复）",
+          at: new Date().toISOString(),
+        }).catch(() => undefined);
+      }
       continue;
     }
     const payload = (job.payload ?? {}) as Record<string, unknown>;
@@ -3920,20 +3935,43 @@ app.get<{ Querystring: { workerId?: string } }>("/api/internal/jobs/pending", as
       run,
       checks: Array.isArray(payload.checks) ? payload.checks : [],
       credentials,
-      wasStarted: job.startedAt !== null,
+      wasStarted: entry.wasStarted,
       ...(payload.resume ? { resume: payload.resume } : {}),
       ...(payload.retryReview ? { retryReview: true } : {}),
     });
   }
-  return { jobs: payloads };
+  return payloads;
+}
+
+app.get<{ Querystring: { workerId?: string } }>("/api/internal/jobs/pending", async (request, reply) => {
+  if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
+  if (!jobQueue) return reply.code(503).send({ error: "Job queue unavailable" });
+  reply.header("Deprecation", "true");
+  // Old workers ignore a failed asynchronous claim. Returning candidate rows
+  // here would therefore preserve the duplicate-execution race during a rolling
+  // upgrade. Keep the endpoint read-only and empty for one compatibility window;
+  // new workers use the atomic POST /jobs/lease endpoint.
+  return { jobs: [] };
+});
+
+app.post("/api/internal/jobs/lease", async (request, reply) => {
+  if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
+  if (!jobQueue) return reply.code(503).send({ error: "Job queue unavailable" });
+  const parsed = z.object({
+    workerId: z.string().trim().min(1).max(120),
+    capacity: z.number().int().min(1).max(4),
+  }).strict().safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "Invalid lease request", details: parsed.error.issues });
+  const leased = await jobQueue.leaseJobs({ ...parsed.data, staleAfterMs: JOB_STALE_MS });
+  return { jobs: await workerPayloadsForJobs(leased, parsed.data.workerId, true) };
 });
 
 app.post<{ Params: { id: string } }>("/api/internal/jobs/:id/claim", async (request, reply) => {
   if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
   if (!jobQueue) return reply.code(503).send({ error: "Job queue unavailable" });
   const workerId = String((request.body as { workerId?: unknown })?.workerId ?? "unknown").slice(0, 120);
-  const job = await jobQueue.claimJob(request.params.id, workerId);
-  if (!job) return reply.code(409).send({ error: "Job is not claimable" });
+  const job = await jobQueue.claimJob(request.params.id, workerId, JOB_STALE_MS);
+  if (!job) return reply.code(409).send({ error: "Job lease lost", code: "JOB_LEASE_LOST" });
   return { ok: true, job };
 });
 
@@ -3941,17 +3979,31 @@ app.post<{ Params: { id: string } }>("/api/internal/jobs/:id/heartbeat", async (
   if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
   if (!jobQueue) return reply.code(503).send({ error: "Job queue unavailable" });
   const workerId = String((request.body as { workerId?: unknown })?.workerId ?? "unknown").slice(0, 120);
-  await jobQueue.heartbeatJob(request.params.id, workerId);
+  if (!await jobQueue.heartbeatJob(request.params.id, workerId)) {
+    return reply.code(409).send({ error: "Job lease lost", code: "JOB_LEASE_LOST" });
+  }
+  return { ok: true };
+});
+
+app.post<{ Params: { id: string } }>("/api/internal/jobs/:id/release", async (request, reply) => {
+  if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
+  if (!jobQueue) return reply.code(503).send({ error: "Job queue unavailable" });
+  const body = (request.body ?? {}) as { workerId?: unknown; reason?: unknown };
+  const workerId = String(body.workerId ?? "unknown").slice(0, 120);
+  const released = await jobQueue.releaseReservation(request.params.id, workerId, String(body.reason ?? "Worker deferred job").slice(0, 500));
+  if (!released) return reply.code(409).send({ error: "Job lease lost", code: "JOB_LEASE_LOST" });
   return { ok: true };
 });
 
 app.post<{ Params: { id: string } }>("/api/internal/jobs/:id/finish", async (request, reply) => {
   if (!safeTokenMatch(request.headers.authorization)) return reply.code(401).send({ error: "Unauthorized" });
   if (!jobQueue) return reply.code(503).send({ error: "Job queue unavailable" });
-  const body = (request.body ?? {}) as { state?: unknown; error?: unknown };
+  const body = (request.body ?? {}) as { workerId?: unknown; state?: unknown; error?: unknown };
+  const workerId = String(body.workerId ?? "unknown").slice(0, 120);
   const state = body.state === "failed" || body.state === "cancelled" ? body.state : "done";
-  await jobQueue.finishJob(request.params.id, state, body.error === undefined ? undefined : String(body.error).slice(0, 500));
-  return { ok: true };
+  const result = await jobQueue.finishJob(request.params.id, workerId, state, body.error === undefined ? undefined : String(body.error).slice(0, 500));
+  if (!result.ok) return reply.code(409).send({ error: "Job lease lost", code: "JOB_LEASE_LOST" });
+  return { ok: true, idempotent: result.idempotent };
 });
 
 app.get<{ Params: { id: string } }>("/api/internal/runs/:id/checkpoints", async (request, reply) => {
