@@ -1,5 +1,6 @@
 import Fastify from "fastify";
 import { afterEach, expect, it, vi } from "vitest";
+import { registerInternalAuthorization } from "./routes/internal/auth.js";
 import type { Db } from "./db.js";
 import { parseOperationalRows, registerOperationalMetrics } from "./operational-metrics.js";
 import { ApiMetrics, metricsAuthorized, operationalLabels } from "../shared/operational-metrics.js";
@@ -13,8 +14,9 @@ function fixture(observe: () => Promise<{ rows: Record<string, unknown>[] }>) {
   const statements: string[] = [];
   const query = vi.fn(async (sql: string) => { statements.push(sql); return sql.startsWith("SET ") ? { rows: [] } : observe(); });
   const db: Db = { query, withTransaction: async fn => fn(db) };
+  registerInternalAuthorization(app, { worker: () => false, release: () => false, metrics: value => value === "Bearer fixture" });
   registerOperationalMetrics(app, { db, pool: { totalCount: 3, idleCount: 2, waitingCount: 1 },
-    version: "1.2.3", environment: { PI_DEPLOYMENT_ENVIRONMENT: "staging" }, authorized: req => req.headers.authorization === "Bearer fixture" });
+    version: "1.2.3", environment: { PI_DEPLOYMENT_ENVIRONMENT: "staging" } });
   app.get("/api/runs/:id", async () => ({ ok: true }));
   return { app, query, statements };
 }

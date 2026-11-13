@@ -1,4 +1,4 @@
-import type { FastifyInstance, FastifyRequest } from "fastify";
+import type { FastifyInstance } from "fastify";
 import type { Db } from "./db.js";
 import { ApiMetrics, gauge, METRICS_CONTENT_TYPE, operationalLabels, processMetrics, type MetricSample } from "../shared/operational-metrics.js";
 
@@ -56,7 +56,7 @@ export function parseOperationalRows(rows: Record<string, unknown>[]): Map<strin
 
 export function registerOperationalMetrics(app: FastifyInstance, options: {
   db: Db; pool: { totalCount: number; idleCount: number; waitingCount: number };
-  authorized: (request: FastifyRequest) => boolean; version: string; environment?: NodeJS.ProcessEnv;
+  version: string; environment?: NodeJS.ProcessEnv;
 }) {
   const labels = operationalLabels("pigo-web", options.version, options.environment);
   const api = new ApiMetrics();
@@ -81,9 +81,8 @@ export function registerOperationalMetrics(app: FastifyInstance, options: {
       return await Promise.race([pending, new Promise<Snapshot>(resolve => { timer = setTimeout(() => resolve({ at: Date.now() }), 2000); timer.unref?.(); })]);
     } finally { if (timer) clearTimeout(timer); }
   }
-  app.get("/api/internal/metrics", async (request, reply) => {
+  app.get("/api/internal/metrics", { config: { internalAuth: "metrics" } }, async (request, reply) => {
     reply.header("Cache-Control", "no-store");
-    if (!options.authorized(request)) return reply.code(401).send({ error: "Unauthorized" });
     const snapshot = await collect();
     let output = processMetrics(labels) + api.render(labels)
       + gauge("pigo_database_up", "Successful bounded database aggregate observation; failure is not zero usage.", labels, [{ value: snapshot.values ? 1 : 0 }])
