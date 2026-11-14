@@ -9,7 +9,6 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { releasesStoryBlocks, storyBlockReleaseNote } from "../shared/run-state.js";
 import { notifyQueuedJob } from "./job-notification.js";
-import { buildStoryRunInput, STORY_STATUS_LABELS, type RunBudget, type StoryDetail } from "../shared/agile.js";
 import { resolveRequestLocale, type Locale } from "../shared/i18n.js";
 import type { ConfigStatus, CurrentUser, ModelCatalogResponse, ReviewScope, Run, RunEvent, RunReleaseRecord, RunRollbackRecord, Workspace } from "../shared/types.js";
 import { AccountService } from "./accounts.js";
@@ -43,7 +42,7 @@ import { PostgresRunStore } from "./run-store-pg.js";
 import { workerRefusalDisposition } from "./worker-refusal.js";
 import { artifactDiagnosticCredentials, artifactDiagnosticDownloadSafe } from "./artifact-api.js";
 import { type ApprovePlan, approveEventMeta, planApprove } from "./approve.js";
-import { conflictReplyFor, isStorageFailure, requestErrorReply } from "./request-errors.js";
+import { conflictReplyFor, requestErrorReply } from "./request-errors.js";
 import { diagnosticSecrets, redactDiagnosticText } from "../shared/diagnostics.js";
 import { appendHumanNote } from "./run-notes.js";
 import { resumeDeadlinePatch } from "./run-deadline-base.js";
@@ -71,15 +70,12 @@ import { planReopen, reopenEventMeta } from "./run-reopen.js";
 import { isActiveRelease, planReleaseStart, sameReleaseAttempt } from "./run-release.js";
 import { buildRollbackPayload, planRollbackStart, sameRollbackAttempt } from "./run-rollback.js";
 import { AgileError, AgileService } from "./agile.js";
-import { readAgileMetrics, readReleaseRetrospective, readReleaseSummary } from "./agile-metrics.js";
-import { projectCreateSchema, projectPatchSchema, releaseCreateSchema, releasePatchSchema, releasePublishSchema, sprintCreateSchema, sprintPatchSchema, storyBlockSchema, storyCreateSchema, storyPatchSchema, storySubmitSchema, templateCreateSchema } from "./agile-schemas.js";
 import { executeRelease } from "./release-execution.js";
-import { isReleasePublishTerminal, planReleasePublish, planReleasePublishGate, RELEASE_DEPLOY_STALE_MS, RELEASE_PUBLISH_POLICY } from "./release-publish.js";
-import { runReleaseDeploy } from "./release-deploy.js";
+import { RELEASE_DEPLOY_STALE_MS } from "./release-publish.js";
 import compress from "@fastify/compress";
 import { cacheControlFor, isBuildAssetRequest } from "./static-cache.js";
 import type { RunStoreLike } from "./store.js";
-import { scmWorkerTimeoutMs, WorkspaceError, WorkspaceService } from "./workspaces.js";
+import { scmWorkerTimeoutMs, WorkspaceService } from "./workspaces.js";
 import { planRemoteSyncGate, type RemoteCommitEvidence } from "./scm-release-gate.js";
 import { serverDiagnosticMessage, serverLoggerOptions } from "./server-diagnostics.js";
 import { readReleaseTimeoutObservation, syncReleaseTimeoutAlerts } from "./release-timeout-alerts.js";
@@ -91,6 +87,11 @@ import { runStateSchema } from "./routes/internal/run-schemas.js";
 import { registerAccountAdminRoutes } from "./routes/account-admin.js";
 import { registerAssistantRoutes } from "./routes/assistant.js";
 import { registerCredentialRoutes } from "./routes/model-key-routes.js";
+
+import { registerAgileRoutes } from "./routes/agile.js";
+import { createRunSchema, type RealRunExtra, type RealRunResult } from "./routes/create-run-schema.js";
+import { classifyWorkspaceError } from "./routes/workspace-errors.js";
+import { registerWorkspaceRoutes } from "./routes/workspaces.js";
 
 const app = Fastify({
   logger: serverLoggerOptions(),
@@ -253,26 +254,6 @@ const agile = new AgileService(db);
 // Map. The TTL also lets a verified Clerk email change flow back through the
 // identity service instead of pinning the first observed address until restart.
 const userCache = new ExpiringLruCache<CurrentUser>({ maxEntries: 5_000, ttlMs: 5 * 60_000 });
-
-const createRunSchema = z.object({
-  title: z.string().trim().min(2).max(80),
-  task: z.string().trim().min(10).max(10_000),
-  repository: z.string().trim().max(240).default("demo/auth-service"),
-  workspaceId: z.string().trim().min(1).max(80).optional(),
-  mode: z.enum(["demo", "real"]).default("demo"),
-  checks: z.array(z.string().trim().min(1).max(500)).max(8).default([]),
-  acceptanceCriteria: z.string().trim().max(4_000).optional(),
-  idempotencyKey: z.string().trim().min(8).max(120).optional(),
-  developerModel: z.object({ provider: z.string().trim().min(1).max(80), model: z.string().trim().min(1).max(120) }).optional(),
-  reviewerModel: z.object({ provider: z.string().trim().min(1).max(80), model: z.string().trim().min(1).max(120) }).optional(),
-}).superRefine((value, context) => {
-  if (value.mode === "real" && value.checks.length === 0) {
-    context.addIssue({ code: "custom", path: ["checks"], message: "Real runs require at least one check command" });
-  }
-  if (value.mode === "real" && !value.workspaceId) {
-    context.addIssue({ code: "custom", path: ["workspaceId"], message: "Real runs require a registered workspace" });
-  }
-});
 
 // SEC-008 / AT-SEC-005: per-user write limits for credential and run mutations.
 const credentialWrites = new RateLimiter(10);
@@ -871,56 +852,8 @@ app.get("/api/system/status", async (request) => {
   });
 });
 
-app.get("/api/projects", async (request, reply) => {
-  // AUD-02: the legacy global project listing is owner scoped (admins see all).
-  const admin = await identities.isAdmin(auth.user(request).id);
-  if (!realRunsEnabled) return reply.code(503).send({ error: "Real runs are disabled" });
-  try {
-    const projects = await workerRequest<Array<{ relativePath: string }>>("/projects");
-    if (admin) return projects;
-    const allowed = new Set((await workspaces.list(ownerKeysFor(request))).map((item) => item.rootPath));
-    return projects.filter((project) => allowed.has(project.relativePath) || allowed.has(project.relativePath.replace(/^\/+/, "")));
-  } catch (error) {
-    return reply.code(503).send({ error: `Worker unavailable: ${serverDiagnosticMessage(error)}` });
-  }
-});
-
-const workspaceRegisterSchema = z.object({ relativePath: z.string().trim().min(1).max(240) });
-const workspaceCloneSchema = z.object({ url: z.string().trim().min(1).max(500), name: z.string().trim().min(1).max(80) });
-const workspaceCreateSchema = z.object({ name: z.string().trim().min(1).max(80) });
-const workspacePatchSchema = z.object({
-  defaultChecks: z.array(z.string().trim().min(1).max(500)).max(8).optional(),
-  defaultBranch: z.string().trim().min(1).max(200).optional(),
-}).strict();
-const workspaceScmSettingsSchema = z.object({
-  provider: z.enum(["github", "gitlab", "generic"]),
-  authMode: z.enum(["https_token", "server_ssh"]),
-  username: z.string().trim().min(1).max(120).nullable().optional(),
-  token: z.string().trim().min(8).max(2_000).nullable().optional(),
-}).strict();
-const workspacePushSchema = z.object({ confirm: z.literal(true) }).strict();
-
-function workspacesDisabled(reply: FastifyReply) {
-  return reply.code(503).send({ error: "Workspaces are disabled", code: "WORKSPACES_DISABLED" });
-}
-
-/** Maps a WorkspaceError / storage failure to an HTTP status + body (shared by
- * the workspace routes and the run-preflight, which must not touch `reply`). */
-function classifyWorkspaceError(error: unknown): { status: number; body: Record<string, unknown> } {
-  if (error instanceof WorkspaceError) return { status: error.status, body: { error: serverDiagnosticMessage(error.message), code: serverDiagnosticMessage(error.code) } };
-  const raw = String((error as Error)?.message ?? error);
-  const message = serverDiagnosticMessage(raw);
-  // AT-REL-005: a database outage is reported as storage degradation, not as a
-  // confusing workspace error.
-  if (isStorageFailure(raw)) {
-    alerts.raise({ key: "storage_failure", severity: "critical", message: "存储不可用：工作区操作无法完成", details: { error: message.slice(0, 200) } });
-    return { status: 503, body: { error: `存储不可用：${message.slice(0, 200)}`, code: "STORAGE_UNAVAILABLE" } };
-  }
-  return { status: 503, body: { error: `Workspace operation failed: ${message}` } };
-}
-
 function workspaceErrorReply(reply: FastifyReply, error: unknown) {
-  const { status, body } = classifyWorkspaceError(error);
+  const { status, body } = classifyWorkspaceError(error, alerts);
   return reply.code(status).send(body);
 }
 
@@ -947,150 +880,19 @@ async function productionRemoteGate(
   return planRemoteSyncGate(evidence);
 }
 
-app.get("/api/workspaces", async (request, reply) => {
-  if (!workspacesEnabled) return workspacesDisabled(reply);
-  return { workspaces: await workspaces.list(ownerKeysFor(request)) };
+registerWorkspaceRoutes(app, {
+  currentUser: (request) => auth.user(request),
+  ownerKeysFor,
+  isAdmin: (userId) => identities.isAdmin(userId),
+  workspaces,
+  workerRequest,
+  realRunsEnabled,
+  workspacesEnabled,
+  runActions,
+  tooManyRequests,
+  workspaceErrorReply,
 });
 
-app.post("/api/workspaces/register", async (request, reply) => {
-  if (!workspacesEnabled) return workspacesDisabled(reply);
-  const parsed = workspaceRegisterSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
-  try {
-    // AUD-02: only the owner (or an admin) may claim a physical repository path.
-    const isAdmin = await identities.isAdmin(auth.user(request).id);
-    return reply.code(201).send(await workspaces.register(auth.user(request).id, parsed.data.relativePath, { isAdmin }));
-  } catch (error) {
-    return workspaceErrorReply(reply, error);
-  }
-});
-
-app.post("/api/workspaces/clone", async (request, reply) => {
-  if (!workspacesEnabled) return workspacesDisabled(reply);
-  const parsed = workspaceCloneSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
-  try {
-    return reply.code(201).send(await workspaces.clone(auth.user(request).id, parsed.data.url, parsed.data.name));
-  } catch (error) {
-    return workspaceErrorReply(reply, error);
-  }
-});
-
-// Creates the directory on the worker host (under its projects root) and then
-// registers it, so an operator never has to shell into the worker container.
-app.post("/api/workspaces/create", async (request, reply) => {
-  if (!workspacesEnabled) return workspacesDisabled(reply);
-  const parsed = workspaceCreateSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
-  try {
-    return reply.code(201).send(await workspaces.create(auth.user(request).id, parsed.data.name));
-  } catch (error) {
-    return workspaceErrorReply(reply, error);
-  }
-});
-
-app.get<{ Params: { id: string } }>("/api/workspaces/:id", async (request, reply) => {
-  if (!workspacesEnabled) return workspacesDisabled(reply);
-  try {
-    return await workspaces.get(ownerKeysFor(request), request.params.id, { isAdmin: await identities.isAdmin(auth.user(request).id) });
-  } catch (error) {
-    return workspaceErrorReply(reply, error);
-  }
-});
-
-app.post<{ Params: { id: string } }>("/api/workspaces/:id/refresh", async (request, reply) => {
-  if (!workspacesEnabled) return workspacesDisabled(reply);
-  try {
-    // B4: refreshing git metadata mutates stored state, so a read grant is refused.
-    return await workspaces.refresh(ownerKeysFor(request), request.params.id, { isAdmin: await identities.isAdmin(auth.user(request).id) });
-  } catch (error) {
-    return workspaceErrorReply(reply, error);
-  }
-});
-
-app.get<{ Params: { id: string } }>("/api/workspaces/:id/scm", async (request, reply) => {
-  if (!workspacesEnabled) return workspacesDisabled(reply);
-  try {
-    return await workspaces.scmOverview(ownerKeysFor(request), request.params.id, { isAdmin: await identities.isAdmin(auth.user(request).id) });
-  } catch (error) {
-    return workspaceErrorReply(reply, error);
-  }
-});
-
-app.post<{ Params: { id: string } }>("/api/workspaces/:id/scm/check", async (request, reply) => {
-  if (!workspacesEnabled) return workspacesDisabled(reply);
-  try {
-    return await workspaces.remoteStatus(ownerKeysFor(request), request.params.id, { isAdmin: await identities.isAdmin(auth.user(request).id) });
-  } catch (error) {
-    return workspaceErrorReply(reply, error);
-  }
-});
-
-app.put<{ Params: { id: string } }>("/api/workspaces/:id/scm", async (request, reply) => {
-  if (!workspacesEnabled) return workspacesDisabled(reply);
-  const user = auth.user(request);
-  if (!(await identities.isAdmin(user.id))) return reply.code(403).send({ error: "仅管理员可以配置代码仓库凭据", code: "ADMIN_REQUIRED" });
-  const parsed = workspaceScmSettingsSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
-  try {
-    return await workspaces.saveScmSettings(ownerKeysFor(request), request.params.id, parsed.data, { isAdmin: true });
-  } catch (error) {
-    return workspaceErrorReply(reply, error);
-  }
-});
-
-app.delete<{ Params: { id: string } }>("/api/workspaces/:id/scm", async (request, reply) => {
-  if (!workspacesEnabled) return workspacesDisabled(reply);
-  const user = auth.user(request);
-  if (!(await identities.isAdmin(user.id))) return reply.code(403).send({ error: "仅管理员可以删除代码仓库凭据", code: "ADMIN_REQUIRED" });
-  try {
-    return await workspaces.deleteScmSettings(ownerKeysFor(request), request.params.id, { isAdmin: true });
-  } catch (error) {
-    return workspaceErrorReply(reply, error);
-  }
-});
-
-app.post<{ Params: { id: string } }>("/api/workspaces/:id/scm/push", async (request, reply) => {
-  if (!workspacesEnabled) return workspacesDisabled(reply);
-  const actionLimit = runActions.check(auth.user(request).id);
-  if (!actionLimit.allowed) return tooManyRequests(reply, actionLimit.retryAfterMs);
-  const parsed = workspacePushSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: "推送需要 confirm=true", code: "SCM_PUSH_CONFIRM_REQUIRED", details: parsed.error.issues });
-  const user = auth.user(request);
-  if (!(await identities.isAdmin(user.id))) return reply.code(403).send({ error: "仅管理员可以推送代码到远程仓库", code: "ADMIN_REQUIRED" });
-  try {
-    return await workspaces.push(ownerKeysFor(request), request.params.id, user.id, { isAdmin: true });
-  } catch (error) {
-    return workspaceErrorReply(reply, error);
-  }
-});
-
-app.patch<{ Params: { id: string } }>("/api/workspaces/:id", async (request, reply) => {
-  if (!workspacesEnabled) return workspacesDisabled(reply);
-  const parsed = workspacePatchSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
-  try {
-    return await workspaces.patch(ownerKeysFor(request), request.params.id, parsed.data, { isAdmin: await identities.isAdmin(auth.user(request).id) });
-  } catch (error) {
-    return workspaceErrorReply(reply, error);
-  }
-});
-
-app.delete<{ Params: { id: string } }>("/api/workspaces/:id", async (request, reply) => {
-  if (!workspacesEnabled) return workspacesDisabled(reply);
-  try {
-    // B4: only the owner, an admin or a write grant may unregister.
-    await workspaces.unregister(ownerKeysFor(request), request.params.id, { isAdmin: await identities.isAdmin(auth.user(request).id) });
-    return reply.code(204).send();
-  } catch (error) {
-    return workspaceErrorReply(reply, error);
-  }
-});
-
-// ------------------------------------------------ Sprint 3: agile domain
-// Planning layer on top of the Run. `/api/projects` is already the legacy
-// global worker listing, so the new owner-scoped project CRUD lives under
-// `/api/agile/projects`; stories/sprints/releases use their own namespaces.
 function agileErrorReply(reply: FastifyReply, error: unknown) {
   if (error instanceof AgileError) return reply.code(error.status).send({ error: error.message, code: error.code });
   return workspaceErrorReply(reply, error);
@@ -1126,498 +928,22 @@ async function reconcileStoryForRun(runId: string) {
   }
 }
 
-app.get("/api/agile/projects", async (request, reply) => {
-  try {
-    return { projects: await agile.listProjects(ownerKeysFor(request)) };
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-app.post("/api/agile/projects", async (request, reply) => {
-  const parsed = projectCreateSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
-  try {
-    return reply.code(201).send(await agile.createProject(auth.user(request).id, parsed.data));
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-app.get<{ Params: { id: string } }>("/api/agile/projects/:id", async (request, reply) => {
-  try {
-    return await agile.getProject(ownerKeysFor(request), request.params.id, await identities.isAdmin(auth.user(request).id));
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-app.patch<{ Params: { id: string } }>("/api/agile/projects/:id", async (request, reply) => {
-  const parsed = projectPatchSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
-  try {
-    return await agile.updateProject(ownerKeysFor(request), request.params.id, parsed.data, await identities.isAdmin(auth.user(request).id));
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-app.delete<{ Params: { id: string } }>("/api/agile/projects/:id", async (request, reply) => {
-  try {
-    await agile.deleteProject(ownerKeysFor(request), request.params.id, await identities.isAdmin(auth.user(request).id));
-    return reply.code(204).send();
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-app.get<{ Querystring: { projectId?: string; sprintId?: string; status?: string } }>("/api/stories", async (request, reply) => {
-  const filter: { projectId?: string; sprintId?: string | null; status?: StoryDetail["status"] } = {};
-  if (request.query.projectId) filter.projectId = request.query.projectId;
-  if (request.query.sprintId) filter.sprintId = request.query.sprintId;
-  if (request.query.status) filter.status = request.query.status as StoryDetail["status"];
-  try {
-    return { stories: await agile.listStories(ownerKeysFor(request), filter) };
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-app.post("/api/stories", async (request, reply) => {
-  const parsed = storyCreateSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
-  try {
-    return reply.code(201).send(await agile.createStory(auth.user(request).id, parsed.data));
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-// Story detail reconciles the derived status from the latest linked run first.
-app.get<{ Params: { id: string } }>("/api/stories/:id", async (request, reply) => {
-  try {
-    return await agile.getStory(ownerKeysFor(request), request.params.id, await identities.isAdmin(auth.user(request).id));
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-app.patch<{ Params: { id: string } }>("/api/stories/:id", async (request, reply) => {
-  const parsed = storyPatchSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
-  try {
-    return await agile.updateStory(ownerKeysFor(request), request.params.id, parsed.data, await identities.isAdmin(auth.user(request).id));
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-app.delete<{ Params: { id: string } }>("/api/stories/:id", async (request, reply) => {
-  try {
-    await agile.deleteStory(ownerKeysFor(request), request.params.id, await identities.isAdmin(auth.user(request).id));
-    return reply.code(204).send();
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-// Kanban blocked-management: manual block/unblock on a story. A manual block
-// wins over the derived in-progress/review status until unblocked; a run that is
-// still parked cannot be unblocked from here (409 BLOCKED_BY_RUN).
-app.post<{ Params: { id: string } }>("/api/stories/:id/block", async (request, reply) => {
-  const parsed = storyBlockSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: "标记阻塞需要填写原因", code: "BLOCK_REASON_REQUIRED", details: parsed.error.issues });
-  const user = auth.user(request);
-  try {
-    return await agile.blockStory(ownerKeysFor(request), request.params.id, parsed.data.reason, user.id, await identities.isAdmin(user.id));
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-app.post<{ Params: { id: string } }>("/api/stories/:id/unblock", async (request, reply) => {
-  const user = auth.user(request);
-  try {
-    return await agile.unblockStory(ownerKeysFor(request), request.params.id, await identities.isAdmin(user.id));
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-// Reopen a story whose latest run is a terminal failed/cancelled run: it goes
-// back to `ready` so it can be submitted again. This is the explicit human path
-// for a stuck (or manually blocked) story and never silently lifts a manual
-// block: 409 with the run id while the latest run is live or needs_human, 409
-// BLOCKED_BY_MANUAL on a manual block, 409 STORY_NOT_REOPENABLE once delivered.
-// The reopen is audited on the latest run (`story.reopened`). See docs/19.
-app.post<{ Params: { id: string } }>("/api/stories/:id/reopen", async (request, reply) => {
-  const user = auth.user(request);
-  try {
-    const result = await agile.reopenStory(ownerKeysFor(request), request.params.id, await identities.isAdmin(user.id));
-    if (result.runId) {
-      const run = store.getRun(result.runId);
-      await store.appendEvent({
-        runId: result.runId,
-        round: run?.round ?? 0,
-        source: "system",
-        type: "story.reopened",
-        message: `故事「${result.story.title}」已重新打开为就绪（原状态 ${STORY_STATUS_LABELS[result.previousStatus]}）`,
-        at: new Date().toISOString(),
-        meta: { storyId: result.story.id, actorId: user.id, previousStatus: result.previousStatus },
-      });
-    }
-    return result.story;
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-// Submit a story as a run. Only a `ready` story may be submitted; the run's
-// task carries the description + acceptance criteria + definition of done.
-app.post<{ Params: { id: string } }>("/api/stories/:id/runs", async (request, reply) => {
-  const parsed = storySubmitSchema.safeParse(request.body ?? {});
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
-  const user = auth.user(request);
-  const creationLimit = runCreations.check(user.id);
-  if (!creationLimit.allowed) return tooManyRequests(reply, creationLimit.retryAfterMs);
-  const isAdmin = await identities.isAdmin(user.id);
-  let story: StoryDetail;
-  try {
-    story = await agile.getStory(ownerKeysFor(request), request.params.id, isAdmin);
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-  if (story.status !== "ready") {
-    return reply.code(409).send({ error: "只有「就绪」状态的故事可以提交为运行", code: "STORY_NOT_READY", status: story.status });
-  }
-  const workspaceId = parsed.data.workspaceId ?? story.workspaceId ?? undefined;
-  // Checks default to the workspace's registered commands.
-  let defaultChecks: string[] = [];
-  if (workspaceId) {
-    try {
-      defaultChecks = (await workspaces.get(ownerKeysFor(request), workspaceId, { isAdmin })).defaultChecks;
-    } catch (error) {
-      return agileErrorReply(reply, error);
-    }
-  }
-  const input = buildStoryRunInput(story, { checks: parsed.data.checks ?? defaultChecks, workspaceId });
-
-  if (parsed.data.mode === "demo") {
-    if (!demoMode) return reply.code(403).send({ error: "Demo mode is disabled" });
-    const run = baseDemoRun({ title: input.title, task: input.task, repository: "demo/agile-story" }, user.id);
-    run.storyId = story.id;
-    // 运行时文案语言 (docs/24-i18n.md §9): the story run records the requester's locale.
-    run.locale = requestLocale(request);
-    await store.createRun(run, { runId: run.id, round: 1, source: "system", type: "run.created", message: "已从用户故事创建演示任务", at: new Date().toISOString() });
-    void runDemo(store, run.id);
-    await agile.linkRun(story.id, run.id);
-    await agile.markStoryInProgress(story.id);
-    return reply.code(201).send({ run: store.getRun(run.id, user.id), story: await agile.getStory(ownerKeysFor(request), story.id, isAdmin) });
-  }
-
-  if (!workspaceId) return reply.code(422).send({ error: "真实运行需要指定工作区（故事或请求中的 workspaceId）", code: "STORY_WORKSPACE_REQUIRED" });
-  if (input.checks.length === 0) return reply.code(422).send({ error: "真实运行需要至少一个检查命令（工作区默认检查或请求中的 checks）", code: "STORY_CHECKS_REQUIRED" });
-  const runParsed = createRunSchema.safeParse({
-    title: input.title,
-    task: input.task,
-    repository: "pending-workspace",
-    workspaceId,
-    mode: "real",
-    checks: input.checks,
-    acceptanceCriteria: input.acceptanceCriteria,
-    idempotencyKey: parsed.data.idempotencyKey,
-    developerModel: input.developerModel,
-    reviewerModel: input.reviewerModel,
-  });
-  if (!runParsed.success) return reply.code(422).send({ error: "故事无法生成合法运行", details: runParsed.error.issues });
-  const result = await startRealRun(request, runParsed.data, {
-    budget: story.budget ?? undefined,
-    maxParallel: story.maxParallel ?? undefined,
-    storyId: story.id,
-  });
-  if (result.run) {
-    await agile.linkRun(story.id, result.run.id);
-    if (result.ok) await agile.markStoryInProgress(story.id);
-    else await agile.reconcileRun(result.run.id);
-  }
-  if (!result.ok) return reply.code(result.status).send({ ...result.body, storyId: story.id });
-  return reply.code(201).send({ run: store.getRun(result.run.id, user.id), story: await agile.getStory(ownerKeysFor(request), story.id, isAdmin) });
-});
-
-app.get<{ Querystring: { projectId?: string } }>("/api/sprints", async (request, reply) => {
-  try {
-    return { sprints: await agile.listSprints(ownerKeysFor(request), request.query.projectId) };
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-app.post("/api/sprints", async (request, reply) => {
-  const parsed = sprintCreateSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
-  try {
-    return reply.code(201).send(await agile.createSprint(auth.user(request).id, parsed.data));
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-app.patch<{ Params: { id: string } }>("/api/sprints/:id", async (request, reply) => {
-  const parsed = sprintPatchSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
-  try {
-    return await agile.updateSprint(ownerKeysFor(request), request.params.id, parsed.data, await identities.isAdmin(auth.user(request).id));
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-app.delete<{ Params: { id: string } }>("/api/sprints/:id", async (request, reply) => {
-  try {
-    await agile.deleteSprint(ownerKeysFor(request), request.params.id, await identities.isAdmin(auth.user(request).id));
-    return reply.code(204).send();
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-app.get<{ Querystring: { projectId?: string } }>("/api/releases", async (request, reply) => {
-  try {
-    return { releases: await agile.listReleases(ownerKeysFor(request), request.query.projectId) };
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-app.post("/api/releases", async (request, reply) => {
-  const parsed = releaseCreateSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
-  try {
-    return reply.code(201).send(await agile.createRelease(auth.user(request).id, parsed.data));
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-app.patch<{ Params: { id: string } }>("/api/releases/:id", async (request, reply) => {
-  const parsed = releasePatchSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
-  try {
-    return await agile.updateRelease(ownerKeysFor(request), request.params.id, parsed.data, await identities.isAdmin(auth.user(request).id));
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-app.delete<{ Params: { id: string } }>("/api/releases/:id", async (request, reply) => {
-  try {
-    await agile.deleteRelease(ownerKeysFor(request), request.params.id, await identities.isAdmin(auth.user(request).id));
-    return reply.code(204).send();
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-/**
- * Release publish action (Sprint 5). Owner-scoped, but **admin-only** to execute
- * (`release.requireAdmin: true`; same source of truth and error code as
- * `POST /api/runs/:id/publish`).
- *
- * The full precondition set (`planReleasePublish`, docs/19 §1.1) is enforced
- * after the admin gate and before any side effect, and is shared by the dry-run
- * preview and the confirmed publish so both report the identical verdict:
- * `RELEASE_EMPTY` / `RELEASE_BLOCKED` (blocked story or an unresolved blocking
- * finding) / `RELEASE_NOT_READY` (missing or unfinished run) /
- * `RELEASE_CHECKS_FAILED` / `RELEASE_NOT_MERGED` (`release.requireMergedCommit`).
- *
- * Without `confirm` this is a dry-run preview so the UI can render the
- * confirmation dialog (`release.requireExplicitConfirmation`: only `confirm:true`
- * reaches a deploy). With `confirm` the release is marked `released`, a DB-level
- * idempotency claim guarantees exactly ONE deploy attempt per confirm, and when
- * PI_POST_MERGE_DEPLOY_HOOK is configured the same deploy transport as run
- * publish (`executeRelease`) is invoked. An HTTP 202 stays `pending` until its
- * callback arrives (or the bounded timeout marks it failed and makes an explicit
- * retry possible); its outcome is recorded on the release + an audit row (never
- * silently skipped, never a premature `ok`).
- */
-app.post<{ Params: { id: string } }>("/api/agile/releases/:id/publish", { bodyLimit: 1024 * 1024 }, async (request, reply) => {
-  const parsed = releasePublishSchema.safeParse(request.body ?? {});
-  if (!parsed.success) {
-    return reply.code(400).send({ error: "发布需要 confirm=true（省略时只做只读预检）", code: "RELEASE_CONFIRM_REQUIRED", details: parsed.error.issues });
-  }
-  const user = auth.user(request);
-  const isAdmin = await identities.isAdmin(user.id);
-  try {
-    const release = await agile.getRelease(ownerKeysFor(request), request.params.id, isAdmin);
-
-    // AUD-P1: publishing is administrator-only, even for the release's owner.
-    // Checked before any guard detail is computed, so a non-admin learns nothing
-    // about blocked stories (and can never trigger a deploy).
-    const gate = planReleasePublishGate({ isAdmin });
-    if (gate.kind === "forbidden") return reply.code(gate.status).send({ error: gate.message, code: gate.code });
-
-    // A terminal release has nothing left to publish (failed/timed-out deploys are
-    // deliberately not terminal: they must be explicitly retried).
-    if (isReleasePublishTerminal(release, parsed.data.environment)) return reply.code(409).send({ error: "该环境已经发布，不可重复发布", code: "RELEASE_RELEASED" });
-
-    // Full, ordered precondition set on the stories' latest runs. Evaluated once
-    // for both the preview and the confirmed publish (same verdict, no side effect).
-    const stories = await agile.collectReleaseStories(ownerKeysFor(request), release, isAdmin);
-    const plan = planReleasePublish({ stories, label: `发布「${release.version} ${release.name}」` });
-    if (plan.kind !== "ready") {
-      return reply.code(plan.status).send({
-        error: plan.message,
-        code: plan.code,
-        ...(plan.kind === "blocked" ? { blocked: plan.blocked, findings: plan.findings } : {}),
-        ...(plan.kind === "not_ready" ? { stories: plan.stories } : {}),
-        ...(plan.kind === "checks_failed" ? { stories: plan.stories } : {}),
-        ...(plan.kind === "not_merged" ? { stories: plan.stories } : {}),
-      });
-    }
-
-    if (parsed.data.environment === "production") {
-      const remoteGate = await productionRemoteGate(
-        request,
-        stories.map((story) => ({ workspaceId: story.workspaceId, commit: story.mergedCommit })),
-        isAdmin,
-      );
-      if (remoteGate.kind === "blocked") {
-        return reply.code(409).send({ error: remoteGate.message, code: remoteGate.code, blocked: remoteGate.blocked });
-      }
-    }
-
-    // Explicit confirmation (`release.requireExplicitConfirmation`): a request
-    // without `confirm: true` is the read-only dry-run preview. It never settles a
-    // `failed` deploy (so the UI can offer a retry) and never reaches the deploy
-    // below — only an explicit confirmation does.
-    if (RELEASE_PUBLISH_POLICY.requireExplicitConfirmation && !parsed.data.confirm) {
-      return {
-        published: false,
-        confirmationRequired: true,
-        release,
-        stories,
-        deploy: release.deploy ?? null,
-      };
-    }
-
-    const now = new Date().toISOString();
-    const releaseRuntime = effectiveReleaseConfig(parsed.data.environment!);
-    const deployPlan = releaseRuntime.deployPlan;
-    if (deployPlan.configured && deployPlan.kind === "webhook" && !releaseRuntime.webhookToken) {
-      return reply.code(409).send({ error: "Webhook 发布必须在发布设置或环境变量中配置 Token", code: "RELEASE_AUTH_NOT_CONFIGURED" });
-    }
-    if (deployPlan.configured && deployPlan.kind === "webhook" && !releaseRuntime.callbackOrigin) {
-      return reply.code(409).send({ error: "Webhook 发布必须配置 PiGO 公网地址以接收异步结果回调", code: "RELEASE_CALLBACK_NOT_CONFIGURED" });
-    }
-    const callbackUrl = releaseRuntime.callbackOrigin
-      ? `${releaseRuntime.callbackOrigin.replace(/\/$/, "")}/api/internal/agile/releases/${encodeURIComponent(release.id)}/release-result`
-      : undefined;
-
-    // AUD-P1: ordering (timeout → claim → execute) is the correctness argument
-    // and lives in `runReleaseDeploy`, unit-tested including the concurrent path.
-    const run = await runReleaseDeploy(
-      {
-        release,
-        stories,
-        deployPlan,
-        retry: parsed.data.retry === true,
-        now,
-        releasedBy: user.id,
-        environment: parsed.data.environment!,
-        note: parsed.data.note,
-        callbackUrl,
-        webhookToken: releaseRuntime.webhookToken || undefined,
-      },
-      {
-        start: (input) => agile.startReleaseDeploy(input),
-        settle: (input) => agile.settleReleaseDeployResult(input),
-        execute: (payload, options) => executeRelease(deployPlan, payload, options),
-        read: () => agile.getRelease(ownerKeysFor(request), release.id, isAdmin),
-      },
-    );
-    if (run.kind === "conflict") {
-      return reply.code(run.status).send({
-        error: run.message,
-        code: run.code,
-        ...(run.attempt === undefined ? {} : { attempt: run.attempt }),
-        ...(run.deliveryId ? { deliveryId: run.deliveryId } : {}),
-      });
-    }
-    return { published: true, release: run.release, deploy: run.deploy };
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-/**
- * Sprint 4 core: release summary + retrospective export. Both are read-only,
- * owner-scoped projections of the release's stories and their linked runs. An
- * unknown/foreign release answers a 404 (`RELEASE_NOT_FOUND`) exactly like the
- * release CRUD routes, never a 500.
- */
-app.get<{ Params: { id: string } }>("/api/agile/releases/:id/summary", async (request, reply) => {
-  try {
-    const summary = await readReleaseSummary(db, ownerKeysFor(request), request.params.id);
-    if (!summary) return reply.code(404).send({ error: "RELEASE_NOT_FOUND", message: "发布不存在" });
-    return summary;
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-app.get<{ Params: { id: string } }>("/api/agile/releases/:id/retrospective", async (request, reply) => {
-  try {
-    const retrospective = await readReleaseRetrospective(db, ownerKeysFor(request), request.params.id);
-    if (!retrospective) return reply.code(404).send({ error: "RELEASE_NOT_FOUND", message: "发布不存在" });
-    return retrospective;
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-/**
- * Sprint 4 core: read-only, owner-scoped sprint metrics + project rollup.
- * Optional `?projectId=` / `?sprintId=` narrow the scope; empty scopes return
- * explicit zeros (never a 500). The heavy lifting is `readAgileMetrics`.
- */
-app.get<{ Querystring: { projectId?: string; sprintId?: string } }>("/api/agile/metrics", async (request, reply) => {
-  try {
-    return await readAgileMetrics(db, ownerKeysFor(request), {
-      projectId: request.query.projectId,
-      sprintId: request.query.sprintId,
-    });
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-// Sprint 4: owner-scoped saved model combinations ("模板"). Lightweight CRUD;
-// nothing is seeded, and the same name may be reused by a different owner.
-app.get("/api/templates", async (request, reply) => {
-  try {
-    return { templates: await agile.listTemplates(ownerKeysFor(request)) };
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-app.post("/api/templates", async (request, reply) => {
-  const parsed = templateCreateSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
-  try {
-    return reply.code(201).send(await agile.createTemplate(auth.user(request).id, parsed.data));
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
-});
-
-app.delete<{ Params: { id: string } }>("/api/templates/:id", async (request, reply) => {
-  try {
-    await agile.deleteTemplate(ownerKeysFor(request), request.params.id, await identities.isAdmin(auth.user(request).id));
-    return reply.code(204).send();
-  } catch (error) {
-    return agileErrorReply(reply, error);
-  }
+registerAgileRoutes(app, {
+  currentUser: (request) => auth.user(request),
+  ownerKeysFor,
+  isAdmin: (userId) => identities.isAdmin(userId),
+  agile,
+  db,
+  workspaces,
+  store,
+  demoMode,
+  runCreations,
+  tooManyRequests,
+  agileErrorReply,
+  requestLocale,
+  startRealRun,
+  productionRemoteGate,
+  effectiveReleaseConfig,
 });
 
 // 需求历史: `?query=` is a case-insensitive substring over title/task/human
@@ -1836,17 +1162,6 @@ app.get<{ Params: { id: string }; Querystring: { after?: string } }>("/api/runs/
 });
 
 /**
- * Extra (non-client) run inputs used when a story is submitted as a run.
- * Additive: `POST /api/runs` passes none of these, so its behaviour is
- * unchanged.
- */
-type RealRunExtra = { budget?: RunBudget; maxParallel?: number; storyId?: string };
-
-type RealRunResult =
-  | { ok: true; created: boolean; run: Run }
-  | { ok: false; status: number; body: Record<string, unknown>; run?: Run };
-
-/**
  * Real-run creation core shared by `POST /api/runs` and
  * `POST /api/stories/:id/runs`: workspace preflight, model/credential checks,
  * idempotency, run persistence and worker dispatch. Pure refactor of the
@@ -1868,7 +1183,7 @@ async function startRealRun(
   try {
     workspace = await workspaces.refresh(ownerKeysFor(request), input.workspaceId!, { isAdmin: await identities.isAdmin(user.id), allowRead: true });
   } catch (error) {
-    const { status, body } = classifyWorkspaceError(error);
+    const { status, body } = classifyWorkspaceError(error, alerts);
     return { ok: false, status, body };
   }
   if (workspace.git?.dirty) {

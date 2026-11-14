@@ -2,11 +2,11 @@ import Fastify, { type FastifyError, type FastifyReply, type FastifyRequest } fr
 import { readFileSync } from "node:fs";
 import { runInNewContext } from "node:vm";
 import ts from "typescript";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { AlertManager, createAlertSink } from "./alerts.js";
-import { requestErrorReply, isStorageFailure } from "./request-errors.js";
+import { requestErrorReply } from "./request-errors.js";
+import { classifyWorkspaceError } from "./routes/workspace-errors.js";
 import { serverDiagnosticMessage, serverLoggerOptions } from "./server-diagnostics.js";
-import { diagnosticSecrets, redactDiagnosticText } from "../shared/diagnostics.js";
 import { WorkspaceError } from "./workspaces.js";
 
 // Exercise the actual entry-point callbacks without starting its database,
@@ -21,7 +21,6 @@ ts.forEachChild(tree, (node) => {
     errorHandler = node.expression.arguments[0];
   }
 });
-const classifier = tree.statements.find((node) => ts.isFunctionDeclaration(node) && node.name?.text === "classifyWorkspaceError");
 function compile<T>(node: ts.Node | undefined, context: Record<string, unknown>): T {
   if (!node) throw new Error("Expected application error boundary is missing");
   const expression = `(${printer.printNode(ts.EmitHint.Unspecified, node, tree)})`;
@@ -31,7 +30,6 @@ function compile<T>(node: ts.Node | undefined, context: Record<string, unknown>)
 }
 
 type ErrorHandler = (error: FastifyError, request: FastifyRequest, reply: FastifyReply) => unknown;
-type Classifier = (error: unknown) => { status: number; body: Record<string, unknown> };
 const privateRoot = "/private/synthetic/workspace";
 const dataFile = `${privateRoot}/runs.json`;
 const secret = ["DUMMY", "opaque-platform-value"].join("_");
@@ -59,8 +57,7 @@ describe("application error HTTP, alert and log boundaries", () => {
       fetchImpl: async (_url, init) => { notifications.push(JSON.parse(String(init?.body))); return new Response("{}"); },
     }));
     const context = {
-      app, alerts, WorkspaceError, isStorageFailure, redactDiagnosticText,
-      diagnosticSecrets: () => diagnosticSecrets(environment),
+      app, alerts,
       requestErrorReply: (error: unknown) => requestErrorReply(error, environment),
       serverDiagnosticMessage: (error: unknown, options: Parameters<typeof serverDiagnosticMessage>[1] = {}) => serverDiagnosticMessage(error, { ...options, environment }),
     };
@@ -75,9 +72,9 @@ describe("application error HTTP, alert and log boundaries", () => {
       app.setErrorHandler(compile<ErrorHandler>(errorHandler, context));
       if (scenario.name.startsWith("global")) app.get("/fixture", async () => { throw error; });
       else {
-        const classify = compile<Classifier>(classifier, context);
+        for (const [name, value] of Object.entries(environment)) vi.stubEnv(name, value);
         app.get("/fixture", async (_request, reply) => {
-          const result = classify(error);
+          const result = classifyWorkspaceError(error, alerts);
           return reply.code(result.status).send(result.body);
         });
       }
@@ -93,6 +90,9 @@ describe("application error HTTP, alert and log boundaries", () => {
       }
       expect(response.json().error).toContain("[redact");
       expect(error.message).toBe(diagnostic);
-    } finally { await app.close(); }
+    } finally {
+      vi.unstubAllEnvs();
+      await app.close();
+    }
   });
 });
