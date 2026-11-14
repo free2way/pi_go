@@ -11,7 +11,7 @@ import { releasesStoryBlocks, storyBlockReleaseNote } from "../shared/run-state.
 import { notifyQueuedJob } from "./job-notification.js";
 import { buildStoryRunInput, STORY_STATUS_LABELS, type RunBudget, type StoryDetail } from "../shared/agile.js";
 import { resolveRequestLocale, type Locale } from "../shared/i18n.js";
-import type { ConfigStatus, CurrentUser, ModelCatalogResponse, ReviewScope, Run, RunEvent, RunReleaseRecord, RunRollbackRecord, Workspace } from "../shared/types.js";
+import type { CurrentUser, ReviewScope, Run, RunEvent, RunReleaseRecord, RunRollbackRecord, Workspace } from "../shared/types.js";
 import { AccountService } from "./accounts.js";
 import { BackupManager, dumpBackup } from "./backups.js";
 import { registerBackupRoutes } from "./backup-routes.js";
@@ -32,7 +32,7 @@ import { ScmSettingsStore } from "./scm-settings.js";
 import { createDb, createPool, newId, runMigrations } from "./db.js";
 import { baseDemoRun, runDemo } from "./demo-runner.js";
 import { IdentityService } from "./identity.js";
-import { availableModels, defaultSelections, loadModelCatalog, preflightRunModels } from "./model-catalog.js";
+import { defaultSelections, loadModelCatalog, preflightRunModels } from "./model-catalog.js";
 import { RunEventStream } from "./event-stream.js";
 import { cleanupRunDirectory, keptRunStorageOutcome, type RunDirectoryCleaner } from "./run-cleanup.js";
 import { baseRealRun } from "./real-run.js";
@@ -56,7 +56,7 @@ import { createDecisionEngine, loadDecisionEngineConfig } from "./decision-engin
 import { resetDecisionCircuitBreakers, decisionCircuitSnapshot } from "./decision-engine/jev.js";
 import { createDecisionMetricsSweeper } from "./decision-engine/metrics.js";
 import { buildReviewTriageBatches } from "./decision-engine/review-triage.js";
-import { decisionEngineStatus, registerDecisionReadRoutes, registerInternalDecisionRoutes, type DecisionEngineStatus, type DecisionServices } from "./decision-routes.js";
+import { decisionEngineStatus, registerDecisionReadRoutes, registerInternalDecisionRoutes, type DecisionServices } from "./decision-routes.js";
 import { registerProviderCreditsRoutes } from "./provider-credits-routes.js";
 import { readModelPriceTable, readProviderCreditBook, writeProviderCreditBook } from "./provider-cost-config.js";
 import { buildAcceptanceSnapshot } from "./acceptance.js";
@@ -91,6 +91,7 @@ import { runStateSchema } from "./routes/internal/run-schemas.js";
 import { registerAccountAdminRoutes } from "./routes/account-admin.js";
 import { registerAssistantRoutes } from "./routes/assistant.js";
 import { registerCredentialRoutes } from "./routes/model-key-routes.js";
+import { registerModelRoutes } from "./routes/models.js";
 
 const app = Fastify({
   logger: serverLoggerOptions(),
@@ -687,60 +688,29 @@ registerAssistantRoutes(app, {
   workerRequest,
 });
 
-app.get("/api/models", async (request): Promise<ModelCatalogResponse> => {
-  const availability = vault.providerAvailability(vaultKeyFor(request));
-  return {
-    models: availableModels(modelCatalog, availability),
-    defaultDeveloper: modelDefaults.developer,
-    defaultReviewer: modelDefaults.reviewer,
-    // AUD-08 / AT-MODEL-001: surface the provider-reported verifiedModels,
-    // the honest verification state (live vs operator-asserted) and the
-    // runtime-reported per-model capabilities.
-    verifiedProviders: availability.map((item) => ({
-      provider: item.provider,
-      verifiedAt: item.verifiedAt,
-      verifiedModels: item.verifiedModels,
-      verification: item.verification,
-      asserted: item.asserted,
-      verificationLabel: item.verification === "live" ? "已验证" : item.verification === "operator_asserted" ? "未校验（操作者断言）" : "未校验",
-      capabilities: item.capabilities ?? null,
-    })),
-  };
-});
-
-app.get("/api/config/status", async (request): Promise<ConfigStatus & { decisionEngine: DecisionEngineStatus }> => {
-  const credentials = vault.status(vaultKeyFor(request));
-  const configured = new Set(credentials.providers.map((item) => item.provider));
-  const releaseRuntime = effectiveReleaseConfig("staging");
-  const releasePlan = releaseRuntime.deployPlan;
-  // AUD-09 / AT-MODEL-006/007: execution availability is decoupled from the
-  // default provider/credential pairing. As long as at least one provider is
-  // configured the user may enter the real-run form; the actual per-role model
-  // combination is preflighted when the run is created (AT-MODEL-008).
-  // docs/26 §11 preflight: shape only — the key, the base URL and every env
-  // value stay server-side (`decisionEngineStatus` projects presence, never
-  // values). The key may live in the credential vault (per user) instead of
-  // `TYPESAFE_API_KEY`, so vault presence is resolved here and reported as a
-  // `keySource` label.
-  const decisionLoaded = loadDecisionEngineConfig(process.env, { allowMissingApiKey: true });
-  const decisionVaultKey =
-    decisionLoaded.ok && decisionLoaded.config.engine === "jev" ? await hasVaultDecisionKey(vaultKeyFor(request)) : false;
-  return {
-    demoMode,
-    piVersion: process.env.PI_VERSION || "1.0.0",
-    developer: { provider: modelDefaults.developer.provider, model: modelDefaults.developer.model, credentialConfigured: configured.has(modelDefaults.developer.provider) },
-    reviewer: { provider: modelDefaults.reviewer.provider, model: modelDefaults.reviewer.model, credentialConfigured: configured.has(modelDefaults.reviewer.provider) },
-    realRunsAvailable: realRunsEnabled && Boolean(internalToken) && configured.size > 0,
-    configuredProviders: [...configured],
-    verifiedProviders: credentials.providers.filter((item) => item.verification === "live").map((item) => item.provider),
-    assertedProviders: credentials.providers.filter((item) => item.verification === "operator_asserted").map((item) => item.provider),
-    // A1: only presence is exposed; the URL/token never reach the browser.
-    mergeRequestConfigured: mergeRequestConfig.configured,
-    releaseConfigured: releasePlan.configured
+registerModelRoutes(app, {
+  vaultKeyFor,
+  providerAvailability: (vaultKey) => vault.providerAvailability(vaultKey),
+  credentialStatus: (vaultKey) => vault.status(vaultKey),
+  modelCatalog,
+  modelDefaults,
+  demoMode,
+  piVersion: process.env.PI_VERSION || "1.0.0",
+  realRunsEnabled,
+  internalTokenConfigured: Boolean(internalToken),
+  mergeRequestConfigured: mergeRequestConfig.configured,
+  releaseConfigured: () => {
+    const releaseRuntime = effectiveReleaseConfig("staging");
+    const releasePlan = releaseRuntime.deployPlan;
+    return releasePlan.configured
       && releasePlan.kind !== "unsupported"
-      && (releasePlan.kind !== "webhook" || Boolean(releaseRuntime.webhookToken && releaseRuntime.callbackOrigin)),
-    decisionEngine: decisionEngineStatus(decisionLoaded, { vaultKey: decisionVaultKey }),
-  };
+      && (releasePlan.kind !== "webhook" || Boolean(releaseRuntime.webhookToken && releaseRuntime.callbackOrigin));
+  },
+  decisionEngineStatus: async (vaultKey) => {
+    const loaded = loadDecisionEngineConfig(process.env, { allowMissingApiKey: true });
+    const decisionVaultKey = loaded.ok && loaded.config.engine === "jev" ? await hasVaultDecisionKey(vaultKey) : false;
+    return decisionEngineStatus(loaded, { vaultKey: decisionVaultKey });
+  },
 });
 
 /**
