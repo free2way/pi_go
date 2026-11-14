@@ -32,7 +32,7 @@ import { ScmSettingsStore } from "./scm-settings.js";
 import { createDb, createPool, newId, runMigrations } from "./db.js";
 import { baseDemoRun, runDemo } from "./demo-runner.js";
 import { IdentityService } from "./identity.js";
-import { availableModels, defaultSelections, loadModelCatalog, preflightRunModels, validateModelSelection } from "./model-catalog.js";
+import { availableModels, defaultSelections, loadModelCatalog, preflightRunModels } from "./model-catalog.js";
 import { RunEventStream } from "./event-stream.js";
 import { cleanupRunDirectory, keptRunStorageOutcome, type RunDirectoryCleaner } from "./run-cleanup.js";
 import { baseRealRun } from "./real-run.js";
@@ -81,8 +81,6 @@ import { cacheControlFor, isBuildAssetRequest } from "./static-cache.js";
 import type { RunStoreLike } from "./store.js";
 import { scmWorkerTimeoutMs, WorkspaceError, WorkspaceService } from "./workspaces.js";
 import { planRemoteSyncGate, type RemoteCommitEvidence } from "./scm-release-gate.js";
-import type { RequirementRefinement } from "../shared/requirement-assistant.js";
-import type { PiAssistantAnswer } from "../shared/pi-assistant.js";
 import { serverDiagnosticMessage, serverLoggerOptions } from "./server-diagnostics.js";
 import { readReleaseTimeoutObservation, syncReleaseTimeoutAlerts } from "./release-timeout-alerts.js";
 import { registerInternalAuthorization, safeSecretMatch } from "./routes/internal/auth.js";
@@ -91,6 +89,7 @@ import { registerInternalReleaseRoutes } from "./routes/internal/releases.js";
 import { registerInternalRunRoutes } from "./routes/internal/runs.js";
 import { runStateSchema } from "./routes/internal/run-schemas.js";
 import { registerAccountAdminRoutes } from "./routes/account-admin.js";
+import { registerAssistantRoutes } from "./routes/assistant.js";
 import { registerCredentialRoutes } from "./routes/model-key-routes.js";
 
 const app = Fastify({
@@ -275,60 +274,6 @@ const createRunSchema = z.object({
   }
 });
 
-const requirementRefineSchema = z.object({
-  draft: z.string().trim().min(10).max(10_000),
-  title: z.string().trim().max(200).optional(),
-  context: z.object({
-    source: z.enum(["run", "story"]).optional(),
-    projectName: z.string().trim().max(120).optional(),
-    workspaceName: z.string().trim().max(120).optional(),
-  }).strict().optional(),
-  model: z.object({
-    provider: z.string().trim().min(1).max(80),
-    model: z.string().trim().min(1).max(120),
-  }).strict().optional(),
-}).strict();
-
-const piAssistantAskSchema = z.object({
-  message: z.string().trim().min(1).max(2_000),
-  context: z.object({
-    page: z.enum(["run", "agile", "workspaces", "models", "history", "system", "release-settings", "accounts", "backups"]),
-    run: z.object({
-      id: z.string().trim().min(1).max(80),
-      title: z.string().trim().max(200),
-      state: runStateSchema,
-      round: z.number().int().min(0).max(1_000),
-      maxRounds: z.number().int().min(1).max(1_000),
-      repository: z.string().trim().max(240),
-      summary: z.string().trim().max(1_000),
-      developer: z.object({ provider: z.string().trim().max(80), model: z.string().trim().max(120) }).strict(),
-      reviewer: z.object({ provider: z.string().trim().max(80), model: z.string().trim().max(120) }).strict(),
-      checks: z.array(z.object({
-        name: z.string().trim().max(160),
-        status: z.enum(["pending", "running", "passed", "failed"]),
-        exitCode: z.number().int().optional(),
-      }).strict()).max(8),
-      findings: z.array(z.object({
-        severity: z.enum(["critical", "high", "medium", "low"]),
-        title: z.string().trim().max(240),
-        resolved: z.boolean(),
-      }).strict()).max(12),
-      mergeStatus: z.enum(["not_merged", "pending", "merged"]),
-      release: z.object({
-        status: z.string().trim().max(60),
-        environment: z.string().trim().max(60).optional(),
-      }).strict().optional(),
-    }).strict().optional(),
-  }).strict(),
-  history: z.array(z.object({
-    role: z.enum(["user", "assistant"]),
-    content: z.string().trim().min(1).max(4_000),
-  }).strict()).max(8).optional(),
-  model: z.object({
-    provider: z.string().trim().min(1).max(80),
-    model: z.string().trim().min(1).max(120),
-  }).strict().optional(),
-}).strict();
 // SEC-008 / AT-SEC-005: per-user write limits for credential and run mutations.
 const credentialWrites = new RateLimiter(10);
 const runCreations = new RateLimiter(Number(process.env.PI_RUN_CREATE_PER_MINUTE || 20));
@@ -729,6 +674,19 @@ registerCredentialRoutes(app, {
   resetDecisionCircuitBreakers,
 });
 
+registerAssistantRoutes(app, {
+  currentUser: (request) => auth.user(request),
+  requestLocale,
+  vaultKeyFor,
+  providerAvailability: (vaultKey) => vault.providerAvailability(vaultKey),
+  getCredential: (vaultKey, provider) => vault.get(vaultKey, provider),
+  modelCatalog,
+  defaultDeveloper: modelDefaults.developer,
+  requirementRefinements,
+  piAssistantQuestions,
+  workerRequest,
+});
+
 app.get("/api/models", async (request): Promise<ModelCatalogResponse> => {
   const availability = vault.providerAvailability(vaultKeyFor(request));
   return {
@@ -748,105 +706,6 @@ app.get("/api/models", async (request): Promise<ModelCatalogResponse> => {
       capabilities: item.capabilities ?? null,
     })),
   };
-});
-
-/**
- * Interactive, non-mutating requirement refinement. It deliberately does not
- * create a run or a story: the browser previews the structured result and the
- * human explicitly applies it to the form before the normal submit path.
- */
-app.post("/api/requirements/refine", async (request, reply) => {
-  const user = auth.user(request);
-  const limit = requirementRefinements.check(user.id);
-  if (!limit.allowed) return tooManyRequests(reply, limit.retryAfterMs);
-  const parsed = requirementRefineSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid requirement", code: "REQUIREMENT_INPUT_INVALID", details: parsed.error.issues });
-
-  const selection = parsed.data.model ?? modelDefaults.developer;
-  const validation = validateModelSelection(modelCatalog, "developer", selection, vault.providerAvailability(vaultKeyFor(request)));
-  if (!validation.ok) {
-    return reply.code(422).send({ error: validation.message, code: validation.code, role: "requirement" });
-  }
-  let apiKey = vault.get(vaultKeyFor(request), validation.entry.provider) ?? "";
-  if (!apiKey) {
-    return reply.code(403).send({ error: "所选需求模型缺少可用凭据", code: "PERSONAL_CREDENTIALS_REQUIRED" });
-  }
-  try {
-    const result = await workerRequest<RequirementRefinement>("/requirements/refine", {
-      method: "POST",
-      body: JSON.stringify({
-        ...parsed.data,
-        locale: requestLocale(request),
-        provider: validation.entry.provider,
-        model: validation.entry.model,
-        apiKey,
-      }),
-    }, Math.max(8_000, Number(process.env.PI_REQUIREMENT_ASSISTANT_HTTP_TIMEOUT_MS || 30_000)));
-    return result;
-  } catch (error) {
-    const failure = error as Error & { code?: string };
-    app.log.warn({
-      provider: validation.entry.provider,
-      model: validation.entry.model,
-      error: serverDiagnosticMessage(failure, { credentials: [apiKey], limit: 300 }),
-    }, "requirement assistant failed");
-    if (failure.code === "REQUIREMENT_ASSISTANT_BUSY") {
-      return reply.code(429).send({ error: "需求助手当前繁忙，请稍后重试", code: failure.code });
-    }
-    return reply.code(502).send({ error: "需求助手暂时不可用，请稍后重试；原始内容仍保留在表单中", code: "REQUIREMENT_ASSISTANT_FAILED" });
-  } finally {
-    apiKey = "";
-  }
-});
-
-/**
- * Global, non-mutating Pi Assistant. The browser sends only the current page and
- * a small run projection; the worker receives no repository mount, tools or
- * plugins. Operational mutations remain behind their existing confirmation
- * routes and cannot be reached from this endpoint.
- */
-app.post("/api/assistant/ask", async (request, reply) => {
-  const user = auth.user(request);
-  const limit = piAssistantQuestions.check(user.id);
-  if (!limit.allowed) return tooManyRequests(reply, limit.retryAfterMs);
-  const parsed = piAssistantAskSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: "Invalid assistant question", code: "PI_ASSISTANT_INPUT_INVALID", details: parsed.error.issues });
-
-  const selection = parsed.data.model ?? modelDefaults.developer;
-  const validation = validateModelSelection(modelCatalog, "developer", selection, vault.providerAvailability(vaultKeyFor(request)));
-  if (!validation.ok) {
-    return reply.code(422).send({ error: validation.message, code: validation.code, role: "assistant" });
-  }
-  let apiKey = vault.get(vaultKeyFor(request), validation.entry.provider) ?? "";
-  if (!apiKey) {
-    return reply.code(403).send({ error: "所选助手模型缺少可用凭据", code: "PERSONAL_CREDENTIALS_REQUIRED" });
-  }
-  try {
-    return await workerRequest<PiAssistantAnswer>("/assistant/ask", {
-      method: "POST",
-      body: JSON.stringify({
-        ...parsed.data,
-        locale: requestLocale(request),
-        provider: validation.entry.provider,
-        model: validation.entry.model,
-        apiKey,
-      }),
-    }, Math.max(8_000, Number(process.env.PI_ASSISTANT_HTTP_TIMEOUT_MS || 35_000)));
-  } catch (error) {
-    const failure = error as Error & { code?: string };
-    app.log.warn({
-      provider: validation.entry.provider,
-      model: validation.entry.model,
-      page: parsed.data.context.page,
-      error: serverDiagnosticMessage(failure, { credentials: [apiKey], limit: 300 }),
-    }, "pi assistant failed");
-    if (failure.code === "PI_ASSISTANT_BUSY") {
-      return reply.code(429).send({ error: "Pi Assistant 当前繁忙，请稍后重试", code: failure.code });
-    }
-    return reply.code(502).send({ error: "Pi Assistant 暂时不可用，请稍后重试", code: "PI_ASSISTANT_FAILED" });
-  } finally {
-    apiKey = "";
-  }
 });
 
 app.get("/api/config/status", async (request): Promise<ConfigStatus & { decisionEngine: DecisionEngineStatus }> => {
