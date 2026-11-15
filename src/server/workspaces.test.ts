@@ -46,6 +46,18 @@ describe("workspace service", () => {
     await expect(service.get(["owner-b"], workspace.id)).rejects.toThrow(WorkspaceError);
   });
 
+  it.each([
+    { code: "WORKSPACE_INVALID", status: 422 },
+    { code: "CLONE_FAILED", status: 422 },
+    { code: "WORKSPACE_EXISTS", status: 409 },
+  ])("surfaces $code from an unsuccessful clone without persisting a workspace", async ({ code, status }) => {
+    const { service } = await createService(async () => ({ ok: false, code, error: "Clone rejected" }));
+    const error = await service.clone("owner-a", "https://example.invalid/repo.git", "fixture").catch((cause: unknown) => cause);
+    expect(error).toBeInstanceOf(WorkspaceError);
+    expect(error).toMatchObject({ code, status, message: "Clone rejected" });
+    expect(await service.list(["owner-a"])).toEqual([]);
+  });
+
   it("rejects invalid paths and surfaces worker error codes", async () => {
     const { service } = await createService(async () => ({ ok: false, code: "WORKSPACE_OUTSIDE_ROOT", error: "outside" }));
     const error = await service.register("owner-a", "../etc").catch((cause: WorkspaceError) => cause);
