@@ -1,10 +1,10 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { mkdir, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
+import { mkdir, readFile, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
-import type { ChatChannel, ChatParticipant, ChatRole, DevelopmentPlan, Finding, ProjectInfo, Run, RunEvent, RunRoleUsage, RunState, SubAgentTask, WorkspaceVerifyResult } from "../shared/types.js";
+import type { ChatChannel, ChatParticipant, ChatRole, DevelopmentPlan, Finding, Run, RunEvent, RunRoleUsage, RunState, SubAgentTask } from "../shared/types.js";
 import { clipChatContent } from "../shared/chat.js";
 import { gauge, METRICS_CONTENT_TYPE, metricsAuthorized, operationalLabels, processMetrics } from "../shared/operational-metrics.js";
 import { assignSubAgentCodenames } from "../shared/codenames.js";
@@ -53,7 +53,7 @@ import {
   reviewSnapshotDirectory,
   type MaterializedReviewSnapshot,
 } from "./review-snapshot.js";
-import { WorkspacePathError, prepareWorkspaceDirectory, resolveInsideRoot, sanitizeRelativePath, sanitizeWorkspaceName, validateCloneUrl } from "./workspace-paths.js";
+import { WorkspacePathError, sanitizeRelativePath } from "./workspace-paths.js";
 import { RunCleanupPathError, planRunDirectoryRemoval, removeRunDirectory } from "./run-cleanup.js";
 import { runGuardedMerge, type GuardedMergeResult, type MergeGuardGitExec } from "./merge-guard.js";
 import { WorkspaceLockManager, workspaceKeyFor } from "./workspace-lock.js";
@@ -117,7 +117,8 @@ import { parseRequirementSpec, renderAcceptanceCriteria, renderRequirementTask, 
 import { buildRequirementPrompt } from "./requirement-assistant.js";
 import { parsePiAssistantOutput, PI_ASSISTANT_PROMPT_VERSION } from "../shared/pi-assistant.js";
 import { buildPiAssistantPrompt, sanitizePiAssistantPayload } from "./pi-assistant.js";
-import { inspectWorkspaceRemote, pushWorkspaceBranch, WorkspaceScmError, type WorkspaceScmCredentialInput } from "./workspace-scm.js";
+import { WorkspaceScmError, type WorkspaceScmCredentialInput } from "./workspace-scm.js";
+import { createWorkspaceService } from "./workspace-service.js";
 import { parseExportCredentialContext } from "../shared/export-credential-context.js";
 
 const port = Number(process.env.PORT || 3200);
@@ -958,159 +959,20 @@ async function prepareRunDirectory(input: {
   return { baseSha: head };
 }
 
-async function resolveProject(relative: string) {
-  if (!/^[a-zA-Z0-9._/-]+$/.test(relative) || relative.includes("..") || path.isAbsolute(relative)) {
-    throw new Error("Invalid project path");
-  }
-  const root = await realpath(projectsRoot);
-  const candidate = await realpath(path.join(root, relative));
-  if (candidate !== root && !candidate.startsWith(`${root}${path.sep}`)) throw new Error("Project is outside allowed root");
-  if ((await git(candidate, ["rev-parse", "--is-inside-work-tree"])) !== "true") throw new Error("Project is not a Git repository");
-  return candidate;
-}
-
-async function listProjects(): Promise<ProjectInfo[]> {
-  const entries = await readdir(projectsRoot, { withFileTypes: true }).catch(() => []);
-  const projects: ProjectInfo[] = [];
-  for (const entry of entries) {
-    if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
-    const directory = path.join(projectsRoot, entry.name);
-    try {
-      await stat(path.join(directory, ".git"));
-      projects.push({
-        id: entry.name,
-        name: entry.name,
-        relativePath: entry.name,
-        branch: await git(directory, ["branch", "--show-current"]),
-        dirty: Boolean(await git(directory, ["status", "--porcelain"])),
-      });
-    } catch {
-      // Ignore non-Git directories.
-    }
-  }
-  return projects;
-}
-
-function redactCredentials(value: string) {
-  return value.replace(/\/\/[^@/\s]*@/g, "//***@");
-}
-
-async function verifyWorkspace(relativePath: string): Promise<WorkspaceVerifyResult> {
-  const candidate = await resolveInsideRoot(projectsRoot, relativePath);
-  const isGit = await git(candidate, ["rev-parse", "--is-inside-work-tree"]).then((value) => value === "true").catch(() => false);
-  if (!isGit) return { ok: false, code: "WORKSPACE_INVALID", error: "Not a Git repository" };
-  const branch = await git(candidate, ["branch", "--show-current"]).catch(() => "");
-  const head = await git(candidate, ["rev-parse", "HEAD"]).catch(() => "");
-  const status = await git(candidate, ["status", "--porcelain"]).catch(() => "");
-  const dirty = Boolean(status);
-  const dirtyFiles = status
-    ? status.split("\n").map((line) => line.trim()).filter(Boolean).slice(0, 20).map((line) => line.slice(0, 200))
-    : [];
-  return {
-    ok: true,
-    relativePath,
-    canonicalPath: candidate,
-    name: path.basename(candidate),
-    branch: branch || undefined,
-    head: head || undefined,
-    dirty,
-    dirtyFiles,
-  };
-}
-
-async function workspaceScmGit(relativePath: string) {
-  const directory = await resolveInsideRoot(projectsRoot, relativePath);
-  const isGit = await git(directory, ["rev-parse", "--is-inside-work-tree"]).then((value) => value === "true").catch(() => false);
-  if (!isGit) throw new WorkspaceScmError("WORKSPACE_INVALID", "Not a Git repository");
-  return {
-    directory,
-    exec: (args: string[], env?: Record<string, string>) => runHardenedGit({
-      cwd: directory,
-      args,
-      env,
-      timeoutMs: 120_000,
-      maxOutput: 4 * 1024 * 1024,
-      failOnOutputLimit: true,
-    }),
-  };
-}
-
-async function workspaceRemoteStatus(input: {
-  relativePath: string;
-  branch: string;
-  requiredCommit?: string;
-  credential?: WorkspaceScmCredentialInput;
-}) {
-  const target = await workspaceScmGit(input.relativePath);
-  return inspectWorkspaceRemote({
-    branch: input.branch,
-    requiredCommit: input.requiredCommit,
-    credential: input.credential,
-    git: target.exec,
-  });
-}
-
-async function pushWorkspace(input: {
-  relativePath: string;
-  branch: string;
-  credential?: WorkspaceScmCredentialInput;
-  exportCredentials?: readonly string[];
-}) {
-  const target = await workspaceScmGit(input.relativePath);
-  return serializeWorktreeMutation(async () => {
-    const dirty = await git(target.directory, ["status", "--porcelain"]);
-    if (dirty) throw new WorkspaceScmError("WORKSPACE_DIRTY", "Workspace has uncommitted changes; push is blocked");
-    return pushWorkspaceBranch({ branch: input.branch, credential: input.credential, exportCredentials: input.exportCredentials, git: target.exec });
-  });
-}
-
-async function cloneWorkspace(url: string, name: string): Promise<WorkspaceVerifyResult> {
-  const urlError = validateCloneUrl(url);
-  if (urlError) return { ok: false, code: "WORKSPACE_INVALID", error: urlError };
-  const cleanName = sanitizeWorkspaceName(name);
-  if (!cleanName) return { ok: false, code: "WORKSPACE_INVALID", error: "Invalid workspace name" };
-  const root = await realpath(projectsRoot).catch(() => projectsRoot);
-  const target = path.join(root, cleanName);
-  if (target !== root && !target.startsWith(`${root}${path.sep}`)) {
-    return { ok: false, code: "WORKSPACE_INVALID", error: "Invalid workspace target" };
-  }
-  const exists = await stat(target).then(() => true).catch(() => false);
-  if (exists) return { ok: false, code: "WORKSPACE_EXISTS", error: `Directory already exists: ${cleanName}` };
-  const result = await runHardenedGit({ cwd: root, args: ["clone", "--quiet", url, target], timeoutMs: 600_000 });
-  if (result.code !== 0) {
-    await rm(target, { recursive: true, force: true }).catch(() => undefined);
-    const reason = diagnosticMessage(redactCredentials(`${result.stderr}\n${result.stdout}`.trim()), [], 500);
-    return { ok: false, code: "CLONE_FAILED", error: reason || "git clone failed" };
-  }
-  return verifyWorkspace(cleanName);
-}
-
-/**
- * Creates a new workspace directory under the projects root and initializes it
- * as an empty Git repository so it is immediately registrable (real runs clone
- * a repository; a bare directory would fail verification). Idempotent for an
- * already-created empty workspace; an existing non-empty directory is reported
- * as WORKSPACE_EXISTS instead of being claimed or overwritten.
- */
-async function createWorkspace(name: string): Promise<WorkspaceVerifyResult> {
-  const cleanName = sanitizeWorkspaceName(name);
-  if (!cleanName) return { ok: false, code: "WORKSPACE_INVALID", error: "Invalid workspace name" };
-  let prepared;
-  try {
-    prepared = await prepareWorkspaceDirectory(projectsRoot, cleanName);
-  } catch (error) {
-    if (error instanceof WorkspacePathError) return { ok: false, code: error.code, error: error.message };
-    throw error;
-  }
-  try {
-    const isGit = await git(prepared.canonicalPath, ["rev-parse", "--is-inside-work-tree"]).then((value) => value === "true").catch(() => false);
-    if (!isGit) await git(prepared.canonicalPath, ["init", "--quiet"]);
-  } catch (error) {
-    if (prepared.created) await rm(prepared.canonicalPath, { recursive: true, force: true }).catch(() => undefined);
-    return { ok: false, code: "WORKSPACE_INVALID", error: `Failed to initialize workspace repository: ${diagnosticMessage(error)}` };
-  }
-  return verifyWorkspace(prepared.relativePath);
-}
+const {
+  cloneWorkspace,
+  createWorkspace,
+  listProjects,
+  pushWorkspace,
+  resolveProject,
+  verifyWorkspace,
+  workspaceRemoteStatus,
+} = createWorkspaceService({
+  projectsRoot,
+  git,
+  serializeMutation: serializeWorktreeMutation,
+  diagnosticMessage,
+});
 
 function parsePiLine(line: string) {
   try { return JSON.parse(line) as Record<string, unknown>; } catch { return undefined; }
