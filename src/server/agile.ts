@@ -7,8 +7,6 @@ import {
   type AgileSprint,
   type AgileStory,
   type ModelTemplate,
-  type ReleaseDeployRecord,
-  type ReleaseDeploySettlementRejection,
   type ReleaseStatus,
   type RunBudget,
   type SprintStatus,
@@ -21,188 +19,29 @@ import type { ModelSelection, Run, RunState } from "../shared/types.js";
 import { diffFilePaths } from "../shared/decision-brief.js";
 import { releasesStoryBlocks } from "../shared/run-state.js";
 import { newId, type Db } from "./db.js";
-import { type ReleasePublishStory } from "./release-publish.js";
+import type { ReleaseDeployStart } from "./release-deploy.js";
+import type { ReleasePublishStory } from "./release-publish.js";
+import {
+  AgileDeployStore,
+  type ExpireStaleReleaseDeploysInput,
+  type RecordReleaseDeployRejectionInput,
+  type SettleReleaseDeployInput,
+} from "./agile-deploy-store.js";
+import {
+  AgileError,
+  toProject,
+  toRelease,
+  toSprint,
+  toStory,
+  toTemplate,
+  type ProjectRow,
+  type ReleaseRow,
+  type SprintRow,
+  type StoryRow,
+  type TemplateRow,
+} from "./agile-records.js";
 
-export class AgileError extends Error {
-  constructor(
-    readonly code: string,
-    message: string,
-    readonly status = 400,
-  ) {
-    super(message);
-  }
-}
-
-type ProjectRow = {
-  id: string;
-  owner_id: string;
-  name: string;
-  project_key: string;
-  description: string;
-  created_at: string;
-  updated_at: string;
-};
-
-type SprintRow = {
-  id: string;
-  project_id: string;
-  owner_id: string;
-  name: string;
-  goal: string;
-  start_date: string | null;
-  end_date: string | null;
-  status: string;
-  created_at: string;
-  updated_at: string;
-};
-
-type StoryRow = {
-  id: string;
-  project_id: string;
-  owner_id: string;
-  title: string;
-  description: string;
-  acceptance_criteria_json: string;
-  priority: string;
-  estimate: number | null;
-  definition_of_done_json: string;
-  developer_model_json: string | null;
-  reviewer_model_json: string | null;
-  budget_json: string | null;
-  max_parallel: number | null;
-  sprint_id: string | null;
-  workspace_id: string | null;
-  status: string;
-  blocked_reason: string | null;
-  blocked_at: string | null;
-  blocked_by: string | null;
-  status_before_block: string | null;
-  created_at: string;
-  updated_at: string;
-};
-
-type ReleaseRow = {
-  id: string;
-  project_id: string;
-  owner_id: string;
-  name: string;
-  version: string;
-  notes: string;
-  status: string;
-  story_ids_json: string;
-  released_at: string | null;
-  released_by: string | null;
-  deploy_json: string | null;
-  created_at: string;
-  updated_at: string;
-};
-
-type TemplateRow = {
-  id: string;
-  owner_id: string;
-  name: string;
-  developer_model_json: string;
-  reviewer_model_json: string;
-  budget_json: string | null;
-  max_parallel: number | null;
-  created_at: string;
-  updated_at: string;
-};
-
-function parseJson<T>(value: string | null, fallback: T): T {
-  if (!value) return fallback;
-  try {
-    return JSON.parse(value) as T;
-  } catch {
-    return fallback;
-  }
-}
-
-function toProject(row: ProjectRow, counts?: { stories: number; sprints: number; releases: number }): AgileProject {
-  return {
-    id: row.id,
-    ownerId: row.owner_id,
-    name: row.name,
-    key: row.project_key,
-    description: row.description,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    ...(counts ? { counts } : {}),
-  };
-}
-
-function toSprint(row: SprintRow): AgileSprint {
-  return {
-    id: row.id,
-    projectId: row.project_id,
-    ownerId: row.owner_id,
-    name: row.name,
-    goal: row.goal,
-    startDate: row.start_date,
-    endDate: row.end_date,
-    status: row.status as SprintStatus,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-  };
-}
-
-function toStory(row: StoryRow): AgileStory {
-  return {
-    id: row.id,
-    projectId: row.project_id,
-    ownerId: row.owner_id,
-    title: row.title,
-    description: row.description,
-    acceptanceCriteria: parseJson<string[]>(row.acceptance_criteria_json, []),
-    priority: row.priority as StoryPriority,
-    estimate: row.estimate === null || row.estimate === undefined ? null : Number(row.estimate),
-    definitionOfDone: parseJson<string[]>(row.definition_of_done_json, []),
-    developerModel: parseJson<ModelSelection | null>(row.developer_model_json, null),
-    reviewerModel: parseJson<ModelSelection | null>(row.reviewer_model_json, null),
-    budget: parseJson<RunBudget | null>(row.budget_json, null),
-    maxParallel: row.max_parallel === null || row.max_parallel === undefined ? null : Number(row.max_parallel),
-    status: row.status as StoryStatus,
-    sprintId: row.sprint_id,
-    workspaceId: row.workspace_id,
-    blockedReason: row.blocked_reason ?? null,
-    blockedAt: row.blocked_at ?? null,
-    blockedBy: row.blocked_by ?? null,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-  };
-}
-
-function toRelease(row: ReleaseRow): AgileRelease {
-  return {
-    id: row.id,
-    projectId: row.project_id,
-    ownerId: row.owner_id,
-    name: row.name,
-    version: row.version,
-    notes: row.notes,
-    status: row.status as ReleaseStatus,
-    storyIds: parseJson<string[]>(row.story_ids_json, []),
-    releasedAt: row.released_at ?? null,
-    releasedBy: row.released_by ?? null,
-    deploy: parseJson<ReleaseDeployRecord | null>(row.deploy_json, null),
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-  };
-}
-
-function toTemplate(row: TemplateRow): ModelTemplate {
-  return {
-    id: row.id,
-    ownerId: row.owner_id,
-    name: row.name,
-    developerModel: parseJson<ModelSelection>(row.developer_model_json, { provider: "", model: "" }),
-    reviewerModel: parseJson<ModelSelection>(row.reviewer_model_json, { provider: "", model: "" }),
-    budget: parseJson<RunBudget | null>(row.budget_json, null),
-    maxParallel: row.max_parallel === null || row.max_parallel === undefined ? null : Number(row.max_parallel),
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-  };
-}
+export { AgileError } from "./agile-records.js";
 
 export interface CreateProjectInput {
   name: string;
@@ -270,10 +109,14 @@ export interface CreateTemplateInput {
  * routes); the `Run` records themselves stay owned by the existing run store.
  */
 export class AgileService {
+  private readonly deployments: AgileDeployStore;
+
   constructor(
     private readonly db: Db,
     private readonly now: () => string = () => new Date().toISOString(),
-  ) {}
+  ) {
+    this.deployments = new AgileDeployStore(db, now);
+  }
 
   // ------------------------------------------------------------------ projects
 
@@ -872,178 +715,20 @@ export class AgileService {
     return stories;
   }
 
-  /**
-   * Atomically starts one deploy attempt: the UNIQUE idempotency record
-   * (`<deliveryId>#<attempt>`) is inserted and the release is written to
-   * `released` with the attempt's deploy record in ONE transaction, so
-   *   - exactly one of two simultaneous confirms can claim the attempt (the
-   *     loser gets `claimed: false` and must not invoke the hook), and
-   *   - there is no window where a claim exists without the matching deploy
-   *     record (which would otherwise wedge the release).
-   *
-   * The attempt number comes from the caller's observed state
-   * (`planReleaseDeployAttempt`), never from a counter, so concurrent callers
-   * compute the same key. A retry uses the next attempt while reusing
-   * `deliveryId`, letting the deploy receiver de-duplicate a repeated delivery.
-   */
-  async startReleaseDeploy(input: {
-    releaseId: string;
-    deliveryId: string;
-    attempt: number;
-    releasedBy: string;
-    releasedAt: string;
-    note?: string;
-    deploy: ReleaseDeployRecord;
-    stories: ReleasePublishStory[];
-  }): Promise<{ claimed: boolean; attempt: number; release: AgileRelease }> {
-    const now = this.now();
-    const existing = (await this.db.query("SELECT * FROM agile_releases WHERE id = $1", [input.releaseId])).rows[0] as unknown as ReleaseRow | undefined;
-    if (!existing) throw new AgileError("RELEASE_NOT_FOUND", "发布不存在", 404);
-    const claimed = await this.db.withTransaction(async (tx) => {
-      const claimId = newId("reldeploy");
-      // pg-mem returns the conflicting row from `DO NOTHING … RETURNING` (real
-      // PostgreSQL returns zero rows), so the winner is identified by comparing
-      // the stored row id with the id this caller generated.
-      await tx.query(
-        `INSERT INTO agile_release_deploy_claims (id, release_id, attempt, idempotency_key, delivery_id, created_at)
-         VALUES ($1,$2,$3,$4,$5,$6)
-         ON CONFLICT (idempotency_key) DO NOTHING`,
-        [claimId, input.releaseId, input.attempt, `${input.deliveryId}#${input.attempt}`, input.deliveryId, now],
-      );
-      const stored = (await tx.query(
-        "SELECT id FROM agile_release_deploy_claims WHERE idempotency_key = $1",
-        [`${input.deliveryId}#${input.attempt}`],
-      )).rows[0] as { id: string } | undefined;
-      if (!stored || stored.id !== claimId) return false;
-      await tx.query(
-        `UPDATE agile_releases SET status = 'released', released_at = $1, released_by = $2, deploy_json = $3, updated_at = $4 WHERE id = $5`,
-        [input.releasedAt, input.releasedBy, JSON.stringify(input.deploy), now, input.releaseId],
-      );
-      await tx.query(
-        `INSERT INTO agile_release_audit (id, release_id, owner_id, action, actor_id, note, status, deploy_json, created_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-        [newId("relaudit"), input.releaseId, existing.owner_id, "release.published", input.releasedBy, input.note?.trim() || null, "released", JSON.stringify(input.deploy), now],
-      );
-      return true;
-    });
-    const release = (await this.db.query("SELECT * FROM agile_releases WHERE id = $1", [input.releaseId])).rows[0] as unknown as ReleaseRow;
-    return { claimed, attempt: input.attempt, release: toRelease(release) };
+  startReleaseDeploy(input: ReleaseDeployStart) {
+    return this.deployments.startReleaseDeploy(input);
   }
 
-  /**
-   * Settles the in-flight deploy of one attempt with the result actually
-   * observed (synchronous outcome or asynchronous callback). The match is
-   * *exact*: the write only applies when the stored record is still `pending`
-   * and its `deliveryId` **and** `attempt` equal the ones carried by the settle
-   * input. A wildcard (missing identity) is refused rather than accepted, so a
-   * late callback from a previous attempt can never settle a newer one.
-   *
-   * The write itself is a compare-and-swap on the stored `deploy_json`; a late
-   * duplicate writer therefore cannot overwrite a callback that already recorded
-   * the final status — it returns `applied: false` with the authoritative release.
-   */
-  async settleReleaseDeployResult(input: {
-    releaseId: string;
-    deploy: ReleaseDeployRecord;
-    action: "release.deploy_result" | "release.deploy_succeeded" | "release.deploy_failed";
-    actorId: string;
-    now?: string;
-  }): Promise<{ applied: boolean; release: AgileRelease; rejected?: ReleaseDeploySettlementRejection }> {
-    const now = input.now ?? this.now();
-    const releaseRow = (await this.db.query("SELECT * FROM agile_releases WHERE id = $1", [input.releaseId])).rows[0] as unknown as ReleaseRow | undefined;
-    if (!releaseRow) throw new AgileError("RELEASE_NOT_FOUND", "发布不存在", 404);
-    const current = parseJson<ReleaseDeployRecord | null>(releaseRow.deploy_json, null);
-    const identityMatches = Boolean(current)
-      && input.deploy.deliveryId !== undefined
-      && input.deploy.attempt !== undefined
-      && current!.deliveryId === input.deploy.deliveryId
-      && current!.attempt === input.deploy.attempt;
-    if (!identityMatches) {
-      return { applied: false, release: toRelease(releaseRow), rejected: "stale_attempt" };
-    }
-    if (current!.status !== "pending") {
-      return { applied: false, release: toRelease(releaseRow), rejected: "not_pending" };
-    }
-    const applied = await this.db.withTransaction(async (tx) => {
-      const row = (await tx.query(
-        `UPDATE agile_releases SET deploy_json = $1, updated_at = $2
-         WHERE id = $3 AND deploy_json = $4 RETURNING id`,
-        [JSON.stringify(input.deploy), now, input.releaseId, releaseRow.deploy_json],
-      )).rows[0];
-      if (!row) return false;
-      await tx.query(
-        `INSERT INTO agile_release_audit (id, release_id, owner_id, action, actor_id, note, status, deploy_json, created_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-        [newId("relaudit"), input.releaseId, releaseRow.owner_id, input.action, input.actorId, null, input.deploy.status, JSON.stringify(input.deploy), now],
-      );
-      return true;
-    });
-    const release = toRelease((await this.db.query("SELECT * FROM agile_releases WHERE id = $1", [input.releaseId])).rows[0] as unknown as ReleaseRow);
-    if (applied) return { applied, release };
-    // The CAS lost a race. Distinguish "another writer settled this same attempt"
-    // (not_pending → idempotent for the caller) from "the attempt changed under
-    // us" (stale_attempt → a newer attempt must never be overwritten).
-    const stored = release.deploy ?? null;
-    const sameIdentity = Boolean(stored) && stored!.deliveryId === input.deploy.deliveryId && stored!.attempt === input.deploy.attempt;
-    return { applied, release, rejected: sameIdentity ? "not_pending" : "stale_attempt" };
+  settleReleaseDeployResult(input: SettleReleaseDeployInput) {
+    return this.deployments.settleReleaseDeployResult(input);
   }
 
-  /**
-   * Append-only audit for a callback that was *rejected* and therefore changed no
-   * state (stale/unsolicited attempt). Keeping this separate from
-   * `settleReleaseDeployResult` makes the "rejected callbacks are audited but
-   * never mutate" property explicit.
-   */
-  async recordReleaseDeployRejection(input: {
-    releaseId: string;
-    actorId: string;
-    detail: string;
-    deploy: ReleaseDeployRecord;
-    now?: string;
-    action?: string;
-  }): Promise<void> {
-    const now = input.now ?? this.now();
-    const releaseRow = (await this.db.query("SELECT owner_id FROM agile_releases WHERE id = $1", [input.releaseId])).rows[0] as { owner_id: string } | undefined;
-    if (!releaseRow) throw new AgileError("RELEASE_NOT_FOUND", "发布不存在", 404);
-    await this.db.query(
-      `INSERT INTO agile_release_audit (id, release_id, owner_id, action, actor_id, note, status, deploy_json, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-      [newId("relaudit"), input.releaseId, releaseRow.owner_id, input.action ?? "release.deploy_rejected", input.actorId, input.detail, input.deploy.status, JSON.stringify(input.deploy), now],
-    );
+  recordReleaseDeployRejection(input: RecordReleaseDeployRejectionInput) {
+    return this.deployments.recordReleaseDeployRejection(input);
   }
 
-  /**
-   * Bounded verification for asynchronous deploys: a `pending` attempt whose
-   * start is older than `timeoutMs` is marked `failed` with the timeout recorded
-   * (and an audit row), so it can be explicitly retried instead of hanging
-   * forever. Returns the ids of the releases that were expired.
-   */
-  async expireStaleReleaseDeploys(input: { now?: string; timeoutMs: number }): Promise<string[]> {
-    const now = input.now ?? this.now();
-    const rows = (await this.db.query("SELECT id, deploy_json FROM agile_releases WHERE deploy_json IS NOT NULL")).rows as unknown as Array<{ id: string; deploy_json: string | null }>;
-    const expired: string[] = [];
-    for (const row of rows) {
-      const deploy = parseJson<ReleaseDeployRecord | null>(row.deploy_json, null);
-      if (!deploy || deploy.status !== "pending") continue;
-      const startedAt = deploy.startedAt ?? deploy.at;
-      const age = Date.parse(now) - Date.parse(startedAt);
-      if (!Number.isFinite(age) || age < input.timeoutMs) continue;
-      const result = await this.settleReleaseDeployResult({
-        releaseId: row.id,
-        actorId: "system:release-callback-timeout",
-        now,
-        action: "release.deploy_failed",
-        deploy: {
-          ...deploy,
-          status: "failed",
-          detail: `等待部署系统回调超时（超过 ${Math.round(input.timeoutMs / 60_000)} 分钟未收到结果）`,
-          at: now,
-          finishedAt: now,
-        },
-      });
-      if (result.applied) expired.push(row.id);
-    }
-    return expired;
+  expireStaleReleaseDeploys(input: ExpireStaleReleaseDeploysInput) {
+    return this.deployments.expireStaleReleaseDeploys(input);
   }
 
   private async requireRelease(ownerKeys: string[], id: string, isAdmin = false): Promise<ReleaseRow> {
