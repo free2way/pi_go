@@ -2,6 +2,15 @@ import { createHash } from "node:crypto";
 import type { Run, RunEvent } from "../shared/types.js";
 import { findingFingerprint } from "../shared/finding-fingerprint.js";
 import type { Db } from "./db.js";
+import {
+  assertJobLease,
+  PostgresRunExecutionStore,
+  type CreateJobInput,
+  type LeaseJobsInput,
+  type PendingJobsQuery,
+  type SaveCheckpointInput,
+  type SettledJobState,
+} from "./run-execution-store-pg.js";
 import { mergeHumanNotes } from "./run-notes.js";
 import { serverDiagnosticMessage } from "./server-diagnostics.js";
 import type {
@@ -15,7 +24,7 @@ import type {
   UpdateGuard,
 } from "./store.js";
 
-export type JobState = "queued" | "claimed" | "done" | "failed" | "cancelled";
+export { JobLeaseLostError, recordDelivery, type CheckpointRecord, type JobRecord, type JobState } from "./run-execution-store-pg.js";
 
 /**
  * AUD-15 / AT-RUN-014: legal run state transitions. Terminal states can never be
@@ -68,48 +77,6 @@ export class RunConflictError extends Error {
   }
 }
 
-export class JobLeaseLostError extends Error {
-  readonly code = "JOB_LEASE_LOST";
-  constructor(readonly jobId: string) {
-    super(`Job lease lost: ${jobId}`);
-    this.name = "JobLeaseLostError";
-  }
-}
-
-/** Creates the delivery table used to make internal updates idempotent. */
-export async function recordDelivery(db: Db, runId: string, deliveryId: string, seq?: number) {
-  await db.query(
-    "INSERT INTO run_deliveries (run_id, delivery_id, seq, applied_at) VALUES ($1, $2, $3, $4) ON CONFLICT (run_id, delivery_id) DO NOTHING",
-    [runId, deliveryId, seq ?? null, new Date().toISOString()],
-  );
-}
-
-export interface JobRecord {
-  id: string;
-  runId: string;
-  kind: string;
-  state: JobState;
-  payload: unknown;
-  workerId: string | null;
-  claimedAt: string | null;
-  heartbeatAt: string | null;
-  /** AUD-05: set only when a worker actually started executing the job. */
-  startedAt: string | null;
-  attempts: number;
-  lastError: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface CheckpointRecord {
-  runId: string;
-  stageKey: string;
-  status: string;
-  payload: unknown;
-  idempotencyKey: string | null;
-  updatedAt: string;
-}
-
 export type EventListenerAlias = EventListener;
 
 interface RunRow {
@@ -139,8 +106,11 @@ function sha256(value: string) {
 export class PostgresRunStore implements RunStoreLike {
   private cache = new Map<string, Run>();
   private listeners = new Map<string, Set<EventListener>>();
+  private readonly execution: PostgresRunExecutionStore;
 
-  constructor(private readonly db: Db) {}
+  constructor(private readonly db: Db) {
+    this.execution = new PostgresRunExecutionStore(db);
+  }
 
   async init() {
     const result = await this.db.query("SELECT id, owner_id, last_seq, document_json FROM runs");
@@ -288,16 +258,7 @@ export class PostgresRunStore implements RunStoreLike {
 
     const result = await this.db.withTransaction(async (tx) => {
       if (input.lease) {
-        const lease = (await tx.query(
-          "SELECT run_id, worker_id, state FROM jobs WHERE id = $1 FOR SHARE",
-          [input.lease.jobId],
-        )).rows[0];
-        if (!lease
-          || String(lease.run_id) !== input.runId
-          || String(lease.worker_id) !== input.lease.workerId
-          || String(lease.state) !== "claimed") {
-          throw new JobLeaseLostError(input.lease.jobId);
-        }
+        await assertJobLease(tx, input.runId, input.lease.jobId, input.lease.workerId);
       }
       const inserted = (await tx.query(
         "INSERT INTO run_deliveries (run_id, delivery_id, applied_at) VALUES ($1, $2, $3) ON CONFLICT (run_id, delivery_id) DO NOTHING RETURNING delivery_id",
@@ -590,215 +551,64 @@ export class PostgresRunStore implements RunStoreLike {
     };
   }
 
-  // ---------------------------------------------------------------- checkpoints
-
-  async saveCheckpoint(input: { runId: string; stageKey: string; status: string; payload?: unknown; idempotencyKey?: string | null }) {
-    await this.db.query(
-      `INSERT INTO run_checkpoints (run_id, stage_key, status, payload_json, idempotency_key, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (run_id, stage_key) DO UPDATE SET
-         status = $3,
-         payload_json = COALESCE($4, run_checkpoints.payload_json),
-         idempotency_key = COALESCE($5, run_checkpoints.idempotency_key),
-         updated_at = $6`,
-      [
-        input.runId,
-        input.stageKey,
-        input.status,
-        input.payload === undefined ? null : JSON.stringify(input.payload),
-        input.idempotencyKey ?? null,
-        new Date().toISOString(),
-      ],
-    );
+  saveCheckpoint(input: SaveCheckpointInput) {
+    return this.execution.saveCheckpoint(input);
   }
 
-  async listCheckpoints(runId: string): Promise<CheckpointRecord[]> {
-    const result = await this.db.query(
-      "SELECT run_id, stage_key, status, payload_json, idempotency_key, updated_at FROM run_checkpoints WHERE run_id = $1 ORDER BY updated_at ASC, stage_key ASC",
-      [runId],
-    );
-    return result.rows.map((row) => ({
-      runId: String(row.run_id),
-      stageKey: String(row.stage_key),
-      status: String(row.status),
-      payload: row.payload_json ? JSON.parse(String(row.payload_json)) : null,
-      idempotencyKey: row.idempotency_key === null ? null : String(row.idempotency_key),
-      updatedAt: String(row.updated_at),
-    }));
+  listCheckpoints(runId: string) {
+    return this.execution.listCheckpoints(runId);
   }
 
-  async clearCheckpoints(runId: string, stagePrefix?: string) {
-    if (stagePrefix) {
-      await this.db.query("DELETE FROM run_checkpoints WHERE run_id = $1 AND stage_key LIKE $2", [runId, `${stagePrefix}%`]);
-      return;
-    }
-    await this.db.query("DELETE FROM run_checkpoints WHERE run_id = $1", [runId]);
+  clearCheckpoints(runId: string, stagePrefix?: string) {
+    return this.execution.clearCheckpoints(runId, stagePrefix);
   }
 
-  // --------------------------------------------------------------------- jobs
-
-  async createJob(input: { id: string; runId: string; kind: string; payload: unknown; state?: JobState }) {
-    const now = new Date().toISOString();
-    await this.db.query(
-      `INSERT INTO jobs (id, run_id, kind, state, payload_json, attempts, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, 0, $6, $6)
-       ON CONFLICT (id) DO UPDATE SET state = $4, payload_json = $5, updated_at = $6`,
-      [input.id, input.runId, input.kind, input.state ?? "queued", JSON.stringify(input.payload), now],
-    );
-    return this.getJob(input.id);
+  createJob(input: CreateJobInput) {
+    return this.execution.createJob(input);
   }
 
-  async getJob(id: string): Promise<JobRecord | undefined> {
-    const rows = await this.db.query(
-      "SELECT id, run_id, kind, state, payload_json, worker_id, claimed_at, heartbeat_at, started_at, attempts, last_error, created_at, updated_at FROM jobs WHERE id = $1",
-      [id],
-    );
-    return rows.rows[0] ? this.mapJob(rows.rows[0]) : undefined;
+  getJob(id: string) {
+    return this.execution.getJob(id);
   }
 
-  /**
-   * Marks a job as dispatched by the web process. The row is already handed to
-   * the worker over HTTP, so it must not also be picked up by the periodic
-   * reclaim sweep before the worker claims it (REL-002). `started_at` stays NULL:
-   * a reserved job has not begun executing (AUD-05).
-   */
-  async reserveJob(id: string) {
-    const now = new Date().toISOString();
-    await this.db.query(
-      "UPDATE jobs SET state = 'claimed', worker_id = 'web-dispatch', claimed_at = $2, heartbeat_at = $2, updated_at = $2 WHERE id = $1 AND state = 'queued'",
-      [id, now],
-    );
+  reserveJob(id: string) {
+    return this.execution.reserveJob(id);
   }
 
-  /** AUD-05: releases a reservation so a queued job can be claimed again immediately. */
-  async releaseReservation(id: string, workerId: string, reason?: string) {
-    const now = new Date().toISOString();
-    const result = await this.db.query(
-      `UPDATE jobs SET state = 'queued', worker_id = NULL, claimed_at = NULL, heartbeat_at = NULL,
-         last_error = COALESCE($3, last_error), updated_at = $4
-       WHERE id = $1 AND state = 'claimed' AND worker_id = $2 RETURNING id`,
-      [id, workerId, reason ?? null, now],
-    );
-    return result.rows.length > 0;
+  releaseReservation(id: string, workerId: string, reason?: string) {
+    return this.execution.releaseReservation(id, workerId, reason);
   }
 
-  async claimJob(id: string, workerId: string, staleAfterMs = 120_000) {
-    const now = new Date().toISOString();
-    const staleCutoff = new Date(Date.now() - staleAfterMs).toISOString();
-    const result = await this.db.query(
-      `UPDATE jobs SET state = 'claimed', worker_id = $2, claimed_at = $3, heartbeat_at = $3, started_at = COALESCE(started_at, $3),
-         attempts = attempts + CASE WHEN worker_id = $2 THEN 0 ELSE 1 END, updated_at = $3
-       WHERE id = $1 AND (
-         (state = 'claimed' AND worker_id = $2)
-         OR (attempts < 5 AND (
-           state = 'queued'
-           OR (state = 'claimed' AND worker_id = 'web-dispatch')
-           OR (state = 'claimed' AND (heartbeat_at IS NULL OR heartbeat_at < $4))
-         ))
-       ) RETURNING id`,
-      [id, workerId, now, staleCutoff],
-    );
-    if (result.rows.length === 0) return undefined;
-    return this.getJob(id);
+  claimJob(id: string, workerId: string, staleAfterMs?: number) {
+    return this.execution.claimJob(id, workerId, staleAfterMs);
   }
 
-  async heartbeatJob(id: string, workerId: string) {
-    const now = new Date().toISOString();
-    const result = await this.db.query(
-      "UPDATE jobs SET heartbeat_at = $3, updated_at = $3 WHERE id = $1 AND worker_id = $2 AND state = 'claimed' RETURNING id",
-      [id, workerId, now],
-    );
-    return result.rows.length > 0;
+  heartbeatJob(id: string, workerId: string) {
+    return this.execution.heartbeatJob(id, workerId);
   }
 
-  async finishJob(id: string, workerId: string, state: Exclude<JobState, "queued" | "claimed">, lastError?: string) {
-    const now = new Date().toISOString();
-    const result = await this.db.query(
-      `UPDATE jobs SET state = $3, last_error = $4, updated_at = $5
-       WHERE id = $1 AND worker_id = $2 AND state = 'claimed' RETURNING id`,
-      [id, workerId, state, lastError ?? null, now],
-    );
-    if (result.rows.length > 0) return { ok: true, idempotent: false };
-    const current = await this.getJob(id);
-    if (current?.workerId === workerId && current.state === state) return { ok: true, idempotent: true };
-    return { ok: false, idempotent: false };
+  finishJob(id: string, workerId: string, state: SettledJobState, lastError?: string) {
+    return this.execution.finishJob(id, workerId, state, lastError);
   }
 
-  /** Web-only terminal path for missing/terminal runs or unavailable credentials. */
-  async finishJobAsSystem(id: string, state: Exclude<JobState, "queued" | "claimed">, reason?: string) {
-    const now = new Date().toISOString();
-    const result = await this.db.query(
-      `UPDATE jobs SET state = $2, last_error = $3, updated_at = $4
-       WHERE id = $1 AND state IN ('queued', 'claimed') RETURNING id`,
-      [id, state, reason ?? null, now],
-    );
-    return result.rows.length > 0;
+  finishJobAsSystem(id: string, state: SettledJobState, reason?: string) {
+    return this.execution.finishJobAsSystem(id, state, reason);
   }
 
-  /** Atomically leases the oldest claimable jobs to one worker. */
-  async leaseJobs(input: { workerId: string; capacity: number; staleAfterMs: number }) {
-    const now = new Date().toISOString();
-    const staleCutoff = new Date(Date.now() - input.staleAfterMs).toISOString();
-    const capacity = Math.min(4, Math.max(1, Math.trunc(input.capacity)));
-    const result = await this.db.query(
-      `WITH picked AS (
-         SELECT id, started_at AS prev_started_at FROM jobs
-          WHERE attempts < 5 AND (
-            state = 'queued'
-            OR (state = 'claimed' AND (heartbeat_at IS NULL OR heartbeat_at < $1))
-          )
-          ORDER BY updated_at ASC
-          FOR UPDATE SKIP LOCKED
-          LIMIT $2
-       )
-       UPDATE jobs j SET state = 'claimed', worker_id = $3, claimed_at = $4, heartbeat_at = $4,
-         attempts = j.attempts + 1, updated_at = $4
-       FROM picked WHERE j.id = picked.id
-       RETURNING j.id, j.run_id, j.kind, j.state, j.payload_json, j.worker_id, j.claimed_at,
-         j.heartbeat_at, j.started_at, j.attempts, j.last_error, j.created_at, j.updated_at,
-         picked.prev_started_at`,
-      [staleCutoff, capacity, input.workerId, now],
-    );
-    return result.rows.map((row) => ({ job: this.mapJob(row), wasStarted: row.prev_started_at !== null }));
+  leaseJobs(input: LeaseJobsInput) {
+    return this.execution.leaseJobs(input);
   }
 
-  /**
-   * Keeps a claimable job in the queue while recording why it could not be
-   * served this cycle (e.g. the run is not visible yet on this web instance).
-   * Deliberately does not touch `attempts`/`state`: a transient condition must
-   * not burn the job's retry budget or strand the run in `queued`.
-   */
-  async deferJob(id: string, reason: string) {
-    const now = new Date().toISOString();
-    await this.db.query("UPDATE jobs SET last_error = $2, updated_at = $3 WHERE id = $1 AND state = 'queued'", [id, reason, now]);
+  deferJob(id: string, reason: string) {
+    return this.execution.deferJob(id, reason);
   }
 
-  /**
-   * Jobs a worker may pick up: never claimed, or claimed by a worker whose
-   * heartbeat went stale (worker restart, AT-REL-002/003).
-   */
-  async listPendingJobs(input: { staleAfterMs: number; kinds?: string[]; limit?: number }) {
-    const cutoff = new Date(Date.now() - input.staleAfterMs).toISOString();
-    const result = await this.db.query(
-      `SELECT id, run_id, kind, state, payload_json, worker_id, claimed_at, heartbeat_at, started_at, attempts, last_error, created_at, updated_at
-       FROM jobs
-       WHERE (state = 'queued' AND attempts < 5)
-          OR (state = 'claimed' AND (heartbeat_at IS NULL OR heartbeat_at < $1) AND attempts < 5)
-       ORDER BY updated_at ASC LIMIT $2`,
-      [cutoff, input.limit ?? 20],
-    );
-    const jobs = result.rows.map((row) => this.mapJob(row));
-    return input.kinds ? jobs.filter((job) => input.kinds!.includes(job.kind)) : jobs;
+  listPendingJobs(input: PendingJobsQuery) {
+    return this.execution.listPendingJobs(input);
   }
 
-  async requeueStaleJobs(staleAfterMs: number) {
-    const cutoff = new Date(Date.now() - staleAfterMs).toISOString();
-    const result = await this.db.query(
-      `UPDATE jobs SET state = 'queued', worker_id = NULL, claimed_at = NULL, heartbeat_at = NULL, updated_at = $2
-       WHERE state = 'claimed' AND (heartbeat_at IS NULL OR heartbeat_at < $1) AND attempts < 5 RETURNING id`,
-      [cutoff, new Date().toISOString()],
-    );
-    return result.rows.map((row) => String(row.id));
+  requeueStaleJobs(staleAfterMs: number) {
+    return this.execution.requeueStaleJobs(staleAfterMs);
   }
 
   /** Row counts per table for backup/restore verification (AT-REL-009). */
@@ -895,24 +705,6 @@ export class PostgresRunStore implements RunStoreLike {
       "UPDATE runs SET last_seq = last_seq + 1, updated_at = $2 WHERE id = $1 RETURNING last_seq",
       [runId, at],
     )).rows[0] as { last_seq: number } | undefined;
-  }
-
-  private mapJob(row: Record<string, unknown>): JobRecord {
-    return {
-      id: String(row.id),
-      runId: String(row.run_id),
-      kind: String(row.kind),
-      state: String(row.state) as JobState,
-      payload: row.payload_json ? JSON.parse(String(row.payload_json)) : null,
-      workerId: row.worker_id === null ? null : String(row.worker_id),
-      claimedAt: row.claimed_at === null ? null : String(row.claimed_at),
-      heartbeatAt: row.heartbeat_at === null ? null : String(row.heartbeat_at),
-      startedAt: row.started_at === null || row.started_at === undefined ? null : String(row.started_at),
-      attempts: Number(row.attempts),
-      lastError: row.last_error === null ? null : String(row.last_error),
-      createdAt: String(row.created_at),
-      updatedAt: String(row.updated_at),
-    };
   }
 
   /** Rewrites normalized metadata projections for one run inside a transaction. */
