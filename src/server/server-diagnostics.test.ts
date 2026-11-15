@@ -117,8 +117,9 @@ describe("actual Fastify/Pino logging boundary", () => {
   });
 
   it("wires the real Web logger and removes early truncation from system-status diagnostics", () => {
-    const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
-    expect(source).toContain("logger: serverLoggerOptions(),");
+    const services = readFileSync(new URL("./web-services.ts", import.meta.url), "utf8");
+    expect(services).toContain("logger: serverLoggerOptions(),");
+    const source = readFileSync(new URL("./system-routes.ts", import.meta.url), "utf8");
     const status = source.slice(source.indexOf('app.get("/api/system/status"'), source.indexOf("// Only the worker reports its own version"));
     expect(status.match(/error: serverDiagnosticMessage\(error, \{ limit: 200 \}\)/g)).toHaveLength(5);
     expect(status).not.toContain(".message.slice(");
