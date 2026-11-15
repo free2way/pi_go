@@ -197,6 +197,7 @@ export class WorkspaceService {
       method: "POST",
       body: JSON.stringify({ url, name }),
     });
+    if (!result.ok) throw this.verifyError(result);
     return this.persist(ownerId, result, redactGitUrl(url));
   }
 
