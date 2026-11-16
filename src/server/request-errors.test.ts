@@ -27,11 +27,12 @@ describe("conflictReplyFor", () => {
 
 describe("requestErrorReply", () => {
   it("registers the application handler before plugin and route contexts exist", () => {
-    const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+    const source = readFileSync(new URL("./web-services.ts", import.meta.url), "utf8");
     const handler = source.indexOf("app.setErrorHandler(");
     expect(handler).toBeGreaterThan(0);
     expect(handler).toBeLessThan(source.indexOf("await app.register("));
-    expect(handler).toBeLessThan(source.indexOf("app.get("));
+    const entry = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+    expect(entry.indexOf("await createWebServices()")).toBeLessThan(entry.indexOf("registerHealthRoutes(services)"));
   });
 
   it.each(["ENOSPC", "ECONNREFUSED", "ETIMEDOUT", "connection timeout", "Connection terminated", "57P01"])("keeps %s as explicit storage failure", (kind) => {

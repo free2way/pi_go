@@ -11,16 +11,18 @@ import { WorkspaceError } from "./workspaces.js";
 
 // Exercise the actual entry-point callbacks without starting its database,
 // timers or listener. Fastify, Pino and alert serialization remain real.
-const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
-const tree = ts.createSourceFile("index.ts", source, ts.ScriptTarget.Latest, true);
+const source = readFileSync(new URL("./web-services.ts", import.meta.url), "utf8");
+const tree = ts.createSourceFile("web-services.ts", source, ts.ScriptTarget.Latest, true);
 const printer = ts.createPrinter();
 let errorHandler: ts.Node | undefined;
-ts.forEachChild(tree, (node) => {
+function findHandler(node: ts.Node) {
   if (ts.isExpressionStatement(node) && ts.isCallExpression(node.expression)
     && node.expression.expression.getText(tree) === "app.setErrorHandler") {
     errorHandler = node.expression.arguments[0];
   }
-});
+  ts.forEachChild(node, findHandler);
+}
+findHandler(tree);
 function compile<T>(node: ts.Node | undefined, context: Record<string, unknown>): T {
   if (!node) throw new Error("Expected application error boundary is missing");
   const expression = `(${printer.printNode(ts.EmitHint.Unspecified, node, tree)})`;
