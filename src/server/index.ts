@@ -5,7 +5,6 @@ import { fileURLToPath } from "node:url";
 import { readQueueObservation, syncQueueAlerts } from "./queue-alerts.js";
 import { createInfrastructureAlertSweeper } from "./infrastructure-alerts.js";
 import { createProviderAlertSweeper, readProviderAlertObservation } from "./provider-alerts.js";
-import { PostgresRunStore } from "./run-store-pg.js";
 import { diagnosticSecrets, redactDiagnosticText } from "../shared/diagnostics.js";
 import { DecisionAuditStore } from "./decision-engine/audit-store.js";
 import { createDecisionEngine, loadDecisionEngineConfig } from "./decision-engine/index.js";
@@ -53,20 +52,6 @@ human.registerRunApprovalRoute();
 registerRunReleaseRoutes(services, workspace);
 human.registerRunManagementRoutes();
 admission.registerRunFollowupRoutes();
-
-// Multi-process safety (rolling deploys / ops tooling): hydrate a run written by
-// another web instance on first touch instead of answering 404.
-app.addHook("preHandler", async (request) => {
-  const url = request.url.split("?")[0];
-  if (!url.startsWith("/api/runs/") && !url.startsWith("/api/internal/runs/")) return;
-  const id = (request.params as { id?: string } | undefined)?.id;
-  if (!id || !(store instanceof PostgresRunStore)) return;
-  // Always refresh from the database: another web instance may have moved the
-  // run on (cancel/approve/worker callback), and a cached snapshot that is
-  // merely stale must not be used to validate a state transition. `hydrate`
-  // keeps the newer of cache/database, so a fresh cache is never downgraded.
-  await store.hydrate(id).catch(() => undefined);
-});
 
 registerInternalRunRoutes(app, { store, jobQueue, persistTerminalDiffArtifact, reconcileStoryForRun, readArtifactCredentials });
 registerInternalJobRoutes(app, { store, jobQueue, staleAfterMs: JOB_STALE_MS, jobCredentialsFor });

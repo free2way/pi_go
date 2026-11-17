@@ -1,6 +1,8 @@
+import { decodeRunCursor } from "../shared/run-pagination.js";
+import { readRunPage, readRuns, readRun } from "./store.js";
 import { RunEventStream } from "./event-stream.js";
 import { artifactDiagnosticDownloadSafe } from "./artifact-api.js";
-import { parseRunSearch, searchRuns } from "./run-search.js";
+import { parseRunSearch } from "./run-search.js";
 import { ROUNDS_SCHEMA_VERSION, readRunRounds } from "./run-rounds.js";
 import { readDecisionBrief } from "./decision-brief.js";
 import { readDecisionUsageSafe } from "./decision-usage.js";
@@ -16,19 +18,22 @@ export function registerRunReadRoutes(services: WebServices) {
     workspaces,
   } = services;
 
-  // 需求历史: `?query=` is a case-insensitive substring over title/task/human
-  // notes and `?state=` filters by run state; both are optional so callers that
-  // omit them get the unchanged owner-scoped, newest-first list. Filtering runs
-  // over that owner-scoped list with no additional pagination (the list is
-  // already bounded to one owner and rendered client-side).
-  app.get<{ Querystring: { query?: string; state?: string } }>("/api/runs", async (request, reply) => {
-    const parsed = parseRunSearch(request.query ?? {});
+  app.get<{ Querystring: { query?: string; state?: string; limit?: string; cursor?: string } }>("/api/runs", async (request, reply) => {
+    const query = request.query ?? {};
+    const parsed = parseRunSearch(query);
     if (!parsed.ok) return reply.code(400).send({ error: "Invalid request", details: [{ message: parsed.error }] });
-    return searchRuns(store.listRuns(ownerKeysFor(request)), parsed.filter);
+    const owner = ownerKeysFor(request);
+    if (query.limit === undefined && query.cursor === undefined) return readRuns(store, owner, parsed.filter);
+    const limit = query.limit === undefined ? 10 : Number(query.limit);
+    const cursor = typeof query.cursor === "string" ? decodeRunCursor(query.cursor) : undefined;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100 || (query.cursor !== undefined && !cursor)) {
+      return reply.code(400).send({ error: "Invalid run page" });
+    }
+    return readRunPage(store, owner, parsed.filter, { limit, cursor });
   });
 
   app.get<{ Params: { id: string } }>("/api/runs/:id", async (request, reply) => {
-    let run = store.getRun(request.params.id, ownerKeysFor(request));
+    let run = await readRun(store, request.params.id, ownerKeysFor(request));
     if (!run) return reply.code(404).send({ error: "Run not found" });
     // B1: a run whose worker merge succeeded but whose record write failed carries
     // a `committed_unrecorded` marker; converge it on read so the database never
@@ -48,7 +53,7 @@ export function registerRunReadRoutes(services: WebServices) {
   });
 
   app.get<{ Params: { id: string }; Querystring: { after?: string; limit?: string } }>("/api/runs/:id/events", async (request, reply) => {
-    if (!store.getRun(request.params.id, ownerKeysFor(request))) return reply.code(404).send({ error: "Run not found" });
+    if (!await readRun(store, request.params.id, ownerKeysFor(request))) return reply.code(404).send({ error: "Run not found" });
     const limit = Math.min(Math.max(Number(request.query.limit || 500), 1), 1_000);
     return store.getEvents(request.params.id, Number(request.query.after || 0), limit);
   });
@@ -61,7 +66,7 @@ export function registerRunReadRoutes(services: WebServices) {
    * back to its event-derived model.
    */
   app.get<{ Params: { id: string } }>("/api/runs/:id/rounds", async (request, reply) => {
-    const run = store.getRun(request.params.id, ownerKeysFor(request));
+    const run = await readRun(store, request.params.id, ownerKeysFor(request));
     if (!run) return reply.code(404).send({ error: "Run not found" });
     return { schemaVersion: ROUNDS_SCHEMA_VERSION, rounds: await readRunRounds(db, run.id, run.round) };
   });
@@ -74,7 +79,7 @@ export function registerRunReadRoutes(services: WebServices) {
    * the model never participates. Same auth/ownership as the run-detail route.
    */
   app.get<{ Params: { id: string } }>("/api/runs/:id/decision-brief", async (request, reply) => {
-    const run = store.getRun(request.params.id, ownerKeysFor(request));
+    const run = await readRun(store, request.params.id, ownerKeysFor(request));
     if (!run) return reply.code(404).send({ error: "Run not found" });
     return readDecisionBrief(db, run, requestLocale(request));
   });
@@ -82,12 +87,12 @@ export function registerRunReadRoutes(services: WebServices) {
   // GAP-04 / AT-UI-005: artifact listing and download, authenticated like every
   // other run route and owner-scoped via ownerKeysFor.
   app.get<{ Params: { id: string } }>("/api/runs/:id/artifacts", async (request, reply) => {
-    if (!store.getRun(request.params.id, ownerKeysFor(request))) return reply.code(404).send({ error: "Run not found" });
+    if (!await readRun(store, request.params.id, ownerKeysFor(request))) return reply.code(404).send({ error: "Run not found" });
     return { artifacts: await store.listArtifacts(request.params.id) };
   });
 
   app.get<{ Params: { id: string; artifactId: string } }>("/api/runs/:id/artifacts/:artifactId/download", async (request, reply) => {
-    const run = store.getRun(request.params.id, ownerKeysFor(request));
+    const run = await readRun(store, request.params.id, ownerKeysFor(request));
     if (!run) return reply.code(404).send({ error: "Run not found" });
     const artifact = await store.getArtifact(request.params.id, request.params.artifactId);
     // A run with a diff but no stored body (legacy/demo) still downloads the preview.
@@ -116,7 +121,7 @@ export function registerRunReadRoutes(services: WebServices) {
    * directory. Never returns an empty or silently-truncated patch.
    */
   app.get<{ Params: { id: string } }>("/api/runs/:id/patch", async (request, reply) => {
-    const run = store.getRun(request.params.id, ownerKeysFor(request));
+    const run = await readRun(store, request.params.id, ownerKeysFor(request));
     if (!run) return reply.code(404).send({ error: "Run not found" });
     const resolved = await resolveRunPatch(run);
     if (!resolved.ok) return reply.code(resolved.status).send({ error: resolved.error, code: resolved.code });
@@ -136,7 +141,7 @@ export function registerRunReadRoutes(services: WebServices) {
   app.post<{ Params: { id: string } }>("/api/runs/:id/merge-request", { bodyLimit: 1024 * 1024 }, async (request, reply) => {
     const actionLimit = runActions.check(auth.user(request).id);
     if (!actionLimit.allowed) return tooManyRequests(reply, actionLimit.retryAfterMs);
-    const run = store.getRun(request.params.id, ownerKeysFor(request));
+    const run = await readRun(store, request.params.id, ownerKeysFor(request));
     if (!run) return reply.code(404).send({ error: "Run not found" });
     if (!mergeRequestConfig.configured) {
       const refusal = mergeRequestUnavailable(mergeRequestConfig);
@@ -190,7 +195,7 @@ export function registerRunReadRoutes(services: WebServices) {
   });
 
   app.get<{ Params: { id: string }; Querystring: { after?: string } }>("/api/runs/:id/stream", async (request, reply) => {
-    if (!store.getRun(request.params.id, ownerKeysFor(request))) return reply.code(404).send({ error: "Run not found" });
+    if (!await readRun(store, request.params.id, ownerKeysFor(request))) return reply.code(404).send({ error: "Run not found" });
     const after = Number(request.headers["last-event-id"] || request.query.after || 0);
     reply.hijack();
     reply.raw.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive", "X-Accel-Buffering": "no" });

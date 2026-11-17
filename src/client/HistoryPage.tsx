@@ -4,7 +4,6 @@ import type { Run, RunState } from "../shared/types";
 import { localizeError } from "../shared/i18n";
 import { api } from "./api";
 import { useT } from "./i18n";
-import { paginate } from "./history-view";
 import {
   RUN_STATE_OPTIONS,
   copyTextForRun,
@@ -16,6 +15,7 @@ import {
 } from "./requirement-history";
 
 const DEBOUNCE_MS = 300;
+const PAGE_SIZE = 10;
 
 /**
  * 需求历史: searchable view over past runs. Search and state filtering are
@@ -31,17 +31,17 @@ export function HistoryPage({ runs, onOpenRun }: {
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [state, setState] = useState<"" | RunState>("");
   const [items, setItems] = useState<Run[]>([]);
+  const [total, setTotal] = useState(0);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [expandedId, setExpandedId] = useState<string>();
   const [copiedId, setCopiedId] = useState<string>();
-  /** 需求：需求历史按每 10 条分页（1-based；越界页码由 paginate 夹紧）。 */
-  const [page, setPage] = useState(1);
-
-  // 过滤条件变化时回到第 1 页，避免"筛完停在空页"。
-  useEffect(() => {
-    setPage(1);
-  }, [debouncedQuery, state]);
+  const filters = JSON.stringify([debouncedQuery, state]);
+  const [navigation, setNavigation] = useState<{ filters: string; cursors: string[] }>({ filters, cursors: [] });
+  const cursors = navigation.filters === filters ? navigation.cursors : [];
+  const cursor = cursors.at(-1);
+  const page = cursors.length + 1;
 
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedQuery(query.trim()), DEBOUNCE_MS);
@@ -53,10 +53,12 @@ export function HistoryPage({ runs, onOpenRun }: {
   useEffect(() => {
     let active = true;
     setLoading(true);
-    api.runs({ query: debouncedQuery || undefined, state: state || undefined })
+    api.runPage({ limit: PAGE_SIZE, cursor, query: debouncedQuery || undefined, state: state || undefined })
       .then((next) => {
         if (!active) return;
-        setItems(next);
+        setItems(next.runs);
+        setTotal(next.total);
+        setNextCursor(next.nextCursor);
         setError("");
       })
       .catch((cause) => {
@@ -66,7 +68,7 @@ export function HistoryPage({ runs, onOpenRun }: {
         if (active) setLoading(false);
       });
     return () => { active = false; };
-  }, [debouncedQuery, state, newest?.id, newest?.updatedAt]);
+  }, [debouncedQuery, state, cursor, newest?.id, newest?.updatedAt]);
 
   const copy = async (run: Run) => {
     try {
@@ -79,8 +81,9 @@ export function HistoryPage({ runs, onOpenRun }: {
   };
 
   const filtering = Boolean(debouncedQuery || state);
-  // 需求：每 10 条一页（作用在已过滤列表上）。
-  const paged = paginate(items, page);
+  const pageCount = Math.max(page, Math.ceil(total / PAGE_SIZE));
+  const from = items.length ? (page - 1) * PAGE_SIZE + 1 : 0;
+  const to = items.length ? from + items.length - 1 : 0;
 
   return (
     <section className="history-page">
@@ -90,7 +93,7 @@ export function HistoryPage({ runs, onOpenRun }: {
           <h1>{t("nav.history")}</h1>
           <p>{t("history.subtitle")}</p>
         </div>
-        <div className="history-count"><History size={15} />{t("history.count", { count: items.length })}</div>
+        <div className="history-count"><History size={15} />{t("history.count", { count: total })}</div>
       </div>
 
       <div className="history-toolbar">
@@ -120,7 +123,7 @@ export function HistoryPage({ runs, onOpenRun }: {
             <span>{filtering ? t("history.emptyFiltered") : t("history.empty")}</span>
           </div>
         )}
-        {paged.items.map((run) => {
+        {items.map((run) => {
           const expanded = expandedId === run.id;
           const notes = humanNotesOf(run);
           return (
@@ -173,25 +176,25 @@ export function HistoryPage({ runs, onOpenRun }: {
         })}
       </div>
 
-      {paged.pageCount > 1 && (
+      {pageCount > 1 && (
         <nav className="history-pager" aria-label={t("history.pagerAria")}>
           <button
             type="button"
             className="button secondary"
-            disabled={paged.page <= 1}
-            onClick={() => setPage(paged.page - 1)}
+            disabled={loading || page <= 1}
+            onClick={() => setNavigation({ filters, cursors: cursors.slice(0, -1) })}
           >
             {t("history.prev")}
           </button>
           <span className="history-pager-info">
-            {t("history.pageOf", { page: paged.page, pages: paged.pageCount })}
-            <small>{t("history.pageRange", { from: paged.from, to: paged.to, total: paged.total })}</small>
+            {t("history.pageOf", { page, pages: pageCount })}
+            <small>{t("history.pageRange", { from, to, total })}</small>
           </span>
           <button
             type="button"
             className="button secondary"
-            disabled={paged.page >= paged.pageCount}
-            onClick={() => setPage(paged.page + 1)}
+            disabled={loading || !nextCursor}
+            onClick={() => { if (nextCursor) setNavigation({ filters, cursors: [...cursors, nextCursor] }); }}
           >
             {t("history.next")}
           </button>

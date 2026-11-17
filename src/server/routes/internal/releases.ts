@@ -1,3 +1,4 @@
+import { readRun } from "../../store.js";
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { z } from "zod";
 import type { RunReleaseRecord, RunRollbackRecord } from "../../../shared/types.js";
@@ -174,7 +175,7 @@ export function registerInternalReleaseRoutes(app: FastifyInstance, deps: {
   app.post<{ Params: { id: string } }>("/api/internal/runs/:id/rollback-result", { config: { internalAuth: "release" } }, async (request, reply) => {
     const parsed = rollbackResultSchema.safeParse(request.body ?? {});
     if (!parsed.success) return reply.code(400).send({ error: "Invalid rollback result", details: parsed.error.issues });
-    const run = store.getRun(request.params.id);
+    const run = await readRun(store, request.params.id);
     if (!run) return reply.code(404).send({ error: "Run not found" });
     const current = run.rollback;
     if (!current || current.deliveryId !== parsed.data.deliveryId) {
@@ -242,7 +243,7 @@ export function registerInternalReleaseRoutes(app: FastifyInstance, deps: {
   app.post<{ Params: { id: string } }>("/api/internal/runs/:id/release-result", { config: { internalAuth: "release" } }, async (request, reply) => {
     const parsed = releaseResultSchema.safeParse(request.body ?? {});
     if (!parsed.success) return reply.code(400).send({ error: "Invalid release result", details: parsed.error.issues });
-    const run = store.getRun(request.params.id);
+    const run = await readRun(store, request.params.id);
     if (!run) return reply.code(404).send({ error: "Run not found" });
     const current = run.release;
     if (!current || current.deliveryId !== parsed.data.deliveryId) {

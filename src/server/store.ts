@@ -1,3 +1,5 @@
+import { paginateRuns, type RunPage, type RunPageRequest } from "../shared/run-pagination.js";
+import { searchRuns, type RunSearchFilter } from "./run-search.js";
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -57,6 +59,10 @@ export interface RunStoreLike {
   init(): Promise<void>;
   listRuns(owner: string | string[]): Run[];
   getRun(id: string, owner?: string | string[]): Run | undefined;
+  readRun?(id: string, owner?: string | string[]): Promise<Run | undefined>;
+  readRuns?(owner: string | string[], filter: RunSearchFilter): Promise<Run[]>;
+  readRunPage?(owner: string | string[], filter: RunSearchFilter, page: RunPageRequest): Promise<RunPage>;
+  findRunByKey?(owner: string | string[], key: string): Promise<Run | undefined>;
   createRun(run: Run, event: Omit<RunEvent, "seq">): Promise<Run>;
   updateRun(id: string, patch: Partial<Run>): Promise<Run>;
   /**
@@ -77,6 +83,35 @@ export interface RunStoreLike {
   getArtifact(runId: string, artifactId: string): Promise<ArtifactContent | undefined>;
   /** AUD-16: persists the full artifact content (overwrites a metadata-only row). */
   saveArtifact(input: SaveArtifactInput): Promise<ArtifactRecord>;
+}
+
+export async function readRun(store: Pick<RunStoreLike, "getRun" | "readRun">, id: string, owner?: string | string[]) {
+  return store.readRun ? store.readRun(id, owner) : store.getRun(id, owner);
+}
+
+export async function readRuns(
+  store: Pick<RunStoreLike, "listRuns" | "readRuns">,
+  owner: string | string[],
+  filter: RunSearchFilter = {},
+) {
+  return store.readRuns ? store.readRuns(owner, filter) : searchRuns(store.listRuns(owner), filter);
+}
+
+export async function readRunPage(
+  store: Pick<RunStoreLike, "listRuns" | "readRunPage" | "readRuns">,
+  owner: string | string[],
+  filter: RunSearchFilter,
+  page: RunPageRequest,
+) {
+  return store.readRunPage ? store.readRunPage(owner, filter, page) : paginateRuns(await readRuns(store, owner, filter), page);
+}
+
+export async function findRunByKey(
+  store: Pick<RunStoreLike, "listRuns" | "findRunByKey">,
+  owner: string | string[],
+  key: string,
+) {
+  return store.findRunByKey ? store.findRunByKey(owner, key) : store.listRuns(owner).find((run) => run.idempotencyKey === key);
 }
 
 export class RunStore implements RunStoreLike {

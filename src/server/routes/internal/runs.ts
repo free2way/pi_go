@@ -1,3 +1,4 @@
+import { readRun } from "../../store.js";
 import type { FastifyInstance } from "fastify";
 import { internalUpdateRejection } from "../../../shared/run-state.js";
 import type { Run } from "../../../shared/types.js";
@@ -18,7 +19,7 @@ export function registerInternalRunRoutes(app: FastifyInstance, deps: {
   app.post<{ Params: { id: string } }>("/api/internal/runs/:id/update", { bodyLimit: 4 * 1024 * 1024 }, async (request, reply) => {
     const parsed = internalUpdateSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: "Invalid internal update", details: parsed.error.issues });
-    const run = store.getRun(request.params.id);
+    const run = await readRun(store, request.params.id);
     if (!run) return reply.code(404).send({ error: "Run not found" });
     // Chat/状态抑制：终态运行（例如用户刚取消）不再接受任何 worker 内部更新，
     // 否则迟到的 chat.message 会追加在 run.cancelled 之后并覆盖终态。
@@ -40,13 +41,13 @@ export function registerInternalRunRoutes(app: FastifyInstance, deps: {
           ...(jobId && workerId ? { lease: { jobId, workerId } } : {}),
         });
         // AUD-16: the terminal callback carries the run diff; persist it in full.
-        if (result.applied) await persistTerminalDiffArtifact(store.getRun(run.id));
+        if (result.applied) await persistTerminalDiffArtifact(await readRun(store, run.id));
         if (result.applied) await reconcileStoryForRun(run.id);
         return { ok: true, applied: result.applied, seq: result.seq };
       }
       if (patch) await store.updateRun(run.id, patch as Partial<Run>);
       if (event) await store.appendEvent({ ...event, runId: run.id, at: new Date().toISOString() });
-      if (patch) await persistTerminalDiffArtifact(store.getRun(run.id));
+      if (patch) await persistTerminalDiffArtifact(await readRun(store, run.id));
       if (patch) await reconcileStoryForRun(run.id);
       return { ok: true, applied: true };
     } catch (error) {

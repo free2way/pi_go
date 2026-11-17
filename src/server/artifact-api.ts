@@ -1,3 +1,4 @@
+import { readRun } from "./store.js";
 import type { ArtifactRecord, RunStoreLike } from "./store.js";
 import type { Run } from "../shared/types.js";
 import { diagnosticSecrets, redactDiagnosticText } from "../shared/diagnostics.js";
@@ -86,7 +87,7 @@ export async function saveInternalRunArtifact(
   environment: NodeJS.ProcessEnv = process.env,
   readCredentialsForRun?: (run: Run) => Promise<readonly string[]>,
 ): Promise<InternalArtifactResult> {
-  const run = store.getRun(input.runId);
+  const run = await readRun(store, input.runId);
   if (!run) return { ok: false, status: 404, error: "Run not found" };
   if (input.ownerId && input.ownerId !== run.ownerId) {
     return { ok: false, status: 403, error: "Artifact owner does not match the run owner" };

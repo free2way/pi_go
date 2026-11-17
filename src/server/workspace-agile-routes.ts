@@ -1,3 +1,4 @@
+import { readRun } from "./store.js";
 import { type FastifyReply, type FastifyRequest } from "fastify";
 import { releasesStoryBlocks, storyBlockReleaseNote } from "../shared/run-state.js";
 import { AgileError } from "./agile.js";
@@ -74,7 +75,7 @@ export function createWorkspaceAgileRoutes(services: WebServices) {
    */
   async function reconcileStoryForRun(runId: string) {
     try {
-      const run = store.getRun(runId);
+      const run = await readRun(store, runId);
       if (run && releasesStoryBlocks(run.state)) {
         const released = await agile.releaseStoryBlocksForTerminalRun(runId, run.state);
         if (released.length > 0) {

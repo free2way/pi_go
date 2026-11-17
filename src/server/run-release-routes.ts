@@ -1,3 +1,4 @@
+import { readRun } from "./store.js";
 import { type FastifyRequest } from "fastify";
 import { z } from "zod";
 import type { Run, RunReleaseRecord, RunRollbackRecord } from "../shared/types.js";
@@ -76,7 +77,7 @@ export function registerRunReleaseRoutes(
     if (!actionLimit.allowed) return tooManyRequests(reply, actionLimit.retryAfterMs);
     const parsed = completedMergeSchema.safeParse(request.body ?? {});
     if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
-    const run = store.getRun(request.params.id, ownerKeysFor(request));
+    const run = await readRun(store, request.params.id, ownerKeysFor(request));
     if (!run) return reply.code(404).send({ error: "Run not found" });
     const user = auth.user(request);
     if (!(await identities.isAdmin(user.id))) return reply.code(403).send({ error: "仅管理员可以合并审核通过的代码", code: "ADMIN_REQUIRED" });
@@ -111,7 +112,7 @@ export function registerRunReleaseRoutes(
     if (!actionLimit.allowed) return tooManyRequests(reply, actionLimit.retryAfterMs);
     const parsed = releaseSchema.safeParse(request.body ?? {});
     if (!parsed.success) return reply.code(400).send({ error: "发布需要有效环境名和 confirm=true", code: "RELEASE_CONFIRM_REQUIRED", details: parsed.error.issues });
-    const run = store.getRun(request.params.id, ownerKeysFor(request));
+    const run = await readRun(store, request.params.id, ownerKeysFor(request));
     if (!run) return reply.code(404).send({ error: "Run not found" });
     const user = auth.user(request);
     const isAdmin = await identities.isAdmin(user.id);
@@ -194,7 +195,7 @@ export function registerRunReleaseRoutes(
       // A fast asynchronous publisher may POST its callback before the original
       // HTTP 202 response reaches us. Never overwrite or report that valid final
       // result as a failure merely because the callback won the CAS race.
-      const latest = store.getRun(run.id);
+      const latest = await readRun(store, run.id);
       if (latest?.release?.deliveryId === release.deliveryId
         && (latest.release.status === "succeeded" || latest.release.status === "failed")) return latest;
       return reply.code(503).send({ error: finalized.message, code: finalized.code, deliveryId: release.deliveryId });
@@ -226,7 +227,7 @@ export function registerRunReleaseRoutes(
     if (!actionLimit.allowed) return tooManyRequests(reply, actionLimit.retryAfterMs);
     const parsed = rollbackSchema.safeParse(request.body ?? {});
     if (!parsed.success) return reply.code(400).send({ error: "回滚需要原因和 confirm=true", code: "ROLLBACK_CONFIRM_REQUIRED", details: parsed.error.issues });
-    const run = store.getRun(request.params.id, ownerKeysFor(request));
+    const run = await readRun(store, request.params.id, ownerKeysFor(request));
     if (!run) return reply.code(404).send({ error: "Run not found" });
     const user = auth.user(request);
     if (!(await identities.isAdmin(user.id))) return reply.code(403).send({ error: "仅管理员可以回滚 production", code: "ADMIN_REQUIRED" });
@@ -294,7 +295,7 @@ export function registerRunReleaseRoutes(
       ? { allow: true as const }
       : { allow: false as const, code: "ROLLBACK_STATE_CHANGED", message: "回滚执行完成，但记录已被其他请求更新" }, { rollback });
     if (!finalized.ok) {
-      const latest = store.getRun(run.id);
+      const latest = await readRun(store, run.id);
       if (latest?.rollback?.deliveryId === rollback.deliveryId
         && (latest.rollback.status === "succeeded" || latest.rollback.status === "failed")) return latest;
       return reply.code(503).send({ error: finalized.message, code: finalized.code, deliveryId: rollback.deliveryId });
