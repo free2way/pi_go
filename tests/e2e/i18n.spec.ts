@@ -57,7 +57,8 @@ test.describe("bilingual UI (中文 / English)", () => {
     let status = 200;
     let returnedBody = body;
     let listFails = false;
-    await page.route("**/api/runs", (route) => route.fulfill({ json: [run] }));
+    await page.route((url) => url.pathname === "/api/runs" && url.searchParams.has("limit"), (route) =>
+      route.fulfill({ json: { runs: [run], nextCursor: null, total: 1, running: 0 } }));
     await page.route("**/api/runs/artifact-ui", (route) => route.fulfill({ json: run }));
     await page.route("**/api/runs/artifact-ui/events", (route) => route.fulfill({ json: [] }));
     await page.route("**/api/runs/artifact-ui/stream", (route) => route.fulfill({ contentType: "text/event-stream", body: "" }));
