@@ -24,7 +24,7 @@ describe("Worker-owned Pi retry policy", () => {
   it("seeds private new settings and leaves model/auth/session content alone", async () => {
     const f = await fixture(); await writeFile(path.join(f.agent, "auth.json"), "DUMMY_AUTH"); await writeFile(path.join(f.agent, "models.json"), "DUMMY_MODELS");
     await preparePiRetryPolicy(f.agent);
-    expect(JSON.parse(await readFile(f.file, "utf8"))).toEqual({ npmCommand: ["pnpm"], retry: { enabled: false, provider: { maxRetries: 0 } } });
+    expect(JSON.parse(await readFile(f.file, "utf8"))).toEqual({ npmCommand: ["npm"], retry: { enabled: false, provider: { maxRetries: 0 } } });
     expect((await stat(f.file)).mode & 0o777).toBe(0o600);
     expect(await readFile(path.join(f.agent, "auth.json"), "utf8")).toBe("DUMMY_AUTH");
     expect(await readFile(path.join(f.agent, "models.json"), "utf8")).toBe("DUMMY_MODELS");
@@ -34,6 +34,14 @@ describe("Worker-owned Pi retry policy", () => {
     await preparePiRetryPolicy(f.agent); const text = await readFile(f.file, "utf8"); const settings = JSON.parse(text);
     expect(settings.npmCommand).toEqual(["custom"]); expect(settings.defaultThinkingLevel).toBe("low"); expect(settings.retry).toEqual({ enabled: false, provider: { maxRetries: 0, timeoutMs: 50 } });
     await preparePiRetryPolicy(f.agent); expect(await readFile(f.file, "utf8")).toBe(text);
+  });
+  it("migrates the previous image default when resuming without changing other state", async () => {
+    const f = await fixture(); const original = { npmCommand: ["pnpm"], theme: "dark", retry: { enabled: true } };
+    await writeFile(f.file, JSON.stringify(original));
+    await preparePiRetryPolicy(f.agent);
+    expect(JSON.parse(await readFile(f.file, "utf8"))).toEqual({ npmCommand: ["npm"], theme: "dark", retry: { enabled: false, provider: { maxRetries: 0 } } });
+    expect(original.npmCommand).toEqual(["pnpm"]);
+    expect(managedPiSettings({ npmCommand: ["custom", "--flag"] }).npmCommand).toEqual(["custom", "--flag"]);
   });
   it.each(["{ DUMMY_PRIVATE", "[]", "null", "x".repeat(128 * 1024 + 1)])("fails closed on corrupt or oversized state without replacing it", async (raw) => {
     const f = await fixture(); await writeFile(f.file, raw); await expect(preparePiRetryPolicy(f.agent)).rejects.toThrow(PiRetryPolicyError);
