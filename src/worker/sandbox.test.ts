@@ -133,7 +133,7 @@ describe("prepareSandboxStateDirectory", () => {
       expect(await readFile(path.join(state, "agent", "models.json"), "utf8")).toBe("");
       expect((await stat(path.join(state, "agent", "models.json"))).mode & 0o777).toBe(0o600);
       expect(JSON.parse(await readFile(path.join(state, "agent", "settings.json"), "utf8"))).toEqual({
-        npmCommand: ["pnpm"],
+        npmCommand: ["npm"],
         retry: { enabled: false, provider: { maxRetries: 0 } },
       });
       expect((await stat(path.join(state, "agent", "settings.json"))).mode & 0o777).toBe(0o600);

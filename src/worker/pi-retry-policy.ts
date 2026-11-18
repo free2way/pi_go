@@ -19,7 +19,10 @@ export function managedPiSettings(value: unknown): Record<string, unknown> {
   if (!object(value) || (value.retry !== undefined && !object(value.retry))) throw new PiRetryPolicyError();
   const retry = (value.retry ?? {}) as Record<string, unknown>;
   if (retry.provider !== undefined && !object(retry.provider)) throw new PiRetryPolicyError();
-  return { ...value, retry: { ...retry, enabled: false, provider: { ...(retry.provider as Record<string, unknown> | undefined), maxRetries: 0 } } };
+  // Migrate the previous image default when resuming an existing run.
+  const migrated = Array.isArray(value.npmCommand) && value.npmCommand.length === 1 && value.npmCommand[0] === "pnpm"
+    ? { npmCommand: ["npm"] } : {};
+  return { ...value, ...migrated, retry: { ...retry, enabled: false, provider: { ...(retry.provider as Record<string, unknown> | undefined), maxRetries: 0 } } };
 }
 
 /** Atomic replacement keeps concurrent readers away from partially-written JSON. */
@@ -55,7 +58,7 @@ export async function preparePiRetryPolicy(agentDirectory: string): Promise<void
     const directory = await lstat(agentDirectory);
     if (!directory.isDirectory() || directory.isSymbolicLink()) throw new PiRetryPolicyError();
     const file = path.join(agentDirectory, "settings.json");
-    let settings: unknown = { npmCommand: ["pnpm"] };
+    let settings: unknown = { npmCommand: ["npm"] };
     try {
       handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
       const info = await handle.stat();

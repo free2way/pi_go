@@ -15,6 +15,7 @@ FROM node:22.23.4-alpine3.24
 
 ARG CURL_VERSION=8.23.0-r0
 ARG EXPAT_VERSION=2.10.0-r0
+ARG OPENSSL_VERSION=3.5.9-r1
 
 RUN apk upgrade --no-cache \
   && echo "@curlfix https://dl-cdn.alpinelinux.org/alpine/edge/main" >> /etc/apk/repositories \
@@ -22,6 +23,8 @@ RUN apk upgrade --no-cache \
     "curl@curlfix=${CURL_VERSION}" \
     "libcurl@curlfix=${CURL_VERSION}" \
     "libexpat=${EXPAT_VERSION}" \
+    "libcrypto3@curlfix=${OPENSSL_VERSION}" \
+    "libssl3@curlfix=${OPENSSL_VERSION}" \
   && rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx \
   && mkdir -p /data \
   && chown node:node /data

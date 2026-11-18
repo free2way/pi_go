@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "vendorFeed": "https://secdb.alpinelinux.org/edge/main.json",
+  "fixedVersion": "3.5.9-r1",
+  "cves": [
+    "CVE-2026-88823",
+    "CVE-2026-95691",
+    "CVE-2026-95692",
+    "CVE-2026-107496"
+  ],
+  "packages": {
+    "libcrypto3": {
+      "version": "3.5.9-r1",
+      "architecture": "x86_64",
+      "origin": "openssl",
+      "apkChecksum": "Q17FKucG1EZ1HMyAQ+4225kZzmhj4=",
+      "archiveSha256": "9ed3115c674dfca1f01c8d3235dc47f04c703aae180423982dc995e330f71010",
+      "source": "https://dl-cdn.alpinelinux.org/alpine/edge/main/x86_64/libcrypto3-3.5.9-r1.apk",
+      "files": {
+        "/usr/lib/engines-3/afalg.so": "5f1f13f50ab333ff6bb99b656b2cbb6889255d456f7bb13bc71adc8a33e82a48",
+        "/usr/lib/engines-3/capi.so": "9e4328d873b167552bf4c807dab303a5a7a0c36e9a9f3bb1f1d84d864776bd2e",
+        "/usr/lib/engines-3/loader_attic.so": "9b9c26db1b0f4a99c106a99ed01cc7c84a3c2bbc14df362517b24b4f18b900d7",
+        "/usr/lib/engines-3/padlock.so": "3327f942be17b9f856cc7f56db23d2f3cff14e90688a00af2aeb970655843e8c",
+        "/usr/lib/libcrypto.so.3": "1887a42b0e69e017567e0f5071aa52c5b870be8b97c339e967f66d9ffc6d0034",
+        "/usr/lib/ossl-modules/legacy.so": "d28ac2184b2b39177578b4cabccee6d178c2b0e6f2ae0ccc8f354267d808ed83"
+      }
+    },
+    "libssl3": {
+      "version": "3.5.9-r1",
+      "architecture": "x86_64",
+      "origin": "openssl",
+      "apkChecksum": "Q1GIu2uIgjSDRw9ab+K43rkFVcXIs=",
+      "archiveSha256": "e4064ad4fd4f26bc841b04173c12a1252f2dcc6f2e345bb6777c85750bbd2027",
+      "source": "https://dl-cdn.alpinelinux.org/alpine/edge/main/x86_64/libssl3-3.5.9-r1.apk",
+      "files": {
+        "/usr/lib/libssl.so.3": "6f35d9d1edb0f75228af331a88d740a891753a4fed32a1fccdbf8bf9183cd3cd"
+      }
+    }
+  }
+}
