@@ -1,3 +1,4 @@
+import { readRun } from "./store.js";
 import type { Run } from "../shared/types.js";
 import {
   projectDecision,
@@ -424,7 +425,7 @@ export async function evaluateDecisionForRun(
   deps: DecisionServices,
 ): Promise<DecisionEvaluateOutcome> {
   const now = (deps.now ?? (() => new Date()))().toISOString();
-  const run = deps.store.getRun(input.runId);
+  const run = await readRun(deps.store, input.runId);
   if (!run) return { status: 404, body: { error: "Run not found" } };
 
   const loaded = deps.loadConfig(deps.env);

@@ -128,7 +128,7 @@ test.describe("read-path error states", () => {
     // unhandled rejection itself is reported as a residual defect (it cannot be
     // fixed from tests/e2e only). Re-add a `pageerror` assertion once App.tsx
     // handles the list failure explicitly.
-    await page.route("**/api/runs", async (route) => {
+    await page.route((url) => url.pathname === "/api/runs" && url.searchParams.has("limit"), async (route) => {
       if (route.request().method() !== "GET") return route.continue();
       await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "Internal Server Error" }) });
     });

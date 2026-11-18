@@ -1,3 +1,4 @@
+import { readRun } from "./store.js";
 import type { ChatChannel, ChatParticipant, ChatRole, CheckResult, Finding, Run, RunEvent, RunState } from "../shared/types.js";
 import type { RunStoreLike } from "./store.js";
 
@@ -83,7 +84,7 @@ export async function runDemo(store: RunStoreLike, runId: string, options: { del
     message: string,
     patch: Partial<Run> = {},
   ) => {
-    const current = store.getRun(runId);
+    const current = await readRun(store, runId);
     if (!current || current.state === "cancelled") throw new Error("cancelled");
     await store.updateRun(runId, { state, durationMs: Date.now() - startedAt, ...patch });
     await store.appendEvent({
@@ -108,7 +109,7 @@ export async function runDemo(store: RunStoreLike, runId: string, options: { del
   ) => {
     // Mirror `emit`'s guard so a cancellation during the preceding wait cannot
     // append a phantom agent message after `run.cancelled`.
-    const current = store.getRun(runId);
+    const current = await readRun(store, runId);
     if (!current || current.state === "cancelled") throw new Error("cancelled");
     await store.appendEvent({
       runId,
@@ -122,7 +123,7 @@ export async function runDemo(store: RunStoreLike, runId: string, options: { del
     await sleep(Math.max(1, Math.round(stepDelay * 0.38)));
   };
 
-  const task = store.getRun(runId)?.task ?? "";
+  const task = (await readRun(store, runId))?.task ?? "";
 
   try {
     await emit("preparing", "system", "workspace.created", "已创建隔离 Git worktree，锁定基线提交 8fd2a91");

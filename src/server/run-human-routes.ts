@@ -1,3 +1,4 @@
+import { readRuns, readRun } from "./store.js";
 import { type FastifyReply, type FastifyRequest } from "fastify";
 import { z } from "zod";
 import type { ReviewScope, Run } from "../shared/types.js";
@@ -121,7 +122,7 @@ export function createRunHumanRoutes(
       await dispatchJob(updated, run.checks.map((check) => check.command), { resume: { instruction: options.note } }, credentials);
       credentials.developer = "";
       credentials.reviewer = "";
-      return { ok: true, run: store.getRun(run.id) ?? updated };
+      return { ok: true, run: await readRun(store, run.id) ?? updated };
     } catch (error) {
       const message = serverDiagnosticMessage(error, { credentials: Object.values(credentials) });
       credentials.developer = "";
@@ -159,7 +160,7 @@ export function createRunHumanRoutes(
       if (!actionLimit.allowed) return tooManyRequests(reply, actionLimit.retryAfterMs);
       const parsed = approveSchema.safeParse(request.body ?? {});
       if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
-      const run = store.getRun(request.params.id, ownerKeysFor(request));
+      const run = await readRun(store, request.params.id, ownerKeysFor(request));
       if (!run) return reply.code(404).send({ error: "Run not found" });
       if (run.state !== "needs_human") return reply.code(409).send({ error: "仅「需要人工处理」的任务可以审批", code: "RUN_NOT_APPROVABLE" });
       const user = auth.user(request);
@@ -281,7 +282,7 @@ export function createRunHumanRoutes(
       if (!actionLimit.allowed) return tooManyRequests(reply, actionLimit.retryAfterMs);
       const parsed = rejectSchema.safeParse(request.body ?? {});
       if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
-      const run = store.getRun(request.params.id, ownerKeysFor(request));
+      const run = await readRun(store, request.params.id, ownerKeysFor(request));
       if (!run) return reply.code(404).send({ error: "Run not found" });
       if (run.state !== "needs_human") return reply.code(409).send({ error: "仅「需要人工处理」的任务可以拒绝", code: "RUN_NOT_REJECTABLE" });
       const user = auth.user(request);
@@ -332,10 +333,10 @@ export function createRunHumanRoutes(
       if (!parsed.success) return reply.code(400).send({ error: "Invalid request", details: parsed.error.issues });
       const user = auth.user(request);
       const isAdminUser = await identities.isAdmin(user.id);
-      let run = store.getRun(request.params.id, ownerKeysFor(request));
+      let run = await readRun(store, request.params.id, ownerKeysFor(request));
       const isOwner = Boolean(run);
       // Admins may reopen a run they do not own.
-      if (!run && isAdminUser) run = store.getRun(request.params.id);
+      if (!run && isAdminUser) run = await readRun(store, request.params.id);
       if (!run) return reply.code(404).send({ error: "Run not found" });
 
       if (isActiveRelease(run)) return reply.code(409).send({ error: "发布仍在进行，不能重新打开任务", code: "RELEASE_IN_PROGRESS" });
@@ -403,9 +404,9 @@ export function createRunHumanRoutes(
       let candidates: Run[];
       if (parsed.data.scope === "all") {
         const owners = (await db.query("SELECT DISTINCT owner_id FROM runs")).rows.map((row) => String(row.owner_id));
-        candidates = owners.flatMap((owner) => store.listRuns(owner));
+        candidates = await readRuns(store, owners);
       } else {
-        candidates = store.listRuns(ownerKeysFor(request));
+        candidates = await readRuns(store, ownerKeysFor(request));
       }
       const allowedStates = new Set(parsed.data.states ?? []);
       const idFilter = parsed.data.runIds ? new Set(parsed.data.runIds) : undefined;
@@ -473,7 +474,7 @@ export function createRunHumanRoutes(
       const outcomes: BatchItemOutcome[] = [];
 
       for (const id of ids.ids) {
-        const run = store.getRun(id, ownerKeysFor(request));
+        const run = await readRun(store, id, ownerKeysFor(request));
         if (!run) {
           outcomes.push(batchItemFailure(id, 404, "RUN_NOT_FOUND", "Run not found"));
           continue;

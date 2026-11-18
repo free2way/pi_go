@@ -1,3 +1,4 @@
+import { runningRunCount } from "../shared/run-pagination";
 import { Activity, AlertTriangle, Bot, Braces, ChevronRight, ClipboardList, Clock3, Code2, Cpu, Download, FileCode2, FolderGit2, GitBranch, History, KeyRound, ListChecks, LoaderCircle, LogOut, Menu, PanelRightClose, Play, Plus, RotateCcw, Scale, Search, ShieldCheck, Sparkles, Square, Trash2, Users, Webhook, X, Zap } from "lucide-react";
 import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { localizeError } from "../shared/i18n";
@@ -62,11 +63,18 @@ export function App({ onSignOut }: { onSignOut?: () => void } = {}) {
   // the server's long-standing behavior of deleting the run directory).
   const [batchDeleteRunDirectory, setBatchDeleteRunDirectory] = useState(true);
 
+  const [otherRunning, setOtherRunning] = useState(0);
+  const readRecentRuns = useCallback(async () => {
+    const page = await api.runPage({ limit: RECENT_RUNS_LIMIT });
+    setOtherRunning(page.running - runningRunCount(page.runs));
+    return page.runs;
+  }, []);
+
   const refreshRuns = useCallback(async () => {
-    const next = await api.runs();
+    const next = await readRecentRuns();
     setRuns(next);
     setSelectedId((current) => current || next[0]?.id);
-  }, []);
+  }, [readRecentRuns]);
 
   /** AUD-17: accept a run snapshot only when it is not older than what is shown. */
   const applyRun = useCallback((next: Run) => {
@@ -190,7 +198,7 @@ export function App({ onSignOut }: { onSignOut?: () => void } = {}) {
   const reworkRounds = useMemo(() => new Set(reworkDetails.map((detail) => detail.round)), [reworkDetails]);
   const selectedRework = reworkRound === null ? undefined : reworkDetails.find((detail) => detail.round === reworkRound);
   const chatMessages = useMemo(() => chatMessagesFromEvents(events), [events]);
-  const running = runs.filter((item) => !terminalStates.includes(item.state)).length;
+  const running = otherRunning + runningRunCount(runs);
 
   const jumpToTopology = useCallback((round: number) => {
     setReworkRound(round);
@@ -243,7 +251,7 @@ export function App({ onSignOut }: { onSignOut?: () => void } = {}) {
     if (!window.confirm(t("alert.deleteConfirm", { title: target.title }))) return;
     try {
       await api.deleteRun(target.id);
-      const next = await api.runs();
+      const next = await readRecentRuns();
       setRuns(next);
       if (selectedId === target.id) setSelectedId(next[0]?.id);
     } catch (cause) {

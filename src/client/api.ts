@@ -1,3 +1,4 @@
+import { decodeRunCursor, paginateRuns, type RunPage } from "../shared/run-pagination";
 import type { ProviderCreditUpdate, ProviderCreditUpdateResponse, ProviderCreditsResponse } from "../shared/provider-credits-api";
 import type { BackupEntry, BackupOverview } from "../shared/backups";
 import type { AgileMetricsResponse, ReleaseRetrospective, ReleaseSummary } from "../shared/agile-metrics";
@@ -211,6 +212,17 @@ export const api = {
     request<WorkspaceScmSettingsStatus>(`/api/workspaces/${id}/scm`, { method: "PUT", body: JSON.stringify(body) }),
   deleteWorkspaceScm: (id: string) => request<WorkspaceScmSettingsStatus>(`/api/workspaces/${id}/scm`, { method: "DELETE" }),
   pushWorkspace: (id: string) => request<WorkspacePushResult>(`/api/workspaces/${id}/scm/push`, { method: "POST", body: JSON.stringify({ confirm: true }) }),
+  runPage: async (params: { limit: number; cursor?: string; query?: string; state?: RunState }) => {
+    const search = new URLSearchParams({ limit: String(params.limit) });
+    if (params.cursor) search.set("cursor", params.cursor);
+    if (params.query?.trim()) search.set("query", params.query.trim());
+    if (params.state) search.set("state", params.state);
+    const result = await request<RunPage | Run[]>(`/api/runs?${search}`);
+    // The browser can still page a response served by an older Web during a rollout.
+    return Array.isArray(result)
+      ? paginateRuns(result, { limit: params.limit, cursor: params.cursor ? decodeRunCursor(params.cursor) : undefined })
+      : result;
+  },
   runs: (params: { query?: string; state?: RunState } = {}) => {
     const search = new URLSearchParams();
     if (params.query?.trim()) search.set("query", params.query.trim());

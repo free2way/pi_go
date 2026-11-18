@@ -1,3 +1,4 @@
+import { readRun } from "../store.js";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { z } from "zod";
 import { buildStoryRunInput, STORY_STATUS_LABELS, type StoryDetail } from "../../shared/agile.js";
@@ -195,7 +196,7 @@ export function registerAgileRoutes(app: FastifyInstance, deps: AgileRouteDepend
     try {
       const result = await agile.reopenStory(ownerKeysFor(request), request.params.id, await deps.isAdmin(user.id));
       if (result.runId) {
-        const run = store.getRun(result.runId);
+        const run = await readRun(store, result.runId);
         await store.appendEvent({
           runId: result.runId,
           round: run?.round ?? 0,
@@ -252,7 +253,7 @@ export function registerAgileRoutes(app: FastifyInstance, deps: AgileRouteDepend
       void runDemo(store, run.id);
       await agile.linkRun(story.id, run.id);
       await agile.markStoryInProgress(story.id);
-      return reply.code(201).send({ run: store.getRun(run.id, user.id), story: await agile.getStory(ownerKeysFor(request), story.id, isAdmin) });
+      return reply.code(201).send({ run: await readRun(store, run.id, user.id), story: await agile.getStory(ownerKeysFor(request), story.id, isAdmin) });
     }
 
     if (!workspaceId) return reply.code(422).send({ error: "真实运行需要指定工作区（故事或请求中的 workspaceId）", code: "STORY_WORKSPACE_REQUIRED" });
@@ -281,7 +282,7 @@ export function registerAgileRoutes(app: FastifyInstance, deps: AgileRouteDepend
       else await agile.reconcileRun(result.run.id);
     }
     if (!result.ok) return reply.code(result.status).send({ ...result.body, storyId: story.id });
-    return reply.code(201).send({ run: store.getRun(result.run.id, user.id), story: await agile.getStory(ownerKeysFor(request), story.id, isAdmin) });
+    return reply.code(201).send({ run: await readRun(store, result.run.id, user.id), story: await agile.getStory(ownerKeysFor(request), story.id, isAdmin) });
   });
 
   app.get<{ Querystring: { projectId?: string } }>("/api/sprints", async (request, reply) => {

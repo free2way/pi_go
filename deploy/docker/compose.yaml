@@ -130,6 +130,7 @@ services:
       PI_RUN_MAX_DURATION_SECONDS: ${PI_RUN_MAX_DURATION_SECONDS:-0}
       # SEC-008: per-user write rate limits.
       PI_RUN_CREATE_PER_MINUTE: ${PI_RUN_CREATE_PER_MINUTE:-20}
+      PI_RUN_CACHE_MAX: ${PI_RUN_CACHE_MAX:-2000}
       PI_RUN_ACTIONS_PER_MINUTE: ${PI_RUN_ACTIONS_PER_MINUTE:-30}
       # REL-005: alert webhook and cooldown.
       PI_ALERT_WEBHOOK: ${PI_ALERT_WEBHOOK:-}

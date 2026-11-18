@@ -1,3 +1,4 @@
+import { findRunByKey, readRun } from "./store.js";
 import { type FastifyReply, type FastifyRequest } from "fastify";
 import { z } from "zod";
 import type { Workspace } from "../shared/types.js";
@@ -111,7 +112,7 @@ export function createRunAdmission(
     // GAP-01 / AT-RUN-010: an idempotency key returns the existing run instead of
     // creating a duplicate.
     if (input.idempotencyKey) {
-      const existing = store.listRuns(ownerKeysFor(request)).find((item) => item.idempotencyKey === input.idempotencyKey);
+      const existing = await findRunByKey(store, ownerKeysFor(request), input.idempotencyKey);
       if (existing) return { ok: true, created: false, run: existing };
     }
     const run = baseRealRun({
@@ -162,7 +163,7 @@ export function createRunAdmission(
       if (parsed.data.mode === "real") {
         const result = await startRealRun(request, parsed.data);
         if (!result.ok) return reply.code(result.status).send(result.body);
-        return reply.code(result.created ? 201 : 200).send(store.getRun(result.run.id, user.id));
+        return reply.code(result.created ? 201 : 200).send(await readRun(store, result.run.id, user.id));
       }
       if (!demoMode) return reply.code(403).send({ error: "Demo mode is disabled" });
       const run = baseDemoRun(parsed.data, user.id);
@@ -176,7 +177,7 @@ export function createRunAdmission(
     app.post<{ Params: { id: string } }>("/api/runs/:id/cancel", async (request, reply) => {
       const cancelLimit = runActions.check(auth.user(request).id);
       if (!cancelLimit.allowed) return tooManyRequests(reply, cancelLimit.retryAfterMs);
-      const run = store.getRun(request.params.id, ownerKeysFor(request));
+      const run = await readRun(store, request.params.id, ownerKeysFor(request));
       if (!run) return reply.code(404).send({ error: "Run not found" });
       if (["completed", "failed", "cancelled"].includes(run.state)) return reply.code(409).send({ error: `Cannot cancel run in ${run.state}` });
       if (run.mode === "real") await workerRequest(`/jobs/${encodeURIComponent(run.id)}/cancel`, { method: "POST" }).catch(() => undefined);
@@ -191,11 +192,11 @@ export function createRunAdmission(
       }
       await store.appendEvent({ runId: run.id, round: run.round, source: "system", type: "run.cancelled", message: "任务已取消", at: new Date().toISOString() });
       await reconcileStoryForRun(run.id);
-      return store.getRun(run.id, ownerKeysFor(request));
+      return await readRun(store, run.id, ownerKeysFor(request));
     });
 
     app.delete<{ Params: { id: string } }>("/api/runs/:id", async (request, reply) => {
-      const run = store.getRun(request.params.id, ownerKeysFor(request));
+      const run = await readRun(store, request.params.id, ownerKeysFor(request));
       if (!run) return reply.code(404).send({ error: "Run not found" });
       if (isActiveRelease(run)) return reply.code(409).send({ error: "发布仍在进行，不能删除任务", code: "RELEASE_IN_PROGRESS" });
       if (!["completed", "failed", "cancelled", "needs_human"].includes(run.state)) {
@@ -223,7 +224,7 @@ export function createRunAdmission(
   ) {
     const actionLimit = runActions.check(auth.user(request).id);
     if (!actionLimit.allowed) return tooManyRequests(reply, actionLimit.retryAfterMs);
-    const run = store.getRun(request.params.id, ownerKeysFor(request));
+    const run = await readRun(store, request.params.id, ownerKeysFor(request));
     if (!run) return reply.code(404).send({ error: "Run not found" });
     if (run.mode !== "real") return reply.code(409).send({ error: "只有真实任务支持人工恢复", code: "RUN_NOT_RESUMABLE" });
     if (run.state !== "needs_human") return reply.code(409).send({ error: "仅「需要人工处理」的任务可以执行该操作", code: "RUN_NOT_RESUMABLE" });
@@ -280,7 +281,7 @@ export function createRunAdmission(
       );
       credentials.developer = "";
       credentials.reviewer = "";
-      return reply.code(201).send(store.getRun(run.id, ownerKeysFor(request)));
+      return reply.code(201).send(await readRun(store, run.id, ownerKeysFor(request)));
     } catch (error) {
       const message = serverDiagnosticMessage(error, { credentials: Object.values(credentials) });
       credentials.developer = "";

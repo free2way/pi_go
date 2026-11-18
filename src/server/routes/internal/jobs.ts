@@ -1,3 +1,4 @@
+import { readRun } from "../../store.js";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import type { Run } from "../../../shared/types.js";
@@ -31,9 +32,7 @@ export function registerInternalJobRoutes(app: FastifyInstance, deps: {
       // Multi-process safety: a run written by another web instance (rolling
       // deploy, ops tooling) is hydrated here before the job payload is built, so
       // the worker never receives a job it cannot resolve.
-      const run = store instanceof PostgresRunStore
-        ? await store.hydrate(job.runId)
-        : store.getRun(job.runId);
+      const run = await readRun(store, job.runId);
       if (!run) {
         if (mutate) {
           const ageMs = Date.now() - Date.parse(job.createdAt);
@@ -139,7 +138,7 @@ export function registerInternalJobRoutes(app: FastifyInstance, deps: {
 
   app.get<{ Params: { id: string } }>("/api/internal/runs/:id/checkpoints", async (request, reply) => {
     if (!jobQueue) return reply.code(503).send({ error: "Checkpoints unavailable" });
-    const run = store.getRun(request.params.id);
+    const run = await readRun(store, request.params.id);
     if (!run) return reply.code(404).send({ error: "Run not found" });
     return { checkpoints: await jobQueue.listCheckpoints(run.id) };
   });
@@ -148,7 +147,7 @@ export function registerInternalJobRoutes(app: FastifyInstance, deps: {
     if (!jobQueue) return reply.code(503).send({ error: "Checkpoints unavailable" });
     const parsed = checkpointSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: "Invalid checkpoint", details: parsed.error.issues });
-    const run = store.getRun(request.params.id);
+    const run = await readRun(store, request.params.id);
     if (!run) return reply.code(404).send({ error: "Run not found" });
     await jobQueue.saveCheckpoint({
       runId: run.id,

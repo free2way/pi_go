@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 import type { Run, RunEvent } from "../shared/types.js";
 import { findingFingerprint } from "../shared/finding-fingerprint.js";
+import type { RunPageRequest } from "../shared/run-pagination.js";
+import { RunCache, runCacheCapacity } from "./run-cache.js";
+import { RunCatalog } from "./run-catalog-pg.js";
+import type { RunSearchFilter } from "./run-search.js";
 import type { Db } from "./db.js";
 import {
   assertJobLease,
@@ -79,70 +83,55 @@ export class RunConflictError extends Error {
 
 export type EventListenerAlias = EventListener;
 
-interface RunRow {
-  id: string;
-  owner_id: string;
-  last_seq: number;
-  document_json: string;
-}
-
 function sha256(value: string) {
   return createHash("sha256").update(value).digest("hex");
 }
 
-/**
- * PostgreSQL-backed run store (REL-001).
- *
- * Runs live in a `runs` row (document + indexed columns) with normalized
- * metadata projections for agents/checks/findings/artifacts, the event log is
- * append-only with a monotonic per-run `seq` (REL-004), stage checkpoints carry
- * idempotency keys (REL-003) and jobs are persisted so a restarted worker can
- * reclaim unfinished work (REL-002).
- *
- * Run lookups are served from a warm in-memory cache because the single web
- * process owns every write; events are never cached so a lagging SSE client
- * cannot grow web memory without bound (AT-REL-008).
- */
+/** PostgreSQL is authoritative across Web instances. History reads leave the bounded cache untouched. */
 export class PostgresRunStore implements RunStoreLike {
-  private cache = new Map<string, Run>();
+  private readonly cache: RunCache;
+  private readonly catalog: RunCatalog;
   private listeners = new Map<string, Set<EventListener>>();
   private readonly execution: PostgresRunExecutionStore;
 
-  constructor(private readonly db: Db) {
+  constructor(private readonly db: Db, private readonly cacheCapacity = runCacheCapacity()) {
     this.execution = new PostgresRunExecutionStore(db);
+    this.catalog = new RunCatalog(db);
+    this.cache = new RunCache(cacheCapacity);
   }
 
   async init() {
-    const result = await this.db.query("SELECT id, owner_id, last_seq, document_json FROM runs");
-    for (const row of result.rows as unknown as RunRow[]) {
-      const run = JSON.parse(row.document_json) as Run;
-      run.lastSeq = Number(row.last_seq);
-      this.cache.set(row.id, run);
-    }
+    const recent = await this.catalog.warm(this.cacheCapacity);
+    for (const run of recent.reverse()) this.cache.set(run.id, run);
+  }
+
+  readRuns(owner: string | string[], filter: RunSearchFilter) {
+    return this.catalog.list(owner, filter);
+  }
+
+  readRunPage(owner: string | string[], filter: RunSearchFilter, page: RunPageRequest) {
+    return this.catalog.page(owner, filter, page);
+  }
+
+  findRunByKey(owner: string | string[], key: string) {
+    return this.catalog.findByKey(owner, key);
   }
 
   listRuns(owner: string | string[]) {
-    const keys = new Set(Array.isArray(owner) ? owner : [owner]);
-    return [...this.cache.values()]
-      .filter((run) => keys.has(run.ownerId))
-      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    return this.cache.list(owner);
   }
 
-  /**
-   * Multi-process safety: load a run created by another web instance (rolling
-   * deploy, ops tooling) instead of treating it as missing. A newer cached
-   * snapshot is never replaced by an older database row.
-   */
-  async hydrate(id: string): Promise<Run | undefined> {
-    const row = (await this.db.query("SELECT id, owner_id, last_seq, document_json FROM runs WHERE id = $1", [id])).rows[0] as unknown as RunRow | undefined;
-    if (!row) return undefined;
-    const fromDb = JSON.parse(row.document_json) as Run;
-    fromDb.lastSeq = Number(row.last_seq);
-    const cached = this.cache.get(row.id);
-    if (!cached || String(cached.updatedAt ?? "") < String(fromDb.updatedAt ?? "")) {
-      this.cache.set(row.id, fromDb);
+  hydrate(id: string) {
+    return this.readRun(id);
+  }
+
+  async readRun(id: string, owner?: string | string[]) {
+    const run = await this.catalog.read(id, owner);
+    const cached = run && this.cache.get(run.id);
+    if (run && (!cached || (cached.lastSeq ?? 0) < (run.lastSeq ?? 0) || cached.updatedAt <= run.updatedAt)) {
+      this.cache.set(run.id, run);
     }
-    return this.cache.get(row.id);
+    return run;
   }
 
   getRun(id: string, owner?: string | string[]) {
@@ -648,8 +637,8 @@ export class PostgresRunStore implements RunStoreLike {
     let skippedRuns = 0;
     const now = new Date().toISOString();
     for (const run of data.runs ?? []) {
-      if (!run?.id || this.cache.has(run.id)) {
-        if (!run?.id) skippedRuns += 1;
+      if (!run?.id) {
+        skippedRuns += 1;
         continue;
       }
       // Runs created before owner scoping have no ownerId; they belong to the
@@ -668,13 +657,14 @@ export class PostgresRunStore implements RunStoreLike {
         updatedAt: run.updatedAt || run.createdAt || now,
         lastSeq,
       };
-      this.cache.set(record.id, record);
-      await this.db.withTransaction(async (tx) => {
-        await tx.query(
+      const inserted = await this.db.withTransaction(async (tx) => {
+        if ((await tx.query("SELECT id FROM runs WHERE id = $1", [record.id])).rows.length) return false;
+        const write = await tx.query(
           `INSERT INTO runs (id, owner_id, state, mode, created_at, updated_at, last_seq, document_json)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (id) DO NOTHING`,
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (id) DO NOTHING RETURNING id`,
           [record.id, record.ownerId, record.state, record.mode, record.createdAt, record.updatedAt, lastSeq, JSON.stringify(record)],
         );
+        if (write.rows.length === 0) return false;
         for (const event of events) {
           await tx.query(
             `INSERT INTO run_events (run_id, seq, at, round, source, type, message, meta_json)
@@ -684,8 +674,12 @@ export class PostgresRunStore implements RunStoreLike {
           importedEvents += 1;
         }
         await this.project(tx, record);
+        return true;
       });
-      importedRuns += 1;
+      if (inserted) {
+        this.cache.set(record.id, record);
+        importedRuns += 1;
+      }
     }
     return { importedRuns, importedEvents, skippedRuns };
   }

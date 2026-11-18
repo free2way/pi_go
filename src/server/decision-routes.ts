@@ -1,3 +1,4 @@
+import { readRun } from "./store.js";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { z } from "zod";
 import type { DecisionMetricsResponse } from "../shared/decision-metrics.js";
@@ -148,7 +149,7 @@ export function registerDecisionReadRoutes(app: FastifyInstance, deps: DecisionS
   app.get<{ Params: { runId: string }; Querystring: { limit?: string } }>(
     "/api/runs/:runId/decisions",
     async (request, reply) => {
-      const run = deps.store.getRun(request.params.runId, deps.ownerKeysFor(request));
+      const run = await readRun(deps.store, request.params.runId, deps.ownerKeysFor(request));
       if (!run) return reply.code(404).send({ error: "Run not found" });
       const requested = Number(request.query?.limit ?? DECISION_AUDIT_DEFAULT_ROWS);
       const limit = Number.isFinite(requested) ? requested : DECISION_AUDIT_DEFAULT_ROWS;

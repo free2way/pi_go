@@ -1,3 +1,4 @@
+import { readRun } from "./store.js";
 /**
  * B1 — two-phase, compensating "approve = merge" coordinator.
  *
@@ -329,7 +330,7 @@ export async function replayPendingMerge(
   runId: string,
   nowMs = Date.now(),
 ): Promise<Run | undefined> {
-  const run = store.getRun(runId);
+  const run = await readRun(store, runId);
   if (!run) return undefined;
   const plan = planMergeReplay(run, nowMs);
   if (plan.kind === "none") return run;
