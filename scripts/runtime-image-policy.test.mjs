@@ -58,12 +58,18 @@ test("every published runtime installs the official OpenSSL security backport", 
 test("OCI vulnerability scanning remains fail closed for unfixed findings", () => {
   const workflow = read(".github/workflows/oci-supply-chain.yml");
   assert.equal((workflow.match(/severity-cutoff: high/gu) ?? []).length, 10);
+  assert.equal((workflow.match(/grype-version: v0\.122\.0/gu) ?? []).length, 10);
   assert.equal((workflow.match(/only-fixed: false/gu) ?? []).length, 10);
   assert.match(workflow, /name: Enforce candidate vulnerability gate/u);
   assert.match(workflow, /steps\.validate_scan_runtime\.outcome != 'success'/u);
   assert.match(workflow, /name: oci-validation-vulnerability-\$\{\{ github\.sha \}\}/u);
   assert.match(workflow, /name: Enforce vulnerability gate/u);
   assert.match(workflow, /steps\.scan_runtime\.outcome != 'success'/u);
+  assert.equal((workflow.match(/node scripts\/openssl-backport-vex\.mjs/gu) ?? []).length, 2);
+  for (const component of ["runtime", "web", "worker", "sandbox", "executor"]) {
+    assert.ok(workflow.includes(`vex: validation-vulnerability/backport/${component}.vex.json`));
+    assert.ok(workflow.includes(`vex: supply-chain/backport/${component}.vex.json`));
+  }
 });
 
 test("curl and libcurl use the fixed package version in every git-capable runtime", () => {

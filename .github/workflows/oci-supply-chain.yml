@@ -51,6 +51,12 @@ jobs:
       - name: Prepare validation evidence directory
         run: mkdir -p validation-vulnerability
 
+      - name: Verify installed OpenSSL backports and prepare candidate VEX
+        run: |
+          node scripts/openssl-backport-vex.mjs \
+            --images '{"runtime":"local/pi-coding-agent:1.0.0","web":"local/pigo-web:ci","worker":"local/pigo-worker:ci","sandbox":"local/pigo-sandbox:ci","executor":"local/pigo-executor:ci"}' \
+            --output-dir validation-vulnerability/backport
+
       - name: Scan candidate runtime for high and critical vulnerabilities
         id: validate_scan_runtime
         continue-on-error: true
@@ -58,10 +64,12 @@ jobs:
         with:
           image: local/pi-coding-agent:1.0.0
           fail-build: true
+          grype-version: v0.122.0
           severity-cutoff: high
           only-fixed: false
           output-format: json
           output-file: validation-vulnerability/runtime.json
+          vex: validation-vulnerability/backport/runtime.vex.json
 
       - name: Scan candidate web for high and critical vulnerabilities
         id: validate_scan_web
@@ -70,10 +78,12 @@ jobs:
         with:
           image: local/pigo-web:ci
           fail-build: true
+          grype-version: v0.122.0
           severity-cutoff: high
           only-fixed: false
           output-format: json
           output-file: validation-vulnerability/web.json
+          vex: validation-vulnerability/backport/web.vex.json
 
       - name: Scan candidate worker for high and critical vulnerabilities
         id: validate_scan_worker
@@ -82,10 +92,12 @@ jobs:
         with:
           image: local/pigo-worker:ci
           fail-build: true
+          grype-version: v0.122.0
           severity-cutoff: high
           only-fixed: false
           output-format: json
           output-file: validation-vulnerability/worker.json
+          vex: validation-vulnerability/backport/worker.vex.json
 
       - name: Scan candidate sandbox for high and critical vulnerabilities
         id: validate_scan_sandbox
@@ -94,10 +106,12 @@ jobs:
         with:
           image: local/pigo-sandbox:ci
           fail-build: true
+          grype-version: v0.122.0
           severity-cutoff: high
           only-fixed: false
           output-format: json
           output-file: validation-vulnerability/sandbox.json
+          vex: validation-vulnerability/backport/sandbox.vex.json
 
       - name: Scan candidate executor for high and critical vulnerabilities
         id: validate_scan_executor
@@ -106,10 +120,12 @@ jobs:
         with:
           image: local/pigo-executor:ci
           fail-build: true
+          grype-version: v0.122.0
           severity-cutoff: high
           only-fixed: false
           output-format: json
           output-file: validation-vulnerability/executor.json
+          vex: validation-vulnerability/backport/executor.vex.json
 
       - name: Upload candidate vulnerability evidence
         if: always()
@@ -267,6 +283,12 @@ jobs:
           upload-artifact: false
           upload-release-assets: false
 
+      - name: Verify installed OpenSSL backports and prepare release VEX
+        run: |
+          node scripts/openssl-backport-vex.mjs \
+            --manifest supply-chain/manifest.json \
+            --output-dir supply-chain/backport
+
       - name: Scan runtime for high and critical vulnerabilities
         id: scan_runtime
         continue-on-error: true
@@ -274,10 +296,12 @@ jobs:
         with:
           sbom: supply-chain/sbom/runtime.spdx.json
           fail-build: true
+          grype-version: v0.122.0
           severity-cutoff: high
           only-fixed: false
           output-format: json
           output-file: supply-chain/vulnerability/runtime.json
+          vex: supply-chain/backport/runtime.vex.json
 
       - name: Scan web for high and critical vulnerabilities
         id: scan_web
@@ -286,10 +310,12 @@ jobs:
         with:
           sbom: supply-chain/sbom/web.spdx.json
           fail-build: true
+          grype-version: v0.122.0
           severity-cutoff: high
           only-fixed: false
           output-format: json
           output-file: supply-chain/vulnerability/web.json
+          vex: supply-chain/backport/web.vex.json
 
       - name: Scan worker for high and critical vulnerabilities
         id: scan_worker
@@ -298,10 +324,12 @@ jobs:
         with:
           sbom: supply-chain/sbom/worker.spdx.json
           fail-build: true
+          grype-version: v0.122.0
           severity-cutoff: high
           only-fixed: false
           output-format: json
           output-file: supply-chain/vulnerability/worker.json
+          vex: supply-chain/backport/worker.vex.json
 
       - name: Scan sandbox for high and critical vulnerabilities
         id: scan_sandbox
@@ -310,10 +338,12 @@ jobs:
         with:
           sbom: supply-chain/sbom/sandbox.spdx.json
           fail-build: true
+          grype-version: v0.122.0
           severity-cutoff: high
           only-fixed: false
           output-format: json
           output-file: supply-chain/vulnerability/sandbox.json
+          vex: supply-chain/backport/sandbox.vex.json
 
       - name: Scan executor for high and critical vulnerabilities
         id: scan_executor
@@ -322,10 +352,12 @@ jobs:
         with:
           sbom: supply-chain/sbom/executor.spdx.json
           fail-build: true
+          grype-version: v0.122.0
           severity-cutoff: high
           only-fixed: false
           output-format: json
           output-file: supply-chain/vulnerability/executor.json
+          vex: supply-chain/backport/executor.vex.json
 
       - name: Enforce vulnerability gate
         if: ${{ steps.scan_runtime.outcome != 'success' || steps.scan_web.outcome != 'success' || steps.scan_worker.outcome != 'success' || steps.scan_sandbox.outcome != 'success' || steps.scan_executor.outcome != 'success' }}
