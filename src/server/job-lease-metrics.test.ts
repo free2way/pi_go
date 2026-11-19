@@ -31,7 +31,7 @@ function fixture() {
   registerOperationalMetrics(app, { db, pool: { totalCount: 0, idleCount: 0, waitingCount: 0 }, version: "fixture" });
   const post = (path: string, payload: object = { workerId: "private-worker-id" }) => app.inject({ method: "POST", url: "/api/internal/" + path, headers: { authorization: `Bearer ${token}` }, payload });
   const scrape = async () => (await app.inject({ url: "/api/internal/metrics", headers: { authorization: `Bearer ${readToken}` } })).body;
-  return { app, queue, job, post, scrape, token, readToken };
+  return { app, queue, job, run, post, scrape, token, readToken };
 }
 
 it("observes actual route outcomes, excludes unauthenticated requests and keeps Web instances separate", async () => {
@@ -68,4 +68,18 @@ it("counts fenced callback lease loss while preserving rejection and idempotent 
   expect(text).toMatch(/operation="callback",outcome="success",[^\n]+\} 1/);
   expect(text).toMatch(/pigo_job_lease_lost_total\{operation="callback",[^\n]+\} 1/);
   expect(text).not.toContain("DUMMY_PRIVATE");
+});
+
+it("acknowledges an already persisted cancellation without applying late callbacks", async () => {
+  const f = fixture();
+  f.run.state = "cancelled";
+  const response = await f.post("runs/private-run-id/update", { jobId: f.job.id, workerId: "private-worker", deliveryId: "private-delivery", patch: { state: "cancelled" } });
+  expect(response.statusCode).toBe(409);
+  expect(response.json().code).toBe("RUN_ALREADY_CANCELLED");
+  expect(f.queue.applyDelivery).not.toHaveBeenCalled();
+  f.run.state = "completed";
+  const completed = await f.post("runs/private-run-id/update", { patch: { state: "cancelled" } });
+  expect(completed.statusCode).toBe(409);
+  expect(completed.json().code).toBeUndefined();
+  expect(f.queue.applyDelivery).not.toHaveBeenCalled();
 });

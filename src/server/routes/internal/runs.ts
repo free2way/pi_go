@@ -25,7 +25,8 @@ export function registerInternalRunRoutes(app: FastifyInstance, deps: {
     // Chat/状态抑制：终态运行（例如用户刚取消）不再接受任何 worker 内部更新，
     // 否则迟到的 chat.message 会追加在 run.cancelled 之后并覆盖终态。
     const rejection = internalUpdateRejection(run);
-    if (rejection) return reply.code(409).send({ error: rejection });
+    if (rejection) return reply.code(409).send({ error: rejection,
+      ...(run.state === "cancelled" ? { code: "RUN_ALREADY_CANCELLED" } : {}) });
     const { patch, event, deliveryId, jobId, workerId } = parsed.data;
     if ((jobId && !workerId) || (!jobId && workerId) || ((jobId || workerId) && !deliveryId)) {
       return reply.code(400).send({ error: "jobId, workerId and deliveryId must be supplied together" });

@@ -232,14 +232,16 @@ export async function postUpdate(runId: string, input: {
   }
   if (!response.ok) {
     const body = await response.text().catch(() => "");
+    let code: unknown;
+    try { code = JSON.parse(body).code; } catch { /* An invalid response is a transport error. */ }
     if (jobId) {
-      let code: unknown;
-      try { code = JSON.parse(body).code; } catch { /* An invalid response is a transport error. */ }
       workerLeaseMetrics.observe("callback", response.status === 409 && code === "JOB_LEASE_LOST" ? "conflict" : "error");
     }
     // Keep the full in-memory diagnostic until the consuming job-aware sink
     // redacts it. Truncating here can expose an unmatchable credential prefix.
-    throw new Error(`Callback failed: ${response.status} ${body}`);
+    throw Object.assign(new Error(`Callback failed: ${response.status} ${body}`), {
+      code: response.status === 409 && code === "RUN_ALREADY_CANCELLED" ? code : undefined,
+    });
   }
   if (jobId) workerLeaseMetrics.observe("callback", "success");
 }
