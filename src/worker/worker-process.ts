@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
-import { type CommandResult } from "./checks.js";
+import { throwIfCancelled, type CommandResult } from "./checks.js";
 import { runHardenedGit } from "./git-hardening.js";
 import { awaitSandboxExit, buildContainerSpec, hostPathFor, withSandboxStateDirectory, SANDBOX_KILLED_EXIT_CODE } from "./sandbox.js";
 import { captureSnapshotHash } from "./snapshot-hash.js";
@@ -68,6 +68,7 @@ interface SandboxRunInput {
 
 /** Runs one invocation inside its own container and always cleans it up. */
 export async function runInSandbox(input: SandboxRunInput): Promise<CommandResult> {
+  throwIfCancelled(input.signal);
   return withSandboxStateDirectory({
     worktree: input.worktree,
     statePath: input.statePath,
@@ -76,6 +77,7 @@ export async function runInSandbox(input: SandboxRunInput): Promise<CommandResul
 }
 
 async function runInSandboxWithState(input: SandboxRunInput, runStateDir: string): Promise<CommandResult> {
+  throwIfCancelled(input.signal);
   const spec = buildContainerSpec({
     image: imageForSandbox,
     user: sandboxUser,
@@ -117,7 +119,13 @@ async function runInSandboxWithState(input: SandboxRunInput, runStateDir: string
   const onAbort = () => { void docker.killContainer(containerId).catch(() => undefined); };
   try {
     input.signal.addEventListener("abort", onAbort, { once: true });
+    // Cancellation can arrive while state or Docker creation is in flight.
+    // A listener registered after abort never fires; never start that command.
+    throwIfCancelled(input.signal);
     await docker.startContainer(containerId);
+    // An early kill may race start and fail because the container was not yet
+    // running. Force removal in finally still stops the newly started process.
+    throwIfCancelled(input.signal);
     // Logs are read after the container starts: Docker only exposes the full
     // log of a started container, and `follow=1` then streams to completion.
     const maxSandboxOutput = 256_000;
