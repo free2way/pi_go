@@ -5,6 +5,7 @@ import type { Run } from "../../../shared/types.js";
 import { PostgresRunStore, type JobRecord } from "../../run-store-pg.js";
 import type { RunStoreLike } from "../../store.js";
 import type { ModelCredentials } from "../../credential-vault.js";
+import { jobLeaseMetricsFor } from "../../job-lease-metrics.js";
 
 const checkpointSchema = z.object({
   stageKey: z.string().trim().min(1).max(120),
@@ -20,6 +21,7 @@ export function registerInternalJobRoutes(app: FastifyInstance, deps: {
   jobCredentialsFor: (run: Run) => Promise<ModelCredentials | undefined>;
 }) {
   const { store, jobQueue, staleAfterMs, jobCredentialsFor } = deps;
+  const metrics = jobLeaseMetricsFor(app);
 
   async function workerPayloadsForJobs(
     entries: Array<{ job: JobRecord; wasStarted: boolean }>,
@@ -96,14 +98,14 @@ export function registerInternalJobRoutes(app: FastifyInstance, deps: {
       capacity: z.number().int().min(1).max(4),
     }).strict().safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: "Invalid lease request", details: parsed.error.issues });
-    const leased = await jobQueue.leaseJobs({ ...parsed.data, staleAfterMs: staleAfterMs });
+    const leased = await metrics.track("lease", () => jobQueue.leaseJobs({ ...parsed.data, staleAfterMs }), rows => rows.length ? "success" : "empty");
     return { jobs: await workerPayloadsForJobs(leased, parsed.data.workerId, true) };
   });
 
   app.post<{ Params: { id: string } }>("/api/internal/jobs/:id/claim", async (request, reply) => {
     if (!jobQueue) return reply.code(503).send({ error: "Job queue unavailable" });
     const workerId = String((request.body as { workerId?: unknown })?.workerId ?? "unknown").slice(0, 120);
-    const job = await jobQueue.claimJob(request.params.id, workerId, staleAfterMs);
+    const job = await metrics.track("claim", () => jobQueue.claimJob(request.params.id, workerId, staleAfterMs), value => value ? "success" : "conflict");
     if (!job) return reply.code(409).send({ error: "Job lease lost", code: "JOB_LEASE_LOST" });
     return { ok: true, job };
   });
@@ -111,7 +113,7 @@ export function registerInternalJobRoutes(app: FastifyInstance, deps: {
   app.post<{ Params: { id: string } }>("/api/internal/jobs/:id/heartbeat", async (request, reply) => {
     if (!jobQueue) return reply.code(503).send({ error: "Job queue unavailable" });
     const workerId = String((request.body as { workerId?: unknown })?.workerId ?? "unknown").slice(0, 120);
-    if (!await jobQueue.heartbeatJob(request.params.id, workerId)) {
+    if (!await metrics.track("heartbeat", () => jobQueue.heartbeatJob(request.params.id, workerId), value => value ? "success" : "conflict")) {
       return reply.code(409).send({ error: "Job lease lost", code: "JOB_LEASE_LOST" });
     }
     return { ok: true };
@@ -121,7 +123,7 @@ export function registerInternalJobRoutes(app: FastifyInstance, deps: {
     if (!jobQueue) return reply.code(503).send({ error: "Job queue unavailable" });
     const body = (request.body ?? {}) as { workerId?: unknown; reason?: unknown };
     const workerId = String(body.workerId ?? "unknown").slice(0, 120);
-    const released = await jobQueue.releaseReservation(request.params.id, workerId, String(body.reason ?? "Worker deferred job").slice(0, 500));
+    const released = await metrics.track("release", () => jobQueue.releaseReservation(request.params.id, workerId, String(body.reason ?? "Worker deferred job").slice(0, 500)), value => value ? "success" : "conflict");
     if (!released) return reply.code(409).send({ error: "Job lease lost", code: "JOB_LEASE_LOST" });
     return { ok: true };
   });
@@ -131,7 +133,7 @@ export function registerInternalJobRoutes(app: FastifyInstance, deps: {
     const body = (request.body ?? {}) as { workerId?: unknown; state?: unknown; error?: unknown };
     const workerId = String(body.workerId ?? "unknown").slice(0, 120);
     const state = body.state === "failed" || body.state === "cancelled" ? body.state : "done";
-    const result = await jobQueue.finishJob(request.params.id, workerId, state, body.error === undefined ? undefined : String(body.error).slice(0, 500));
+    const result = await metrics.track("finish", () => jobQueue.finishJob(request.params.id, workerId, state, body.error === undefined ? undefined : String(body.error).slice(0, 500)), value => value.ok ? "success" : "conflict");
     if (!result.ok) return reply.code(409).send({ error: "Job lease lost", code: "JOB_LEASE_LOST" });
     return { ok: true, idempotent: result.idempotent };
   });

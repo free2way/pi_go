@@ -3,6 +3,8 @@ import { timingSafeEqual } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { gauge, METRICS_CONTENT_TYPE, metricsAuthorized, operationalLabels, processMetrics } from "../shared/operational-metrics.js";
+import { storageStateMetrics } from "../shared/job-lease-metrics.js";
+import { workerLeaseMetrics } from "./job-lease-metrics.js";
 import { apiKeyEnvName } from "./provider-errors.js";
 import { PiInputTransportError } from "./pi-cli-input.js";
 import { WorkspacePathError, sanitizeRelativePath } from "./workspace-paths.js";
@@ -81,8 +83,9 @@ export function createWorkerServer({ dispatchJob, pendingJobWake }: Pick<WorkerJ
       if (request.method === "GET" && url.pathname === "/metrics") {
         if (!metricsAuthorized(request.headers.authorization, process.env.PI_METRICS_TOKEN?.trim() || "", internalToken)) return json(response, 401, { error: "Unauthorized" });
         const labels = operationalLabels("pigo-worker", process.env.PI_WORKER_VERSION?.trim() || "unknown");
+        const storage = await storageStatus();
         response.writeHead(200, { "Content-Type": METRICS_CONTENT_TYPE, "Cache-Control": "no-store" });
-        return response.end(processMetrics(labels)
+        return response.end(processMetrics(labels) + workerLeaseMetrics.render(labels) + storageStateMetrics(labels, storage.state)
           + gauge("pigo_worker_active_jobs", "Currently admitted Worker jobs.", labels, [{ value: active.size }])
           + gauge("pigo_worker_capacity", "Configured maximum concurrent jobs.", labels, [{ value: maxActiveJobs }]));
       }

@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import type { Db } from "./db.js";
+import { jobLeaseMetricsFor } from "./job-lease-metrics.js";
 import { ApiMetrics, gauge, METRICS_CONTENT_TYPE, operationalLabels, processMetrics, type MetricSample } from "../shared/operational-metrics.js";
 
 const GROUPS = {
@@ -84,7 +85,7 @@ export function registerOperationalMetrics(app: FastifyInstance, options: {
   app.get("/api/internal/metrics", { config: { internalAuth: "metrics" } }, async (request, reply) => {
     reply.header("Cache-Control", "no-store");
     const snapshot = await collect();
-    let output = processMetrics(labels) + api.render(labels)
+    let output = processMetrics(labels) + api.render(labels) + jobLeaseMetricsFor(app).render(labels)
       + gauge("pigo_database_up", "Successful bounded database aggregate observation; failure is not zero usage.", labels, [{ value: snapshot.values ? 1 : 0 }])
       + gauge("pigo_database_pool_connections", "Current database pool connections and waiters.", labels,
         ["total", "idle", "waiting"].map((state, i) => ({ value: [options.pool.totalCount, options.pool.idleCount, options.pool.waitingCount][i]!, labels: { state } })));

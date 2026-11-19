@@ -6,6 +6,7 @@ import { saveInternalRunArtifact } from "../../artifact-api.js";
 import { conflictReplyFor } from "../../request-errors.js";
 import type { PostgresRunStore } from "../../run-store-pg.js";
 import type { RunStoreLike } from "../../store.js";
+import { jobLeaseMetricsFor } from "../../job-lease-metrics.js";
 import { INTERNAL_ARTIFACT_BODY_LIMIT, internalArtifactSchema, internalUpdateSchema } from "./run-schemas.js";
 
 export function registerInternalRunRoutes(app: FastifyInstance, deps: {
@@ -33,13 +34,14 @@ export function registerInternalRunRoutes(app: FastifyInstance, deps: {
       if (deliveryId && jobQueue) {
         // AUD-15: patch + event + delivery record commit in one transaction, so a
         // duplicated internal call can neither double count nor rewind state.
-        const result = await jobQueue.applyDelivery({
+        const apply = () => jobQueue.applyDelivery({
           runId: run.id,
           deliveryId,
           patch: patch as Partial<Run> | undefined,
           event: event ? { ...event, runId: run.id, at: new Date().toISOString() } : undefined,
           ...(jobId && workerId ? { lease: { jobId, workerId } } : {}),
         });
+        const result = jobId && workerId ? await jobLeaseMetricsFor(app).track("callback", apply) : await apply();
         // AUD-16: the terminal callback carries the run diff; persist it in full.
         if (result.applied) await persistTerminalDiffArtifact(await readRun(store, run.id));
         if (result.applied) await reconcileStoryForRun(run.id);
