@@ -616,6 +616,12 @@ export async function executeJob(input: JobInput, controller: AbortController, a
         terminalRecorded = true;
         break;
       } catch (writeError) {
+        // The user cancellation may have committed before our callback. Keep
+        // its terminal state/event intact, but settle our still-fenced job.
+        if (cancelled && (writeError as { code?: unknown })?.code === "RUN_ALREADY_CANCELLED") {
+          terminalRecorded = true;
+          break;
+        }
         console.warn(`[store] terminal update failed (attempt ${attempt}): ${diagnosticMessage(writeError, Object.values(input.credentials))}`);
         if (attempt < 3) await sleep(1_000 * 2 ** (attempt - 1));
       }

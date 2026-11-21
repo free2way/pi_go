@@ -32,6 +32,10 @@ export function gauge(name: string, help: string, labels: MetricLabels, values: 
   return `# HELP ${name} ${help}\n# TYPE ${name} gauge\n` + values.map(v => sample(name, v.value, { ...v.labels, ...labels })).join("");
 }
 
+export function counter(name: string, help: string, labels: MetricLabels, values: MetricSample[]): string {
+  return `# HELP ${name} ${help}\n# TYPE ${name} counter\n` + values.map(v => sample(name, v.value, { ...v.labels, ...labels })).join("");
+}
+
 export function processMetrics(labels: MetricLabels): string {
   return gauge("pigo_process_uptime_seconds", "Process uptime; resets on restart.", labels, [{ value: process.uptime() }])
     + gauge("pigo_process_resident_memory_bytes", "Process resident memory.", labels, [{ value: process.memoryUsage().rss }]);

@@ -372,7 +372,7 @@ export function createGateway(config) {
       const route = classifyGatewayRequest(request.method, request.url, config.apiVersion);
       if (route.kind === "health") return json(reply, 200, { status: "ok", service: "pigo-sandbox-gateway" });
       if (!authorizeGateway(request.headers, config.token)) return json(reply, 401, { error: "Unauthorized" });
-      if (route.kind === "not_found") return json(reply, 404, { error: "Not found" });
+      if (route.kind === "not_found") return json(reply, 403, { error: "Operation is outside the sandbox allowlist" });
       const { url } = route;
 
       if (route.kind === "ping") {
@@ -395,7 +395,8 @@ export function createGateway(config) {
         const raw = await readBody(request);
         let spec;
         try { spec = JSON.parse(raw.toString("utf8")); } catch { return json(reply, 400, { error: "Invalid JSON" }); }
-        await validateSandboxSpec(spec, config.policy);
+        try { await validateSandboxSpec(spec, config.policy); }
+        catch { return json(reply, 403, { error: "Container specification is outside the sandbox policy" }); }
         const created = await dockerJson(config, "POST", `${prefix}/containers/create?name=${encodeURIComponent(name)}`, spec);
         if (!CONTAINER_ID.test(created.Id ?? "")) throw new Error("Docker returned an invalid container id");
         managed.add(created.Id);
@@ -404,7 +405,7 @@ export function createGateway(config) {
 
       if (route.kind !== "container") return json(reply, 404, { error: "Managed sandbox container not found" });
       if (!managed.has(route.id)) {
-        if (!await recoverManagedSandbox(config, route.id)) return json(reply, 404, { error: "Managed sandbox container not found" });
+        if (!await recoverManagedSandbox(config, route.id)) return json(reply, 403, { error: "Container is outside the sandbox policy" });
         managed.add(route.id);
       }
       const { id, action } = route;
@@ -429,7 +430,7 @@ export function createGateway(config) {
         managed.delete(id);
         reply.writeHead(204, { "Cache-Control": "no-store" }); return reply.end();
       }
-      return json(reply, 405, { error: "Operation is not allowed" });
+      return json(reply, 403, { error: "Operation is outside the sandbox allowlist" });
     } catch (error) {
       const status = Number.isInteger(error?.statusCode) ? error.statusCode : 400;
       return json(reply, status, { error: status >= 500 ? "Sandbox gateway failed" : error.message });

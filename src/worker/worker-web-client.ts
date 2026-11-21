@@ -12,6 +12,8 @@ import { createReviewTriageTrigger, jevReviewTriageEnabled } from "./decision-tr
 import { createAuditRetentionTrigger } from "./audit-retention.js";
 import { callbackBase, internalToken, workerId, diagnosticMessage, workspaceRoot } from "./worker-runtime.js";
 import type { JobInput } from "./worker-runtime.js";
+import type { LeaseOperation } from "../shared/job-lease-metrics.js";
+import { workerLeaseMetrics } from "./job-lease-metrics.js";
 
 /**
  * Internal control-plane call. `timeoutMs` bounds this hop only; it defaults to
@@ -44,12 +46,17 @@ const checkpointClient: CheckpointClient = {
   },
 };
 
+async function leaseRequest(operation: LeaseOperation, path: string, init: RequestInit) {
+  return workerLeaseMetrics.track(operation, () => internalRequest(path, init),
+    value => operation === "lease" && Array.isArray(value.jobs) && value.jobs.length === 0 ? "empty" : "success");
+}
+
 export const jobApi = {
-  claim: (jobId: string) => internalRequest(`/jobs/${encodeURIComponent(jobId)}/claim`, { method: "POST", body: JSON.stringify({ workerId }) }),
-  heartbeat: (jobId: string) => internalRequest(`/jobs/${encodeURIComponent(jobId)}/heartbeat`, { method: "POST", body: JSON.stringify({ workerId }) }),
-  finish: (jobId: string, state: string, error?: string) => internalRequest(`/jobs/${encodeURIComponent(jobId)}/finish`, { method: "POST", body: JSON.stringify({ workerId, state, error }) }),
-  release: (jobId: string, reason: string) => internalRequest(`/jobs/${encodeURIComponent(jobId)}/release`, { method: "POST", body: JSON.stringify({ workerId, reason }) }),
-  lease: async (capacity: number) => (await internalRequest("/jobs/lease", { method: "POST", body: JSON.stringify({ workerId, capacity }) })).jobs as PendingJob[],
+  claim: (jobId: string) => leaseRequest("claim", `/jobs/${encodeURIComponent(jobId)}/claim`, { method: "POST", body: JSON.stringify({ workerId }) }),
+  heartbeat: (jobId: string) => leaseRequest("heartbeat", `/jobs/${encodeURIComponent(jobId)}/heartbeat`, { method: "POST", body: JSON.stringify({ workerId }) }),
+  finish: (jobId: string, state: string, error?: string) => leaseRequest("finish", `/jobs/${encodeURIComponent(jobId)}/finish`, { method: "POST", body: JSON.stringify({ workerId, state, error }) }),
+  release: (jobId: string, reason: string) => leaseRequest("release", `/jobs/${encodeURIComponent(jobId)}/release`, { method: "POST", body: JSON.stringify({ workerId, reason }) }),
+  lease: async (capacity: number) => (await leaseRequest("lease", "/jobs/lease", { method: "POST", body: JSON.stringify({ workerId, capacity }) })).jobs as PendingJob[],
 };
 
 /**
@@ -220,14 +227,23 @@ export async function postUpdate(runId: string, input: {
     });
   } catch (error) {
     // AT-REL-007: an unreachable store is a storage failure, never a success.
+    if (jobId) workerLeaseMetrics.observe("callback", "error");
     throw new Error(`Callback failed: ${(error as Error).message || "store unreachable"}`);
   }
   if (!response.ok) {
     const body = await response.text().catch(() => "");
+    let code: unknown;
+    try { code = JSON.parse(body).code; } catch { /* An invalid response is a transport error. */ }
+    if (jobId) {
+      workerLeaseMetrics.observe("callback", response.status === 409 && code === "JOB_LEASE_LOST" ? "conflict" : "error");
+    }
     // Keep the full in-memory diagnostic until the consuming job-aware sink
     // redacts it. Truncating here can expose an unmatchable credential prefix.
-    throw new Error(`Callback failed: ${response.status} ${body}`);
+    throw Object.assign(new Error(`Callback failed: ${response.status} ${body}`), {
+      code: response.status === 409 && code === "RUN_ALREADY_CANCELLED" ? code : undefined,
+    });
   }
+  if (jobId) workerLeaseMetrics.observe("callback", "success");
 }
 
 export async function update(run: Run, state: RunState, source: RunEvent["source"], type: string, message: string, patch: Partial<Run> = {}, options: { diffArtifact?: DiffArtifactRef; meta?: Record<string, unknown> } = {}) {

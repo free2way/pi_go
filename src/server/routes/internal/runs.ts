@@ -6,6 +6,7 @@ import { saveInternalRunArtifact } from "../../artifact-api.js";
 import { conflictReplyFor } from "../../request-errors.js";
 import type { PostgresRunStore } from "../../run-store-pg.js";
 import type { RunStoreLike } from "../../store.js";
+import { jobLeaseMetricsFor } from "../../job-lease-metrics.js";
 import { INTERNAL_ARTIFACT_BODY_LIMIT, internalArtifactSchema, internalUpdateSchema } from "./run-schemas.js";
 
 export function registerInternalRunRoutes(app: FastifyInstance, deps: {
@@ -24,7 +25,8 @@ export function registerInternalRunRoutes(app: FastifyInstance, deps: {
     // Chat/状态抑制：终态运行（例如用户刚取消）不再接受任何 worker 内部更新，
     // 否则迟到的 chat.message 会追加在 run.cancelled 之后并覆盖终态。
     const rejection = internalUpdateRejection(run);
-    if (rejection) return reply.code(409).send({ error: rejection });
+    if (rejection) return reply.code(409).send({ error: rejection,
+      ...(run.state === "cancelled" ? { code: "RUN_ALREADY_CANCELLED" } : {}) });
     const { patch, event, deliveryId, jobId, workerId } = parsed.data;
     if ((jobId && !workerId) || (!jobId && workerId) || ((jobId || workerId) && !deliveryId)) {
       return reply.code(400).send({ error: "jobId, workerId and deliveryId must be supplied together" });
@@ -33,13 +35,14 @@ export function registerInternalRunRoutes(app: FastifyInstance, deps: {
       if (deliveryId && jobQueue) {
         // AUD-15: patch + event + delivery record commit in one transaction, so a
         // duplicated internal call can neither double count nor rewind state.
-        const result = await jobQueue.applyDelivery({
+        const apply = () => jobQueue.applyDelivery({
           runId: run.id,
           deliveryId,
           patch: patch as Partial<Run> | undefined,
           event: event ? { ...event, runId: run.id, at: new Date().toISOString() } : undefined,
           ...(jobId && workerId ? { lease: { jobId, workerId } } : {}),
         });
+        const result = jobId && workerId ? await jobLeaseMetricsFor(app).track("callback", apply) : await apply();
         // AUD-16: the terminal callback carries the run diff; persist it in full.
         if (result.applied) await persistTerminalDiffArtifact(await readRun(store, run.id));
         if (result.applied) await reconcileStoryForRun(run.id);
