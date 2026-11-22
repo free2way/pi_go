@@ -61,11 +61,12 @@ try:
         raise ValueError('unsafe directory')
     manifest = json.loads((root / 'manifest.json').read_text())
     database = manifest['database']
-    required = {'users', 'identities', 'workspaces', 'runs', 'events', 'agents',
-                'checks', 'findings', 'artifacts', 'checkpoints', 'jobs', 'digest'}
-    if not isinstance(database, dict) or set(database) != required:
+    legacy = {'users', 'identities', 'workspaces', 'runs', 'events', 'agents',
+              'checks', 'findings', 'artifacts', 'checkpoints', 'jobs', 'digest'}
+    current = legacy | {'profiles', 'teams', 'teamMembers'}
+    if not isinstance(database, dict) or set(database) not in (legacy, current):
         raise ValueError('database evidence is incomplete')
-    for key in required - {'digest'}:
+    for key in set(database) - {'digest'}:
         if type(database[key]) is not int or database[key] < 0:
             raise ValueError('database counts are invalid')
     if database['digest'] is not None and not re.fullmatch(r'[0-9a-f]{32}', str(database['digest'])):
@@ -91,6 +92,7 @@ except Exception:
 PY
 )"
 EXPECTED="$(python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["database"], sort_keys=True))' <<< "$VERIFIED_INPUT")"
+HAS_TEAM_COUNTS="$(python3 -c 'import json,sys; print("yes" if "profiles" in json.load(sys.stdin)["database"] else "no")' <<< "$VERIFIED_INPUT")"
 
 # A receipt is written only after data validation AND successful scratch cleanup.
 # Bind the exact pre-restore bytes so later retention cannot trust a stale drill.
@@ -160,13 +162,17 @@ created=1
 docker exec -i "$PG_CONTAINER" pg_restore -U "$PG_USER" -d "$SCRATCH_DB" --no-owner --exit-on-error < "$TARGET/database.dump"
 echo "restored into $SCRATCH_DB"
 
-RESTORED="$(docker exec "$PG_CONTAINER" psql -X -v ON_ERROR_STOP=1 -U "$PG_USER" -d "$SCRATCH_DB" -tAc \
-  "select json_build_object('users', (select count(*) from users), 'identities', (select count(*) from user_identities),
+COUNTS_SQL="select json_build_object('users', (select count(*) from users), 'identities', (select count(*) from user_identities),
     'workspaces', (select count(*) from workspaces), 'runs', (select count(*) from runs),
     'events', (select count(*) from run_events), 'agents', (select count(*) from run_agents),
     'checks', (select count(*) from run_checks), 'findings', (select count(*) from run_findings),
     'artifacts', (select count(*) from run_artifacts), 'checkpoints', (select count(*) from run_checkpoints),
-    'jobs', (select count(*) from jobs), 'digest', (select md5(string_agg(id || ':' || last_seq || ':' || md5(document_json), ',' order by id)) from runs))")"
+    'jobs', (select count(*) from jobs)"
+if [ "$HAS_TEAM_COUNTS" = "yes" ]; then
+  COUNTS_SQL+=", 'profiles', (select count(*) from agent_profiles), 'teams', (select count(*) from agent_teams), 'teamMembers', (select count(*) from agent_team_members)"
+fi
+COUNTS_SQL+=", 'digest', (select md5(string_agg(id || ':' || last_seq || ':' || md5(document_json), ',' order by id)) from runs))"
+RESTORED="$(docker exec "$PG_CONTAINER" psql -X -v ON_ERROR_STOP=1 -U "$PG_USER" -d "$SCRATCH_DB" -tAc "$COUNTS_SQL")"
 
 ACTUAL="$(python3 -c "import json,sys; print(json.dumps(json.loads(sys.stdin.read()), sort_keys=True))" <<< "$RESTORED")"
 

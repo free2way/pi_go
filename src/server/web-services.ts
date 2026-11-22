@@ -30,6 +30,7 @@ import { buildAcceptanceSnapshot } from "./acceptance.js";
 import { planPostMergeDeploy } from "./run-merge.js";
 import { resolveMergeRequestConfig, selectPatch, type PatchSelection } from "./run-patch.js";
 import { AgileService } from "./agile.js";
+import { AgentTeamService } from "./agent-teams.js";
 import compress from "@fastify/compress";
 import { cacheControlFor } from "./static-cache.js";
 import type { RunStoreLike } from "./store.js";
@@ -195,6 +196,7 @@ export async function createWebServices() {
     (actorId) => sourceExportCredentials(actorId, vault, (id) => identities.legacyOwnerFor(id)),
   );
   const agile = new AgileService(db);
+  const agentTeams = new AgentTeamService(db);
   // Open registration means this cache can no longer be an unbounded process-wide
   // Map. The TTL also lets a verified Clerk email change flow back through the
   // identity service instead of pinning the first observed address until restart.
@@ -501,7 +503,7 @@ export async function createWebServices() {
 
   return {
     JOB_STALE_MS, ARTIFACT_DOWNLOAD_MAX_BYTES, PIPELINE_VERSION, TERMINAL_RUN_STATES, acceptanceSnapshotFor,
-    activeReleaseTokens, agile, alerts, app, auth, credentialFingerprint, credentialWrites, dataFile,
+    activeReleaseTokens, agile, agentTeams, alerts, app, auth, credentialFingerprint, credentialWrites, dataFile,
     db, demoMode, effectiveReleaseConfig, hasVaultDecisionKey, host, identities, internalToken,
     jobQueue, mergeRequestConfig, modelCatalog, modelDefaults, ownerKeysFor,
     persistTerminalDiffArtifact, piAssistantQuestions, pingDatabase, pool, port, providerProbe,

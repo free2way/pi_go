@@ -9,7 +9,8 @@ import { fileURLToPath } from "node:url";
 
 const script = fileURLToPath(new URL("../deploy/docker/restore-verify.sh", import.meta.url));
 const counts = { users: 1, identities: 1, workspaces: 1, runs: 1, events: 2,
-  agents: 1, checks: 1, findings: 0, artifacts: 0, checkpoints: 1, jobs: 1, digest: "a".repeat(32) };
+  agents: 1, checks: 1, findings: 0, artifacts: 0, checkpoints: 1, jobs: 1,
+  profiles: 2, teams: 1, teamMembers: 2, digest: "a".repeat(32) };
 const hash = (value) => createHash("sha256").update(value).digest("hex");
 
 function fixture(t) {
@@ -68,6 +69,19 @@ test("restore succeeds only in its newly created scratch database, including quo
   assert.equal(receipt.result, "verified");
   assert.equal(receipt.files["database.dump"], hash(readFileSync(join(backup, "database.dump"))));
   assert.equal(statSync(join(backup, "restore-verification.json")).mode & 0o777, 0o600);
+});
+
+test("restore remains compatible with manifests created before team tables", (t) => {
+  const { manifest, saveManifest, run } = fixture(t);
+  delete manifest.database.profiles;
+  delete manifest.database.teams;
+  delete manifest.database.teamMembers;
+  saveManifest();
+  const result = run({ RESTORE_TEST_COUNTS: JSON.stringify(manifest.database) });
+  assert.equal(result.status, 0, result.output);
+  const query = result.calls.find((args) => String(args.at(-1)).startsWith("select json_build_object"));
+  assert.ok(query);
+  assert.doesNotMatch(query.at(-1), /agent_profiles|agent_teams|agent_team_members/);
 });
 
 for (const name of ["pigo", "postgres", "template1", "pigo_restore_verify;DROP DATABASE pigo", "pigo_restore_verify_" + "x".repeat(64)]) {

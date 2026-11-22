@@ -27,10 +27,11 @@ import { createWebJobQueue } from "./web-job-queue.js";
 import { createRunAdmission } from "./run-admission.js";
 import { createRunHumanRoutes } from "./run-human-routes.js";
 import { registerRunReleaseRoutes } from "./run-release-routes.js";
+import { registerAgentTeamRoutes } from "./routes/agent-teams.js";
 
 const services = await createWebServices();
 const {
-  JOB_STALE_MS, activeReleaseTokens, agile, alerts, app, auth, db, host, identities, jobQueue, modelCatalog,
+  JOB_STALE_MS, activeReleaseTokens, agile, agentTeams, alerts, app, auth, db, host, identities, jobQueue, modelCatalog,
   ownerKeysFor, persistTerminalDiffArtifact, pingDatabase, pool, port, readArtifactCredentials,
   readVaultKey, store, workerRequest,
 } = services;
@@ -44,6 +45,7 @@ const { agileErrorReply, reconcileStoryForRun } = workspace;
 registerHealthRoutes(services);
 registerWebSettingsRoutes(services);
 registerSystemStatusRoutes(services);
+registerAgentTeamRoutes(app, { currentUser: (request) => auth.user(request), teams: agentTeams });
 workspace.registerWorkspaceApi();
 workspace.registerAgileApi(admission.startRealRun);
 registerRunReadRoutes(services);

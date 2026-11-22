@@ -598,6 +598,49 @@ export const databaseMigrations: Migration[] = [
     sql: `CREATE INDEX jobs_claimable_idx ON jobs (state, heartbeat_at, updated_at)
       WHERE state IN ('queued', 'claimed');`,
   },
+  {
+    // P3 Team / multi-role foundation. All structures are additive. Existing
+    // run documents remain valid because team_id is nullable and Run.teamId is
+    // optional; deleting a team never rewrites historical run snapshots.
+    id: 20,
+    name: "agent-profiles-teams-and-run-team",
+    sql: `
+      CREATE TABLE agent_profiles (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        role TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (owner_id, name)
+      );
+      CREATE INDEX idx_agent_profiles_owner ON agent_profiles(owner_id, updated_at);
+
+      CREATE TABLE agent_teams (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (owner_id, name)
+      );
+      CREATE INDEX idx_agent_teams_owner ON agent_teams(owner_id, updated_at);
+
+      CREATE TABLE agent_team_members (
+        team_id TEXT NOT NULL REFERENCES agent_teams(id) ON DELETE CASCADE,
+        profile_id TEXT NOT NULL REFERENCES agent_profiles(id),
+        ordinal INTEGER NOT NULL,
+        PRIMARY KEY (team_id, profile_id),
+        UNIQUE (team_id, ordinal)
+      );
+      CREATE INDEX idx_agent_team_members_profile ON agent_team_members(profile_id, team_id);
+
+      ALTER TABLE runs ADD COLUMN team_id TEXT;
+      CREATE INDEX idx_runs_team ON runs(team_id, updated_at);
+    `,
+  },
 ];
 
 export async function runMigrations(db: Db) {

@@ -146,6 +146,8 @@ export type WorkloadSize = "small" | "medium" | "large";
 
 export interface SubAgentTask {
   id: string;
+  /** Optional AgentProfile id. Omitted preserves the legacy role selection. */
+  assignee?: string;
   title: string;
   description: string;
   files: string[];
@@ -175,6 +177,8 @@ export interface Run {
   task: string;
   repository: string;
   workspaceId?: string;
+  /** P3: optional owner-scoped team selected for this run. Legacy runs omit it. */
+  teamId?: string;
   branch: string;
   mode: RunMode;
   state: RunState;
@@ -487,6 +491,8 @@ export interface CreateRunInput {
   task: string;
   repository: string;
   workspaceId?: string;
+  /** P3: optional owner-scoped team. Omitted preserves the legacy two-role flow. */
+  teamId?: string;
   mode: RunMode;
   checks?: string[];
   developerModel?: ModelSelection;
@@ -495,6 +501,28 @@ export interface CreateRunInput {
   idempotencyKey?: string;
   /** GAP-01: acceptance criteria captured with the task. */
   acceptanceCriteria?: string;
+}
+
+export type AgentProfileRole = "planner" | "developer" | "integrator" | "reviewer" | "custom";
+
+export interface AgentProfile {
+  id: string;
+  ownerId: string;
+  name: string;
+  role: AgentProfileRole;
+  provider: string;
+  model: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AgentTeam {
+  id: string;
+  ownerId: string;
+  name: string;
+  profiles: AgentProfile[];
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface ConfigStatus {

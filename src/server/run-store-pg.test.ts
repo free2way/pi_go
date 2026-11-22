@@ -25,6 +25,37 @@ function event(runId: string, type: string, message = type): Omit<RunEvent, "seq
 }
 
 describe("PostgresRunStore", () => {
+  it("keeps legacy runs readable without teamId and persists new team selections", async () => {
+    const db = await createTestDb();
+    const store = new PostgresRunStore(db);
+    await store.init();
+
+    const legacy = makeRun({ id: "run_legacy_team" });
+    delete legacy.teamId;
+    await store.createRun(legacy, event(legacy.id, "run.created"));
+    expect((await store.readRun(legacy.id))?.teamId).toBeUndefined();
+    expect((await db.query("SELECT team_id FROM runs WHERE id = $1", [legacy.id])).rows[0].team_id).toBeNull();
+
+    const current = makeRun({
+      id: "run_current_team",
+      teamId: "team_fixture",
+      plan: {
+        complexity: "small",
+        rationale: "team persistence",
+        strategy: "single",
+        tasks: [{ id: "implementation", assignee: "profile_fixture", title: "Implement", description: "d", files: [], dependsOn: [], status: "planned" }],
+      },
+    });
+    await store.createRun(current, event(current.id, "run.created"));
+    expect((await store.readRun(current.id))?.teamId).toBe("team_fixture");
+    expect((await store.readRun(current.id))?.plan?.tasks[0].assignee).toBe("profile_fixture");
+    expect((await db.query("SELECT team_id FROM runs WHERE id = $1", [current.id])).rows[0].team_id).toBe("team_fixture");
+
+    await store.updateRun(current.id, { teamId: "team_replacement" });
+    expect((await store.readRun(current.id))?.teamId).toBe("team_replacement");
+    expect((await db.query("SELECT team_id FROM runs WHERE id = $1", [current.id])).rows[0].team_id).toBe("team_replacement");
+  });
+
   it("rechecks a retried review before reviewing again without reopening terminal runs", async () => {
     const db = await createTestDb();
     const store = new PostgresRunStore(db);
@@ -98,6 +129,9 @@ describe("PostgresRunStore", () => {
     expect(counts.run_findings).toBe(1);
     expect(counts.run_artifacts).toBe(1);
     expect(counts.run_events).toBe(1);
+    expect(counts.agent_profiles).toBe(0);
+    expect(counts.agent_teams).toBe(0);
+    expect(counts.agent_team_members).toBe(0);
 
     const artifact = (await db.query("SELECT bytes, sha256 FROM run_artifacts WHERE run_id = $1", [run.id])).rows[0];
     expect(Number(artifact.bytes)).toBe(Buffer.byteLength(run.diff, "utf8"));
