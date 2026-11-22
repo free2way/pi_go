@@ -7,6 +7,7 @@ import {
 import type { JobInput } from "./worker-runtime.js";
 import { jobApi, activeJobLeases, postUpdate, workspaceLockHeartbeatMs } from "./worker-web-client.js";
 import type { PendingJob } from "./worker-web-client.js";
+import { clearModelCredentials, hasRequiredCredentials } from "../shared/run-roles.js";
 
 export function createWorkerJobs(executeJob: (input: JobInput, controller: AbortController) => Promise<void>) {
   /**
@@ -27,8 +28,7 @@ export function createWorkerJobs(executeJob: (input: JobInput, controller: Abort
         if ((error as { code?: unknown }).code === "JOB_LEASE_LOST" || (error as { status?: unknown }).status === 409) {
           active.delete(input.run.id);
           deferredJobs.delete(input.run.id);
-          input.credentials.developer = "";
-          input.credentials.reviewer = "";
+          clearModelCredentials(input.credentials);
           console.warn(`[jobs] refusing ${input.run.id}: durable lease is held by another worker`);
           return false;
         }
@@ -147,7 +147,7 @@ export function createWorkerJobs(executeJob: (input: JobInput, controller: Abort
     for (const job of jobs) {
       if (shuttingDown || active.size >= maxActiveJobs) break;
       if (active.has(job.run.id)) continue;
-      if (!job.credentials?.developer || !job.credentials?.reviewer) {
+      if (!hasRequiredCredentials(job.run, job.credentials)) {
         console.warn(`[jobs] skipping ${job.jobId}: credentials unavailable`);
         continue;
       }

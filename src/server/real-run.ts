@@ -11,6 +11,7 @@ export function baseRealRun(input: CreateRunInput, ownerId: string): Run {
     task: input.task,
     repository: input.repository,
     workspaceId: input.workspaceId,
+    ...(input.teamId ? { teamId: input.teamId } : {}),
     branch: `pigo/${id.replace("run_", "")}`,
     mode: "real",
     state: "queued",

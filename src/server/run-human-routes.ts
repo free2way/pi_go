@@ -2,6 +2,7 @@ import { readRuns, readRun } from "./store.js";
 import { type FastifyReply, type FastifyRequest } from "fastify";
 import { z } from "zod";
 import type { ReviewScope, Run } from "../shared/types.js";
+import { clearModelCredentials, resolveRunCredentials } from "../shared/run-roles.js";
 import { newId } from "./db.js";
 import { cleanupRunDirectory, keptRunStorageOutcome } from "./run-cleanup.js";
 import { type ApprovePlan, approveEventMeta, planApprove } from "./approve.js";
@@ -72,12 +73,11 @@ export function createRunHumanRoutes(
   ): Promise<ContinueResult> {
     if (run.mode !== "real") return { ok: false, status: 409, code: "RUN_NOT_RESUMABLE", error: "只有真实任务支持「继续开发」" };
     if (!realRunsEnabled || !internalToken) return { ok: false, status: 503, code: "REAL_RUNNER_NOT_AVAILABLE", error: "Real agent execution is disabled" };
-    const developerKey = vault.get(options.vaultKey, run.developer.provider);
-    const reviewerKey = vault.get(options.vaultKey, run.reviewer.provider);
-    if (!developerKey || !reviewerKey) {
+    const resolved = resolveRunCredentials(run, (provider) => vault.get(options.vaultKey, provider));
+    if (!resolved.ok) {
       return { ok: false, status: 403, code: "PERSONAL_CREDENTIALS_REQUIRED", error: "该任务所用模型的 provider 凭据缺失，请在「模型与凭据」页配置" };
     }
-    const credentials = { developer: developerKey, reviewer: reviewerKey };
+    const credentials = resolved.credentials;
 
     const now = new Date().toISOString();
     const round = run.round + 1;
@@ -120,13 +120,11 @@ export function createRunHumanRoutes(
 
     try {
       await dispatchJob(updated, run.checks.map((check) => check.command), { resume: { instruction: options.note } }, credentials);
-      credentials.developer = "";
-      credentials.reviewer = "";
+      clearModelCredentials(credentials);
       return { ok: true, run: await readRun(store, run.id) ?? updated };
     } catch (error) {
       const message = serverDiagnosticMessage(error, { credentials: Object.values(credentials) });
-      credentials.developer = "";
-      credentials.reviewer = "";
+      clearModelCredentials(credentials);
       await store.updateRun(run.id, { state: "needs_human", summary: "Worker 拒绝任务，保持人工处理" });
       await store.appendEvent({
         runId: run.id,

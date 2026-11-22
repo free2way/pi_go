@@ -40,8 +40,10 @@ import type { ReviewOutcome, ReviewInput } from "./run-review.js";
 import { executeJob, type DevelopmentRoundInput } from "./run-execution.js";
 import { createWorkerJobs } from "./worker-jobs.js";
 import { createWorkerServer } from "./worker-http.js";
+import { credentialForRole, runModelForRole } from "../shared/run-roles.js";
 
 async function planDevelopment(run: Run, worktree: string, credentials: JobInput["credentials"], signal: AbortSignal, usage: UsageTotals, budget?: RunBudgetContext, sessions?: SessionAccumulator) {
+  const planner = runModelForRole(run, "planner");
   const prompt = [
     "You are the lead engineering planner. Inspect the current repository read-only and size the requested implementation.",
     `Task: ${run.task}`,
@@ -56,15 +58,15 @@ async function planDevelopment(run: Run, worktree: string, credentials: JobInput
   try {
     const result = await runPiWithRetry({
       cwd: worktree,
-      provider: run.developer.provider,
-      model: run.developer.model,
+      provider: planner.provider,
+      model: planner.model,
       prompt,
       readOnly: true,
       // COST-006: planning is a sizing decision, so it runs with low reasoning.
       thinking: process.env.PI_PLANNER_THINKING === "high" || process.env.PI_PLANNER_THINKING === "medium" ? process.env.PI_PLANNER_THINKING : "low",
-      apiKey: credentials.developer,
+      apiKey: credentialForRole(run, credentials, "planner"),
       diagnosticCredentials: Object.values(credentials),
-      apiKeyEnvironmentName: apiKeyEnvName(run.developer.provider),
+      apiKeyEnvironmentName: apiKeyEnvName(planner.provider),
       signal,
       onActivity: (message) => postUpdate(run.id, { event: { round: run.round, source: "developer", type: "planner.activity", message: `主 Agent：${message}` } }),
     }, { runId: run.id, round: run.round, label: "主 Agent 规划", role: "planner", budget, sessions, usage });
@@ -96,15 +98,17 @@ async function runDeveloperAgent(input: {
   statePath?: string;
 }) {
   const extra = input.agentName ? { agent: input.agentName } : {};
+  const role = input.role === "integrator" ? "integrator" : "developer";
+  const selection = runModelForRole(input.run, role);
   await chat(input.run, "developer", "orchestrator", "developer", "prompt", input.prompt, input.signal, extra);
   const result = await runPiWithRetry({
     cwd: input.worktree,
-    provider: input.run.developer.provider,
-    model: input.run.developer.model,
+    provider: selection.provider,
+    model: selection.model,
     prompt: input.prompt,
-    apiKey: input.credentials.developer,
+    apiKey: credentialForRole(input.run, input.credentials, role),
     diagnosticCredentials: Object.values(input.credentials),
-    apiKeyEnvironmentName: apiKeyEnvName(input.run.developer.provider),
+    apiKeyEnvironmentName: apiKeyEnvName(selection.provider),
     signal: input.signal,
     onActivity: (message) => postUpdate(input.run.id, {
       event: {

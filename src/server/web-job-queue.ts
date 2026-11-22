@@ -1,5 +1,6 @@
 import { notifyQueuedJob } from "./job-notification.js";
-import type { Run } from "../shared/types.js";
+import type { ModelCredentials, Run } from "../shared/types.js";
+import { resolveRunCredentials } from "../shared/run-roles.js";
 import { newId } from "./db.js";
 import { workerRefusalDisposition } from "./worker-refusal.js";
 import { RELEASE_DEPLOY_STALE_MS } from "./release-publish.js";
@@ -10,7 +11,7 @@ import type { WebServices } from "./web-services.js";
 export function createWebJobQueue(services: WebServices) {
   const {
     JOB_STALE_MS,
-    agile, alerts, app, db, identities, jobQueue, requireCredentials, store, vault, workerRequest,
+    agile, alerts, app, db, identities, jobQueue, store, vault, workerRequest,
   } = services;
 
   // ---------------------------------------------------------------- job queue (REL-002)
@@ -21,16 +22,13 @@ export function createWebJobQueue(services: WebServices) {
    * Credentials may live under the internal user id or its legacy owner key, so
    * both are tried before giving up (AT-REL-002).
    */
-  async function jobCredentialsFor(run: Run): Promise<{ developer: string; reviewer: string } | undefined> {
+  async function jobCredentialsFor(run: Run): Promise<ModelCredentials | undefined> {
     const candidates = [run.ownerId];
     const legacy = await identities.legacyOwnerFor(run.ownerId).catch(() => undefined);
     if (legacy) candidates.push(legacy);
     for (const key of candidates) {
-      const credentials = requireCredentials({
-        developer: vault.get(key, run.developer.provider),
-        reviewer: vault.get(key, run.reviewer.provider),
-      });
-      if (credentials) return credentials;
+      const resolved = resolveRunCredentials(run, (provider) => vault.get(key, provider));
+      if (resolved.ok) return resolved.credentials;
     }
     return undefined;
   }
@@ -40,7 +38,7 @@ export function createWebJobQueue(services: WebServices) {
     run: Run,
     checks: string[],
     payload: Record<string, unknown>,
-    credentials: { developer: string; reviewer: string },
+    credentials: ModelCredentials,
   ) {
     if (!jobQueue) throw new Error("Job queue unavailable (PostgreSQL store required)");
     const jobId = newId("job");

@@ -6,7 +6,13 @@ import { DEFAULT_LOCALE, localizeError, t, type Locale } from "../shared/i18n";
 import { useT } from "./i18n";
 import { availabilityLabel, modelCapabilityHint, verificationBadge } from "./model-verification";
 
-const roleKey = { developer: "role.developer", reviewer: "role.reviewer" } as const;
+const roleKey = {
+  planner: "role.planner",
+  developer: "role.developer",
+  integrator: "role.integrator",
+  reviewer: "role.reviewer",
+  custom: "role.custom",
+} as const;
 
 /** Provider id whose key feeds the decision plane (docs/26 §11). */
 export const DECISION_PROVIDER_ID = "typesafe";
