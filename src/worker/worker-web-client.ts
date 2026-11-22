@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import type { ChatChannel, ChatParticipant, ChatRole, Finding, Run, RunEvent, RunState } from "../shared/types.js";
+import type { ChatChannel, ChatParticipant, ChatRole, Finding, ModelCredentials, Run, RunEvent, RunState } from "../shared/types.js";
 import { clipChatContent } from "../shared/chat.js";
 import { throwIfCancelled } from "./checks.js";
 import { CheckpointTracker, memoryCheckpointClient, type Checkpoint, type CheckpointClient } from "./checkpoints.js";
@@ -95,7 +95,7 @@ export type PendingJob = {
   kind: string;
   run: Run;
   checks: string[];
-  credentials: { developer: string; reviewer: string };
+  credentials: ModelCredentials;
   /** AUD-05: false means the job never started, so it must create the run directory. */
   wasStarted: boolean;
   resume?: { instruction?: string };
@@ -139,7 +139,7 @@ export function redactJobSecrets(message: string, credentials: JobInput["credent
   // Structured replies must remain valid JSON. Replace only known values;
   // generic diagnostic field patterns would rewrite model protocol fields.
   return redactKnownSecretText(message, [
-    credentials.developer, credentials.reviewer,
+    ...Object.values(credentials),
     ...diagnosticSecrets(process.env), callbackBase, workspaceRoot,
   ]);
 }

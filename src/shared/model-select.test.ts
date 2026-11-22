@@ -116,11 +116,11 @@ describe("model selection predicate (AUD-09)", () => {
     const uncovered: ModelInfo[] = [model({ roles: ["reviewer"], available: false, unavailableReason: "credential_missing" })];
     expect(roleCovered(uncovered, "reviewer")).toBe(false);
     expect(roleCovered([], "developer")).toBe(false);
-    expect(MODEL_ROLES).toEqual(["developer", "reviewer"]);
+    expect(MODEL_ROLES).toEqual(["planner", "developer", "integrator", "reviewer", "custom"]);
   });
 
   it("keeps every role in MODEL_ROLES", () => {
-    const roles: ModelRole[] = ["developer", "reviewer"];
+    const roles: ModelRole[] = ["planner", "developer", "integrator", "reviewer", "custom"];
     expect([...MODEL_ROLES]).toEqual(roles);
   });
 });

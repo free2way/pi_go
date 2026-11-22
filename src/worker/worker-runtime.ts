@@ -1,5 +1,5 @@
 import path from "node:path";
-import type { Run } from "../shared/types.js";
+import type { ModelCredentials, Run } from "../shared/types.js";
 import { DockerApi } from "./docker-api.js";
 import { readStorageStatus, type StorageStatus } from "./storage-status.js";
 import { convergenceGuardEnabled, reviewStallRounds } from "./review-convergence.js";
@@ -77,10 +77,7 @@ export function serializeWorktreeMutation<T>(operation: () => Promise<T>) {
 export type JobInput = {
   run: Run;
   checks: string[];
-  credentials: {
-    developer: string;
-    reviewer: string;
-  };
+  credentials: ModelCredentials;
   /** Persisted job row used for heartbeats and stale-worker recovery (REL-002). */
   jobId?: string;
   /** True when this execution resumes a job that a previous worker left unfinished. */

@@ -1,10 +1,11 @@
 import { findRunByKey, readRun } from "./store.js";
 import { type FastifyReply, type FastifyRequest } from "fastify";
 import { z } from "zod";
-import type { Workspace } from "../shared/types.js";
+import type { AgentProfileRole, RunAgentProfile, Workspace } from "../shared/types.js";
+import { clearModelCredentials, requiredCredentialRoles, resolveRunCredentials, runModelForRole } from "../shared/run-roles.js";
 import { syncStorageAlerts, type WorkspaceStorageStatus } from "./storage-alerts.js";
 import { baseDemoRun, runDemo } from "./demo-runner.js";
-import { preflightRunModels } from "./model-catalog.js";
+import { preflightRunModels, validateModelSelection } from "./model-catalog.js";
 import { baseRealRun } from "./real-run.js";
 import { conflictReplyFor } from "./request-errors.js";
 import { appendHumanNote } from "./run-notes.js";
@@ -16,6 +17,8 @@ import { classifyWorkspaceError } from "./routes/workspace-errors.js";
 import type { WebServices } from "./web-services.js";
 import type { WebJobQueue } from "./web-job-queue.js";
 import type { WorkspaceAgileRoutes } from "./workspace-agile-routes.js";
+import { AgentTeamError } from "./agent-teams.js";
+import { snapshotTeamAgents, TeamRunError } from "./team-run.js";
 
 export function createRunAdmission(
   services: WebServices,
@@ -25,9 +28,9 @@ export function createRunAdmission(
   >,
 ) {
   const {
-    PIPELINE_VERSION, alerts, app, auth, credentialFingerprint, demoMode, identities, internalToken,
+    PIPELINE_VERSION, agentTeams, alerts, app, auth, credentialFingerprint, demoMode, identities, internalToken,
     modelCatalog, modelDefaults, ownerKeysFor, readRunBudget, realRunsEnabled, requestLocale,
-    requireCredentials, runActions, runCreations, store, tooManyRequests, vault, vaultKeyFor,
+    runActions, runCreations, store, tooManyRequests, vault, vaultKeyFor,
     workerRequest, workspaces,
   } = services;
   const {
@@ -93,21 +96,36 @@ export function createRunAdmission(
     // developer share the developer selection; reviewer has its own) before
     // queueing. A single provider that serves both roles is enough.
     const availability = vault.providerAvailability(vaultKeyFor(request));
+    let agents: Partial<Record<AgentProfileRole, RunAgentProfile>> | undefined;
+    if (input.teamId) {
+      try {
+        agents = snapshotTeamAgents(await agentTeams.getTeam(user.id, input.teamId));
+      } catch (error) {
+        if (error instanceof AgentTeamError) {
+          return { ok: false, status: error.status, body: { error: error.message, code: error.code } };
+        }
+        if (error instanceof TeamRunError) {
+          return { ok: false, status: 422, body: { error: error.message, code: error.code } };
+        }
+        throw error;
+      }
+    }
     const selections = {
-      developer: input.developerModel ?? modelDefaults.developer,
-      reviewer: input.reviewerModel ?? modelDefaults.reviewer,
+      developer: agents?.developer ?? input.developerModel ?? modelDefaults.developer,
+      reviewer: agents?.reviewer ?? input.reviewerModel ?? modelDefaults.reviewer,
     };
     const preflight = preflightRunModels(modelCatalog, selections, availability);
     if (!preflight.ok) return { ok: false, status: 422, body: { error: preflight.message, code: preflight.code, role: preflight.role } };
     const developerEntry = preflight.roles.developer;
     const reviewerEntry = preflight.roles.reviewer;
-
-    const credentials = requireCredentials({
-      developer: vault.get(vaultKeyFor(request), developerEntry.provider),
-      reviewer: vault.get(vaultKeyFor(request), reviewerEntry.provider),
-    });
-    if (!credentials) {
-      return { ok: false, status: 403, body: { error: "所选模型的 provider 凭据不完整，请在「模型与凭据」页配置", code: "PERSONAL_CREDENTIALS_REQUIRED" } };
+    if (agents) {
+      for (const [role, profile] of Object.entries(agents) as Array<[AgentProfileRole, RunAgentProfile]>) {
+        if (role === "developer" || role === "reviewer") continue;
+        const validation = validateModelSelection(modelCatalog, role, profile, availability);
+        if (!validation.ok) {
+          return { ok: false, status: 422, body: { error: validation.message, code: validation.code, role } };
+        }
+      }
     }
     // GAP-01 / AT-RUN-010: an idempotency key returns the existing run instead of
     // creating a duplicate.
@@ -122,14 +140,29 @@ export function createRunAdmission(
       developerModel: { provider: developerEntry.provider, model: developerEntry.model },
       reviewerModel: { provider: reviewerEntry.provider, model: reviewerEntry.model },
     }, user.id);
+    if (agents) run.agents = agents;
+    const credentialResolution = resolveRunCredentials(run, (provider) => vault.get(vaultKeyFor(request), provider));
+    if (!credentialResolution.ok) {
+      return {
+        ok: false,
+        status: 403,
+        body: {
+          error: `Team role ${credentialResolution.role} requires a configured ${credentialResolution.provider} credential`,
+          code: input.teamId ? "TEAM_ROLE_CREDENTIAL_REQUIRED" : "PERSONAL_CREDENTIALS_REQUIRED",
+          role: credentialResolution.role,
+          provider: credentialResolution.provider,
+        },
+      };
+    }
+    const credentials = credentialResolution.credentials;
     // GAP-01: freeze the reproducible inputs with the run.
     run.baseSha = workspace.git?.head ?? undefined;
     run.budget = extra.budget ?? readRunBudget();
     run.pipelineVersion = PIPELINE_VERSION;
-    run.credentialVersions = {
-      developer: credentialFingerprint(vault.get(vaultKeyFor(request), developerEntry.provider)),
-      reviewer: credentialFingerprint(vault.get(vaultKeyFor(request), reviewerEntry.provider)),
-    };
+    run.credentialVersions = Object.fromEntries(requiredCredentialRoles(run).map((role) => [
+      role,
+      credentialFingerprint(vault.get(vaultKeyFor(request), runModelForRole(run, role).provider)),
+    ]));
     if (extra.storyId) run.storyId = extra.storyId;
     // 运行时文案语言 (docs/24-i18n.md §9): the run remembers the locale it was
     // created in, so the worker writes its guard/stop text and prompts in the
@@ -139,13 +172,11 @@ export function createRunAdmission(
     await store.createRun(run, { runId: run.id, round: 1, source: "system", type: "run.created", message: "真实任务已创建，正在交给隔离 Pi Worker", at: new Date().toISOString() });
     try {
       await dispatchJob(run, input.checks, {}, credentials);
-      credentials.developer = "";
-      credentials.reviewer = "";
+      for (const role of Object.keys(credentials) as AgentProfileRole[]) credentials[role] = "";
       return { ok: true, created: true, run };
     } catch (error) {
       const message = serverDiagnosticMessage(error, { credentials: Object.values(credentials) });
-      credentials.developer = "";
-      credentials.reviewer = "";
+      for (const role of Object.keys(credentials) as AgentProfileRole[]) credentials[role] = "";
       await store.updateRun(run.id, { state: "failed", summary: message });
       await store.appendEvent({ runId: run.id, round: 1, source: "system", type: "run.failed", message: `Worker 拒绝任务：${message}`, at: new Date().toISOString() });
       return { ok: false, status: 503, body: { error: message, runId: run.id }, run };
@@ -229,12 +260,11 @@ export function createRunAdmission(
     if (run.mode !== "real") return reply.code(409).send({ error: "只有真实任务支持人工恢复", code: "RUN_NOT_RESUMABLE" });
     if (run.state !== "needs_human") return reply.code(409).send({ error: "仅「需要人工处理」的任务可以执行该操作", code: "RUN_NOT_RESUMABLE" });
     if (!realRunsEnabled || !internalToken) return reply.code(503).send({ error: "Real agent execution is disabled", code: "REAL_RUNNER_NOT_AVAILABLE" });
-    const developerKey = vault.get(vaultKeyFor(request), run.developer.provider);
-    const reviewerKey = vault.get(vaultKeyFor(request), run.reviewer.provider);
-    if (!developerKey || !reviewerKey) {
+    const resolved = resolveRunCredentials(run, (provider) => vault.get(vaultKeyFor(request), provider));
+    if (!resolved.ok) {
       return reply.code(403).send({ error: "该任务所用模型的 provider 凭据缺失，请在「模型与凭据」页配置", code: "PERSONAL_CREDENTIALS_REQUIRED" });
     }
-    const credentials = { developer: developerKey, reviewer: reviewerKey };
+    const credentials = resolved.credentials;
 
     const instruction = options.kind === "resume" ? options.instruction?.trim() : undefined;
     const round = options.kind === "resume" ? run.round + 1 : run.round;
@@ -279,13 +309,11 @@ export function createRunAdmission(
         options.kind === "resume" ? { resume: { instruction } } : { retryReview: true },
         credentials,
       );
-      credentials.developer = "";
-      credentials.reviewer = "";
+      clearModelCredentials(credentials);
       return reply.code(201).send(await readRun(store, run.id, ownerKeysFor(request)));
     } catch (error) {
       const message = serverDiagnosticMessage(error, { credentials: Object.values(credentials) });
-      credentials.developer = "";
-      credentials.reviewer = "";
+      clearModelCredentials(credentials);
       await store.updateRun(run.id, { state: "needs_human", summary: "Worker 拒绝任务，保持人工处理" });
       await store.appendEvent({
         runId: run.id,

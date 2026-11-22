@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { hasRequiredCredentials } from "../shared/run-roles.js";
 import { timingSafeEqual } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
@@ -296,7 +297,7 @@ export function createWorkerServer({ dispatchJob, pendingJobWake }: Pick<WorkerJ
         // sandbox containers without racing a new run.
         if (shuttingDown) return json(response, 503, { error: "Worker 正在停止，暂不接受新任务，请稍后重试", code: "WORKER_SHUTTING_DOWN" });
         const body = await readJson(request) as unknown as JobInput;
-        if (!body.run?.id || body.run.mode !== "real" || !Array.isArray(body.checks) || !body.credentials?.developer || !body.credentials?.reviewer) return json(response, 400, { error: "Invalid job" });
+        if (!body.run?.id || body.run.mode !== "real" || !Array.isArray(body.checks) || !hasRequiredCredentials(body.run, body.credentials)) return json(response, 400, { error: "Invalid job" });
         // Dispatch is at-least-once: a run already executing locally is not an error.
         if (active.has(body.run.id)) return json(response, 202, { accepted: true, runId: body.run.id, note: "already running" });
         if (active.size >= maxActiveJobs) return json(response, 429, { error: "Worker capacity reached; retry after an active job finishes", code: "WORKER_CAPACITY" });

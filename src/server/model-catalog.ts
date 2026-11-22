@@ -34,7 +34,7 @@ function normalizeEntry(raw: unknown, _index: number): ModelCatalogEntry | undef
   const model = String(item.model || "").trim();
   if (!provider || !model) return undefined;
   const roles = Array.isArray(item.roles)
-    ? item.roles.map((role) => String(role)).filter((role): role is ModelRole => role === "developer" || role === "reviewer")
+    ? item.roles.map((role) => String(role)).filter((role): role is ModelRole => MODEL_ROLES.includes(role as ModelRole))
     : [];
   return {
     id: String(item.id || `${provider}/${model}`).slice(0, 120),
@@ -180,6 +180,10 @@ export type ModelValidation =
   | { ok: true; entry: ModelCatalogEntry }
   | { ok: false; code: "MODEL_NOT_FOUND" | "MODEL_NOT_ALLOWED" | "MODEL_UNAVAILABLE" | "MODEL_NOT_AVAILABLE" | "MODEL_CONFIG_INVALID"; message: string };
 
+function roleLabel(role: ModelRole): string {
+  return ({ planner: "规划", developer: "开发", integrator: "集成", reviewer: "审核", custom: "自定义" } as const)[role];
+}
+
 export function validateModelSelection(
   entries: ModelCatalogEntry[],
   role: ModelRole,
@@ -189,14 +193,14 @@ export function validateModelSelection(
   if (!entries.some((entry) => entry.roles.includes(role))) {
     // AUD-08 / AT-MODEL-002: an explicit allowlist can leave a role uncovered;
     // report the configuration error instead of falling back to a default.
-    return { ok: false, code: "MODEL_CONFIG_INVALID", message: `允许目录未包含可用于${role === "developer" ? "开发" : "审核"}角色的模型，请修正模型目录配置` };
+    return { ok: false, code: "MODEL_CONFIG_INVALID", message: `允许目录未包含可用于${roleLabel(role)}角色的模型，请修正模型目录配置` };
   }
   const entry = findModel(entries, selection.provider, selection.model);
   if (!entry) {
     return { ok: false, code: "MODEL_NOT_FOUND", message: `模型 ${selection.provider}/${selection.model} 不在允许目录中` };
   }
   if (!entry.roles.includes(role)) {
-    return { ok: false, code: "MODEL_NOT_ALLOWED", message: `模型 ${entry.label} 不允许用于${role === "developer" ? "开发" : "审核"}角色` };
+    return { ok: false, code: "MODEL_NOT_ALLOWED", message: `模型 ${entry.label} 不允许用于${roleLabel(role)}角色` };
   }
   const state = providerModelState(availability, entry.provider, entry.model);
   if (state === "missing") {
@@ -282,7 +286,7 @@ export function preflightRunModels(
   availability: ProviderAvailabilityInput,
 ): RunPreflightResult {
   const resolved: Partial<Record<ModelRole, ModelCatalogEntry>> = {};
-  for (const role of ["developer", "reviewer"] as ModelRole[]) {
+  for (const role of ["developer", "reviewer"] as const) {
     const check = validateModelSelection(entries, role, selections[role], availability);
     if (!check.ok) return { ok: false, role, code: check.code, message: check.message };
     resolved[role] = check.entry;

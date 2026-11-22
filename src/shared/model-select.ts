@@ -32,8 +32,8 @@ import type { ModelInfo, ModelRole } from "./types";
  */
 export type ModelSelectCode = "MODEL_NOT_FOUND" | "MODEL_NOT_ALLOWED" | "MODEL_UNAVAILABLE" | "MODEL_NOT_AVAILABLE";
 
-/** Every role a real run can be preflighted for (see `preflightRunModels`). */
-export const MODEL_ROLES: readonly ModelRole[] = ["developer", "reviewer"];
+/** Every role a Team-backed real run can preflight and receive credentials for. */
+export const MODEL_ROLES: readonly ModelRole[] = ["planner", "developer", "integrator", "reviewer", "custom"];
 
 export interface ModelSelectionDecision {
   /** True only when the preflight would accept this pair for the role. */

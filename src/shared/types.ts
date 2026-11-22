@@ -179,6 +179,8 @@ export interface Run {
   workspaceId?: string;
   /** P3: optional owner-scoped team selected for this run. Legacy runs omit it. */
   teamId?: string;
+  /** Immutable role selections captured when a Team-backed run is admitted. */
+  agents?: Partial<Record<AgentProfileRole, RunAgentProfile>>;
   branch: string;
   mode: RunMode;
   state: RunState;
@@ -243,7 +245,7 @@ export interface Run {
     maxDurationSeconds: number;
   };
   /** GAP-01: credential fingerprint (sha256 prefix) per role at creation time. */
-  credentialVersions?: { developer?: string; reviewer?: string };
+  credentialVersions?: Partial<Record<ModelRole, string>>;
   /** GAP-01: workflow/prompt/plugin policy snapshot used for this run. */
   pipelineVersion?: string;
   /**
@@ -505,6 +507,14 @@ export interface CreateRunInput {
 
 export type AgentProfileRole = "planner" | "developer" | "integrator" | "reviewer" | "custom";
 
+export interface RunAgentProfile {
+  id: string;
+  name: string;
+  role: AgentProfileRole;
+  provider: string;
+  model: string;
+}
+
 export interface AgentProfile {
   id: string;
   ownerId: string;
@@ -638,7 +648,13 @@ export interface ProviderAvailability {
   capabilities?: Record<string, ProviderModelCapability> | null;
 }
 
-export type ModelRole = "developer" | "reviewer";
+export type ModelRole = AgentProfileRole;
+
+/** Worker payload: old runs require the pair; Team-backed runs may add roles. */
+export type ModelCredentials = Partial<Record<ModelRole, string>> & {
+  developer: string;
+  reviewer: string;
+};
 
 export interface ModelCatalogEntry {
   id: string;

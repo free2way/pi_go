@@ -7,6 +7,7 @@ export const createRunSchema = z.object({
   task: z.string().trim().min(10).max(10_000),
   repository: z.string().trim().max(240).default("demo/auth-service"),
   workspaceId: z.string().trim().min(1).max(80).optional(),
+  teamId: z.string().trim().min(1).max(80).optional(),
   mode: z.enum(["demo", "real"]).default("demo"),
   checks: z.array(z.string().trim().min(1).max(500)).max(8).default([]),
   acceptanceCriteria: z.string().trim().max(4_000).optional(),

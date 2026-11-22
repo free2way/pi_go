@@ -10,10 +10,7 @@ import type {
 } from "../shared/types.js";
 
 /** Credentials the worker receives for a single job (resolved from the run's pinned models). */
-export type ModelCredentials = {
-  developer: string;
-  reviewer: string;
-};
+export type { ModelCredentials } from "../shared/types.js";
 
 type EncryptedValue = {
   iv: string;

@@ -1,6 +1,7 @@
 import { stat } from "node:fs/promises";
 import path from "node:path";
 import type { DevelopmentPlan, Finding, Run, RunState } from "../shared/types.js";
+import { clearModelCredentials, runModelForRole } from "../shared/run-roles.js";
 import { isCheckpointCurrent, stages, type CheckpointTracker, type StoredChecks, type StoredReview } from "./checkpoints.js";
 import { toRunUsage, type UsageTotals } from "./pi-events.js";
 import { readBudgetLimits } from "./budget.js";
@@ -281,7 +282,7 @@ export async function executeJob(input: JobInput, controller: AbortController, a
       await executeRetryReview({ run, worktree, baseCommit, credentials: input.credentials, controller, usage, started, budget, sessions, checks: input.checks }, actions.performReview);
       return;
     }
-    await update(run, "developing", "developer", "agent.started", `${run.developer.model} 主 Agent 开始评估工作量`, { summary: "主 Agent 正在分析任务并决定是否拆分 Sub Agent" });
+    await update(run, "developing", "developer", "agent.started", `${runModelForRole(run, "planner").model} 主 Agent 开始评估工作量`, { summary: "主 Agent 正在分析任务并决定是否拆分 Sub Agent" });
 
     let feedback = input.resume || recovering ? unresolvedFeedback(run.findings) : "";
     let findings: Finding[] = input.resume || recovering ? [...(run.findings ?? [])] : [];
@@ -637,8 +638,7 @@ export async function executeJob(input: JobInput, controller: AbortController, a
     } else if (input.jobId && !heartbeat.leaseLost()) {
       console.warn(`[jobs] keeping ${input.jobId} claimed so it can be retried after the store recovers`);
     }
-    input.credentials.developer = "";
-    input.credentials.reviewer = "";
+    clearModelCredentials(input.credentials);
     active.delete(run.id);
   }
 }
