@@ -43,8 +43,9 @@ test.describe("multi-agent team UI", () => {
       reviewer = await createProfile(request, reviewerName, "reviewer", reviewerModel!);
 
       await openTeams(page);
-      await expect(page.getByText(developerName, { exact: true })).toBeVisible();
-      await expect(page.getByText(reviewerName, { exact: true })).toBeVisible();
+      const profileRows = page.locator(".team-settings-column").first().locator(".team-rows");
+      await expect(profileRows.locator(".team-row", { hasText: developerName })).toBeVisible();
+      await expect(profileRows.locator(".team-row", { hasText: reviewerName })).toBeVisible();
 
       await page.getByLabel("Team 名称").fill(teamName);
       await page.locator(".team-member-picker label", { hasText: developerName }).getByRole("checkbox").check();
