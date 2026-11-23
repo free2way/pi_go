@@ -15,10 +15,10 @@ import {
 import { triggerAuditRetention, postUpdate, redactJobSecrets, chat, update } from "./worker-web-client.js";
 import { mkdir, rm } from "node:fs/promises";
 import path from "node:path";
-import type { DevelopmentPlan, Run, SubAgentTask } from "../shared/types.js";
+import type { AgentProfileRole, DevelopmentPlan, Run, SubAgentTask } from "../shared/types.js";
 import { assignSubAgentCodenames } from "../shared/codenames.js";
 import { CheckpointTracker, stages } from "./checkpoints.js";
-import { conflictFreeBatches, executionWaves, fallbackPlan, parseDevelopmentPlan } from "./orchestrator.js";
+import { conflictFreeBatches, executionWaves, fallbackPlan, parseDevelopmentPlan, shouldOrchestrateSubAgents } from "./orchestrator.js";
 import { addUsage, type UsageTotals, toRunUsage } from "./pi-events.js";
 import { BudgetExceededError, type RunBudgetContext } from "./run-budget.js";
 import { runHardenedGit } from "./git-hardening.js";
@@ -40,20 +40,30 @@ import type { ReviewOutcome, ReviewInput } from "./run-review.js";
 import { executeJob, type DevelopmentRoundInput } from "./run-execution.js";
 import { createWorkerJobs } from "./worker-jobs.js";
 import { createWorkerServer } from "./worker-http.js";
-import { credentialForRole, runModelForRole } from "../shared/run-roles.js";
+import { credentialForRole, runModelForRole, taskInvocationForAssignee } from "../shared/run-roles.js";
 
 async function planDevelopment(run: Run, worktree: string, credentials: JobInput["credentials"], signal: AbortSignal, usage: UsageTotals, budget?: RunBudgetContext, sessions?: SessionAccumulator) {
   const planner = runModelForRole(run, "planner");
+  const availableAssignees = Object.values(run.agents ?? {}).map((agent) => ({
+    id: agent.id,
+    name: agent.name,
+    role: agent.role,
+    provider: agent.provider,
+    model: agent.model,
+  }));
   const prompt = [
     "You are the lead engineering planner. Inspect the current repository read-only and size the requested implementation.",
     `Task: ${run.task}`,
     `You may create at most ${maxSubagents} implementation tasks. Prefer one task for small cohesive changes.`,
     "Use multiple tasks only when work can be separated by component or file ownership.",
     "Tasks in the same dependency wave must not edit overlapping files. Add dependsOn for ordering when one task needs another.",
+    availableAssignees.length > 0
+      ? `Available assignees (use only an id from this list, or omit assignee): ${JSON.stringify(availableAssignees)}`
+      : "This run has no Team assignees. Omit assignee from every task.",
     // docs/24-i18n.md §10: the single locale instruction block.
     localeInstruction(runLocale(run)),
     "Return JSON only with this exact shape:",
-    '{"complexity":"small|medium|large","rationale":"...","tasks":[{"id":"kebab-id","title":"...","description":"...","files":["relative/path"],"dependsOn":[]}]}',
+    '{"complexity":"small|medium|large","rationale":"...","tasks":[{"id":"kebab-id","assignee":"optional-agent-profile-id","title":"...","description":"...","files":["relative/path"],"dependsOn":[]}]}',
   ].join("\n\n");
   try {
     const result = await runPiWithRetry({
@@ -71,7 +81,10 @@ async function planDevelopment(run: Run, worktree: string, credentials: JobInput
       onActivity: (message) => postUpdate(run.id, { event: { round: run.round, source: "developer", type: "planner.activity", message: `主 Agent：${message}` } }),
     }, { runId: run.id, round: run.round, label: "主 Agent 规划", role: "planner", budget, sessions, usage });
     addUsage(usage, result.usage);
-    return parseDevelopmentPlan(redactJobSecrets(result.text, credentials), maxSubagents);
+    return parseDevelopmentPlan(redactJobSecrets(result.text, credentials),
+      maxSubagents,
+      availableAssignees.map((agent) => agent.id),
+    );
   } catch (error) {
     if (error instanceof BudgetExceededError || error instanceof PiInputTransportError) throw error;
     const safeMessage = diagnosticMessage(error, Object.values(credentials));
@@ -93,22 +106,28 @@ async function runDeveloperAgent(input: {
   usage: UsageTotals;
   budget?: RunBudgetContext;
   role?: PiSessionRole;
+  /** Model/credential role can differ from the Pi session accounting role. */
+  modelRole?: AgentProfileRole;
+  /** Optional frozen task assignee; takes precedence over modelRole. */
+  assignee?: string;
   sessions?: SessionAccumulator;
   /** Pi state outside a nested sub-agent worktree. */
   statePath?: string;
 }) {
   const extra = input.agentName ? { agent: input.agentName } : {};
-  const role = input.role === "integrator" ? "integrator" : "developer";
-  const selection = runModelForRole(input.run, role);
+  const role = input.modelRole ?? (input.role === "integrator" ? "integrator" : "developer");
+  const invocation = input.assignee
+    ? taskInvocationForAssignee(input.run, input.credentials, input.assignee)
+    : { role, ...runModelForRole(input.run, role), apiKey: credentialForRole(input.run, input.credentials, role) };
   await chat(input.run, "developer", "orchestrator", "developer", "prompt", input.prompt, input.signal, extra);
   const result = await runPiWithRetry({
     cwd: input.worktree,
-    provider: selection.provider,
-    model: selection.model,
+    provider: invocation.provider,
+    model: invocation.model,
     prompt: input.prompt,
-    apiKey: credentialForRole(input.run, input.credentials, role),
+    apiKey: invocation.apiKey,
     diagnosticCredentials: Object.values(input.credentials),
-    apiKeyEnvironmentName: apiKeyEnvName(selection.provider),
+    apiKeyEnvironmentName: apiKeyEnvName(invocation.provider),
     signal: input.signal,
     onActivity: (message) => postUpdate(input.run.id, {
       event: {
@@ -203,6 +222,7 @@ async function runSubAgent(input: {
       usage: input.usage,
       budget: input.budget,
       role: "sub-agent",
+      assignee: input.task.assignee,
       sessions: input.sessions,
       // A sibling root keeps child auth/session files out of the main agent's mount.
       statePath: subAgentStateDirectory(input.project, input.task.id),
@@ -337,6 +357,11 @@ async function orchestrateSubAgents(input: {
   budget?: RunBudgetContext;
   sessions?: SessionAccumulator;
 }) {
+  // Validate every persisted/planner-produced assignee before creating any Git
+  // worktree. A forged or stale profile id must fail closed without side effects.
+  for (const task of input.plan.tasks) {
+    taskInvocationForAssignee(input.run, input.credentials, task.assignee);
+  }
   const integrationNotes: string[] = [];
   const restored: string[] = [];
   for (const wave of executionWaves(input.plan.tasks)) {
@@ -626,7 +651,7 @@ function createRunActions() {
           });
           await tracker.complete(stages.planning, plan);
         }
-        if (plan.tasks.length > 1) {
+        if (shouldOrchestrateSubAgents(plan)) {
           const integrationNotes = await orchestrateSubAgents({ run, project: worktree, worktree, plan, credentials: input.credentials, signal: controller.signal, usage, tracker, budget, sessions });
           const integrationPrompt = [
             "You are the lead integration agent. Work only in the current Git worktree.",

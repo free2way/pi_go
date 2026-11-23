@@ -18,6 +18,36 @@ export function runModelForRole(run: Run, role: AgentProfileRole): ModelSelectio
   return role === "reviewer" ? run.reviewer : run.developer;
 }
 
+/** Resolve a task assignee against the immutable Team snapshot on the Run. */
+export function runAgentForAssignee(run: Run, assignee: string): RunAgentProfile {
+  const agent = TEAM_AGENT_ROLES
+    .map((role) => run.agents?.[role])
+    .find((candidate) => candidate?.id === assignee);
+  if (!agent) throw new Error(`Task assignee is not part of the admitted Team: ${assignee}`);
+  return agent;
+}
+
+/** Unassigned tasks deliberately preserve the legacy developer selection. */
+export function runRoleForAssignee(run: Run, assignee?: string): AgentProfileRole {
+  return assignee ? runAgentForAssignee(run, assignee).role : "developer";
+}
+
+/** Complete, testable model invocation projection for one implementation task. */
+export function taskInvocationForAssignee(
+  run: Run,
+  credentials: ModelCredentials,
+  assignee?: string,
+): { role: AgentProfileRole; provider: string; model: string; apiKey: string } {
+  const role = runRoleForAssignee(run, assignee);
+  const selection = runModelForRole(run, role);
+  return {
+    role,
+    provider: selection.provider,
+    model: selection.model,
+    apiKey: credentialForRole(run, credentials, role),
+  };
+}
+
 /** Roles whose provider keys must be present before a run may enter the queue. */
 export function requiredCredentialRoles(run: Run): AgentProfileRole[] {
   if (!run.agents) return ["developer", "reviewer"];
