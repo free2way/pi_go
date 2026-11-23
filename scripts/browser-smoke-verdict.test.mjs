@@ -16,12 +16,13 @@ const complete = () => report([
   spec("tests/e2e/auth.spec.ts", "authenticated shell"),
   spec("tests/e2e/i18n.spec.ts", "locale selector"),
   spec("tests/e2e/i18n.spec.ts", "locale persistence"),
+  spec("tests/e2e/teams.spec.ts", "ordered team persistence"),
 ]);
 
 test("browser smoke passes only when every expected scenario executes cleanly", () => {
   const verdict = evaluateBrowserSmoke(complete());
   assert.equal(verdict.ok, true);
-  assert.deepEqual(verdict.counts, { total: 4, passed: 4, failed: 0, flaky: 0, skipped: 0 });
+  assert.deepEqual(verdict.counts, { total: 5, passed: 5, failed: 0, flaky: 0, skipped: 0 });
 });
 
 test("browser smoke rejects an all-skipped report even when Playwright exits zero", () => {
@@ -33,7 +34,7 @@ test("browser smoke rejects an all-skipped report even when Playwright exits zer
   }
   const verdict = evaluateBrowserSmoke(input);
   assert.equal(verdict.ok, false);
-  assert.match(verdict.failures.join(" | "), /4 scenario\(s\) skipped/);
+  assert.match(verdict.failures.join(" | "), /5 scenario\(s\) skipped/);
 });
 
 test("browser smoke rejects missing files, flaky tests and a non-zero process exit", () => {
@@ -44,5 +45,5 @@ test("browser smoke rejects missing files, flaky tests and a non-zero process ex
   assert.equal(verdict.ok, false);
   assert.match(verdict.failures.join(" | "), /Playwright exited 1/);
   assert.match(verdict.failures.join(" | "), /flaky/);
-  assert.deepEqual(verdict.missing.map((item) => item.file), ["i18n.spec.ts"]);
+  assert.deepEqual(verdict.missing.map((item) => item.file), ["i18n.spec.ts", "teams.spec.ts"]);
 });
