@@ -169,13 +169,13 @@ export function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, 
                   </select>
                 </label>
               )}
-              <label>{t("createRun.developerModel")}<select value={developerModelId} onChange={(event) => setDeveloperModelId(event.target.value)}>
+              <label data-testid="legacy-run-role-model">{t("createRun.developerModel")}<select value={developerModelId} onChange={(event) => setDeveloperModelId(event.target.value)}>
                 {developerOptions.map((option) => (
                   <option value={option.id} key={option.id} disabled={!option.selectable}>{modelOptionText(option)}</option>
                 ))}
               </select></label>
               {developerUncovered && <div className="form-error">{t("createRun.modelRoleUncovered")}</div>}
-              <label>{t("createRun.reviewerModel")}<select value={reviewerModelId} onChange={(event) => setReviewerModelId(event.target.value)}>
+              <label data-testid="legacy-run-role-model">{t("createRun.reviewerModel")}<select value={reviewerModelId} onChange={(event) => setReviewerModelId(event.target.value)}>
                 {reviewerOptions.map((option) => (
                   <option value={option.id} key={option.id} disabled={!option.selectable}>{modelOptionText(option)}</option>
                 ))}

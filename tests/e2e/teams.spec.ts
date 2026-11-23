@@ -96,10 +96,10 @@ test.describe("multi-agent team UI", () => {
       await page.getByRole("button", { name: /New run/ }).click();
       await page.getByRole("button", { name: "Real development" }).click();
       const runDialog = page.locator(".create-run-modal");
+      await expect(runDialog.getByTestId("legacy-run-role-model")).toHaveCount(2);
       await runDialog.getByLabel("Multi-agent team").selectOption({ label: updatedTeamName });
       await expect(runDialog.locator(".selected-team-summary")).toContainText(updatedTeamName);
-      await expect(runDialog.getByLabel("Developer model")).toHaveCount(0);
-      await expect(runDialog.getByLabel("Reviewer model")).toHaveCount(0);
+      await expect(runDialog.getByTestId("legacy-run-role-model")).toHaveCount(0);
     } finally {
       if (team) await request.delete(`/api/teams/${team.id}`).catch(() => undefined);
       if (developer) await request.delete(`/api/agent-profiles/${developer.id}`).catch(() => undefined);
