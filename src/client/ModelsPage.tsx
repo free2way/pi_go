@@ -5,6 +5,7 @@ import { api, type DecisionEngineStatus } from "./api";
 import { DEFAULT_LOCALE, localizeError, t, type Locale } from "../shared/i18n";
 import { useT } from "./i18n";
 import { availabilityLabel, modelCapabilityHint, verificationBadge } from "./model-verification";
+import { TeamSettings } from "./TeamSettings";
 
 const roleKey = {
   planner: "role.planner",
@@ -266,6 +267,7 @@ export function ModelsPage({ config, onChanged }: { config?: ModelsPageConfig; o
           })}
         </p>
       )}
+      <TeamSettings catalog={catalog} onChanged={onChanged} />
     </div>
   );
 }

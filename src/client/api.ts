@@ -7,7 +7,7 @@ import type { DecisionAuditProjection } from "../shared/decision-audit";
 import type { DecisionMetricsResponse } from "../shared/decision-metrics";
 export type { DecisionMetricsResponse } from "../shared/decision-metrics";
 import type { AgileProject, AgileRelease, AgileSprint, AgileStory, ReleaseDeployRecord, ModelTemplate, RunBudget, StoryDetail, StoryPriority, StoryStatus } from "../shared/agile";
-import type { ConfigStatus, CredentialStatus, CurrentUser, ModelCatalogResponse, ModelSelection, Run, RunArtifact, RunEvent, RunRoundsResponse, RunState, Workspace, AccountDetail, AccountSummary, AccountWorkspaceOption, WorkspacePermission, ReleaseWebhookSettingsStatus, ScmAuthMode, ScmProvider, WorkspacePushResult, WorkspaceRemoteStatus, WorkspaceScmOverview, WorkspaceScmSettingsStatus } from "../shared/types";
+import type { AgentProfile, AgentProfileRole, AgentTeam, ConfigStatus, CredentialStatus, CurrentUser, ModelCatalogResponse, ModelSelection, Run, RunArtifact, RunEvent, RunRoundsResponse, RunState, Workspace, AccountDetail, AccountSummary, AccountWorkspaceOption, WorkspacePermission, ReleaseWebhookSettingsStatus, ScmAuthMode, ScmProvider, WorkspacePushResult, WorkspaceRemoteStatus, WorkspaceScmOverview, WorkspaceScmSettingsStatus } from "../shared/types";
 import { LOCALE_TAGS, type Locale } from "../shared/i18n";
 import type { RequirementRefineInput, RequirementRefinement } from "../shared/requirement-assistant";
 import type { PiAssistantAnswer, PiAssistantAskInput } from "../shared/pi-assistant";
@@ -263,8 +263,20 @@ export const api = {
     request<Run>(`/api/runs/${id}/reopen`, { method: "POST", body: JSON.stringify(body) }),
   batchRuns: (body: { action: "continue" | "accept" | "cleanup"; runIds: string[]; note?: string; acknowledgeOpenFindings?: boolean; deleteRunDirectory?: boolean }) =>
     request<BatchSummary>("/api/runs/batch", { method: "POST", body: JSON.stringify(body) }),
-  createRun: (body: { title: string; task: string; repository?: string; workspaceId?: string; mode: "demo" | "real"; checks?: string[]; acceptanceCriteria?: string; developerModel?: ModelSelection; reviewerModel?: ModelSelection }, options: { locale?: Locale } = {}) =>
+  createRun: (body: { title: string; task: string; repository?: string; workspaceId?: string; teamId?: string; mode: "demo" | "real"; checks?: string[]; acceptanceCriteria?: string; developerModel?: ModelSelection; reviewerModel?: ModelSelection }, options: { locale?: Locale } = {}) =>
     request<Run>("/api/runs", { method: "POST", body: JSON.stringify(body), headers: localeHeaders(options.locale) }),
+  agentProfiles: () => request<{ profiles: AgentProfile[] }>("/api/agent-profiles"),
+  createAgentProfile: (body: { name: string; role: AgentProfileRole; provider: string; model: string }) =>
+    request<AgentProfile>("/api/agent-profiles", { method: "POST", body: JSON.stringify(body) }),
+  updateAgentProfile: (id: string, body: { name: string; role: AgentProfileRole; provider: string; model: string }) =>
+    request<AgentProfile>(`/api/agent-profiles/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify(body) }),
+  deleteAgentProfile: (id: string) => request<void>(`/api/agent-profiles/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  agentTeams: () => request<{ teams: AgentTeam[] }>("/api/teams"),
+  createAgentTeam: (body: { name: string; profileIds: string[] }) =>
+    request<AgentTeam>("/api/teams", { method: "POST", body: JSON.stringify(body) }),
+  updateAgentTeam: (id: string, body: { name: string; profileIds: string[] }) =>
+    request<AgentTeam>(`/api/teams/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify(body) }),
+  deleteAgentTeam: (id: string) => request<void>(`/api/teams/${encodeURIComponent(id)}`, { method: "DELETE" }),
   cancelRun: (id: string) => request<Run>(`/api/runs/${id}/cancel`, { method: "POST" }),
   approveRun: (id: string, body: { mode?: "continue" | "accept"; note?: string; acknowledgeOpenFindings?: boolean; mergeIntoWorkspace?: boolean; reviewScope?: "all" | "blocking" } = {}) =>
     request<Run>(`/api/runs/${id}/approve`, { method: "POST", body: JSON.stringify(body) }),

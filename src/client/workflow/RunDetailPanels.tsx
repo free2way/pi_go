@@ -68,18 +68,20 @@ export function SubAgentsPanel({ run }: { run: Run }) {
   return (
     <div className="agent-plan">
       <div className="agent-plan-summary"><span>{run.plan.complexity} · {run.plan.strategy}</span><p>{run.plan.rationale}</p></div>
-      {run.plan.tasks.map((task, index) => (
-        <article className={`subagent-row subagent-${task.status}`} key={task.id}>
+      {run.plan.tasks.map((task, index) => {
+        const assignee = task.assignee ? Object.values(run.agents ?? {}).find((profile) => profile.id === task.assignee) : undefined;
+        return <article className={`subagent-row subagent-${task.status}`} key={task.id}>
           <span className="subagent-index">{String(index + 1).padStart(2, "0")}</span>
           <div>
             {task.name && <span className="subagent-codename">{task.name}</span>}
             <strong>{task.title}</strong>
+            {assignee && <span className="subagent-assignee">{t("agents.assignee", { name: assignee.name, role: t(`role.${assignee.role}`), provider: assignee.provider, model: assignee.model })}</span>}
             <p>{task.summary || task.description}</p>
             {task.files.length > 0 && <code>{task.files.join(" · ")}</code>}
           </div>
           <em>{task.status}</em>
-        </article>
-      ))}
+        </article>;
+      })}
     </div>
   );
 }

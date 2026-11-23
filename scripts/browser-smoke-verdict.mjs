@@ -16,6 +16,7 @@ import { collectSpecs } from "./e2e-suite-result.mjs";
 export const REQUIRED_BROWSER_SMOKE = Object.freeze([
   { file: "auth.spec.ts", minimum: 2 },
   { file: "i18n.spec.ts", minimum: 2 },
+  { file: "teams.spec.ts", minimum: 1 },
 ]);
 
 function matchesFile(actual, expected) {

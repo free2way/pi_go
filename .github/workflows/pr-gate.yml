@@ -178,7 +178,7 @@ jobs:
           PLAYWRIGHT_JSON_OUTPUT_NAME: /tmp/pigo-browser-report.json
         run: |
           playwright_status=0
-          npx playwright test tests/e2e/auth.spec.ts tests/e2e/i18n.spec.ts --project=chromium --reporter=list --reporter=json || playwright_status=$?
+          npx playwright test tests/e2e/auth.spec.ts tests/e2e/i18n.spec.ts tests/e2e/teams.spec.ts --project=chromium --reporter=list --reporter=json || playwright_status=$?
           node scripts/browser-smoke-verdict.mjs /tmp/pigo-browser-report.json "$playwright_status"
 
       - name: Print server diagnostics on failure
