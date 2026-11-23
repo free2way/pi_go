@@ -1,8 +1,8 @@
-import { AlertTriangle, Code2, LoaderCircle, Play, ShieldCheck, Sparkles, X } from "lucide-react";
+import { AlertTriangle, Code2, LoaderCircle, Play, ShieldCheck, Sparkles, Users, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { localizeError } from "../../shared/i18n";
 import { useT } from "../i18n";
-import type { ConfigStatus, ModelCatalogResponse, Run, RunMode, Workspace } from "../../shared/types";
+import type { AgentTeam, ConfigStatus, ModelCatalogResponse, Run, RunMode, Workspace } from "../../shared/types";
 import type { ModelTemplate } from "../../shared/agile";
 import { api } from "../api";
 import { requirementSummary } from "../requirement-history";
@@ -31,16 +31,19 @@ export function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, 
   const [developerModelId, setDeveloperModelId] = useState("");
   const [reviewerModelId, setReviewerModelId] = useState("");
   const [templates, setTemplates] = useState<ModelTemplate[]>([]);
+  const [teams, setTeams] = useState<AgentTeam[]>([]);
+  const [teamId, setTeamId] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
     if (!open || !config?.realRunsAvailable) return;
     void api.templates().then((result) => setTemplates(result.templates)).catch(() => undefined);
-    void Promise.all([api.workspaces(), api.models()]).then(([workspaceResult, modelResult]) => {
+    void Promise.all([api.workspaces(), api.models(), api.agentTeams()]).then(([workspaceResult, modelResult, teamResult]) => {
       const active = workspaceResult.workspaces.filter((item) => item.status === "active");
       setWorkspaces(active);
       setModels(modelResult);
+      setTeams(teamResult.teams);
       const preferred = active.find((item) => !item.git?.dirty) ?? active[0];
       if (preferred) {
         setWorkspaceId(preferred.id);
@@ -68,6 +71,7 @@ export function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, 
   const developerUncovered = roleUncovered(models?.models, "developer");
   const reviewerUncovered = roleUncovered(models?.models, "reviewer");
   const selectedWorkspace = workspaces.find((item) => item.id === workspaceId);
+  const selectedTeam = teams.find((item) => item.id === teamId);
   const selectedDirty = Boolean(selectedWorkspace?.git?.dirty);
   const selectWorkspace = (nextId: string) => {
     setWorkspaceId(nextId);
@@ -89,9 +93,10 @@ export function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, 
         ...(mode === "real"
           ? {
               workspaceId,
+              teamId: teamId || undefined,
               checks: checks.split("\n").map((item) => item.trim()).filter(Boolean),
-              developerModel: developer ? { provider: developer.provider, model: developer.model } : undefined,
-              reviewerModel: reviewer ? { provider: reviewer.provider, model: reviewer.model } : undefined,
+              developerModel: !teamId && developer ? { provider: developer.provider, model: developer.model } : undefined,
+              reviewerModel: !teamId && reviewer ? { provider: reviewer.provider, model: reviewer.model } : undefined,
             }
           : { repository, checks: [] }),
       }, { locale });
@@ -134,6 +139,12 @@ export function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, 
                   </option>
                 ))}
               </select></label>
+              <label>{t("createRun.team")}<select value={teamId} onChange={(event) => setTeamId(event.target.value)}>
+                <option value="">{t("createRun.teamLegacy")}</option>
+                {teams.map((team) => <option key={team.id} value={team.id}>{team.name}</option>)}
+              </select></label>
+              {selectedTeam && <div className="selected-team-summary"><Users size={15} /><div><strong>{selectedTeam.name}</strong><span>{selectedTeam.profiles.map((profile) => `${t(`role.${profile.role}`)} · ${profile.name}`).join(" · ")}</span></div></div>}
+              {!teamId && <>
               {templates.length > 0 && (
                 <label>{t("createRun.template")}
                   <select value="" onChange={(event) => {
@@ -170,6 +181,7 @@ export function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, 
                 ))}
               </select></label>
               {reviewerUncovered && <div className="form-error">{t("createRun.modelRoleUncovered")}</div>}
+              </>}
               {selectedDirty && (
                 <div className="dirty-warning">
                   <AlertTriangle size={15} />
@@ -223,7 +235,7 @@ export function CreateRunDialog({ open, onClose, onCreated, config, recentRuns, 
         {error && <div className="form-error">{error}</div>}
         <div className="modal-actions">
           <button type="button" className="button secondary" onClick={onClose}>{t("common.cancel")}</button>
-          <button type="submit" className="button primary" disabled={submitting || (mode === "real" && (!workspaceId || selectedDirty || !developerUsable || !reviewerUsable))}>
+          <button type="submit" className="button primary" disabled={submitting || (mode === "real" && (!workspaceId || selectedDirty || (!teamId && (!developerUsable || !reviewerUsable))))}>
             {submitting ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}{t(mode === "real" ? "createRun.submitReal" : "createRun.submitDemo")}
           </button>
         </div>

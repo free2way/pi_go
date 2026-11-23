@@ -265,6 +265,7 @@ button { color: inherit; }
 .subagent-codename { display: inline-block; margin-bottom: 3px; padding: 1px 6px; border-radius: 999px; background: rgba(223,248,84,.08); border: 1px solid rgba(223,248,84,.25); color: #c3d274; font: 500 var(--panel-mono-fs) "DM Mono", monospace; }
 .subagent-row p { color: var(--panel-dim); font-size: var(--panel-fs-sm); line-height: var(--panel-lh); margin: 4px 0; }
 .subagent-row code { color: var(--panel-dim); font: 500 var(--panel-mono-fs) "DM Mono", monospace; }
+.subagent-assignee { display: block; margin-top: 4px; color: #c3d274; font: 500 var(--panel-mono-fs) "DM Mono", monospace; }
 .subagent-row em { color: var(--panel-dim); font: 500 var(--panel-mono-fs) "DM Mono", monospace; font-style: normal; text-transform: uppercase; }
 .subagent-running { border-color: #535e2c; }
 .subagent-running em { color: var(--accent); }
@@ -531,6 +532,49 @@ button { color: inherit; }
 /* ---------- models & credentials ---------- */
 .model-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 12px; margin-top: 14px; }
 .model-card { display: flex; flex-direction: column; }
+.team-settings { margin-top: 34px; padding-top: 24px; border-top: 1px solid #252c33; }
+.team-settings-head, .team-section-title, .team-row, .team-row-main, .team-form-actions { display: flex; align-items: center; }
+.team-settings-head { justify-content: space-between; gap: 20px; }
+.team-settings-head h2 { margin: 5px 0 4px; font-size: 24px; }
+.team-settings-head p, .team-section-title p { margin: 0; color: #8e9aa6; font-size: 13px; line-height: 1.5; }
+.team-settings-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; margin-top: 20px; }
+.team-settings-column { min-width: 0; }
+.team-section-title { justify-content: space-between; gap: 16px; padding-bottom: 10px; border-bottom: 1px solid #252c33; }
+.team-section-title h3 { margin: 0 0 3px; font-size: 16px; }
+.team-section-title > span { color: #c3d274; font: 600 12px "DM Mono", monospace; }
+.team-form-grid { display: grid; grid-template-columns: 1fr 150px; gap: 10px; padding: 14px 0; }
+.team-form-grid label { display: grid; gap: 6px; color: #aeb8c2; font-size: 12px; }
+.team-form-grid input, .team-form-grid select { width: 100%; }
+.team-form-wide, .team-form-actions, .team-member-picker { grid-column: 1 / -1; }
+.team-form-actions { gap: 8px; }
+.team-rows { display: grid; border-top: 1px solid #252c33; }
+.team-row { justify-content: space-between; gap: 14px; min-height: 58px; padding: 10px 2px; border-bottom: 1px solid #252c33; }
+.team-row strong, .team-row span { display: block; }
+.team-row strong { color: #e8edf2; font-size: 13px; }
+.team-row span { margin-top: 3px; color: #83909c; font: 500 11px "DM Mono", monospace; line-height: 1.45; }
+.team-row-main { min-width: 0; gap: 9px; }
+.team-row-main > div { min-width: 0; }
+.team-row-actions { display: flex; flex: 0 0 auto; gap: 4px; }
+.team-member-picker { display: grid; gap: 6px; max-height: 220px; overflow: auto; }
+.team-member-picker label { display: flex; align-items: center; gap: 9px; padding: 8px 9px; border: 1px solid #252c33; border-radius: 7px; cursor: pointer; }
+.team-member-picker label.selected { border-color: rgba(223,248,84,.35); background: rgba(223,248,84,.045); }
+.team-member-picker label:has(input:disabled) { opacity: .42; cursor: not-allowed; }
+.team-member-picker input { width: auto; }
+.team-member-picker span { min-width: 0; }
+.team-member-picker strong, .team-member-picker small { display: block; }
+.team-member-picker small { margin-top: 2px; color: #83909c; font: 500 10px "DM Mono", monospace; }
+.team-member-order { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.team-member-order li { display: flex; align-items: center; justify-content: space-between; min-width: 0; padding: 7px 8px; border-top: 1px solid #252c33; }
+.team-member-order li > span { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.team-member-order b { color: #71808d; font: 600 10px "DM Mono", monospace; }
+.team-member-order strong { overflow: hidden; color: #dce4ea; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.team-member-order small { color: #7f8c98; font-size: 10px; }
+.team-member-order li > div { display: flex; gap: 4px; }
+.team-empty { padding: 18px 2px; color: #77838e; font-size: 13px; }
+.selected-team-summary { display: flex; align-items: flex-start; gap: 9px; padding: 10px; border: 1px solid rgba(223,248,84,.22); border-radius: 8px; background: rgba(223,248,84,.04); }
+.selected-team-summary strong, .selected-team-summary span { display: block; }
+.selected-team-summary strong { font-size: 13px; color: #dce5c0; }
+.selected-team-summary span { margin-top: 3px; color: #8e9a83; font: 500 10px "DM Mono", monospace; line-height: 1.45; }
 .model-credential { font: 500 9px "DM Mono", monospace; color: #b9885b; background: rgba(243,166,90,.07); border: 1px solid rgba(243,166,90,.18); border-radius: 6px; padding: 4px 8px; }
 .model-credential.is-set { color: #83ccaa; background: rgba(115,214,162,.07); border-color: rgba(115,214,162,.16); }
 .model-head-tags { display: flex; align-items: center; gap: 6px; }
@@ -550,7 +594,8 @@ button { color: inherit; }
 .model-credential-form input:focus { border-color: #59652c; }
 .model-credential-form .button { height: 34px; padding: 0 12px; font-size: 10px; }
 .model-credential-form .danger-text { height: 34px; border-radius: 8px; padding: 0 12px; font-size: 10px; font-weight: 650; cursor: pointer; }
-@media (max-width: 760px) { .model-grid { grid-template-columns: 1fr; } .model-credential-form { flex-wrap: wrap; } }
+@media (max-width: 900px) { .team-settings-columns { grid-template-columns: 1fr; } }
+@media (max-width: 760px) { .model-grid { grid-template-columns: 1fr; } .model-credential-form { flex-wrap: wrap; } .team-form-grid { grid-template-columns: 1fr; } .team-form-grid > * { grid-column: 1; } }
 
 /* ---------- GAP-04: artifacts, checks exit code, budget & per-agent usage ---------- */
 .sidebar-head-actions { display: flex; align-items: center; gap: 8px; }
