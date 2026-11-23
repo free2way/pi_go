@@ -6,7 +6,10 @@ import {
   hasRequiredCredentials,
   requiredCredentialRoles,
   resolveRunCredentials,
+  runAgentForAssignee,
   runModelForRole,
+  runRoleForAssignee,
+  taskInvocationForAssignee,
 } from "./run-roles.js";
 
 function run(): Run {
@@ -64,5 +67,38 @@ describe("Team run role projection", () => {
     const credentials: ModelCredentials = { planner: "plan", developer: "dev", reviewer: "review" };
     clearModelCredentials(credentials);
     expect(credentials).toEqual({ planner: "", developer: "", reviewer: "" });
+  });
+
+  it("resolves an assignee from the immutable Team snapshot and preserves legacy fallback", () => {
+    const current = run();
+    current.agents = {
+      developer: { id: "d", name: "Developer", role: "developer", provider: "deepseek", model: "deepseek-chat" },
+      custom: { id: "c", name: "Frontend specialist", role: "custom", provider: "anthropic", model: "claude-sonnet" },
+    };
+    expect(runAgentForAssignee(current, "c")).toEqual(current.agents.custom);
+    expect(runRoleForAssignee(current, "c")).toBe("custom");
+    expect(runRoleForAssignee(current)).toBe("developer");
+    const credentials: ModelCredentials = {
+      developer: "DUMMY_developer_credential",
+      reviewer: "DUMMY_reviewer_credential",
+      custom: "DUMMY_custom_credential",
+    };
+    const assigned = taskInvocationForAssignee(current, credentials, "c");
+    expect({ ...assigned, apiKey: undefined }).toEqual({
+      role: "custom",
+      provider: "anthropic",
+      model: "claude-sonnet",
+      apiKey: undefined,
+    });
+    expect(assigned.apiKey).toBe(credentials.custom);
+    const legacy = taskInvocationForAssignee(current, credentials);
+    expect({ ...legacy, apiKey: undefined }).toEqual({
+      role: "developer",
+      provider: "deepseek",
+      model: "deepseek-chat",
+      apiKey: undefined,
+    });
+    expect(legacy.apiKey).toBe(credentials.developer);
+    expect(() => runRoleForAssignee(current, "foreign-profile")).toThrow(/not part of the admitted Team/);
   });
 });

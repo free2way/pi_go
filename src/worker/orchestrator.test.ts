@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { conflictFreeBatches, executionWaves, filesOverlap, parseDevelopmentPlan } from "./orchestrator.js";
+import { conflictFreeBatches, executionWaves, filesOverlap, parseDevelopmentPlan, shouldOrchestrateSubAgents } from "./orchestrator.js";
 
 describe("development orchestrator", () => {
   it("caps and normalizes planner tasks", () => {
@@ -98,6 +98,40 @@ describe("development orchestrator", () => {
     const ids = plan.tasks.map((task) => task.id);
     expect(new Set(ids).size).toBe(12);
     for (const id of ids) expect(id.length).toBeLessThanOrEqual(32);
+  });
+
+  it("accepts only assignees captured in the admitted Team snapshot", () => {
+    const plan = parseDevelopmentPlan(JSON.stringify({
+      complexity: "medium",
+      tasks: [
+        { id: "api", title: "API", assignee: "profile-api" },
+        { id: "ui", title: "UI" },
+      ],
+    }), 4, ["profile-api", "profile-review"]);
+    expect(plan.tasks.map((task) => task.assignee)).toEqual(["profile-api", undefined]);
+
+    expect(() => parseDevelopmentPlan(JSON.stringify({
+      complexity: "small",
+      tasks: [{ id: "api", title: "API", assignee: "foreign-profile" }],
+    }), 4, ["profile-api"])).toThrow(/unknown assignee/);
+
+    expect(() => parseDevelopmentPlan(JSON.stringify({
+      complexity: "small",
+      tasks: [{ id: "legacy", title: "Legacy", assignee: "profile-api" }],
+    }), 4)).toThrow(/unknown assignee/);
+  });
+
+  it("routes a single assigned task through the assignee execution path", () => {
+    const assigned = parseDevelopmentPlan(JSON.stringify({
+      complexity: "small",
+      tasks: [{ id: "api", title: "API", assignee: "profile-api" }],
+    }), 4, ["profile-api"]);
+    const legacy = parseDevelopmentPlan(JSON.stringify({
+      complexity: "small",
+      tasks: [{ id: "api", title: "API" }],
+    }), 4);
+    expect(shouldOrchestrateSubAgents(assigned)).toBe(true);
+    expect(shouldOrchestrateSubAgents(legacy)).toBe(false);
   });
 
 });

@@ -28,15 +28,21 @@ function uniqueId(base: string, index: number, taken: Set<string>) {
   throw new Error(`Planner returned more than 1000 tasks with colliding id "${base}"`);
 }
 
-export function parseDevelopmentPlan(text: string, maxSubagents: number): DevelopmentPlan {
+export function parseDevelopmentPlan(text: string, maxSubagents: number, allowedAssignees: readonly string[] = []): DevelopmentPlan {
   const parsed = JSON.parse(cleanJson(text)) as Record<string, unknown>;
   const rawTasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
   if (rawTasks.length === 0) throw new Error("Planner returned no tasks");
+  const allowed = new Set(allowedAssignees);
 
   const tasks: SubAgentTask[] = rawTasks.slice(0, maxSubagents).map((raw, index) => {
     const item = raw as Record<string, unknown>;
+    const assignee = typeof item.assignee === "string" && item.assignee.trim() ? item.assignee.trim() : undefined;
+    if (assignee && !allowed.has(assignee)) {
+      throw new Error(`Planner returned unknown assignee "${assignee}"`);
+    }
     return {
       id: normalizeId(item.id, index),
+      ...(assignee ? { assignee } : {}),
       title: String(item.title || `Task ${index + 1}`).slice(0, 120),
       description: String(item.description || item.title || "Implement the assigned part.").slice(0, 4_000),
       files: Array.isArray(item.files) ? item.files.map(String).filter((file) => !file.includes("..") && !file.startsWith("/")).slice(0, 30) : [],
@@ -97,6 +103,11 @@ export function executionWaves(tasks: SubAgentTask[]) {
     }
   }
   return waves;
+}
+
+/** Assigned work always uses the sub-agent path, even for a one-task plan. */
+export function shouldOrchestrateSubAgents(plan: DevelopmentPlan): boolean {
+  return plan.tasks.length > 1 || Boolean(plan.tasks[0]?.assignee);
 }
 
 function normalizeFile(file: string) {
