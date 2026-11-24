@@ -403,6 +403,7 @@ export const projectPluginPaths = [
   ".pi/extensions",
   ".pi/skills",
   ".pi/prompt-templates",
+  ".pi/mcp.json",
   ".agents/skills",
 ] as const;
 

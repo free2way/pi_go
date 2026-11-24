@@ -23,7 +23,7 @@ test("Pi uses patched pinned npm; server and executor remove their unused packag
   const web = read("deploy/docker/Dockerfile.web");
   const executor = read("deploy/executor/Dockerfile");
 
-  assert.match(runtime, /^ARG PI_VERSION=1\.3\.0$/mu);
+  assert.match(runtime, /^ARG PI_VERSION=1\.6\.0$/mu);
   assert.match(runtime, /^ARG NPM_VERSION=12\.2\.3$/mu);
   assert.match(runtime, /"npm@\$\{NPM_VERSION\}"/u);
   assert.match(runtime, /node \/tmp\/patch-runtime-npm\.mjs \/usr\/local\/lib\/node_modules\/npm/u);
