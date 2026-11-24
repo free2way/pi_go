@@ -117,10 +117,10 @@ it("captures the registered route surface and checks each service credential", a
       authChecks.push({ key, credential: label, status: result.statusCode, handlerCalls });
     }
   }
-  expect(snapshot).toHaveLength(157);
+  expect(snapshot).toHaveLength(171);
   expect(authChecks).toHaveLength(114);
   // Registered method, path, effective body limit and anonymous auth outcome on the baseline.
-  expect(createHash("sha256").update(JSON.stringify(snapshot)).digest("hex")).toBe("f5f389993989a070785c1dd640d6a55d643d3753553cb177fad17916d90ffeda");
+  expect(createHash("sha256").update(JSON.stringify(snapshot)).digest("hex")).toBe("ecfb0af28a1dc7a843ec6fbbe2efa957f8333fcfe469a9177e11b52b7da1ade9");
   if (process.env.PIGO_ROUTE_SNAPSHOT) {
     await writeFile(process.env.PIGO_ROUTE_SNAPSHOT, JSON.stringify({ routes: snapshot, authChecks }, null, 2) + "\n");
   }

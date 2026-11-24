@@ -30,6 +30,8 @@ const checkResultSchema = z.object({
 });
 const subAgentTaskSchema = z.object({
   id: z.string().min(1).max(64),
+  // P3: owner-scoped AgentProfile id; execution routing is added in AT-NX-T04.
+  assignee: z.string().min(1).max(80).optional(),
   title: z.string().min(1).max(200),
   description: z.string().max(8_000),
   files: z.array(z.string().max(400)).max(40),

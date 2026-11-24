@@ -41,7 +41,8 @@ try {
   create(source);
   const tables = { users: "users", identities: "user_identities", workspaces: "workspaces",
     events: "run_events", agents: "run_agents", checks: "run_checks", findings: "run_findings",
-    artifacts: "run_artifacts", checkpoints: "run_checkpoints", jobs: "jobs" };
+    artifacts: "run_artifacts", checkpoints: "run_checkpoints", jobs: "jobs",
+    profiles: "agent_profiles", teams: "agent_teams", teamMembers: "agent_team_members" };
   for (const table of Object.values(tables)) {
     sql(source, `CREATE TABLE ${table}(id text PRIMARY KEY); INSERT INTO ${table} VALUES ('fixture-1')`);
   }

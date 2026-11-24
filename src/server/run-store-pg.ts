@@ -146,10 +146,11 @@ export class PostgresRunStore implements RunStoreLike {
     const snapshot: Run = { ...run };
     await this.db.withTransaction(async (tx) => {
       await tx.query(
-        `INSERT INTO runs (id, owner_id, state, mode, created_at, updated_at, last_seq, document_json)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         ON CONFLICT (id) DO UPDATE SET state = $3, updated_at = $6, last_seq = $7, document_json = $8, revision = runs.revision + 1`,
-        [snapshot.id, snapshot.ownerId, snapshot.state, snapshot.mode, snapshot.createdAt, snapshot.updatedAt, snapshot.lastSeq ?? 0, JSON.stringify(snapshot)],
+        `INSERT INTO runs (id, owner_id, state, mode, created_at, updated_at, last_seq, document_json, team_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (id) DO UPDATE SET state = $3, updated_at = $6, last_seq = $7, document_json = $8,
+           team_id = $9, revision = runs.revision + 1`,
+        [snapshot.id, snapshot.ownerId, snapshot.state, snapshot.mode, snapshot.createdAt, snapshot.updatedAt, snapshot.lastSeq ?? 0, JSON.stringify(snapshot), snapshot.teamId ?? null],
       );
       await this.project(tx, snapshot);
     });
@@ -355,11 +356,12 @@ export class PostgresRunStore implements RunStoreLike {
   private async casWrite(tx: Db, id: string, revision: number, candidate: Run): Promise<Run> {
     const updated = await tx.query(
       `UPDATE runs
-         SET state = $2, updated_at = $3, document_json = $4, revision = revision + 1,
-             last_seq = CASE WHEN last_seq < $5 THEN $5 ELSE last_seq END
-       WHERE id = $1 AND revision = $6
+         SET state = $2, updated_at = $3, document_json = $4, team_id = $5,
+             revision = revision + 1,
+             last_seq = CASE WHEN last_seq < $6 THEN $6 ELSE last_seq END
+       WHERE id = $1 AND revision = $7
        RETURNING last_seq`,
-      [id, candidate.state, candidate.updatedAt, JSON.stringify(candidate), candidate.lastSeq ?? 0, revision],
+      [id, candidate.state, candidate.updatedAt, JSON.stringify(candidate), candidate.teamId ?? null, candidate.lastSeq ?? 0, revision],
     );
     if (updated.rows.length === 0) {
       throw new RunConflictError(id, `Run ${id} was modified concurrently; the stale write was rejected`);
@@ -602,7 +604,10 @@ export class PostgresRunStore implements RunStoreLike {
 
   /** Row counts per table for backup/restore verification (AT-REL-009). */
   async statistics() {
-    const tables = ["runs", "run_events", "run_agents", "run_checks", "run_findings", "run_artifacts", "run_usage_role", "run_checkpoints", "jobs"];
+    const tables = [
+      "runs", "run_events", "run_agents", "run_checks", "run_findings", "run_artifacts",
+      "run_usage_role", "run_checkpoints", "jobs", "agent_profiles", "agent_teams", "agent_team_members",
+    ];
     const counts: Record<string, number> = {};
     for (const table of tables) {
       const row = (await this.db.query(`SELECT COUNT(*) AS total FROM ${table}`)).rows[0];
@@ -660,9 +665,9 @@ export class PostgresRunStore implements RunStoreLike {
       const inserted = await this.db.withTransaction(async (tx) => {
         if ((await tx.query("SELECT id FROM runs WHERE id = $1", [record.id])).rows.length) return false;
         const write = await tx.query(
-          `INSERT INTO runs (id, owner_id, state, mode, created_at, updated_at, last_seq, document_json)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (id) DO NOTHING RETURNING id`,
-          [record.id, record.ownerId, record.state, record.mode, record.createdAt, record.updatedAt, lastSeq, JSON.stringify(record)],
+          `INSERT INTO runs (id, owner_id, state, mode, created_at, updated_at, last_seq, document_json, team_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (id) DO NOTHING RETURNING id`,
+          [record.id, record.ownerId, record.state, record.mode, record.createdAt, record.updatedAt, lastSeq, JSON.stringify(record), record.teamId ?? null],
         );
         if (write.rows.length === 0) return false;
         for (const event of events) {

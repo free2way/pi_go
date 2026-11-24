@@ -26,6 +26,10 @@ describe("database", () => {
     await db.query("SELECT COUNT(*) FROM users");
     await db.query("SELECT COUNT(*) FROM user_identities");
     await db.query("SELECT COUNT(*) FROM workspaces");
+    await db.query("SELECT COUNT(*) FROM agent_profiles");
+    await db.query("SELECT COUNT(*) FROM agent_teams");
+    await db.query("SELECT COUNT(*) FROM agent_team_members");
+    await db.query("SELECT team_id FROM runs");
 
     await runMigrations(db);
     const count = (await db.query("SELECT COUNT(*)::int AS count FROM schema_migrations")).rows[0] as { count: number };

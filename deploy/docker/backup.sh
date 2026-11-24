@@ -67,7 +67,9 @@ counts() {
       'events', (select count(*) from run_events), 'agents', (select count(*) from run_agents),
       'checks', (select count(*) from run_checks), 'findings', (select count(*) from run_findings),
       'artifacts', (select count(*) from run_artifacts), 'checkpoints', (select count(*) from run_checkpoints),
-      'jobs', (select count(*) from jobs), 'digest', (select md5(string_agg(id || ':' || last_seq || ':' || md5(document_json), ',' order by id)) from runs))"
+      'jobs', (select count(*) from jobs), 'profiles', (select count(*) from agent_profiles),
+      'teams', (select count(*) from agent_teams), 'teamMembers', (select count(*) from agent_team_members),
+      'digest', (select md5(string_agg(id || ':' || last_seq || ':' || md5(document_json), ',' order by id)) from runs))"
 }
 
 DB_JSON="$(counts)"
