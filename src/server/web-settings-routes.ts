@@ -110,7 +110,7 @@ export function registerWebSettingsRoutes(services: WebServices) {
     modelCatalog,
     modelDefaults,
     demoMode,
-    piVersion: process.env.PI_VERSION || "1.0.0",
+    piVersion: process.env.PI_VERSION || "1.6.0",
     realRunsEnabled,
     internalTokenConfigured: Boolean(internalToken),
     mergeRequestConfigured: mergeRequestConfig.configured,

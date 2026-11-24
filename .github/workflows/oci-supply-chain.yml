@@ -31,7 +31,7 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Build Pi runtime foundation
-        run: docker build --pull --file deploy/docker/Dockerfile --tag local/pi-coding-agent:1.0.0 .
+        run: docker build --pull --file deploy/docker/Dockerfile --tag local/pi-coding-agent:1.6.0 .
 
       - name: Build web image
         run: docker build --file deploy/docker/Dockerfile.web --tag local/pigo-web:ci .
@@ -54,7 +54,7 @@ jobs:
       - name: Verify installed OpenSSL backports and prepare candidate VEX
         run: |
           node scripts/openssl-backport-vex.mjs \
-            --images '{"runtime":"local/pi-coding-agent:1.0.0","web":"local/pigo-web:ci","worker":"local/pigo-worker:ci","sandbox":"local/pigo-sandbox:ci","executor":"local/pigo-executor:ci"}' \
+            --images '{"runtime":"local/pi-coding-agent:1.6.0","web":"local/pigo-web:ci","worker":"local/pigo-worker:ci","sandbox":"local/pigo-sandbox:ci","executor":"local/pigo-executor:ci"}' \
             --output-dir validation-vulnerability/backport
 
       - name: Scan candidate runtime for high and critical vulnerabilities
@@ -62,7 +62,7 @@ jobs:
         continue-on-error: true
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
         with:
-          image: local/pi-coding-agent:1.0.0
+          image: local/pi-coding-agent:1.6.0
           fail-build: true
           grype-version: v0.122.0
           severity-cutoff: high

@@ -96,6 +96,7 @@ export async function runPi(input: {
     "--no-extensions",
     "--no-skills",
     "--no-prompt-templates",
+    "--no-mcp",
     "--provider", input.provider,
     "--model", input.model,
     "--thinking", input.thinking === "low" || input.thinking === "medium" ? input.thinking : "high",

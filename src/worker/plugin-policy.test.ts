@@ -254,6 +254,13 @@ describe("detectProjectPlugins (AT-PI-006)", () => {
     expect(found).toEqual([".pi/extensions", ".agents/skills"]);
   });
 
+  it("detects project-local .pi/mcp.json configs", async () => {
+    const worktree = await mkdtemp(path.join(tmpdir(), "pigo-plugins-"));
+    await mkdir(path.join(worktree, ".pi"), { recursive: true });
+    await writeFile(path.join(worktree, ".pi", "mcp.json"), '{"mcpServers":{}}\n');
+    expect(await detectProjectPlugins(worktree)).toEqual([".pi/mcp.json"]);
+  });
+
   it("returns nothing for a clean repository", async () => {
     const worktree = await mkdtemp(path.join(tmpdir(), "pigo-plugins-"));
     expect(await detectProjectPlugins(worktree)).toEqual([]);
